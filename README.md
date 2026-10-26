@@ -156,8 +156,8 @@ See [`session/README.md`](session/README.md).
 - AEE ipanic/mrdump/dram-console are separate downstream ports.
 - CLDMA TX purge ordering and L3 per-queue bit attribution need hardware.
 - WCN scan retune/WoWLAN/filter and FM ASRC tables remain.
-- CCCI MASP/HACC key material, ADC EFUSE calibration and AEE DB client remain.
-- Vcodec MMDVFS SMI-bandwidth/VCORE vote remains.
+- CCCI MASP/HACC key material, ADC EFUSE calibration and AEE DB client remain. https://android.googlesource.com/kernel/mediatek/+/android-mtk-3.18/drivers/misc/mediatek/aee/aed/aed.h  https://android.googlesource.com/kernel/mediatek/+/android-mtk-3.18/drivers/misc/mediatek/aee/aed/monitor_hang.c 
+- Vcodec MMDVFS SMI-bandwidth/VCORE vote remains. https://android.googlesource.com/kernel/mediatek/+/android-mtk-3.18/drivers/misc/mediatek/smi/mmdvfs_mgr.c 
 - No phone attached; hardware validation is pending.
 
 ## Licensing and provenance
