@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config MTK_VCODEC_MT6735
+	tristate "MediaTek MT6735 video codec hardware service"
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	depends on COMMON_CLK
+	depends on PM
+	help
+	  Shared power, clock, interrupt and hardware-ownership services for
+	  the MediaTek MT6735 VENC (encoder) and VDEC (decoder) video codec
+	  engines.  Ported from the Samsung/MediaTek downstream
+	  drivers/misc/mediatek/videocodec driver.
+
+	  The codec register sequences themselves are executed by the vendor
+	  userspace codec libraries through the register windows exported by
+	  this driver; no codec firmware runs in the kernel.

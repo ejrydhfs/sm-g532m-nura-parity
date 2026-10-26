@@ -1,0 +1,20 @@
+diff --git a/drivers/misc/mediatek/vcodec/vcodec-core.c b/drivers/misc/mediatek/vcodec/vcodec-core.c
+index a21a49c15..179eadfce 100644
+--- a/drivers/misc/mediatek/vcodec/vcodec-core.c
++++ b/drivers/misc/mediatek/vcodec/vcodec-core.c
+@@ -1085,6 +1085,15 @@ static long vcodec_compat_ioctl(struct file *file, unsigned int cmd,
+ 		mb();
+ 		return 0;
+ 	default:
++		/*
++		 * Same distinction as the native dispatcher: a command that
++		 * exists in the ABI but has no implementation is refused with
++		 * -EOPNOTSUPP, anything else is not our ioctl at all.  Without
++		 * this a 32-bit caller would get -ENOTTY for the very commands
++		 * a 64-bit caller sees as -EOPNOTSUPP.
++		 */
++		if (vcodec_cmd_is_unsupported(cmd))
++			return -EOPNOTSUPP;
+ 		return -ENOTTY;
+ 	}
+ }

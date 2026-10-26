@@ -1,0 +1,267 @@
+diff --git a/drivers/misc/mediatek/ccci/ccci_boot.c b/drivers/misc/mediatek/ccci/ccci_boot.c
+index a73a4b0a1..11dd6e186 100644
+--- a/drivers/misc/mediatek/ccci/ccci_boot.c
++++ b/drivers/misc/mediatek/ccci/ccci_boot.c
+@@ -259,29 +259,20 @@ int ccci_boot_smem_setup(struct ccci_md *md, struct device *dev)
+ 	if (np) {
+ 		ret = ccci_boot_region_get(dev, "memory-region", 0, &img_phys,
+ 					   &img_size);
+-		if (!ret) {
+-			md->img_phy = img_phys;
+-			md->img_size = img_size;
+-			md->img_vir = ioremap(img_phys, img_size);
+-			if (!md->img_vir) {
+-				ccci_md_err(md,
+-					    "cannot map md image region %pa+0x%zx\n",
+-					    &img_phys, (size_t)img_size);
+-				return -ENOMEM;
+-			}
+-			md->img_present = true;
+-			ccci_md_info(md, "md image region %pa size 0x%zx\n",
+-				     &md->img_phy, md->img_size);
+-		} else {
++		if (ret)
+ 			ccci_md_warn(md,
+ 				     "no memory-region[0] (md image), boot will fail\n");
+-		}
+ 	}
+ 
+-	/* shared memory: memory-region index 1, then md_smem_size, then a
+-	 * coherent allocation sized for the CCIF rings
++	/* shared memory: memory-region index 1; when absent, a single carve-out
++	 * (memory-region[0]) is split exactly like downstream
++	 * ccci_util_lib_fo.c:1113-1122: md_smem_size bytes are taken from the
++	 * end of the region and the image part is rounded up to 16 KiB
++	 * (get_md_smem_align() at ccci_util_lib_fo.c:948-951).
+ 	 */
+ 	if (np) {
++		of_property_read_u32(np, "mediatek,md_smem_size",
++				     &dt_smem_size);
+ 		ret = ccci_boot_region_get(dev, "memory-region", 1, &smem_phys,
+ 					   &smem_size);
+ 		if (!ret) {
+@@ -294,20 +285,68 @@ int ccci_boot_smem_setup(struct ccci_md *md, struct device *dev)
+ 				return -ENOMEM;
+ 			}
+ 			md->smem_coherent = false;
+-		}
+-		if (!of_property_read_u32(np, "mediatek,md_smem_size",
+-					  &dt_smem_size) && dt_smem_size &&
+-		    !md->smem_vir)
++		} else if (img_size && dt_smem_size) {
++			resource_size_t image_size;
++
++			if (dt_smem_size >= img_size) {
++				ccci_md_err(md,
++					    "md_smem_size 0x%x exceeds carve-out 0x%zx\n",
++					    dt_smem_size, (size_t)img_size);
++				return -EINVAL;
++			}
++			image_size = round_up(img_size - dt_smem_size,
++					      CCCI_IMAGE_ALIGN);
++			if (image_size + dt_smem_size > img_size) {
++				ccci_md_err(md,
++					    "carve-out 0x%zx cannot hold image 0x%zx + smem 0x%x\n",
++					    (size_t)img_size,
++					    (size_t)image_size, dt_smem_size);
++				return -EINVAL;
++			}
++			smem_phys = img_phys + image_size;
+ 			smem_size = dt_smem_size;
++			img_size = image_size;
++			md->smem_phy = smem_phys;
++			md->smem_size = smem_size;
++			md->smem_vir = ioremap(smem_phys, smem_size);
++			if (!md->smem_vir) {
++				ccci_md_err(md, "cannot map smem %pa+0x%zx\n",
++					    &smem_phys, (size_t)smem_size);
++				return -ENOMEM;
++			}
++			md->smem_coherent = false;
++			ccci_md_info(md,
++				     "carve-out 0x%zx split: image 0x%zx smem 0x%zx\n",
++				     (size_t)(image_size + dt_smem_size),
++				     (size_t)image_size, (size_t)smem_size);
++		}
++	}
++
++	if (img_size) {
++		md->img_phy = img_phys;
++		md->img_size = img_size;
++		md->img_vir = ioremap(img_phys, img_size);
++		if (!md->img_vir) {
++			ccci_md_err(md, "cannot map md image region %pa+0x%zx\n",
++				    &img_phys, (size_t)img_size);
++			return -ENOMEM;
++		}
++		md->img_present = true;
++		ccci_md_info(md, "md image region %pa size 0x%zx\n",
++			     &md->img_phy, md->img_size);
+ 	}
+ 
+ 	if (!md->smem_vir) {
+ 		if (!smem_size) {
+-			/* worst case: exception + runtime + all CCIF rings */
+-			smem_size = CCCI_SMEM_SIZE_EXCEPTION +
+-				    CCCI_SMEM_SIZE_RUNTIME +
+-				    ccci_ccif_ring_total_size();
+-			smem_size = max_t(size_t, smem_size, 0x30000);
++			if (dt_smem_size) {
++				smem_size = dt_smem_size;
++			} else {
++				/* worst case: exception + runtime + CCIF rings */
++				smem_size = CCCI_SMEM_SIZE_EXCEPTION +
++					    CCCI_SMEM_SIZE_RUNTIME +
++					    ccci_ccif_ring_total_size();
++				smem_size = max_t(size_t, smem_size, 0x30000);
++			}
+ 		}
+ 		smem_size = round_up(smem_size, PAGE_SIZE);
+ 		dma_virt = dma_alloc_coherent(dma_dev, smem_size, &dma_addr,
+diff --git a/drivers/misc/mediatek/ccci_c2k/ccci_c2k_hw.c b/drivers/misc/mediatek/ccci_c2k/ccci_c2k_hw.c
+index 8845ef0f5..68b7d65da 100644
+--- a/drivers/misc/mediatek/ccci_c2k/ccci_c2k_hw.c
++++ b/drivers/misc/mediatek/ccci_c2k/ccci_c2k_hw.c
+@@ -25,6 +25,7 @@
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ #include <linux/regulator/consumer.h>
+ 
+ #include "ccci_c2k.h"
+@@ -228,6 +229,7 @@ unsigned int ccci_c2k_hw_read_chip_id(struct ccci_c2k *c2k)
+ int ccci_c2k_hw_init(struct ccci_c2k *c2k)
+ {
+ 	struct device *dev = c2k->dev;
++	int ret;
+ 
+ 	c2k->md1_pccif = c2k_map_resource(dev, C2K_REG_MD1_PCCIF);
+ 	if (IS_ERR(c2k->md1_pccif))
+@@ -295,7 +297,17 @@ int ccci_c2k_hw_init(struct ccci_c2k *c2k)
+ 		return PTR_ERR(c2k->clk_md_main);
+ 	if (!c2k->clk_md_main)
+ 		dev_warn(dev,
+-			 "no scp-sys-md2-main clock, relying on the boot loader\n");
++			 "no scp-sys-md2-main clock, relying on power domain\n");
++
++	/*
++	 * On mainline the SCP_SYS_MD2 gate is the MT6735 MD2 power domain;
++	 * the platform bus attaches it from the DT power-domains phandle and
++	 * powers it on before probe.  Runtime PM is used to keep it on while
++	 * MD3 runs (same pattern as the MD1 core in ccci_platform.c:208).
++	 */
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
+ 
+ 	c2k->vtcxo1 = devm_regulator_get_optional(dev, "vtcxo1");
+ 	if (IS_ERR(c2k->vtcxo1))
+@@ -338,10 +350,22 @@ int ccci_c2k_hw_power_on(struct ccci_c2k *c2k)
+ 		c2k->clk_enabled = true;
+ 	}
+ 
++	/* SCP_SYS_MD2 gate modelled as a power domain (MT6735_POWER_DOMAIN_MD2) */
++	ret = pm_runtime_resume_and_get(c2k->dev);
++	if (ret) {
++		dev_err(c2k->dev, "MD2 power domain resume failed %d\n", ret);
++		if (c2k->clk_enabled) {
++			clk_disable_unprepare(c2k->clk_md_main);
++			c2k->clk_enabled = false;
++		}
++		return ret;
++	}
++
+ 	if (c2k->vtcxo1) {
+ 		ret = regulator_enable(c2k->vtcxo1);
+ 		if (ret) {
+ 			dev_err(c2k->dev, "vtcxo1 enable failed %d\n", ret);
++			pm_runtime_put_sync(c2k->dev);
+ 			if (c2k->clk_enabled) {
+ 				clk_disable_unprepare(c2k->clk_md_main);
+ 				c2k->clk_enabled = false;
+@@ -372,6 +396,8 @@ int ccci_c2k_hw_power_off(struct ccci_c2k *c2k)
+ 		c2k->vtcxo_enabled = false;
+ 	}
+ 
++	pm_runtime_put_sync(c2k->dev);
++
+ 	if (c2k->clk_enabled) {
+ 		clk_disable_unprepare(c2k->clk_md_main);
+ 		c2k->clk_enabled = false;
+diff --git a/drivers/pmdomain/mediatek/mt6735-pm-domains.h b/drivers/pmdomain/mediatek/mt6735-pm-domains.h
+index 71896be68..7d9d820cd 100644
+--- a/drivers/pmdomain/mediatek/mt6735-pm-domains.h
++++ b/drivers/pmdomain/mediatek/mt6735-pm-domains.h
+@@ -23,6 +23,23 @@ static const struct scpsys_domain_data scpsys_domain_data_mt6735[] = {
+ 			BUS_PROT_INFRA_UPDATE_TOPAXI(MT6735_TOP_AXI_PROT_EN_MD1),
+ 		},
+ 	},
++	/*
++	 * MD2 (C2K) power domain.  Downstream mt_spm_mtcmos.c:1775-1830
++	 * (spm_mtcmos_ctrl_mdsys2) uses SPM_C2K_PWR_CON, status bit 22,
++	 * SRAM_PDN bit 8 and TOPAXI protect bits 29..31.
++	 */
++	[MT6735_POWER_DOMAIN_MD2] = {
++		.name = "md2",
++		.sta_mask = PWR_STATUS_MD2,
++		.ctl_offs = SPM_C2K_PWR_CON,
++		.pwr_sta_offs = SPM_PWR_STATUS,
++		.pwr_sta2nd_offs = SPM_PWR_STATUS_2ND,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = 0,
++		.bp_cfg = {
++			BUS_PROT_INFRA_UPDATE_TOPAXI(MT6735_TOP_AXI_PROT_EN_MD2),
++		},
++	},
+ 	[MT6735_POWER_DOMAIN_CONN] = {
+ 		.name = "conn",
+ 		.sta_mask = PWR_STATUS_CONN,
+diff --git a/drivers/pmdomain/mediatek/mtk-pm-domains.h b/drivers/pmdomain/mediatek/mtk-pm-domains.h
+index f608e6ec4..a72e53484 100644
+--- a/drivers/pmdomain/mediatek/mtk-pm-domains.h
++++ b/drivers/pmdomain/mediatek/mtk-pm-domains.h
+@@ -33,6 +33,8 @@
+ #define SPM_MFG_2D_PWR_CON		0x02c0
+ #define SPM_MFG_ASYNC_PWR_CON		0x02c4
+ #define SPM_USB_PWR_CON			0x02cc
++/* MT6735 C2K (MD2) power control, downstream mt_spm.h:127 (SPM_BASE + 0x2d4) */
++#define SPM_C2K_PWR_CON			0x02d4
+ 
+ #define SPM_PWR_STATUS			0x060c
+ #define SPM_PWR_STATUS_2ND		0x0610
+@@ -46,6 +48,10 @@
+ #define PWR_STATUS_VENC_LT		BIT(20)
+ #define PWR_STATUS_VENC			BIT(21)
+ #define PWR_STATUS_MFG_2D		BIT(22)
++/* MT6735 MD2 (C2K) reports on the same status bit as MFG_2D,
++ * downstream mt_spm_mtcmos.c:1133 (MD2_PWR_STA_MASK)
++ */
++#define PWR_STATUS_MD2			BIT(22)
+ #define PWR_STATUS_MFG_ASYNC		BIT(23)
+ #define PWR_STATUS_AUDIO		BIT(24)
+ #define PWR_STATUS_USB			BIT(25)
+diff --git a/include/dt-bindings/power/mediatek,mt6735-power-controller.h b/include/dt-bindings/power/mediatek,mt6735-power-controller.h
+index 6957075fc..4bcbc7a67 100644
+--- a/include/dt-bindings/power/mediatek,mt6735-power-controller.h
++++ b/include/dt-bindings/power/mediatek,mt6735-power-controller.h
+@@ -10,5 +10,6 @@
+ #define MT6735_POWER_DOMAIN_ISP		4
+ #define MT6735_POWER_DOMAIN_VDE		5
+ #define MT6735_POWER_DOMAIN_VEN		6
++#define MT6735_POWER_DOMAIN_MD2		7
+ 
+ #endif
+diff --git a/include/linux/soc/mediatek/infracfg.h b/include/linux/soc/mediatek/infracfg.h
+index 9956e18c5..57c2e8a1f 100644
+--- a/include/linux/soc/mediatek/infracfg.h
++++ b/include/linux/soc/mediatek/infracfg.h
+@@ -438,6 +438,8 @@
+ #define MT6735_TOP_AXI_PROT_EN_MD1		(BIT(24) | BIT(25) | \
+ 						 BIT(26) | BIT(27) | \
+ 						 BIT(28))
++/* MD2/C2K AXI protection, downstream mt_spm_mtcmos.c:1166 (MD2_PROT_MASK) */
++#define MT6735_TOP_AXI_PROT_EN_MD2		(BIT(29) | BIT(30) | BIT(31))
+ 
+ #define INFRA_TOPAXI_PROTECTEN			0x0220
+ #define INFRA_TOPAXI_PROTECTSTA1		0x0228

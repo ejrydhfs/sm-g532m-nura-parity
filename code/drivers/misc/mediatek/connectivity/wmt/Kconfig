@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# WMT/CONSYS core: STP transport, WMT control protocol and the MT6735
+# connectivity-subsystem power/clock/GPIO glue.
+
+config MTK_WCN_WMT
+	tristate "MediaTek WMT/CONSYS core"
+	depends on MTK_BTIF
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	help
+	  Core driver for the MediaTek connectivity subsystem (CONSYS).  It
+	  owns the STP serial transport, the WMT control protocol, firmware
+	  patch download and the power/clock/reset sequence used by the
+	  WLAN, Bluetooth, GPS and FM functions.
+
+	  The module is called mtk_wcn_wmt.

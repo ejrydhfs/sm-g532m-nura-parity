@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config VIDEO_MTK_ISP
+	tristate "MediaTek MT6735 camera ISP character driver"
+	depends on MEDIA_SUPPORT
+	depends on VIDEO_DEV
+	depends on COMMON_CLK
+	depends on OF
+	depends on PM
+	help
+	  Character driver for the MediaTek MT6735 / MT6737T camera ISP
+	  ("camera-isp").  It implements the downstream libcamdrv ABI
+	  published in include/uapi/linux/mtk_isp.h: register window mmap,
+	  register read/write, the hold-register write buffers, per-user
+	  interrupt status/wait/mark/clear with user keys, the Pass-1 /
+	  Pass-1-D / CAMSV DMA buffer rings with SOF-time base address and
+	  RCNT_INC programming, the Pass-2 early-done queue, reset, register
+	  scenario and burst queue controls.
+
+	  Frame completion is derived exclusively from the ISP interrupt
+	  lines; no timer or polled completion path exists.  Interrupt
+	  status registers are read-to-clear, so they are sampled once per
+	  interrupt and never from a diagnostic path.
+
+	  The ISP power domain and the IMGSYS clock gates are shared with
+	  the mtk-imgsys platform driver; this driver takes its own
+	  references so register access is always safe.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called mtk-isp.

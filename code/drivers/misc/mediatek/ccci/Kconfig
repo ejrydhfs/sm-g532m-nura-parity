@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: GPL-2.0
+config MTK_CCCI
+	bool "MediaTek CCCI modem subsystem (eccci core)"
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	depends on OF
+	depends on FW_LOADER
+	select MTK_CCCI_CLDMA
+	select MTK_CCCI_UTIL
+	select MTK_CCMNI
+	help
+	  Core of the MediaTek CCCI (Cross Chip Communication Interface)
+	  modem subsystem for MT6735/MT6737T: modem object and state machine,
+	  the CCIF control transport, the modem image loader, character
+	  ports (/dev/ccci_monitor, /dev/ttyC0..C4, /dev/ccci_fs, ...) and the
+	  CCMNI network binding hooks.
+
+	  The CLDMA data engine (MTK_CCCI_CLDMA), the log/dump helpers
+	  (MTK_CCCI_UTIL), the CCMNI netdev driver (MTK_CCMNI) and the
+	  C2K/MD3 companion (MTK_CCCI_C2K) are separate options that the
+	  platform configuration must enable alongside this one.
+
+	  Modem firmware (md1img/md3img) is loaded with request_firmware() and
+	  must be present in the firmware search path.
+
+	  Say N unless you are building for such a modem platform.
+
+config MTK_MD_SBP_CUSTOM_VALUE
+	string "Configure modem 1 default bind operator ID"
+	depends on MTK_CCCI
+	default ""
+	help
+	  Default MD SBP (Single Binary Platform) operator/bind value
+	  reported to userspace by CCCI_IOC_GET_MD_SBP_CFG and used for the
+	  handshake-2 runtime data when userspace has not called
+	  CCCI_IOC_SET_MD_SBP_CFG.
+
+	  Ported from Samsung/MTK 3.18 ccci_util/Kconfig:99-105.  The value is
+	  parsed as an unsigned integer (kstrtouint base 0); an empty string,
+	  which is the ROM default, disables the SBP feature.
+
+config MTK_MD2_SBP_CUSTOM_VALUE
+	string "Configure modem 2 default bind operator ID"
+	depends on MTK_CCCI
+	default ""
+	help
+	  Same as MTK_MD_SBP_CUSTOM_VALUE for modem 2
+	  (Samsung/MTK 3.18 ccci_util/Kconfig:107-113).

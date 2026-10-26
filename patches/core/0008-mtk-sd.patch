@@ -1,0 +1,315 @@
+diff --git a/drivers/mmc/host/mtk-sd.c b/drivers/mmc/host/mtk-sd.c
+index ed7a7365e..e6e37e8f0 100644
+--- a/drivers/mmc/host/mtk-sd.c
++++ b/drivers/mmc/host/mtk-sd.c
+@@ -111,6 +111,9 @@
+ #define MSDC_CFG_BV18PSS        BIT(6)	/* R  */
+ #define MSDC_CFG_CKSTB          BIT(7)	/* R  */
+ #define MSDC_CFG_CKDIV          GENMASK(15, 8)	/* RW */
++#define MSDC_CFG_START_BIT      GENMASK(24, 23)	/* RW */
++#define MSDC_CFG_START_AT_RISING		0
++#define MSDC_CFG_START_AT_RISING_AND_FALLING	2
+ #define MSDC_CFG_CKMOD          GENMASK(17, 16)	/* RW */
+ #define MSDC_CFG_HS400_CK_MODE  BIT(18)	/* RW */
+ #define MSDC_CFG_HS400_CK_MODE_EXTRA  BIT(22)	/* RW */
+@@ -458,6 +461,23 @@ struct msdc_tune_para {
+ 	u32 emmc_top_cmd;
+ };
+ 
++/*
++ * Port from Samsung/MTK downstream: one entry of the ETT register table
++ * supplied by the board devicetree as (register offset, field mask, value).
++ */
++#define MSDC_MAX_ETT_SETTINGS	16
++
++struct msdc_ett_setting {
++	u32 reg;
++	u32 mask;
++	u32 val;
++};
++
++/* Sampling edge overrides from the board devicetree, see msdc_set_sample_edges() */
++#define MSDC_EDGE_CMD		BIT(0)
++#define MSDC_EDGE_RDATA		BIT(1)
++#define MSDC_EDGE_WDATA		BIT(2)
++
+ struct msdc_delay_phase {
+ 	u8 maxlen;
+ 	u8 start;
+@@ -520,6 +540,14 @@ struct msdc_host {
+ 	struct msdc_save_para save_para; /* used when gate HCLK */
+ 	struct msdc_tune_para def_tune_para; /* default tune setting */
+ 	struct msdc_tune_para saved_tune_para; /* tune result of CMD21/CMD19 */
++	u8 edge_valid;		/* MSDC_EDGE_* sampled edge overrides */
++	u8 cmd_edge;
++	u8 rdata_edge;
++	u8 wdata_edge;
++	struct msdc_ett_setting ett_hs200[MSDC_MAX_ETT_SETTINGS];
++	unsigned int ett_hs200_count;
++	struct msdc_ett_setting ett_hs400[MSDC_MAX_ETT_SETTINGS];
++	unsigned int ett_hs400_count;
+ 	struct cqhci_host *cq_host;
+ 	u32 cq_ssc1_time;
+ };
+@@ -755,6 +783,52 @@ static void sdr_get_field(void __iomem *reg, u32 field, u32 *val)
+ 	*val = ((tv & field) >> (ffs((unsigned int)field) - 1));
+ }
+ 
++/*
++ * Port from Samsung/MTK downstream sd.c:msdc_apply_ett_settings().
++ * The ETT table is the board's HS200/HS400 register setup from devicetree
++ * (downstream "ett-hs200-default"/"ett-hs400-default" properties).  It
++ * carries the CMD/DAT sampling delays and turnaround settings that are not
++ * otherwise discoverable by tuning.
++ */
++static void msdc_apply_ett_settings(struct msdc_host *host, bool hs400)
++{
++	unsigned int i;
++
++	if (hs400) {
++		/* Downstream clears the HS200 values before applying HS400 */
++		for (i = 0; i < host->ett_hs200_count; i++)
++			sdr_set_field(host->base + host->ett_hs200[i].reg,
++				      host->ett_hs200[i].mask, 0);
++		for (i = 0; i < host->ett_hs400_count; i++)
++			sdr_set_field(host->base + host->ett_hs400[i].reg,
++				      host->ett_hs400[i].mask,
++				      host->ett_hs400[i].val);
++	} else {
++		for (i = 0; i < host->ett_hs200_count; i++)
++			sdr_set_field(host->base + host->ett_hs200[i].reg,
++				      host->ett_hs200[i].mask,
++				      host->ett_hs200[i].val);
++	}
++}
++
++/*
++ * Port from Samsung/MTK downstream sd.c:msdc_set_smpl().  The board may
++ * require CMD response and DAT sampling on the falling clock edge instead of
++ * the controller default rising edge.
++ */
++static void msdc_set_sample_edges(struct msdc_host *host)
++{
++	if (host->edge_valid & MSDC_EDGE_CMD)
++		sdr_set_field(host->base + MSDC_IOCON, MSDC_IOCON_RSPL,
++			      host->cmd_edge);
++	if (host->edge_valid & MSDC_EDGE_RDATA)
++		sdr_set_field(host->base + MSDC_IOCON, MSDC_IOCON_DSPL,
++			      host->rdata_edge);
++	if (host->edge_valid & MSDC_EDGE_WDATA)
++		sdr_set_field(host->base + MSDC_IOCON, MSDC_IOCON_W_DSPL,
++			      host->wdata_edge);
++}
++
+ static void msdc_reset_hw(struct msdc_host *host)
+ {
+ 	u32 val;
+@@ -1122,11 +1196,30 @@ static void msdc_set_mclk(struct msdc_host *host, unsigned char timing, u32 hz)
+ 		}
+ 	}
+ 
+-	if (timing == MMC_TIMING_MMC_HS400 &&
+-	    host->dev_comp->hs400_tune)
++	/*
++	 * Port from Samsung/MTK downstream sd.c:msdc_set_mclk() and the
++	 * HS400 ETT table: select the HS400 command response internal delay.
++	 * mt6735/mt6737 do not use the mt8173-only hs400_tune path, so the
++	 * "mediatek,hs400-cmd-int-delay" property was previously ignored.
++	 */
++	if (timing == MMC_TIMING_MMC_HS400 && host->hs400_cmd_int_delay)
+ 		sdr_set_field(host->base + tune_reg,
+ 			      MSDC_PAD_TUNE_CMDRRDLY,
+ 			      host->hs400_cmd_int_delay);
++
++	/*
++	 * Port from Samsung/MTK downstream sd.c:msdc_set_smpl(): in HS400 the
++	 * data start bit is driven on both clock edges, otherwise only on the
++	 * rising edge.
++	 */
++	sdr_set_field(host->base + MSDC_CFG, MSDC_CFG_START_BIT,
++		      timing == MMC_TIMING_MMC_HS400 ?
++		      MSDC_CFG_START_AT_RISING_AND_FALLING :
++		      MSDC_CFG_START_AT_RISING);
++
++	/* Board CMD/DAT sampling edge overrides, if the DT provides them */
++	msdc_set_sample_edges(host);
++
+ 	if (host->dev_comp->support_new_tx && timing_changed)
+ 		msdc_new_tx_setting(host);
+ 
+@@ -1134,6 +1227,20 @@ static void msdc_set_mclk(struct msdc_host *host, unsigned char timing, u32 hz)
+ 		timing);
+ }
+ 
++/*
++ * Port from Samsung/MTK downstream sd.c:msdc_sd_clock_run(): after an SD
++ * card is powered the card must see the identification clock, a short clock
++ * stop and a clean restart.  Downstream does this from msdc_ops_set_ios()
++ * on MMC_POWER_ON for the SD host.
++ */
++static void msdc_sd_clock_run(struct msdc_host *host)
++{
++	msdc_set_mclk(host, MMC_TIMING_LEGACY, 400000);
++	sdr_set_bits(host->base + MSDC_CFG, MSDC_CFG_CKPDN);
++	mdelay(1);
++	sdr_clr_bits(host->base + MSDC_CFG, MSDC_CFG_CKPDN);
++}
++
+ static inline u32 msdc_cmd_find_resp(struct msdc_host *host,
+ 		struct mmc_command *cmd)
+ {
+@@ -2132,6 +2239,7 @@ static void msdc_init_gpd_bd(struct msdc_host *host, struct msdc_dma *dma)
+ static void msdc_ops_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
+ {
+ 	struct msdc_host *host = mmc_priv(mmc);
++	bool timing_changed = host->timing != ios->timing;
+ 	int ret;
+ 
+ 	msdc_set_buswidth(host, ios->bus_width);
+@@ -2157,6 +2265,22 @@ static void msdc_ops_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
+ 			else
+ 				host->vqmmc_enabled = true;
+ 		}
++
++		/*
++		 * Port from Samsung/MTK downstream sd.c:msdc_set_power_mode():
++		 * wait for the card rails to settle before clocking the card.
++		 */
++		mdelay(10);
++
++		/*
++		 * Port from Samsung/MTK downstream sd.c:msdc_ops_set_ios():
++		 * give a freshly powered SD card the identification clock with
++		 * a clean stop/restart.  eMMC is non-removable and SDIO-only
++		 * hosts are excluded.
++		 */
++		if (!(mmc->caps & MMC_CAP_NONREMOVABLE) &&
++		    !(mmc->caps2 & MMC_CAP2_NO_SD))
++			msdc_sd_clock_run(host);
+ 		break;
+ 	case MMC_POWER_OFF:
+ 		if (!IS_ERR(mmc->supply.vmmc))
+@@ -2166,13 +2290,37 @@ static void msdc_ops_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
+ 			regulator_disable(mmc->supply.vqmmc);
+ 			host->vqmmc_enabled = false;
+ 		}
++
++		/* Downstream msdc_set_power_mode() waits after power down too */
++		mdelay(10);
+ 		break;
+ 	default:
+ 		break;
+ 	}
+ 
+-	if (host->mclk != ios->clock || host->timing != ios->timing)
++	if (host->mclk != ios->clock || timing_changed)
+ 		msdc_set_mclk(host, ios->timing, ios->clock);
++
++	/*
++	 * Port from Samsung/MTK downstream sd.c:msdc_ops_set_ios() and
++	 * msdc_apply_ett_settings(): apply the board HS200/HS400 ETT register
++	 * table on a timing change.  This must happen after msdc_set_mclk()
++	 * because that restores the default/saved pad tuning registers.
++	 */
++	if (timing_changed && ios->clock) {
++		if (ios->timing == MMC_TIMING_MMC_HS200)
++			msdc_apply_ett_settings(host, false);
++		else if (ios->timing == MMC_TIMING_MMC_HS400)
++			msdc_apply_ett_settings(host, true);
++
++		/*
++		 * The ETT table also carries IOCON sampling-edge cells, but
++		 * downstream re-applies cmd_edge/rdata_edge/wdata_edge after
++		 * the table when the clock is reprogrammed.  Do the same so
++		 * the board values win.
++		 */
++		msdc_set_sample_edges(host);
++	}
+ }
+ 
+ static u64 test_delay_bit(u64 delay, u32 bit)
+@@ -2876,10 +3024,48 @@ static const struct cqhci_host_ops msdc_cmdq_ops = {
+ 	.post_disable = msdc_cqe_post_disable,
+ };
+ 
++/*
++ * Port from Samsung/MTK downstream sd.c devicetree parsing: an ETT table is
++ * a list of (register offset, field mask, value) cells.  "ett-hsX-cells" is
++ * the number of entries; "ett-hsX-customer" takes precedence over the
++ * "ett-hsX-default" table, matching downstream.
++ */
++static void msdc_of_parse_ett(struct device *dev, struct device_node *np,
++			      const char *count_name, const char *customer_name,
++			      const char *default_name,
++			      struct msdc_ett_setting *table,
++			      unsigned int *count)
++{
++	u32 cells[MSDC_MAX_ETT_SETTINGS * 3];
++	u32 n;
++	unsigned int i;
++
++	if (of_property_read_u32(np, count_name, &n) || !n)
++		return;
++
++	if (n > MSDC_MAX_ETT_SETTINGS) {
++		dev_warn(dev, "%s: %u entries, using first %d\n", count_name, n,
++			 MSDC_MAX_ETT_SETTINGS);
++		n = MSDC_MAX_ETT_SETTINGS;
++	}
++
++	if (of_property_read_u32_array(np, customer_name, cells, n * 3) &&
++	    of_property_read_u32_array(np, default_name, cells, n * 3))
++		return;
++
++	for (i = 0; i < n; i++) {
++		table[i].reg = cells[i * 3];
++		table[i].mask = cells[i * 3 + 1];
++		table[i].val = cells[i * 3 + 2];
++	}
++	*count = n;
++}
++
+ static void msdc_of_property_parse(struct platform_device *pdev,
+ 				   struct msdc_host *host)
+ {
+ 	struct mmc_host *mmc = mmc_from_priv(host);
++	u32 val;
+ 
+ 	of_property_read_u32(pdev->dev.of_node, "mediatek,latch-ck",
+ 			     &host->latch_ck);
+@@ -2915,6 +3101,35 @@ static void msdc_of_property_parse(struct platform_device *pdev,
+ 		host->cqhci = true;
+ 	else
+ 		host->cqhci = false;
++
++	/*
++	 * Port from Samsung/MTK downstream sd.c register_setting node:
++	 * cmd_edge/rdata_edge/wdata_edge.  mtk-sd historically only ever
++	 * used the rising edge; the mt6735/6737 boards sample on the falling
++	 * edge for all non-tuned modes.
++	 */
++	if (!of_property_read_u32(pdev->dev.of_node, "mediatek,cmd-edge",
++				  &val)) {
++		host->cmd_edge = val & 1;
++		host->edge_valid |= MSDC_EDGE_CMD;
++	}
++	if (!of_property_read_u32(pdev->dev.of_node, "mediatek,rdata-edge",
++				  &val)) {
++		host->rdata_edge = val & 1;
++		host->edge_valid |= MSDC_EDGE_RDATA;
++	}
++	if (!of_property_read_u32(pdev->dev.of_node, "mediatek,wdata-edge",
++				  &val)) {
++		host->wdata_edge = val & 1;
++		host->edge_valid |= MSDC_EDGE_WDATA;
++	}
++
++	msdc_of_parse_ett(&pdev->dev, pdev->dev.of_node, "ett-hs200-cells",
++			  "ett-hs200-customer", "ett-hs200-default",
++			  host->ett_hs200, &host->ett_hs200_count);
++	msdc_of_parse_ett(&pdev->dev, pdev->dev.of_node, "ett-hs400-cells",
++			  "ett-hs400-customer", "ett-hs400-default",
++			  host->ett_hs400, &host->ett_hs400_count);
+ }
+ 
+ static int msdc_of_clock_parse(struct platform_device *pdev,

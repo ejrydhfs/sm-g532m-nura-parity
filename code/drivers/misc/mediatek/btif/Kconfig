@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# MediaTek BTIF (Bluetooth interface) controller driver.
+#
+# Ported from Samsung/MTK downstream drivers/misc/mediatek/btif.
+
+config MTK_BTIF
+	tristate "MediaTek BTIF DMA controller"
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	depends on HAS_DMA
+	help
+	  BTIF is the DMA-capable serial interface between the application
+	  processor and the MediaTek connectivity subsystem (CONSYS).  It is
+	  used to carry the STP protocol for Bluetooth, GPS and FM.
+
+	  Say M here to build the driver as a module.  The module will be
+	  called mtk_btif.

@@ -1,0 +1,6624 @@
+diff --git a/drivers/misc/mediatek/connectivity/wmt/Makefile b/drivers/misc/mediatek/connectivity/wmt/Makefile
+index 22793da3c..06f56625b 100644
+--- a/drivers/misc/mediatek/connectivity/wmt/Makefile
++++ b/drivers/misc/mediatek/connectivity/wmt/Makefile
+@@ -4,3 +4,20 @@
+ #
+ ccflags-y += -I$(srctree)/drivers/misc/mediatek/connectivity/include
+ ccflags-y += -I$(srctree)/drivers/misc/mediatek/btif/include
++
++obj-$(CONFIG_MTK_WCN_WMT) += mtk_wcn_wmt.o
++
++mtk_wcn_wmt-y := \
++	wmt_main.o \
++	stp_core.o \
++	stp_btif.o \
++	wmt_core.o \
++	wmt_ctrl.o \
++	wmt_func.o \
++	wmt_lib.o \
++	wmt_conf.o \
++	wmt_ic_soc.o \
++	consys_mt6735.o \
++	wmt_dev.o \
++	wmt_chrdev_wifi.o \
++	wmt_api.o
+diff --git a/drivers/misc/mediatek/connectivity/wmt/consys_mt6735.c b/drivers/misc/mediatek/connectivity/wmt/consys_mt6735.c
+new file mode 100644
+index 000000000..9aa0eb7e6
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wmt/consys_mt6735.c
+@@ -0,0 +1,853 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek MT6735/MT6737T CONSYS platform glue.
++ *
++ * Port from Samsung/MTK downstream
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/mt6735/mtk_wcn_consys_hw.c
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/mt6735/wmt_plat_alps.c
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * The connectivity subsystem is a separate MCU with its own power domain,
++ * clock gates and LDOs.  Register layout (see the DT binding of
++ * "mediatek,mt6735-consys"):
++ *
++ *	reg[0] CONN_MCU_CONFIG_BASE	chip id, MBIST control, CPUPCR
++ *	reg[1] AP_RGU_BASE		CPU software reset
++ *	reg[2] TOPCKGEN_BASE		EMI remapping window
++ *	reg[3] SPM_BASE			power-on configuration
++ *
++ * The SPM power gate and AXI bus protection of the downstream sequence
++ * (CONSYS_TOP1_PWR_CTRL_REG / CONSYS_TOPAXI_PROT_*) are handled by the
++ * MT6735 power-domain controller declared through "power-domains"; this
++ * driver asserts the reset, powers the rails, gates the clocks and polls the
++ * chip id exactly like the downstream driver does around those steps.
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_irq.h>
++#include <linux/of_platform.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
++
++#include "wmt_local.h"
++
++/* mtk_wcn_consys_hw.h:57-86 */
++#define CONSYS_CPU_SW_RST_OFFSET	0x00000018
++#define CONSYS_CPU_SW_RST_BIT		BIT(12)
++#define CONSYS_CPU_SW_RST_CTRL_KEY	(0x88 << 24)
++
++#define CONSYS_PWRON_CONFG_EN_OFFSET	0x00000000
++#define CONSYS_PWRON_CONFG_EN_VALUE	0x0b160001
++
++#define CONSYS_EMI_MAPPING_OFFSET	0x00000320
++#define CONSYS_CHIP_ID_OFFSET		0x00000008
++#define CONSYS_MCU_CFG_ACR_OFFSET	0x00000110
++#define CONSYS_MCU_CFG_ACR_MBIST_BIT	BIT(18)
++#define CONSYS_CPUPCR_OFFSET		0x00000160
++
++/* mtk_wcn_consys_hw.h:171-181 */
++#define CONSYS_EMI_AP_PHY_OFFSET	0x80000
++#define CONSYS_EMI_MEM_SIZE		(343 * 1024)
++#define CONSYS_EMI_MAPPING_EN		BIT(12)
++#define CONSYS_EMI_ADDR_MASK		0xfff00000
++
++/* Accepted CONSYS chip ids (mtk_wcn_consys_hw.c:487-489). */
++#define CONSYS_CHIP_ID_MT6735		0x0321
++#define CONSYS_CHIP_ID_MT6735M		0x0335
++#define CONSYS_CHIP_ID_MT6753		0x0337
++
++/* PMIC LDO voltages, downstream VOL_1800 / VOL_2800 / VOL_3300. */
++#define CONSYS_VCN18_UV			1800000
++#define CONSYS_VCN28_UV			2800000
++#define CONSYS_VCN33_UV			3300000
++
++/* mtk_wcn_consys_hw.c:481-490 (10 retries, 20 ms apart). */
++#define CONSYS_CHIPID_RETRY		10
++#define CONSYS_CHIPID_DELAY_MS		20
++
++struct mtk_consys {
++	struct device *dev;
++	void __iomem *mcu;
++	void __iomem *ap_rgu;
++	void __iomem *topckgen;
++	void __iomem *spm;
++
++	struct clk *clk_conn;
++	struct clk *clk_bus;		/* optional, ROM DT has a second gate */
++
++	struct regulator *vcn18;
++	struct regulator *vcn28;
++	struct regulator *vcn33_bt;
++	struct regulator *vcn33_wifi;
++
++	struct pinctrl *pinctrl;
++
++	int irq_bgf;
++	bool bgf_irq_requested;
++	bool powered;
++	bool probed;
++
++	/* Resources currently enabled by this driver. */
++	bool pm_on;
++	bool clk_conn_on;
++	bool clk_bus_on;
++	bool vcn18_on;
++	bool vcn28_on;
++
++	phys_addr_t emi_phys;
++	void __iomem *emi_virt;
++
++	struct mutex wake_lock;
++	int wake_count;
++};
++
++static struct mtk_consys consys;
++
++static inline u32 consys_read(void __iomem *base, u32 off)
++{
++	return readl(base + off);
++}
++
++static inline void consys_write(void __iomem *base, u32 off, u32 val)
++{
++	writel(val, base + off);
++}
++
++static void consys_read_modify_write(void __iomem *base, u32 off, u32 set,
++				     u32 clr)
++{
++	u32 val = consys_read(base, off);
++
++	val &= ~clr;
++	val |= set;
++	consys_write(base, off, val);
++}
++
++static bool consys_chipid_valid(u32 id)
++{
++	return id == CONSYS_CHIP_ID_MT6735 || id == CONSYS_CHIP_ID_MT6735M ||
++	       id == CONSYS_CHIP_ID_MT6753;
++}
++
++/*
++ * Regulators (mtk_wcn_consys_hw.c:349-410, 900-1050)
++ */
++
++static int consys_regulator_enable(struct regulator *reg, u32 uv,
++				   const char *name)
++{
++	int ret;
++
++	if (!reg)
++		return -ENODEV;
++
++	ret = regulator_set_voltage(reg, uv, uv);
++	if (ret) {
++		wmt_err("failed to set %s to %u uV (%d)\n", name, uv, ret);
++		return ret;
++	}
++
++	ret = regulator_enable(reg);
++	if (ret) {
++		wmt_err("failed to enable %s (%d)\n", name, ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void consys_regulator_disable(struct regulator *reg, const char *name)
++{
++	if (reg &&
++	    regulator_disable(reg))
++		wmt_err("failed to disable %s\n", name);
++}
++
++int wmt_plat_soc_paldo_ctrl(enum wmt_paldo_type type, enum wmt_paldo_op op)
++{
++	bool on = op == PALDO_ON;
++	int ret;
++
++	switch (type) {
++	case BT_PALDO:
++		if (on)
++			ret = consys_regulator_enable(consys.vcn33_bt,
++						      CONSYS_VCN33_UV,
++						      "vcn33_bt");
++		else {
++			consys_regulator_disable(consys.vcn33_bt, "vcn33_bt");
++			ret = 0;
++		}
++		break;
++	case WIFI_PALDO:
++		if (on)
++			ret = consys_regulator_enable(consys.vcn33_wifi,
++						      CONSYS_VCN33_UV,
++						      "vcn33_wifi");
++		else {
++			consys_regulator_disable(consys.vcn33_wifi,
++						 "vcn33_wifi");
++			ret = 0;
++		}
++		break;
++	case FM_PALDO:
++	case GPS_PALDO:
++		/* In co-clock mode FM/GPS power VCN28 explicitly
++		 * (mtk_wcn_consys_hw.c:1084-1110).
++		 */
++		if (on)
++			ret = consys_regulator_enable(consys.vcn28,
++						      CONSYS_VCN28_UV,
++						      "vcn28");
++		else {
++			consys_regulator_disable(consys.vcn28, "vcn28");
++			ret = 0;
++		}
++		break;
++	case PMIC_CHIPID_PALDO:
++	case WIFI_5G_PALDO:
++	default:
++		wmt_warn("PALDO %d is not supported\n", type);
++		ret = -EOPNOTSUPP;
++		break;
++	}
++
++	return ret;
++}
++
++/*
++ * Power on / off (mtk_wcn_consys_hw.c:335-845)
++ */
++
++static int consys_reg_ctrl(bool on)
++{
++	u32 chip_id = 0;
++	int retry = CONSYS_CHIPID_RETRY;
++	int ret;
++
++	wmt_dbg("CONSYS register control (%d)\n", on);
++
++	if (on) {
++		/* 1. VCN18 always on (mtk_wcn_consys_hw.c:356-370) */
++		ret = consys_regulator_enable(consys.vcn18, CONSYS_VCN18_UV,
++					      "vcn18");
++		if (ret)
++			return ret;
++		consys.vcn18_on = true;
++		udelay(150);
++
++		/* 2. VCN28: software controlled in co-clock mode, powered
++		 * here otherwise (mtk_wcn_consys_hw.c:372-400).
++		 */
++		if (!wmt_lib_co_clock()) {
++			ret = consys_regulator_enable(consys.vcn28,
++						      CONSYS_VCN28_UV,
++						      "vcn28");
++			if (ret)
++				goto err_vcn18;
++			consys.vcn28_on = true;
++		}
++
++		/* 3. assert the CONNSYS CPU software reset */
++		consys_write(consys.ap_rgu, CONSYS_CPU_SW_RST_OFFSET,
++			     consys_read(consys.ap_rgu,
++					 CONSYS_CPU_SW_RST_OFFSET) |
++			     CONSYS_CPU_SW_RST_BIT |
++			     CONSYS_CPU_SW_RST_CTRL_KEY);
++
++		/* 4. SPM clock gating for the power-on configuration */
++		consys_write(consys.spm, CONSYS_PWRON_CONFG_EN_OFFSET,
++			     CONSYS_PWRON_CONFG_EN_VALUE);
++
++		/* 5. power up the CONN power domain */
++		ret = pm_runtime_get_sync(consys.dev);
++		if (ret < 0) {
++			wmt_err("failed to power on the CONN domain (%d)\n",
++				ret);
++			goto err_vcn28;
++		}
++		consys.pm_on = true;
++
++		/* 6. CONN bus clock.  The downstream driver waits 10 us
++		 * after the domain is powered before enabling it
++		 * (mtk_wcn_consys_hw.c:487-501).
++		 */
++		udelay(10);
++		ret = clk_prepare_enable(consys.clk_conn);
++		if (ret) {
++			wmt_err("failed to enable the conn clock (%d)\n", ret);
++			goto err_pm;
++		}
++		consys.clk_conn_on = true;
++
++		if (consys.clk_bus) {
++			ret = clk_prepare_enable(consys.clk_bus);
++			if (ret) {
++				wmt_err("failed to enable the bus clock (%d)\n",
++					ret);
++				goto err_clk;
++			}
++			consys.clk_bus_on = true;
++		}
++
++		/* 7. wait until the MCU reports its chip id */
++		while (retry-- > 0) {
++			chip_id = consys_read(consys.mcu, CONSYS_CHIP_ID_OFFSET);
++			if (consys_chipid_valid(chip_id)) {
++				wmt_info("CONSYS chip id 0x%08x\n", chip_id);
++				break;
++			}
++			wmt_dbg("CONSYS chip id 0x%08x, retrying\n", chip_id);
++			msleep(CONSYS_CHIPID_DELAY_MS);
++		}
++
++		if (!consys_chipid_valid(chip_id)) {
++			wmt_err("CONSYS did not report a valid chip id (0x%08x)\n",
++				chip_id);
++			wmt_err("RGU 0x%08x SPM 0x%08x\n",
++				consys_read(consys.ap_rgu,
++					    CONSYS_CPU_SW_RST_OFFSET),
++				consys_read(consys.spm,
++					    CONSYS_PWRON_CONFG_EN_OFFSET));
++			ret = -ENODEV;
++			goto err_bus_clk;
++		}
++
++		/* 8. run the memory MBIST at full MCU speed */
++		consys_read_modify_write(consys.mcu,
++					 CONSYS_MCU_CFG_ACR_OFFSET,
++					 CONSYS_MCU_CFG_ACR_MBIST_BIT, 0);
++
++		/* 9. release the CPU software reset */
++		consys_write(consys.ap_rgu, CONSYS_CPU_SW_RST_OFFSET,
++			     (consys_read(consys.ap_rgu,
++					  CONSYS_CPU_SW_RST_OFFSET) &
++			      ~CONSYS_CPU_SW_RST_BIT) |
++			     CONSYS_CPU_SW_RST_CTRL_KEY);
++
++		/* 10. give the firmware time to boot (msleep < 20 ms can
++		 * sleep up to 20 ms, mtk_wcn_consys_hw.c:845).
++		 */
++		msleep(20);
++		return 0;
++	}
++
++	/* Power off in the reverse order (mtk_wcn_consys_hw.c:640-720). */
++	if (consys.clk_bus_on) {
++		clk_disable_unprepare(consys.clk_bus);
++		consys.clk_bus_on = false;
++	}
++	if (consys.clk_conn_on) {
++		clk_disable_unprepare(consys.clk_conn);
++		consys.clk_conn_on = false;
++	}
++	if (consys.pm_on) {
++		pm_runtime_put_sync(consys.dev);
++		consys.pm_on = false;
++	}
++
++	if (consys.vcn28_on) {
++		consys_regulator_disable(consys.vcn28, "vcn28");
++		consys.vcn28_on = false;
++	}
++	if (consys.vcn18_on) {
++		consys_regulator_disable(consys.vcn18, "vcn18");
++		consys.vcn18_on = false;
++	}
++
++	return 0;
++
++err_bus_clk:
++	if (consys.clk_bus_on) {
++		clk_disable_unprepare(consys.clk_bus);
++		consys.clk_bus_on = false;
++	}
++err_clk:
++	if (consys.clk_conn_on) {
++		clk_disable_unprepare(consys.clk_conn);
++		consys.clk_conn_on = false;
++	}
++err_pm:
++	if (consys.pm_on) {
++		pm_runtime_put_sync(consys.dev);
++		consys.pm_on = false;
++	}
++err_vcn28:
++	if (consys.vcn28_on) {
++		consys_regulator_disable(consys.vcn28, "vcn28");
++		consys.vcn28_on = false;
++	}
++err_vcn18:
++	if (consys.vcn18_on) {
++		consys_regulator_disable(consys.vcn18, "vcn18");
++		consys.vcn18_on = false;
++	}
++	return ret;
++}
++
++/*
++ * BGF (BTIF wakeup) interrupt, mtk_wcn_consys_hw.c:800-845 and
++ * wmt_plat_alps.c:224-270.
++ */
++static irqreturn_t consys_bgf_irq(int irq, void *data)
++{
++	/* The downstream handler disables the line and notifies the STP
++	 * power-saving engine.  The power-saving engine is not ported, so the
++	 * line stays disabled and this handler only kicks any waiter.
++	 */
++	wmt_dev_rx_event_cb();
++	return IRQ_HANDLED;
++}
++
++static int consys_irq_init(bool on)
++{
++	int ret;
++
++	if (on) {
++		if (consys.irq_bgf > 0 && !consys.bgf_irq_requested) {
++			ret = request_irq(consys.irq_bgf, consys_bgf_irq,
++					  irq_get_trigger_type(consys.irq_bgf),
++					  "BTIF_WAKEUP_IRQ", NULL);
++			if (ret) {
++				wmt_err("failed to request BGF IRQ %d (%d)\n",
++					consys.irq_bgf, ret);
++				return ret;
++			}
++			consys.bgf_irq_requested = true;
++		}
++
++		/* The downstream driver keeps the wakeup interrupt disabled and
++		 * only enables it from the STP power-saving engine
++		 * (wmt_plat_alps.c:300-330), which is not ported.
++		 */
++		disable_irq_nosync(consys.irq_bgf);
++		wmt_dbg("BGF IRQ registered and disabled\n");
++		return 0;
++	}
++
++	if (consys.bgf_irq_requested) {
++		disable_irq_nosync(consys.irq_bgf);
++		free_irq(consys.irq_bgf, NULL);
++		consys.bgf_irq_requested = false;
++	}
++
++	return 0;
++}
++
++int mtk_wcn_consys_hw_pwr_on(void)
++{
++	int ret;
++
++	if (!consys.probed)
++		return -ENODEV;
++
++	if (consys.powered)
++		return -EALREADY;
++
++	wmt_info("CONSYS power on\n");
++	ret = consys_reg_ctrl(true);
++	if (ret) {
++		wmt_err("CONSYS register control failed (%d)\n", ret);
++		return ret;
++	}
++
++	ret = consys_irq_init(true);
++	consys.powered = true;
++	wmt_info("CONSYS power on done (%d)\n", ret);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_consys_hw_pwr_on);
++
++
++int mtk_wcn_consys_hw_pwr_off(void)
++{
++	if (!consys.probed)
++		return -ENODEV;
++
++	if (!consys.powered)
++		return -EALREADY;
++
++	wmt_info("CONSYS power off\n");
++	consys_irq_init(false);
++	consys.powered = false;
++	return consys_reg_ctrl(false);
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_consys_hw_pwr_off);
++
++
++/* mtk_wcn_consys_hw.c:825-845 */
++int mtk_wcn_consys_hw_rst(void)
++{
++	int ret;
++
++	wmt_info("CONSYS hardware reset\n");
++
++	if (!consys.probed)
++		return -ENODEV;
++
++	consys_irq_init(false);
++	ret = consys_reg_ctrl(false);
++	if (ret)
++		wmt_err("CONSYS power off during reset failed (%d)\n", ret);
++
++	consys.powered = false;
++	ret = consys_reg_ctrl(true);
++	if (ret) {
++		wmt_err("CONSYS power on during reset failed (%d)\n", ret);
++		return ret;
++	}
++
++	consys.powered = true;
++	ret = consys_irq_init(true);
++	wmt_info("CONSYS hardware reset done (%d)\n", ret);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_consys_hw_rst);
++
++
++/* mtk_wcn_consys_hw.c:1190-1233 */
++phys_addr_t mtk_wcn_consys_emi_phys_get(void)
++{
++	return consys.emi_phys;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_consys_emi_phys_get);
++
++
++void __iomem *mtk_wcn_consys_emi_virt_get(void)
++{
++	return consys.emi_virt;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_consys_emi_virt_get);
++
++
++/* mtk_wcn_consys_hw.c:1235-1240 */
++u32 mtk_wcn_consys_soc_chipid_get(void)
++{
++	/* Never touch the CONNSYS register window while the power domain is
++	 * off: such an access can stall the AP bus.
++	 */
++	if (!consys.probed || !consys.powered)
++		return 0;
++
++	return consys_read(consys.mcu, CONSYS_CHIP_ID_OFFSET) & 0xffff;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_consys_soc_chipid_get);
++
++
++int mtk_wcn_consys_hw_init(void)
++{
++	struct reserved_mem *rmem;
++	struct device_node *np;
++	u32 addr_phy;
++
++	if (!consys.probed) {
++		wmt_err("CONSYS device not probed\n");
++		return -ENODEV;
++	}
++
++	if (consys.emi_virt)
++		return 0;
++
++	np = of_parse_phandle(consys.dev->of_node, "memory-region", 0);
++	if (!np) {
++		wmt_err("no memory-region for CONSYS\n");
++		return -ENODEV;
++	}
++
++	rmem = of_reserved_mem_lookup(np);
++	of_node_put(np);
++	if (!rmem || !rmem->size) {
++		wmt_err("CONSYS reserved memory is invalid\n");
++		return -ENODEV;
++	}
++
++	consys.emi_phys = rmem->base;
++	wmt_info("CONSYS shared memory at 0x%pa (0x%llx bytes)\n",
++		 &consys.emi_phys, (unsigned long long)rmem->size);
++
++	/* Enable the CONSYS -> AP EMI remapping window
++	 * (mtk_wcn_consys_hw.c:1140-1150).
++	 */
++	addr_phy = ((u32)consys.emi_phys & CONSYS_EMI_ADDR_MASK) >> 20;
++	addr_phy |= CONSYS_EMI_MAPPING_EN;
++	consys_write(consys.topckgen, CONSYS_EMI_MAPPING_OFFSET,
++		     consys_read(consys.topckgen, CONSYS_EMI_MAPPING_OFFSET) |
++		     addr_phy);
++	wmt_info("EMI mapping register 0x%08x\n",
++		 consys_read(consys.topckgen, CONSYS_EMI_MAPPING_OFFSET));
++
++	/* The firmware uses the upper half of the reserved 512 KiB region. */
++	consys.emi_virt = ioremap(consys.emi_phys + CONSYS_EMI_AP_PHY_OFFSET,
++				  CONSYS_EMI_MEM_SIZE);
++	if (!consys.emi_virt) {
++		wmt_err("failed to map the CONSYS shared memory\n");
++		return -ENOMEM;
++	}
++
++	memset_io(consys.emi_virt, 0, CONSYS_EMI_MEM_SIZE);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_consys_hw_init);
++
++
++void mtk_wcn_consys_hw_deinit(void)
++{
++	if (consys.emi_virt) {
++		iounmap(consys.emi_virt);
++		consys.emi_virt = NULL;
++	}
++
++	if (consys.powered)
++		mtk_wcn_consys_hw_pwr_off();
++}
++
++/*
++ * Platform glue
++ */
++EXPORT_SYMBOL_GPL(mtk_wcn_consys_hw_deinit);
++
++
++int wmt_plat_pwr_ctrl(enum wmt_func_state state)
++{
++	switch (state) {
++	case FUNC_ON:
++		return mtk_wcn_consys_hw_pwr_on();
++	case FUNC_OFF:
++		return mtk_wcn_consys_hw_pwr_off();
++	case FUNC_RST:
++		return mtk_wcn_consys_hw_rst();
++	case FUNC_STAT:
++		wmt_info("CONSYS %s, chip id 0x%04x\n",
++			 consys.powered ? "on" : "off",
++			 mtk_wcn_consys_soc_chipid_get());
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++/*
++ * The GPS_SYNC/I2S pins of the connectivity SoC are configured through
++ * wmt_ic_soc_pin_ctrl(); the host side only drives the GPS LNA enable pin
++ * through its pinctrl states (wmt_plat_alps.c:700-780).
++ */
++int wmt_plat_gpio_ctrl(enum wmt_pin_id id, enum wmt_pin_state state)
++{
++	static const char * const state_name[] = {
++		[PIN_STA_INIT] = "gps_lna_state_init",
++		[PIN_STA_OUT_H] = "gps_lna_state_oh",
++		[PIN_STA_OUT_L] = "gps_lna_state_ol",
++	};
++	struct pinctrl_state *pstate;
++	const char *name;
++	int ret;
++
++	if (id == PIN_GPS_SYNC || id == PIN_I2S_GRP)
++		return 0;
++
++	if (id != PIN_GPS_LNA)
++		return -EINVAL;
++
++	if (state == PIN_STA_DEINIT)
++		state = PIN_STA_INIT;
++
++	name = state_name[state];
++	if (!name)
++		return -EINVAL;
++
++	if (!consys.pinctrl) {
++		wmt_dbg("no pinctrl for the GPS LNA pin\n");
++		return 0;
++	}
++
++	pstate = pinctrl_lookup_state(consys.pinctrl, name);
++	if (IS_ERR(pstate)) {
++		wmt_err("missing pinctrl state %s\n", name);
++		return PTR_ERR(pstate);
++	}
++
++	ret = pinctrl_select_state(consys.pinctrl, pstate);
++	if (ret)
++		wmt_err("failed to select %s (%d)\n", name, ret);
++
++	return ret;
++}
++
++int wmt_plat_wake_lock_ctrl(enum wmt_wl_op op)
++{
++	int ret = 0;
++
++	mutex_lock(&consys.wake_lock);
++
++	if (op == WL_OP_GET) {
++		if (consys.wake_count++ == 0)
++			pm_stay_awake(consys.dev);
++	} else if (op == WL_OP_PUT) {
++		if (consys.wake_count == 0) {
++			wmt_warn("unbalanced wake lock release\n");
++			ret = -EINVAL;
++		} else if (--consys.wake_count == 0) {
++			pm_relax(consys.dev);
++		}
++	} else {
++		ret = -EINVAL;
++	}
++
++	mutex_unlock(&consys.wake_lock);
++	return ret;
++}
++
++int wmt_plat_init(void)
++{
++	int ret;
++
++	if (!consys.probed)
++		return -ENODEV;
++
++	ret = mtk_wcn_consys_hw_init();
++	wmt_dbg("platform init (%d)\n", ret);
++	return ret;
++}
++
++void wmt_plat_deinit(void)
++{
++	mtk_wcn_consys_hw_deinit();
++}
++
++/*
++ * Platform driver
++ */
++
++static int mtk_consys_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	int ret;
++
++	memset(&consys, 0, sizeof(consys));
++	consys.dev = dev;
++	mutex_init(&consys.wake_lock);
++
++	consys.mcu = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(consys.mcu))
++		return PTR_ERR(consys.mcu);
++
++	consys.ap_rgu = devm_platform_ioremap_resource(pdev, 1);
++	if (IS_ERR(consys.ap_rgu))
++		return PTR_ERR(consys.ap_rgu);
++
++	consys.topckgen = devm_platform_ioremap_resource(pdev, 2);
++	if (IS_ERR(consys.topckgen))
++		return PTR_ERR(consys.topckgen);
++
++	consys.spm = devm_platform_ioremap_resource(pdev, 3);
++	if (IS_ERR(consys.spm))
++		return PTR_ERR(consys.spm);
++
++	consys.clk_conn = devm_clk_get(dev, "conn");
++	if (IS_ERR(consys.clk_conn)) {
++		wmt_err("failed to get the conn clock (%ld)\n",
++			PTR_ERR(consys.clk_conn));
++		return PTR_ERR(consys.clk_conn);
++	}
++
++	consys.clk_bus = devm_clk_get_optional(dev, "bus");
++	if (IS_ERR(consys.clk_bus)) {
++		wmt_err("failed to get the bus clock (%ld)\n",
++			PTR_ERR(consys.clk_bus));
++		return PTR_ERR(consys.clk_bus);
++	}
++
++	consys.vcn18 = devm_regulator_get_optional(dev, "vcn18");
++	if (IS_ERR(consys.vcn18))
++		return dev_err_probe(dev, PTR_ERR(consys.vcn18),
++				     "failed to get vcn18\n");
++	if (!consys.vcn18)
++		wmt_warn("no vcn18 supply, CONSYS may not power up\n");
++
++	consys.vcn28 = devm_regulator_get_optional(dev, "vcn28");
++	if (IS_ERR(consys.vcn28))
++		return dev_err_probe(dev, PTR_ERR(consys.vcn28),
++				     "failed to get vcn28\n");
++
++	consys.vcn33_bt = devm_regulator_get_optional(dev, "vcn33_bt");
++	if (IS_ERR(consys.vcn33_bt))
++		return dev_err_probe(dev, PTR_ERR(consys.vcn33_bt),
++				     "failed to get vcn33_bt\n");
++
++	consys.vcn33_wifi = devm_regulator_get_optional(dev, "vcn33_wifi");
++	if (IS_ERR(consys.vcn33_wifi))
++		return dev_err_probe(dev, PTR_ERR(consys.vcn33_wifi),
++				     "failed to get vcn33_wifi\n");
++
++	consys.pinctrl = devm_pinctrl_get(dev);
++	if (IS_ERR(consys.pinctrl)) {
++		ret = PTR_ERR(consys.pinctrl);
++		if (ret != -ENODEV) {
++			wmt_err("failed to get pinctrl (%d)\n", ret);
++			return ret;
++		}
++		consys.pinctrl = NULL;
++	}
++
++	consys.irq_bgf = platform_get_irq(pdev, 0);
++	if (consys.irq_bgf < 0) {
++		wmt_err("failed to get the BGF interrupt (%d)\n",
++			consys.irq_bgf);
++		return consys.irq_bgf;
++	}
++
++	pm_runtime_enable(dev);
++	platform_set_drvdata(pdev, &consys);
++	consys.probed = true;
++
++	wmt_info("CONSYS platform probed (irq %d)\n", consys.irq_bgf);
++	return 0;
++}
++
++static void mtk_consys_remove(struct platform_device *pdev)
++{
++	if (consys.powered)
++		mtk_wcn_consys_hw_pwr_off();
++
++	consys_irq_init(false);
++	pm_runtime_disable(&pdev->dev);
++	mutex_destroy(&consys.wake_lock);
++	consys.probed = false;
++}
++
++static const struct of_device_id mtk_consys_of_ids[] = {
++	{ .compatible = "mediatek,mt6735-consys" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mtk_consys_of_ids);
++
++static struct platform_driver mtk_consys_driver = {
++	.probe = mtk_consys_probe,
++	.remove = mtk_consys_remove,
++	.driver = {
++		.name = "mtk-wcn-consys",
++		.of_match_table = mtk_consys_of_ids,
++	},
++};
++
++int wmt_plat_consys_driver_register(void)
++{
++	return platform_driver_register(&mtk_consys_driver);
++}
++
++void wmt_plat_consys_driver_unregister(void)
++{
++	platform_driver_unregister(&mtk_consys_driver);
++}
+diff --git a/drivers/misc/mediatek/connectivity/wmt/stp_btif.c b/drivers/misc/mediatek/connectivity/wmt/stp_btif.c
+new file mode 100644
+index 000000000..06e3068b3
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wmt/stp_btif.c
+@@ -0,0 +1,161 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WCN STP transport binding for BTIF.
++ *
++ * Port from Samsung/MTK downstream
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/linux/pri/stp_btif.c
++ *
++ * Copyright (C) 2011-2014 MediaTek Inc.
++ *
++ * The connectivity SoC is attached to the application processor through the
++ * BTIF DMA controller on MT6735/MC6737T.  This file owns the BTIF channel
++ * used by STP ("CONSYS_STP"), registers the STP transmit path with the STP
++ * engine and forwards received bytes to the STP parser.
++ *
++ * The channel is opened lazily by WMT_CTRL_STP_OPEN and closed by
++ * WMT_CTRL_STP_CLOSE, matching the downstream power-on/off ordering.
++ */
++
++#include <linux/delay.h>
++#include <linux/module.h>
++
++#include <mtk_btif.h>
++#include <mtk_wcn_stp.h>
++
++#include "wmt_local.h"
++
++#define BTIF_OWNER_NAME		"CONSYS_STP"
++
++/* stp_btif.c:43-46 */
++#define STP_MAX_PACKAGE_ALLOWED	2000
++#define STP_BTIF_TX_RTY_LMT	10
++#define STP_BTIF_TX_RTY_DLY	5	/* ms */
++
++static unsigned long stp_btif_id;
++
++/* stp_btif.c:129-200 */
++static int stp_btif_tx(const u8 *buf, u32 len, u32 *written_len)
++{
++	int retry_left = STP_BTIF_TX_RTY_LMT;
++	int wr_count, written;
++
++	*written_len = 0;
++
++	if (!stp_btif_id) {
++		wmt_warn("no BTIF channel\n");
++		return -ENODEV;
++	}
++
++	if (len == 0)
++		return 0;
++
++	if (len > STP_MAX_PACKAGE_ALLOWED) {
++		wmt_warn("abnormal packet length %u\n", len);
++		return -EMSGSIZE;
++	}
++
++	wr_count = mtk_wcn_btif_write(stp_btif_id, buf, len);
++	if (wr_count < 0) {
++		wmt_err("btif write failed (%d)\n", wr_count);
++		return -EIO;
++	}
++	if (wr_count == len) {
++		*written_len = wr_count;
++		return 0;
++	}
++
++	while (retry_left-- && wr_count < len) {
++		msleep(STP_BTIF_TX_RTY_DLY);
++		written = mtk_wcn_btif_write(stp_btif_id, buf + wr_count,
++					     len - wr_count);
++		if (written < 0) {
++			wmt_err("btif write failed (%d) while recovering\n",
++				written);
++			break;
++		}
++		wr_count += written;
++	}
++
++	if (wr_count == len) {
++		wmt_info("btif write recovered, len %u, retries left %d\n",
++			 len, retry_left);
++		*written_len = wr_count;
++		return 0;
++	}
++
++	wmt_err("btif write %u/%d, retries left %d\n", len, wr_count,
++		retry_left);
++	return -EIO;
++}
++
++static int stp_btif_parser(const unsigned char *buf, unsigned int len)
++{
++	mtk_wcn_stp_parser_data((u8 *)(uintptr_t)buf, len);
++	return len;
++}
++
++int stp_btif_open(void)
++{
++	int ret;
++
++	if (stp_btif_id)
++		return -EALREADY;
++
++	ret = mtk_wcn_btif_open(BTIF_OWNER_NAME, &stp_btif_id);
++	if (ret) {
++		wmt_err("btif open failed (%d)\n", ret);
++		return ret;
++	}
++
++	ret = mtk_wcn_stp_register_if_tx(STP_TX_IF_BTIF, stp_btif_tx);
++	if (ret) {
++		mtk_wcn_btif_close(stp_btif_id);
++		stp_btif_id = 0;
++		return ret;
++	}
++
++	mtk_wcn_stp_set_if_tx_type(STP_TX_IF_BTIF);
++	wmt_dbg("STP BTIF channel opened\n");
++	return 0;
++}
++
++int stp_btif_close(void)
++{
++	int ret;
++
++	if (!stp_btif_id)
++		return -ENODEV;
++
++	ret = mtk_wcn_btif_close(stp_btif_id);
++	if (ret) {
++		wmt_err("btif close failed (%d)\n", ret);
++		return ret;
++	}
++
++	stp_btif_id = 0;
++	return 0;
++}
++
++int stp_btif_rx_register(void)
++{
++	if (!stp_btif_id)
++		return -ENODEV;
++
++	return mtk_wcn_btif_rx_cb_register(stp_btif_id, stp_btif_parser);
++}
++
++int stp_btif_rx_unregister(void)
++{
++	if (!stp_btif_id)
++		return -ENODEV;
++
++	return mtk_wcn_btif_rx_cb_register(stp_btif_id, NULL);
++}
++
++int stp_btif_wakeup(void)
++{
++	if (!stp_btif_id)
++		return -ENODEV;
++
++	return mtk_wcn_btif_wakeup_consys(stp_btif_id);
++}
+diff --git a/drivers/misc/mediatek/connectivity/wmt/stp_core.c b/drivers/misc/mediatek/connectivity/wmt/stp_core.c
+new file mode 100644
+index 000000000..c622a427b
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wmt/stp_core.c
+@@ -0,0 +1,1311 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WCN STP (Serial Transport Protocol) engine.
++ *
++ * Port from Samsung/MTK downstream
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/core/stp_core.c
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/linux/pri/stp_exp.c
++ *
++ * Copyright (C) 2011-2014 MediaTek Inc.
++ *
++ * STP is a sliding-window protocol carried over the BTIF serial link.  Each
++ * frame is
++ *
++ *	seq/ack | type/len_hi | len_lo | header checksum | payload | crc16
++ *
++ * with an optional 0x55 0x55 delimiter.  Payloads are demultiplexed into one
++ * ring buffer per logical channel (BT/FM/GPS/WIFI/WMT/STP/INFO/ANT) and the
++ * registered channel callback is invoked without any STP lock held.
++ *
++ * The power-saving (PSM) and firmware-coredump (BTM) engines of the
++ * downstream driver are not ported; the corresponding hooks are replaced by
++ * a whole-chip reset request, which is the recovery action the downstream
++ * driver ends up performing when it cannot talk to the firmware anymore.
++ */
++
++#include <linux/crc16.h>
++#include <linux/delay.h>
++#include <linux/jiffies.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/timer.h>
++#include <linux/workqueue.h>
++
++#include <mtk_wcn_stp.h>
++
++#include "wmt_local.h"
++
++/* Downstream static configuration: NAK and delimiter generation disabled
++ * (stp_core.c:40-41).
++ */
++#define STP_ENABLE_NAK		0
++#define STP_ENABLE_DELIMITER	0
++
++static const u8 stp_delimiter[STP_DEL_SIZE] = { 0x55, 0x55 };
++
++struct stp_ctx {
++	struct mutex lock;		/* protects tx window, ack state */
++	struct mutex parse_lock;	/* serialises the rx parser */
++	struct stp_ring ring[MTKSTP_MAX_TASK_NUM];
++	struct stp_parser parser;
++	struct stp_sequence sequence;
++
++	u8 rx_buf[MTKSTP_BUFFER_SIZE];
++	u32 rx_counter;
++
++	u8 tx_buf[MTKSTP_BUFFER_SIZE];
++	u32 tx_read;
++	u32 tx_write;
++	u32 tx_start_addr[MTKSTP_SEQ_SIZE];
++	u32 tx_length[MTKSTP_SEQ_SIZE];
++
++	struct timer_list tx_timer;
++	struct work_struct tx_timeout_work;
++	struct work_struct reset_work;
++
++	bool enabled;
++	bool ready;
++	bool bluez;
++	u32 mode;			/* MTKSTP_*_MODE bits */
++	u8 pending_type;
++	u32 wmt_last_close;
++	u32 evt_err_assert;
++};
++
++static struct stp_ctx stp;
++static int stp_ctx_ready;
++static enum stp_parser_state stp_prev_state;
++static int stp_packet_fail_count;
++
++static int (*stp_if_tx[STP_TX_IF_MAX])(const u8 *data, u32 size, u32 *written);
++static mtk_wcn_stp_if_rx stp_if_rx;
++static enum mtk_wcn_stp_tx_if stp_if_type = STP_TX_IF_MAX;
++static mtk_wcn_stp_event_cb stp_event_cb[MTKSTP_MAX_TASK_NUM];
++static mtk_wcn_stp_event_cb stp_tx_event_cb[MTKSTP_MAX_TASK_NUM];
++
++/*
++ * TX side helpers
++ */
++
++static int stp_sys_if_tx(const u8 *data, u32 size, u32 *written)
++{
++	if (stp_if_type >= STP_TX_IF_MAX || !stp_if_tx[stp_if_type])
++		return -EIO;
++
++	return stp_if_tx[stp_if_type](data, size, written);
++}
++
++static bool stp_tx_room(u32 length)
++{
++	u32 room;
++
++	if (stp.tx_read <= stp.tx_write)
++		room = MTKSTP_BUFFER_SIZE - stp.tx_write + stp.tx_read - 1;
++	else
++		room = stp.tx_read - stp.tx_write - 1;
++
++	if (room < length) {
++		stp_err("tx queue room shortage\n");
++		return false;
++	}
++
++	return true;
++}
++
++static void stp_add_to_tx_queue(const u8 *buffer, u32 length)
++{
++	u32 last_len;
++
++	if (length + stp.tx_write < MTKSTP_BUFFER_SIZE) {
++		memcpy(stp.tx_buf + stp.tx_write, buffer, length);
++		stp.tx_write += length;
++	} else {
++		last_len = MTKSTP_BUFFER_SIZE - stp.tx_write;
++		memcpy(stp.tx_buf + stp.tx_write, buffer, last_len);
++		memcpy(stp.tx_buf, buffer + last_len, length - last_len);
++		stp.tx_write = length - last_len;
++	}
++}
++
++/* stp_core.c:267-291 */
++static void stp_update_tx_queue(u32 txseq)
++{
++	u32 tx_read = stp.tx_start_addr[txseq];
++	u8 checksum = 0;
++	int i;
++
++	stp.tx_buf[tx_read] &= 0xf8;
++	stp.tx_buf[tx_read] |= stp.sequence.txack;
++
++	for (i = 0; i < 3; i++) {
++		checksum += stp.tx_buf[tx_read];
++		tx_read++;
++		if (tx_read >= MTKSTP_BUFFER_SIZE)
++			tx_read -= MTKSTP_BUFFER_SIZE;
++	}
++
++	stp.tx_buf[tx_read] = checksum;
++}
++
++/* stp_core.c:712-752 */
++static void stp_send_tx_queue(u32 txseq)
++{
++	u32 ret = 0;
++	u32 tx_read = stp.tx_start_addr[txseq];
++	u32 tx_length = stp.tx_length[txseq];
++	u32 last_len;
++
++	stp_update_tx_queue(txseq);
++
++	if (tx_read + tx_length < MTKSTP_BUFFER_SIZE) {
++		stp_sys_if_tx(&stp.tx_buf[tx_read], tx_length, &ret);
++		if (ret != tx_length)
++			stp_err("stp_send_tx_queue %u/%u\n", tx_length, ret);
++	} else {
++		last_len = MTKSTP_BUFFER_SIZE - tx_read;
++		stp_sys_if_tx(&stp.tx_buf[tx_read], last_len, &ret);
++		if (ret != last_len)
++			stp_err("stp_send_tx_queue %u/%u\n", last_len, ret);
++
++		stp_sys_if_tx(&stp.tx_buf[0], tx_length - last_len, &ret);
++		if (ret != tx_length - last_len)
++			stp_err("stp_send_tx_queue %u/%u\n",
++				tx_length - last_len, ret);
++	}
++}
++
++/* stp_core.c:762-802 */
++static void stp_send_ack(u8 tx_ack, u8 nak)
++{
++	u8 header[MTKSTP_HEADER_SIZE];
++	u32 ret = 0;
++
++	header[0] = 0x80 + (0 << 3) + tx_ack;
++	if (STP_ENABLE_NAK)
++		header[1] = nak ? 0x80 : 0x00;
++	else
++		header[1] = 0x00;
++	header[2] = 0;
++	header[3] = (header[0] + header[1] + header[2]) & 0xff;
++
++	if (STP_ENABLE_DELIMITER)
++		stp_sys_if_tx(stp_delimiter, STP_DEL_SIZE, &ret);
++
++	ret = 0;
++	stp_sys_if_tx(&header[0], MTKSTP_HEADER_SIZE, &ret);
++	if (ret != MTKSTP_HEADER_SIZE)
++		stp_err("stp_send_ack %u/%u\n", MTKSTP_HEADER_SIZE, ret);
++}
++
++/*
++ * RX side helpers
++ */
++
++/* Requires stp.parse_lock and stp.lock. */
++static void stp_rest_ctx_state(void)
++{
++	int i;
++
++	stp.rx_counter = 0;
++
++	for (i = 0; i < MTKSTP_MAX_TASK_NUM; i++) {
++		unsigned long flags;
++
++		spin_lock_irqsave(&stp.ring[i].lock, flags);
++		stp.ring[i].read_p = 0;
++		stp.ring[i].write_p = 0;
++		spin_unlock_irqrestore(&stp.ring[i].lock, flags);
++	}
++
++	stp.tx_write = 0;
++	stp.tx_read = 0;
++
++	stp.parser.state = STP_SYNC;
++	stp.sequence.txseq = 0;
++	stp.sequence.txack = 7;
++	stp.sequence.rxack = 7;
++	stp.sequence.winspace = MTKSTP_WINSIZE;
++	stp.sequence.expected_rxseq = 0;
++	stp.sequence.retry_times = 0;
++}
++
++static void stp_change_rx_state(enum stp_parser_state next)
++{
++	stp_prev_state = stp.parser.state;
++	stp.parser.state = next;
++}
++
++/* stp_core.c:604-652 */
++static int stp_add_to_rx_queue(u8 *buffer, u32 length, u8 type)
++{
++	struct stp_ring *ring;
++	unsigned long flags;
++	u32 room, last_len;
++
++	if (type >= MTKSTP_MAX_TASK_NUM)
++		return -EINVAL;
++
++	ring = &stp.ring[type];
++	spin_lock_irqsave(&ring->lock, flags);
++
++	if (ring->read_p <= ring->write_p)
++		room = MTKSTP_BUFFER_SIZE - ring->write_p + ring->read_p - 1;
++	else
++		room = ring->read_p - ring->write_p - 1;
++
++	if (room < length) {
++		spin_unlock_irqrestore(&ring->lock, flags);
++		stp_err("queue %u is full\n", type);
++		return -ENOSPC;
++	}
++
++	if (length + ring->write_p < MTKSTP_BUFFER_SIZE) {
++		memcpy(ring->buffer + ring->write_p, buffer, length);
++		ring->write_p += length;
++	} else {
++		last_len = MTKSTP_BUFFER_SIZE - ring->write_p;
++		memcpy(ring->buffer + ring->write_p, buffer, last_len);
++		memcpy(ring->buffer, buffer + last_len, length - last_len);
++		ring->write_p = length - last_len;
++	}
++
++	spin_unlock_irqrestore(&ring->lock, flags);
++
++	return 0;
++}
++
++/* stp_core.c:921-963 */
++static int stp_process_rxack(void)
++{
++	u8 rxack;
++	int j = 0, k = 0;
++
++	if (stp.sequence.rxack == stp.parser.ack)
++		return -1;
++
++	rxack = stp.sequence.rxack;
++	rxack = (rxack + 1) & 0x7;
++	while (rxack != stp.sequence.txseq) {
++		j++;
++		if (rxack == stp.parser.ack) {
++			k = 1;
++			break;
++		}
++		rxack = (rxack + 1) & 0x7;
++	}
++
++	if (k != 1)
++		return -1;
++
++	stp.sequence.rxack = stp.parser.ack;
++	stp.tx_read = stp.tx_start_addr[rxack] + stp.tx_length[rxack];
++	if (stp.tx_read >= MTKSTP_BUFFER_SIZE)
++		stp.tx_read -= MTKSTP_BUFFER_SIZE;
++
++	stp.sequence.winspace += j;
++	stp.sequence.retry_times = 0;
++
++	timer_delete(&stp.tx_timer);
++	if (stp.sequence.winspace != MTKSTP_WINSIZE)
++		mod_timer(&stp.tx_timer,
++			  jiffies + msecs_to_jiffies(MTKSTP_TX_TIMEOUT));
++
++	return 0;
++}
++
++static bool stp_function_active(u8 type)
++{
++	return type < MTKSTP_MAX_TASK_NUM && stp_event_cb[type];
++}
++
++/* stp_core.c:965-1160
++ *
++ * Runs with stp.parse_lock held; the TX window and ack state are protected by
++ * stp.lock inside the critical sections.  Channel callbacks are invoked after
++ * stp.lock has been released, as required by mtk_wcn_stp.h.
++ */
++static void stp_process_packet(void)
++{
++	int trigger_resume = -1;
++	u8 tx_ack = 0;
++	static int rx_ok;
++	bool active;
++	bool notify = false;
++	int ret;
++
++	mutex_lock(&stp.lock);
++
++	if (stp.sequence.expected_rxseq == stp.parser.seq &&
++	    stp.parser.type == BT_TASK_INDX && stp.bluez) {
++		/* BlueZ stack: hand the HCI packet straight to the HCI core. */
++		mutex_unlock(&stp.lock);
++		if (stp_if_rx)
++			stp_if_rx(stp.rx_buf, stp.rx_counter);
++		else
++			stp_err("bluez packet without registered rx handler\n");
++		mutex_lock(&stp.lock);
++
++		trigger_resume = stp_process_rxack();
++		stp.sequence.txack = stp.parser.seq;
++		stp.sequence.expected_rxseq =
++			(stp.sequence.expected_rxseq + 1) & 0x7;
++		tx_ack = stp.sequence.txack;
++		stp_send_ack(tx_ack, 0);
++		rx_ok = 0;
++	} else if (stp.sequence.expected_rxseq == stp.parser.seq) {
++		active = stp_function_active(stp.parser.type);
++
++		trigger_resume = stp_process_rxack();
++		stp.sequence.txack = stp.parser.seq;
++		stp.sequence.expected_rxseq =
++			(stp.sequence.expected_rxseq + 1) & 0x7;
++		tx_ack = stp.sequence.txack;
++		stp_send_ack(tx_ack, 0);
++
++		if (stp.parser.type < MTKSTP_MAX_TASK_NUM && active) {
++			if (stp.parser.type == WMT_TASK_INDX &&
++			    stp.parser.wmt_subtype == WMT_LTE_COEX_FLAG) {
++				stp_warn("LTE coex frame on non-LTE project, dropped\n");
++				rx_ok = 0;
++			} else {
++				ret = stp_add_to_rx_queue(stp.rx_buf,
++							  stp.rx_counter,
++							  stp.parser.type);
++				rx_ok = ret ? -1 : 0;
++			}
++		} else {
++			if (active)
++				stp_err("type %u is invalid, dropped\n",
++					stp.parser.type);
++			else
++				stp_err("function %u is inactive, dropped\n",
++					stp.parser.type);
++			rx_ok = 0;
++		}
++
++		if (!rx_ok) {
++			stp_packet_fail_count = 0;
++			if (stp.parser.type == WMT_TASK_INDX &&
++			    stp.parser.wmt_subtype == WMT_LTE_COEX_FLAG)
++				stp_warn("LTE coex frame dropped\n");
++			else
++				notify = true;
++		} else {
++			stp_packet_fail_count++;
++			/* A full GPS queue is drained rather than retried. */
++			if (stp.parser.type == GPS_TASK_INDX)
++				mtk_wcn_stp_flush_rx_queue(GPS_TASK_INDX);
++			else
++				notify = true;
++			/* Do not ack: let the peer retry. */
++			stp_err("enqueue to rx queue %u failed\n",
++				stp.parser.type);
++		}
++	} else if (!rx_ok) {
++		stp_err("expected_rxseq %u, parser.seq %u\n",
++			stp.sequence.expected_rxseq, stp.parser.seq);
++		stp_packet_fail_count++;
++		stp_send_ack(stp.sequence.txack, 1);
++	} else {
++		stp_packet_fail_count++;
++		stp_err("sequence mismatch after enqueue failure\n");
++	}
++
++	mutex_unlock(&stp.lock);
++
++	if (notify && stp_event_cb[stp.parser.type])
++		stp_event_cb[stp.parser.type]();
++
++	if (trigger_resume == 0) {
++		int i;
++
++		for (i = 0; i < MTKSTP_MAX_TASK_NUM; i++)
++			if (stp_tx_event_cb[i])
++				stp_tx_event_cb[i]();
++	}
++
++	if (stp_packet_fail_count > MTKSTP_RETRY_LIMIT) {
++		stp_packet_fail_count = 0;
++		stp_err("too many packet failures, resetting CONSYS\n");
++		stp.ready = false;
++		schedule_work(&stp.reset_work);
++	}
++}
++
++/* stp_core.c:1956-2210 (mandatory mode, no sequence/ack/crc) */
++static int stp_parser_data_in_mand_mode(u32 length, u8 *p_data)
++{
++	u8 padding_len;
++	int remain_length;
++	int i = length;
++
++	while (i > 0) {
++		switch (stp.parser.state) {
++		case STP_SYNC:
++			if ((*p_data & 0x80) == 0x80) {
++				if (*p_data != 0x80)
++					stp_warn("mandatory mode sync byte 0x%x\n",
++						 *p_data);
++				stp_change_rx_state(STP_NAK);
++				stp.rx_counter++;
++			} else {
++				stp_warn("sync to sync, byte 0x%x\n", *p_data);
++				stp_change_rx_state(STP_SYNC);
++			}
++			break;
++		case STP_NAK:
++			stp_change_rx_state(STP_LENGTH);
++			stp.parser.type = (*p_data & 0x70) >> 4;
++			if (stp.parser.type <= MTKSTP_MAX_TASK_NUM) {
++				stp.parser.length = (*p_data & 0x0f) << 8;
++				stp.rx_counter++;
++			} else {
++				stp_warn("invalid type, back to sync\n");
++				stp_change_rx_state(STP_SYNC);
++			}
++			break;
++		case STP_LENGTH:
++			stp_change_rx_state(STP_CHECKSUM);
++			stp.parser.length += *p_data;
++			if (stp.parser.length < 2000) {
++				stp.rx_counter++;
++			} else {
++				stp_warn("invalid STP length %u\n",
++					 stp.parser.length);
++				stp_change_rx_state(STP_SYNC);
++				stp.rx_counter = 0;
++			}
++			break;
++		case STP_CHECKSUM:
++			if (stp.parser.type == STP_TASK_INDX ||
++			    stp.parser.type == INFO_TASK_INDX) {
++				stp_change_rx_state(STP_FW_MSG);
++				stp.rx_counter = 0;
++				i -= 1;
++				if (i != 0)
++					p_data += 1;
++				continue;
++			}
++			if (stp.parser.length == 0) {
++				stp_change_rx_state(STP_SYNC);
++				stp.rx_counter = 0;
++			} else {
++				stp_change_rx_state(STP_DATA);
++				stp.rx_counter = 0;
++			}
++			break;
++		case STP_DATA:
++			if (stp.parser.length < stp.rx_counter) {
++				stp_err("abnormal length %u/%u in DATA\n",
++					stp.parser.length, stp.rx_counter);
++				stp_change_rx_state(STP_SYNC);
++				stp.rx_counter = 0;
++				return -1;
++			}
++			remain_length = stp.parser.length - stp.rx_counter;
++			if (i >= remain_length) {
++				if (stp.rx_counter + remain_length >=
++				    MTKSTP_BUFFER_SIZE) {
++					stp_err("rx buffer overrun\n");
++					stp_change_rx_state(STP_SYNC);
++					stp.rx_counter = 0;
++					return -1;
++				}
++				memcpy(stp.rx_buf + stp.rx_counter, p_data,
++				       remain_length);
++				i -= remain_length;
++				p_data += remain_length;
++				stp.rx_counter = stp.parser.length;
++				stp.parser.state = STP_CRC1;
++				continue;
++			}
++			if (i + stp.rx_counter >= MTKSTP_BUFFER_SIZE) {
++				stp_err("rx buffer overrun 2\n");
++				stp.rx_counter = 0;
++				return -1;
++			}
++			memcpy(stp.rx_buf + stp.rx_counter, p_data, i);
++			stp.rx_counter += i;
++			i = 0;
++			continue;
++		case STP_CRC1:
++			stp_change_rx_state(STP_CRC2);
++			break;
++		case STP_CRC2:
++			if (stp.parser.type == WMT_TASK_INDX)
++				stp.parser.wmt_subtype = stp.rx_buf[1];
++
++			/* STP packets are 4-byte aligned in mandatory mode. */
++			if (i <= 4) {
++				p_data += (i - 1);
++				i -= (i - 1);
++			} else {
++				padding_len = (0x04 -
++					((stp.parser.length + 6) & 0x03)) & 0x03;
++				p_data += padding_len;
++				i -= padding_len;
++			}
++
++			if (stp.parser.type == BT_TASK_INDX && stp.bluez) {
++				if (stp_if_rx)
++					stp_if_rx(stp.rx_buf, stp.rx_counter);
++				else
++					stp_err("bluez packet without handler\n");
++			} else if (stp_function_active(stp.parser.type)) {
++				if (stp.parser.type == WMT_TASK_INDX &&
++				    stp.parser.wmt_subtype ==
++				    WMT_LTE_COEX_FLAG) {
++					stp_warn("LTE coex frame dropped\n");
++				} else {
++					stp_add_to_rx_queue(stp.rx_buf,
++							    stp.rx_counter,
++							    stp.parser.type);
++					if (stp_event_cb[stp.parser.type])
++						stp_event_cb[stp.parser.type]();
++				}
++			} else {
++				stp_err("function %u inactive, dropped\n",
++					stp.parser.type);
++			}
++
++			stp.rx_counter = 0;
++			stp_change_rx_state(STP_SYNC);
++			break;
++		case STP_FW_MSG:
++			stp_err("firmware message, length %u (not dumped)\n",
++				stp.parser.length);
++			stp.rx_counter = 0;
++			stp_change_rx_state(STP_SYNC);
++			break;
++		default:
++			break;
++		}
++		p_data++;
++		i--;
++	}
++
++	return 0;
++}
++
++/* stp_core.c:1779-1954 (full mode) */
++static int stp_parser_data_in_full_mode(u32 length, u8 *p_data)
++{
++	int remain_length;
++	int i = length;
++
++	while (i > 0) {
++		switch (stp.parser.state) {
++		case STP_RESYNC1:
++			stp_change_rx_state(*p_data == 0x7f ?
++					    STP_RESYNC2 : STP_RESYNC1);
++			break;
++		case STP_RESYNC2:
++			stp_change_rx_state(*p_data == 0x7f ?
++					    STP_RESYNC3 : STP_RESYNC1);
++			break;
++		case STP_RESYNC3:
++			stp_change_rx_state(*p_data == 0x7f ?
++					    STP_RESYNC4 : STP_RESYNC1);
++			break;
++		case STP_RESYNC4:
++			stp_change_rx_state(*p_data == 0x7f ?
++					    STP_SYNC : STP_RESYNC1);
++			break;
++		case STP_SYNC:
++			if ((*p_data & 0x80) == 0x80 &&
++			    (*p_data & 0x40) == 0x00) {
++				stp_change_rx_state(STP_NAK);
++				stp.parser.seq = (*p_data & 0x38) >> 3;
++				stp.parser.ack = *p_data & 0x07;
++				stp.rx_buf[0] = *p_data;
++			} else if (*p_data == 0x7f &&
++				   stp_prev_state == STP_RESYNC4) {
++				stp_err("continuous resync pattern\n");
++			} else if (*p_data == 0x7f) {
++				stp_change_rx_state(STP_RESYNC2);
++				stp_err("resync pattern start\n");
++			} else if (*p_data == 0x55) {
++				/* STP delimiter, ignored */
++			} else {
++				stp_err("unexpected byte 0x%x in sync\n",
++					*p_data);
++			}
++			break;
++		case STP_NAK:
++			stp.parser.nak = STP_ENABLE_NAK ?
++				((*p_data & 0x80) >> 7) : 0;
++			stp.parser.type = (*p_data & 0x70) >> 4;
++			stp.parser.length = (*p_data & 0x0f) << 8;
++			stp.rx_buf[1] = *p_data;
++			if (stp.parser.nak)
++				stp_err("NAK received\n");
++
++			if (stp.parser.type < MTKSTP_MAX_TASK_NUM)
++				stp_change_rx_state(STP_LENGTH);
++			else
++				stp_change_rx_state(STP_SYNC);
++			break;
++		case STP_LENGTH:
++			stp_change_rx_state(STP_CHECKSUM);
++			stp.parser.length += *p_data;
++			if (stp.parser.length > MTKSTP_MAX_PKT_SIZE) {
++				stp_err("invalid STP length %u\n",
++					stp.parser.length);
++				stp_change_rx_state(STP_RESYNC1);
++				stp.rx_counter = 0;
++				return -1;
++			}
++			stp.rx_buf[2] = *p_data;
++			break;
++		case STP_CHECKSUM:
++			if (stp.parser.type == STP_TASK_INDX ||
++			    stp.parser.type == INFO_TASK_INDX) {
++				stp_change_rx_state(STP_FW_MSG);
++				stp.rx_counter = 0;
++				i -= 1;
++				if (i != 0)
++					p_data += 1;
++				continue;
++			}
++
++			if (((stp.rx_buf[0] + stp.rx_buf[1] +
++			      stp.rx_buf[2]) & 0xff) != *p_data) {
++				stp_err("header checksum error %02x %02x %02x %02x\n",
++					stp.rx_buf[0], stp.rx_buf[1],
++					stp.rx_buf[2], *p_data);
++				stp_change_rx_state(STP_RESYNC1);
++				stp.rx_counter = 0;
++				return -1;
++			}
++
++			if (stp.parser.length == 0) {
++				int trigger_resume;
++
++				mutex_lock(&stp.lock);
++				trigger_resume = stp_process_rxack();
++				mutex_unlock(&stp.lock);
++
++				if (trigger_resume == 0) {
++					int t;
++
++					for (t = 0; t < MTKSTP_MAX_TASK_NUM; t++)
++						if (stp_tx_event_cb[t])
++							stp_tx_event_cb[t]();
++				}
++				stp_change_rx_state(STP_SYNC);
++				stp.rx_counter = 0;
++			} else {
++				stp_change_rx_state(STP_DATA);
++				stp.rx_counter = 0;
++			}
++			break;
++		case STP_DATA:
++			if (stp.parser.length < stp.rx_counter) {
++				stp_err("abnormal length %u/%u in DATA\n",
++					stp.parser.length, stp.rx_counter);
++				stp_change_rx_state(STP_RESYNC1);
++				stp.rx_counter = 0;
++				return -1;
++			}
++			remain_length = stp.parser.length - stp.rx_counter;
++			if (i >= remain_length) {
++				memcpy(stp.rx_buf + stp.rx_counter, p_data,
++				       remain_length);
++				i -= remain_length;
++				p_data += remain_length;
++				stp.rx_counter = stp.parser.length;
++				stp.parser.state = STP_CRC1;
++				continue;
++			}
++			if (i + stp.rx_counter >= MTKSTP_BUFFER_SIZE) {
++				stp_err("rx buffer overrun\n");
++				stp_change_rx_state(STP_RESYNC1);
++				stp.rx_counter = 0;
++				return -1;
++			}
++			memcpy(stp.rx_buf + stp.rx_counter, p_data, i);
++			stp.rx_counter += i;
++			i = 0;
++			continue;
++		case STP_CRC1:
++			stp_change_rx_state(STP_CRC2);
++			stp.parser.crc = *p_data;
++			break;
++		case STP_CRC2:
++			stp_change_rx_state(STP_SYNC);
++			stp.parser.crc += (*p_data) << 8;
++			if (stp.parser.type == WMT_TASK_INDX)
++				stp.parser.wmt_subtype = stp.rx_buf[1];
++
++			if (crc16(0, stp.rx_buf, stp.rx_counter) !=
++			    stp.parser.crc) {
++				stp_err("payload CRC error (len %u)\n",
++					stp.rx_counter);
++				stp_change_rx_state(STP_RESYNC1);
++				stp.rx_counter = 0;
++				return -1;
++			}
++			stp_process_packet();
++			break;
++		case STP_FW_MSG:
++			/* Firmware assert/trace messages are not decoded; the
++			 * payload is consumed so that the stream resynchronises.
++			 * stp_core.c:2035-2165.
++			 */
++			if (stp.parser.length < stp.rx_counter) {
++				stp_err("abnormal length %u/%u in FW_MSG\n",
++					stp.parser.length, stp.rx_counter);
++				stp_change_rx_state(STP_SYNC);
++				stp.rx_counter = 0;
++				return -1;
++			}
++			remain_length = stp.parser.length - stp.rx_counter;
++			if (i < remain_length) {
++				if (i + stp.rx_counter >= MTKSTP_BUFFER_SIZE) {
++					stp_change_rx_state(STP_RESYNC1);
++					stp.rx_counter = 0;
++					return -1;
++				}
++				memcpy(stp.rx_buf + stp.rx_counter, p_data, i);
++				stp.rx_counter += i;
++				i = 0;
++				continue;
++			}
++
++			memcpy(stp.rx_buf + stp.rx_counter, p_data,
++			       remain_length);
++			i -= remain_length;
++			p_data += remain_length;
++			stp.rx_counter = stp.parser.length;
++			stp_change_rx_state(STP_SYNC);
++
++			if (stp.parser.type == STP_TASK_INDX) {
++				stp_warn("firmware assert message (%u bytes), resetting\n",
++					 stp.rx_counter);
++				stp.ready = false;
++				schedule_work(&stp.reset_work);
++			} else {
++				stp_warn("firmware trace message (%u bytes)\n",
++					 stp.rx_counter);
++			}
++			stp.rx_counter = 0;
++
++			if (i >= 2) {
++				i -= 2;
++				if (i > 0)
++					p_data += 2;
++			}
++			continue;
++		default:
++			break;
++		}
++		p_data++;
++		i--;
++	}
++
++	return 0;
++}
++
++/*
++ * TX timeout handling (stp_core.c:345-495)
++ */
++
++static void stp_do_tx_timeout(void)
++{
++	u8 resync[4];
++	u32 seq, ret = 0;
++
++	mutex_lock(&stp.lock);
++
++	if (stp.sequence.retry_times > MTKSTP_RETRY_LIMIT) {
++		stp_info("retry limit reached, stop\n");
++		mutex_unlock(&stp.lock);
++		return;
++	}
++
++	seq = (stp.sequence.rxack + 1) & 0x7;
++	if (seq != stp.sequence.txseq) {
++		memset(resync, 0x7f, sizeof(resync));
++		stp_sys_if_tx(resync, sizeof(resync), &ret);
++		if (ret != sizeof(resync))
++			stp_err("failed to send resync pattern\n");
++
++		do {
++			stp_warn("resend STP packet seq %u\n", seq);
++			stp_send_tx_queue(seq);
++			seq = (seq + 1) & 0x7;
++		} while (seq != stp.sequence.txseq);
++	}
++
++	timer_delete(&stp.tx_timer);
++	if (stp.sequence.winspace != MTKSTP_WINSIZE) {
++		mod_timer(&stp.tx_timer,
++			  jiffies + msecs_to_jiffies(MTKSTP_TX_TIMEOUT));
++		stp.sequence.retry_times++;
++		if (stp.sequence.retry_times > MTKSTP_RETRY_LIMIT) {
++			timer_delete(&stp.tx_timer);
++			stp_err("TX retry limit %d, resetting CONSYS\n",
++				MTKSTP_RETRY_LIMIT);
++			stp.ready = false;
++			mutex_unlock(&stp.lock);
++			schedule_work(&stp.reset_work);
++			return;
++		}
++	}
++
++	mutex_unlock(&stp.lock);
++}
++
++static void stp_tx_timeout_work_fn(struct work_struct *work)
++{
++	stp_do_tx_timeout();
++}
++
++static void stp_tx_timeout_cb(struct timer_list *timer)
++{
++	schedule_work(&stp.tx_timeout_work);
++}
++
++static void stp_reset_work_fn(struct work_struct *work)
++{
++	wmt_lib_schedule_reset(WMTRSTSRC_RESET_STP);
++}
++
++/*
++ * Public STP API
++ */
++
++bool mtk_wcn_stp_is_ready(void)
++{
++	return stp_ctx_ready && stp.ready;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_stp_is_ready);
++
++int mtk_wcn_stp_send_data(const u8 *buffer, u32 length, u8 type)
++{
++	u8 header[MTKSTP_HEADER_SIZE], crc_bytes[2];
++	u16 crc;
++	u32 written = 0;
++	int ret = 0;
++
++	if (!buffer)
++		return -EINVAL;
++	if (length > MTKSTP_MAX_PKT_SIZE)
++		return -EINVAL;
++
++	if (stp.wmt_last_close) {
++		stp_err("link closed by WMT, dropping tx\n");
++		return length;
++	}
++
++	mutex_lock(&stp.lock);
++
++	if (!stp.enabled && type != WMT_TASK_INDX) {
++		mutex_unlock(&stp.lock);
++		return -EAGAIN;
++	}
++
++	if (stp.enabled && mtk_wcn_stp_is_btif_mand_mode()) {
++		/* stp_core.c:2512-2555 */
++		header[0] = 0x80;
++		header[1] = (type << 4) + ((length >> 8) & 0x0f);
++		header[2] = length & 0xff;
++		header[3] = 0x00;
++
++		memcpy(stp.tx_buf, header, MTKSTP_HEADER_SIZE);
++		memcpy(stp.tx_buf + MTKSTP_HEADER_SIZE, buffer, length);
++		crc_bytes[0] = 0;
++		crc_bytes[1] = 0;
++		memcpy(stp.tx_buf + MTKSTP_HEADER_SIZE + length, crc_bytes, 2);
++
++		stp_sys_if_tx(stp.tx_buf,
++			      MTKSTP_HEADER_SIZE + length + MTKSTP_CRC_SIZE,
++			      &written);
++		if (written == MTKSTP_HEADER_SIZE + length + MTKSTP_CRC_SIZE)
++			ret = length;
++		else
++			ret = -EIO;
++		mutex_unlock(&stp.lock);
++		return ret;
++	}
++
++	if (stp.enabled && mtk_wcn_stp_is_btif_fullset_mode()) {
++		if (stp.sequence.winspace > 0 &&
++		    stp_tx_room(MTKSTP_HEADER_SIZE + length +
++				MTKSTP_CRC_SIZE)) {
++			header[0] = 0x80 +
++				    (stp.sequence.txseq << 3) +
++				    stp.sequence.txack;
++			header[1] = (type << 4) + ((length & 0xf00) >> 8);
++			header[2] = length & 0xff;
++			header[3] = (header[0] + header[1] + header[2]) & 0xff;
++
++			stp.tx_start_addr[stp.sequence.txseq] = stp.tx_write;
++			stp.tx_length[stp.sequence.txseq] =
++				MTKSTP_HEADER_SIZE + length + MTKSTP_CRC_SIZE;
++
++			if (STP_ENABLE_DELIMITER) {
++				stp.tx_length[stp.sequence.txseq] +=
++					STP_DEL_SIZE;
++				stp_add_to_tx_queue(stp_delimiter,
++						    STP_DEL_SIZE);
++			}
++
++			stp_add_to_tx_queue(header, MTKSTP_HEADER_SIZE);
++			stp_add_to_tx_queue(buffer, length);
++
++			crc = crc16(0, buffer, length);
++			crc_bytes[0] = crc & 0xff;
++			crc_bytes[1] = (crc & 0xff00) >> 8;
++			stp_add_to_tx_queue(crc_bytes, 2);
++
++			stp_send_tx_queue(stp.sequence.txseq);
++			stp.sequence.txseq =
++				(stp.sequence.txseq + 1) & 0x7;
++			stp.sequence.winspace--;
++
++			timer_delete(&stp.tx_timer);
++			if (stp.sequence.winspace != MTKSTP_WINSIZE)
++				mod_timer(&stp.tx_timer,
++					  jiffies +
++					  msecs_to_jiffies(MTKSTP_TX_TIMEOUT));
++
++			ret = length;
++		} else {
++			stp_err("no window space / tx room\n");
++			ret = 0;
++		}
++	}
++
++	mutex_unlock(&stp.lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_stp_send_data);
++
++/* Raw channel used by WMT before STP is formally enabled (stp_core.c:2653-2700).
++ */
++int mtk_wcn_stp_send_data_raw(const u8 *buffer, u32 length, u8 type)
++{
++	u32 written = 0;
++
++	if (!buffer)
++		return -EINVAL;
++
++	if (stp.wmt_last_close) {
++		stp_err("link closed by WMT, dropping raw tx\n");
++		return length;
++	}
++
++	mutex_lock(&stp.lock);
++	stp.pending_type = type;
++	stp_sys_if_tx(buffer, length, &written);
++	mutex_unlock(&stp.lock);
++
++	if (written == length)
++		return written;
++
++	stp_err("raw tx %u/%u\n", length, written);
++	return -EIO;
++}
++
++int mtk_wcn_stp_receive_data(u8 *buffer, u32 length, u8 type)
++{
++	struct stp_ring *ring;
++	unsigned long flags;
++	u32 copy_len = 0, tail_len;
++
++	if (!buffer || type >= MTKSTP_MAX_TASK_NUM)
++		return -EINVAL;
++
++	ring = &stp.ring[type];
++	spin_lock_irqsave(&ring->lock, flags);
++
++	while (ring->read_p != ring->write_p) {
++		if (ring->write_p > ring->read_p) {
++			copy_len = ring->write_p - ring->read_p;
++			if (copy_len > length)
++				copy_len = length;
++			memcpy(buffer, ring->buffer + ring->read_p, copy_len);
++			ring->read_p += copy_len;
++		} else {
++			tail_len = MTKSTP_BUFFER_SIZE - ring->read_p;
++			if (tail_len > length) {
++				copy_len = length;
++				memcpy(buffer, ring->buffer + ring->read_p,
++				       copy_len);
++				ring->read_p += copy_len;
++			} else {
++				memcpy(buffer, ring->buffer + ring->read_p,
++				       tail_len);
++				buffer += tail_len;
++
++				copy_len = length - tail_len;
++				copy_len = min(copy_len, ring->write_p);
++				if (copy_len)
++					memcpy(buffer, ring->buffer, copy_len);
++				ring->read_p = copy_len;
++				copy_len += tail_len;
++			}
++		}
++		break;
++	}
++
++	spin_unlock_irqrestore(&ring->lock, flags);
++
++	return copy_len;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_stp_receive_data);
++
++bool mtk_wcn_stp_is_rxqueue_empty(u8 type)
++{
++	struct stp_ring *ring;
++	unsigned long flags;
++	bool empty;
++
++	if (type >= MTKSTP_MAX_TASK_NUM)
++		return true;
++
++	ring = &stp.ring[type];
++	spin_lock_irqsave(&ring->lock, flags);
++	empty = ring->read_p == ring->write_p;
++	spin_unlock_irqrestore(&ring->lock, flags);
++
++	return empty;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_stp_is_rxqueue_empty);
++
++/* stp_core.c:2233-2300 */
++int mtk_wcn_stp_parser_data(u8 *buffer, u32 length)
++{
++	int ret = 0;
++
++	if (!buffer)
++		return -EINVAL;
++
++	if (!stp_ctx_ready)
++		return -ENODEV;
++
++	if (!stp.enabled) {
++		if (stp.pending_type == WMT_TASK_INDX) {
++			/* Raw WMT traffic before STP is enabled. */
++			stp_add_to_rx_queue(buffer, length, WMT_TASK_INDX);
++			if (stp_event_cb[WMT_TASK_INDX])
++				stp_event_cb[WMT_TASK_INDX]();
++		}
++		return 0;
++	}
++
++	mutex_lock(&stp.parse_lock);
++	if (mtk_wcn_stp_is_btif_mand_mode())
++		ret = stp_parser_data_in_mand_mode(length, buffer);
++	else if (mtk_wcn_stp_is_btif_fullset_mode())
++		ret = stp_parser_data_in_full_mode(length, buffer);
++	mutex_unlock(&stp.parse_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_stp_parser_data);
++
++int mtk_wcn_stp_register_event_cb(int type, mtk_wcn_stp_event_cb func)
++{
++	if (type < 0 || type >= MTKSTP_MAX_TASK_NUM)
++		return -EINVAL;
++
++	stp_event_cb[type] = func;
++
++	/* stp_exp.c:200-216: a new consumer always starts with an empty queue. */
++	mtk_wcn_stp_flush_rx_queue(type);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_stp_register_event_cb);
++
++int mtk_wcn_stp_register_tx_event_cb(int type, mtk_wcn_stp_event_cb func)
++{
++	if (type < 0 || type >= MTKSTP_MAX_TASK_NUM)
++		return -EINVAL;
++
++	stp_tx_event_cb[type] = func;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_stp_register_tx_event_cb);
++
++int mtk_wcn_stp_register_if_rx(mtk_wcn_stp_if_rx func)
++{
++	stp_if_rx = func;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_stp_register_if_rx);
++
++int mtk_wcn_stp_register_if_tx(enum mtk_wcn_stp_tx_if stp_interface,
++			       mtk_wcn_stp_if_tx func)
++{
++	if (stp_interface >= STP_TX_IF_MAX) {
++		stp_warn("STP_IF_TX(%d) out of boundary\n", stp_interface);
++		return -EINVAL;
++	}
++
++	stp_if_tx[stp_interface] = func;
++	if (func && stp_if_type == STP_TX_IF_MAX)
++		stp_if_type = stp_interface;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_stp_register_if_tx);
++
++/*
++ * Internal STP control used by the WMT core
++ */
++
++int stp_drv_init(void)
++{
++	int i;
++
++	memset(&stp, 0, sizeof(stp));
++	mutex_init(&stp.lock);
++	mutex_init(&stp.parse_lock);
++
++	for (i = 0; i < MTKSTP_MAX_TASK_NUM; i++)
++		spin_lock_init(&stp.ring[i].lock);
++
++	timer_setup(&stp.tx_timer, stp_tx_timeout_cb, 0);
++	INIT_WORK(&stp.tx_timeout_work, stp_tx_timeout_work_fn);
++	INIT_WORK(&stp.reset_work, stp_reset_work_fn);
++
++	stp.enabled = false;
++	stp.ready = false;
++	stp.bluez = false;
++	stp.mode = 0;
++	stp.pending_type = 0;
++	stp.wmt_last_close = 0;
++	stp.evt_err_assert = 0;
++	stp_ctx_ready = 1;
++
++	return 0;
++}
++
++void stp_drv_exit(void)
++{
++	if (!stp_ctx_ready)
++		return;
++
++	stp_ctx_ready = 0;
++	cancel_work_sync(&stp.reset_work);
++	cancel_work_sync(&stp.tx_timeout_work);
++	timer_delete_sync(&stp.tx_timer);
++
++	mutex_lock(&stp.lock);
++	stp.enabled = false;
++	stp.ready = false;
++	memset(stp_event_cb, 0, sizeof(stp_event_cb));
++	memset(stp_tx_event_cb, 0, sizeof(stp_tx_event_cb));
++	memset(stp_if_tx, 0, sizeof(stp_if_tx));
++	stp_if_rx = NULL;
++	stp_if_type = STP_TX_IF_MAX;
++	mutex_unlock(&stp.lock);
++
++	mutex_destroy(&stp.parse_lock);
++	mutex_destroy(&stp.lock);
++}
++
++int mtk_wcn_stp_enable(int value)
++{
++	mutex_lock(&stp.parse_lock);
++	mutex_lock(&stp.lock);
++	stp_rest_ctx_state();
++	stp.enabled = !!value;
++	mutex_unlock(&stp.lock);
++	mutex_unlock(&stp.parse_lock);
++
++	stp_dbg("STP %s\n", value ? "enabled" : "disabled");
++	return 0;
++}
++
++int mtk_wcn_stp_ready(int value)
++{
++	if (!stp_ctx_ready)
++		return -ENODEV;
++
++	stp.ready = !!value;
++	stp_dbg("STP %s\n", value ? "ready" : "not ready");
++	return 0;
++}
++
++void mtk_wcn_stp_flush_rx_queue(u32 type)
++{
++	struct stp_ring *ring;
++	unsigned long flags;
++
++	if (type >= MTKSTP_MAX_TASK_NUM)
++		return;
++
++	ring = &stp.ring[type];
++	spin_lock_irqsave(&ring->lock, flags);
++	ring->read_p = 0;
++	ring->write_p = 0;
++	spin_unlock_irqrestore(&ring->lock, flags);
++}
++
++void mtk_wcn_stp_flush_context(void)
++{
++	if (!stp_ctx_ready)
++		return;
++
++	mutex_lock(&stp.parse_lock);
++	mutex_lock(&stp.lock);
++	stp_rest_ctx_state();
++	mutex_unlock(&stp.lock);
++	mutex_unlock(&stp.parse_lock);
++}
++
++void mtk_wcn_stp_set_mode(u32 mode)
++{
++	stp.mode = mode;
++	stp_dbg("STP mode 0x%08x\n", mode);
++}
++
++void mtk_wcn_stp_set_if_tx_type(enum mtk_wcn_stp_tx_if type)
++{
++	if (type >= STP_TX_IF_MAX) {
++		stp_err("invalid tx interface %d\n", type);
++		return;
++	}
++
++	stp_if_type = type;
++}
++
++void mtk_wcn_stp_set_bluez(bool bluez)
++{
++	stp.bluez = bluez;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_stp_set_bluez);
++
++bool mtk_wcn_stp_is_btif_fullset_mode(void)
++{
++	return stp.mode & MTKSTP_BTIF_FULL_MODE;
++}
++
++bool mtk_wcn_stp_is_btif_mand_mode(void)
++{
++	return stp.mode & MTKSTP_BTIF_MAND_MODE;
++}
++
++int mtk_wcn_stp_set_wmt_last_close(u32 value)
++{
++	stp.wmt_last_close = value;
++	stp_dbg("wmt_last_close %u\n", value);
++	return 0;
++}
++
++/* stp_core.c:3300-3330 */
++u32 mtk_wcn_stp_get_wmt_evt_err_trg_assert(void)
++{
++	return stp.evt_err_assert;
++}
++
++void mtk_wcn_stp_set_wmt_evt_err_trg_assert(u32 value)
++{
++	stp_info("event error assert flag %u\n", value);
++	stp.evt_err_assert = value;
++}
+diff --git a/drivers/misc/mediatek/connectivity/wmt/wmt_api.c b/drivers/misc/mediatek/connectivity/wmt/wmt_api.c
+new file mode 100644
+index 000000000..2a7c69a91
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wmt/wmt_api.c
+@@ -0,0 +1,206 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WCN WMT public API (frozen mtk_wcn_wmt.h).
++ *
++ * Port from Samsung/MTK downstream
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/linux/pri/wmt_exp.c
++ *
++ * Copyright (C) 2011-2014 MediaTek Inc.
++ */
++
++#include <linux/module.h>
++
++#include "wmt_local.h"
++
++/* Downstream ENUM_WMTTHERM_TYPE_T (wmt_exp.h:71-78). */
++#define WMTTHERM_ENABLE		1
++#define WMTTHERM_READ		2
++#define WMTTHERM_DISABLE	3
++#define WMTTHERM_MAX		4
++
++static bool wmt_public_op(enum wmt_opid op_id, enum mtk_wcn_wmt_drv type)
++{
++	struct wmt_op op = {
++		.op_id = op_id,
++		.data = { type },
++	};
++	bool ret;
++
++	if (!g_wmt.ready)
++		return false;
++
++	wmt_plat_wake_lock_ctrl(WL_OP_GET);
++	ret = wmt_lib_run_op(&op) == 0;
++	wmt_plat_wake_lock_ctrl(WL_OP_PUT);
++
++	return ret;
++}
++
++bool mtk_wcn_wmt_func_on(enum mtk_wcn_wmt_drv type)
++{
++	if (type > WMTDRV_WIFI) {
++		wmt_warn("function %d is not supported\n", type);
++		return false;
++	}
++
++	return wmt_public_op(WMT_OPID_FUNC_ON, type);
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_wmt_func_on);
++
++bool mtk_wcn_wmt_func_off(enum mtk_wcn_wmt_drv type)
++{
++	if (type > WMTDRV_WIFI) {
++		wmt_warn("function %d is not supported\n", type);
++		return false;
++	}
++
++	return wmt_public_op(WMT_OPID_FUNC_OFF, type);
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_wmt_func_off);
++
++int mtk_wcn_wmt_msgcb_reg(enum mtk_wcn_wmt_drv type, mtk_wcn_wmt_msgcb cb)
++{
++	if (type < 0 || type >= WMTDRV_MAX)
++		return -EINVAL;
++
++	g_wmt.msgcb[type] = cb;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_wmt_msgcb_reg);
++
++int mtk_wcn_wmt_msgcb_unreg(enum mtk_wcn_wmt_drv type)
++{
++	if (type < 0 || type >= WMTDRV_MAX)
++		return -EINVAL;
++
++	g_wmt.msgcb[type] = NULL;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_wmt_msgcb_unreg);
++
++/* wmt_exp.c:426-462 */
++int mtk_wcn_wmt_wlan_reg(const struct mtk_wcn_wmt_wlan_cb *cb)
++{
++	if (!cb || !cb->probe || !cb->remove)
++		return -EINVAL;
++
++	memcpy(&g_wmt.wlan_cb, cb, sizeof(g_wmt.wlan_cb));
++	wmt_info("WLAN driver registered\n");
++
++	if (g_wmt.wlan_probed) {
++		int ret = cb->probe();
++
++		if (ret) {
++			wmt_err("deferred WLAN probe failed (%d)\n", ret);
++			return ret;
++		}
++		g_wmt.wlan_probed = false;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_wmt_wlan_reg);
++
++int mtk_wcn_wmt_wlan_unreg(void)
++{
++	memset(&g_wmt.wlan_cb, 0, sizeof(g_wmt.wlan_cb));
++	wmt_info("WLAN driver unregistered\n");
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_wmt_wlan_unreg);
++
++/* wmt_exp.c:340-400 */
++bool mtk_wcn_wmt_assert(enum mtk_wcn_wmt_drv type, u32 reason)
++{
++	struct wmt_op op = { .op_id = WMT_OPID_ASSERT };
++	unsigned long pa1 = 0, pa2 = 0;
++	bool ret;
++
++	if (type < 0 || type >= WMTDRV_MAX)
++		return false;
++
++	if (!g_wmt.ready)
++		return false;
++
++	wmt_warn("driver %d asserts the firmware (reason %u)\n", type, reason);
++
++	/* Wake the connectivity MCU before sending the assert command; the
++	 * downstream driver does the same through the STP power-saving engine
++	 * (wmt_exp.c:209).
++	 */
++	wmt_core_ctrl(WMT_CTRL_SOC_WAKEUP_CONSYS, &pa1, &pa2);
++
++	wmt_plat_wake_lock_ctrl(WL_OP_GET);
++	ret = wmt_lib_run_op(&op) == 0;
++	wmt_plat_wake_lock_ctrl(WL_OP_PUT);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_wmt_assert);
++
++int mtk_wcn_wmt_system_state_reset(void)
++{
++	g_wmt.func_on_bits = 0;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_wmt_system_state_reset);
++
++/* wmt_exp.c:265-335 */
++bool mtk_wcn_wmt_dsns_ctrl(enum mtk_wcn_wmt_dsns type)
++{
++	struct wmt_op op = {
++		.op_id = WMT_OPID_DSNS,
++		.data = { WMTDRV_FM, type },
++	};
++	bool ok;
++
++	if (type >= WMTDSNS_MAX)
++		return false;
++
++	if (!g_wmt.ready || !mtk_wcn_stp_is_ready())
++		return false;
++
++	wmt_plat_wake_lock_ctrl(WL_OP_GET);
++	ok = wmt_lib_run_op(&op) == 0;
++	wmt_plat_wake_lock_ctrl(WL_OP_PUT);
++
++	return ok;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_wmt_dsns_ctrl);
++
++/* wmt_exp.c:180-260 */
++s8 mtk_wcn_wmt_therm_ctrl(u8 type)
++{
++	struct wmt_op op = { .op_id = WMT_OPID_THERM_CTRL };
++	s8 ret;
++
++	if (type < WMTTHERM_ENABLE || type >= WMTTHERM_MAX) {
++		wmt_err("invalid thermal control command %u\n", type);
++		return 0;
++	}
++
++	if (!g_wmt.ready || !mtk_wcn_stp_is_ready()) {
++		wmt_err("thermal control needs a ready STP\n");
++		return 0;
++	}
++
++	op.data[0] = type;
++
++	wmt_plat_wake_lock_ctrl(WL_OP_GET);
++	if (wmt_lib_run_op(&op)) {
++		wmt_warn("thermal command %u failed\n", type);
++		ret = type == WMTTHERM_READ ? (s8)0xff : 0;
++	} else {
++		ret = (s8)op.data[1];
++	}
++	wmt_plat_wake_lock_ctrl(WL_OP_PUT);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_wmt_therm_ctrl);
++
++enum mtk_wcn_wmt_hwver mtk_wcn_wmt_hwver_get(void)
++{
++	return wmt_lib_hwver();
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_wmt_hwver_get);
+diff --git a/drivers/misc/mediatek/connectivity/wmt/wmt_chrdev_wifi.c b/drivers/misc/mediatek/connectivity/wmt/wmt_chrdev_wifi.c
+new file mode 100644
+index 000000000..0b3000d04
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wmt/wmt_chrdev_wifi.c
+@@ -0,0 +1,194 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WCN /dev/wmtWifi power control channel.
++ *
++ * Port from Samsung/MTK downstream
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/linux/pub/wmt_chrdev_wifi.c
++ *
++ * Copyright (C) 2011-2014 MediaTek Inc.
++ *
++ * The Wi-Fi HAL powers the WCN Wi-Fi function by writing '1' (on) or '0'
++ * (off) to /dev/wmtWifi.  The downstream driver also forwarded 'D<n>' debug
++ * level changes and P2P/AP mode reconfiguration to the WLAN driver; neither
++ * is part of the frozen WMT interface, so Wi-Fi recovery after a WCN reset is
++ * left to the WLAN driver's WMTMSG_RESET callback.
++ */
++
++#include <linux/cdev.h>
++#include <linux/device.h>
++#include <linux/fs.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++
++#include "wmt_local.h"
++
++/* wmt_chrdev_wifi.c:39-41 */
++#define WIFI_DRIVER_NAME	"wmtWifi"
++#define WIFI_DEV_MAJOR		153
++
++/* wmt_chrdev_wifi.c:170-180 */
++static int wifi_major = WIFI_DEV_MAJOR;
++module_param(wifi_major, uint, 0444);
++
++static struct cdev wifi_cdev;
++static struct class *wifi_class;
++
++enum wifi_power_state {
++	WIFI_POWER_OFF,
++	WIFI_POWER_ON,
++};
++
++static enum wifi_power_state wifi_powered = WIFI_POWER_OFF;
++static DEFINE_MUTEX(wifi_mutex);
++
++/* wmt_chrdev_wifi.c:185-196 */
++#define WMT_CHECK_DO_CHIP_RESET()					\
++	do {								\
++		wmt_err("Wi-Fi power control failed, asserting CONNSYS\n"); \
++		mtk_wcn_wmt_assert(WMTDRV_WIFI, 0x40);			\
++	} while (0)
++
++static int wifi_open(struct inode *inode, struct file *file)
++{
++	wmt_dbg("wmtWifi open by pid %d\n", current->pid);
++	return 0;
++}
++
++static int wifi_release(struct inode *inode, struct file *file)
++{
++	wmt_dbg("wmtWifi release by pid %d\n", current->pid);
++	return 0;
++}
++
++/* wmt_chrdev_wifi.c:349-470 */
++static ssize_t wifi_write(struct file *file, const char __user *buf,
++			  size_t count, loff_t *ppos)
++{
++	char cmd[16] = { };
++	size_t len = min(count, sizeof(cmd) - 1);
++	ssize_t ret = count;
++
++	if (!len)
++		return -EINVAL;
++
++	if (copy_from_user(cmd, buf, len))
++		return -EFAULT;
++
++	mutex_lock(&wifi_mutex);
++
++	switch (cmd[0]) {
++	case '0':
++		if (wifi_powered == WIFI_POWER_OFF) {
++			wmt_dbg("Wi-Fi already off\n");
++			break;
++		}
++
++		if (!mtk_wcn_wmt_func_off(WMTDRV_WIFI)) {
++			WMT_CHECK_DO_CHIP_RESET();
++			ret = -EIO;
++			break;
++		}
++
++		wifi_powered = WIFI_POWER_OFF;
++		wmt_info("Wi-Fi powered off\n");
++		break;
++
++	case '1':
++		if (wifi_powered == WIFI_POWER_ON) {
++			wmt_dbg("Wi-Fi already on\n");
++			break;
++		}
++
++		if (!mtk_wcn_wmt_func_on(WMTDRV_WIFI)) {
++			WMT_CHECK_DO_CHIP_RESET();
++			ret = -EIO;
++			break;
++		}
++
++		wifi_powered = WIFI_POWER_ON;
++		wmt_info("Wi-Fi powered on\n");
++		break;
++
++	case 'D':
++		/* Dynamic WLAN debug levels are not part of the frozen WMT
++		 * interface.
++		 */
++		ret = -EOPNOTSUPP;
++		break;
++
++	default:
++		wmt_warn("invalid wmtWifi command '%c'\n", cmd[0]);
++		ret = -EINVAL;
++		break;
++	}
++
++	mutex_unlock(&wifi_mutex);
++	return ret;
++}
++
++static const struct file_operations wifi_fops = {
++	.owner = THIS_MODULE,
++	.open = wifi_open,
++	.release = wifi_release,
++	.write = wifi_write,
++};
++
++int mtk_wcn_wmt_wifi_init(void)
++{
++	dev_t dev = MKDEV(wifi_major, 0);
++	int ret;
++
++	ret = register_chrdev_region(dev, 1, WIFI_DRIVER_NAME);
++	if (ret) {
++		wmt_err("failed to register the wmtWifi device (%d)\n", ret);
++		return ret;
++	}
++
++	cdev_init(&wifi_cdev, &wifi_fops);
++	wifi_cdev.owner = THIS_MODULE;
++
++	ret = cdev_add(&wifi_cdev, dev, 1);
++	if (ret)
++		goto err_region;
++
++	wifi_class = class_create("wmtWifi");
++	if (IS_ERR(wifi_class)) {
++		ret = PTR_ERR(wifi_class);
++		wifi_class = NULL;
++		goto err_cdev;
++	}
++
++	if (IS_ERR(device_create(wifi_class, NULL, dev, NULL, "wmtWifi"))) {
++		ret = -ENODEV;
++		goto err_class;
++	}
++
++	wifi_powered = WIFI_POWER_OFF;
++	wmt_info("/dev/wmtWifi registered (major %d)\n", wifi_major);
++	return 0;
++
++err_class:
++	class_destroy(wifi_class);
++	wifi_class = NULL;
++err_cdev:
++	cdev_del(&wifi_cdev);
++err_region:
++	unregister_chrdev_region(dev, 1);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_wmt_wifi_init);
++
++void mtk_wcn_wmt_wifi_exit(void)
++{
++	dev_t dev = MKDEV(wifi_major, 0);
++
++	device_destroy(wifi_class, dev);
++	class_destroy(wifi_class);
++	wifi_class = NULL;
++	cdev_del(&wifi_cdev);
++	unregister_chrdev_region(dev, 1);
++	wifi_powered = WIFI_POWER_OFF;
++}
++EXPORT_SYMBOL_GPL(mtk_wcn_wmt_wifi_exit);
+diff --git a/drivers/misc/mediatek/connectivity/wmt/wmt_conf.c b/drivers/misc/mediatek/connectivity/wmt/wmt_conf.c
+new file mode 100644
+index 000000000..bd097e785
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wmt/wmt_conf.c
+@@ -0,0 +1,157 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WCN WMT_SOC.cfg parser.
++ *
++ * Port from Samsung/MTK downstream
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/core/wmt_conf.c
++ *
++ * Copyright (C) 2011-2014 MediaTek Inc.
++ *
++ * The configuration file is a plain "key=value" list in
++ * /system/etc/firmware/WMT_SOC.cfg.  Only the keys used by the ported
++ * functionality are consumed; the coexistence keys of the downstream parser
++ * are accepted and ignored because the coexistence engine is not ported.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++
++#include "wmt_local.h"
++
++static int wmt_conf_parse_u8(const char *val, u8 *dst)
++{
++	unsigned int tmp;
++	int ret;
++
++	ret = kstrtouint(val, 0, &tmp);
++	if (ret || tmp > 0xff)
++		return -EINVAL;
++
++	*dst = tmp;
++	return 0;
++}
++
++static int wmt_conf_parse_u16(const char *val, u16 *dst)
++{
++	unsigned int tmp;
++	int ret;
++
++	ret = kstrtouint(val, 0, &tmp);
++	if (ret || tmp > 0xffff)
++		return -EINVAL;
++
++	*dst = tmp;
++	return 0;
++}
++
++/* wmt_conf.c:520-560 */
++static int wmt_conf_parse_pair(const char *key, const char *val)
++{
++	struct wmt_gen_conf *conf = &g_wmt.gen_conf;
++	int ret;
++
++	if (!strcmp(key, "co_clock_flag"))
++		ret = wmt_conf_parse_u8(val, &conf->co_clock_flag);
++	else if (!strcmp(key, "wmt_gps_lna_pin"))
++		ret = wmt_conf_parse_u8(val, &conf->wmt_gps_lna_pin);
++	else if (!strcmp(key, "wmt_gps_lna_enable"))
++		ret = wmt_conf_parse_u8(val, &conf->wmt_gps_lna_enable);
++	else if (!strcmp(key, "bt_tssi_from_wifi"))
++		ret = wmt_conf_parse_u8(val, &conf->bt_tssi_from_wifi);
++	else if (!strcmp(key, "bt_tssi_target"))
++		ret = wmt_conf_parse_u16(val, &conf->bt_tssi_target);
++	else
++		return -ENOENT;	/* coexistence/debug key, not ported */
++
++	if (ret)
++		wmt_warn("invalid value '%s' for %s\n", val, key);
++
++	return ret;
++}
++
++/* wmt_conf.c:330-470 */
++static int wmt_conf_parse(const u8 *buf, size_t size)
++{
++	char *line, *next, *eq, *key, *val;
++	char *copy;
++	int ret = 0;
++
++	copy = kmemdup_nul((const char *)buf, size, GFP_KERNEL);
++	if (!copy)
++		return -ENOMEM;
++
++	for (line = copy; line && *line; line = next) {
++		next = strchr(line, '\n');
++		if (next)
++			*next++ = '\0';
++
++		line = strim(line);
++		if (!*line)
++			continue;
++
++		eq = strchr(line, '=');
++		if (!eq) {
++			wmt_dbg("malformed config line '%s'\n", line);
++			continue;
++		}
++
++		*eq = '\0';
++		key = strim(line);
++		val = strim(eq + 1);
++
++		if (wmt_conf_parse_pair(key, val) == -EINVAL)
++			ret = -EINVAL;
++	}
++
++	kfree(copy);
++	return ret;
++}
++
++int wmt_conf_read_file(void)
++{
++	struct wmt_gen_conf *conf = &g_wmt.gen_conf;
++	u8 *buf = NULL;
++	size_t size = 0;
++	int ret;
++
++	memset(conf, 0, sizeof(*conf));
++
++	ret = wmt_dev_read_file(g_wmt.cfg_name, &buf, &size);
++	if (ret) {
++		wmt_dbg("cannot read %s (%d)\n", g_wmt.cfg_name, ret);
++		return ret;
++	}
++
++	ret = wmt_conf_parse(buf, size);
++	kfree(buf);
++	if (ret) {
++		wmt_err("failed to parse %s\n", g_wmt.cfg_name);
++		return ret;
++	}
++
++	conf->co_clock_flag &= 0x0f;
++	conf->cfg_exist = true;
++
++	wmt_info("%s: co-clock %u, gps lna pin %u enable %u, bt tssi %u/%u\n",
++		 g_wmt.cfg_name, conf->co_clock_flag, conf->wmt_gps_lna_pin,
++		 conf->wmt_gps_lna_enable, conf->bt_tssi_from_wifi,
++		 conf->bt_tssi_target);
++	return 0;
++}
++
++int wmt_conf_set_cfg_file(const char *name)
++{
++	if (!name || !name[0])
++		return -EINVAL;
++
++	strscpy(g_wmt.cfg_name, name, sizeof(g_wmt.cfg_name));
++	wmt_info("WMT config file set to %s\n", g_wmt.cfg_name);
++	return 0;
++}
++
++const struct wmt_gen_conf *wmt_conf_get(void)
++{
++	return g_wmt.gen_conf.cfg_exist ? &g_wmt.gen_conf : NULL;
++}
+diff --git a/drivers/misc/mediatek/connectivity/wmt/wmt_core.c b/drivers/misc/mediatek/connectivity/wmt/wmt_core.c
+new file mode 100644
+index 000000000..02e3ba1df
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wmt/wmt_core.c
+@@ -0,0 +1,750 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WCN WMT control protocol engine.
++ *
++ * Port from Samsung/MTK downstream
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/core/wmt_core.c
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/core/wmt_func.c
++ *
++ * Copyright (C) 2011-2014 MediaTek Inc.
++ *
++ * WMT is the management protocol spoken with the connectivity firmware over
++ * the STP WMT channel.  Every exchange is a command PDU followed by an event
++ * PDU:
++ *
++ *	command: type=1, opcode, len, params...
++ *	event:   type=2, opcode, len, status, params...
++ *
++ * All exchanges are serialised by wmt_lib_run_op() and complete when the
++ * event has been received (or the 2000 ms receive timeout expires).
++ */
++
++#include <linux/delay.h>
++#include <linux/module.h>
++#include <linux/string.h>
++
++#include <mtk_wcn_stp.h>
++
++#include "wmt_local.h"
++
++/* WMT command/event PDUs (wmt_core.c:203-259, wmt_ic_soc.c:100-160). */
++static const u8 wmt_therm_cmd[] = { 0x01, 0x11, 0x01, 0x00, 0x00 };
++static const u8 wmt_therm_ctrl_evt[] = { 0x02, 0x11, 0x01, 0x00, 0x00 };
++static const u8 wmt_therm_read_evt[] = { 0x02, 0x11, 0x02, 0x00, 0x00, 0x00 };
++static const u8 wmt_dsns_evt[] = { 0x02, 0x0e, 0x01, 0x00, 0x00 };
++static const u8 wmt_assert_cmd[] = { 0x01, 0x02, 0x01, 0x00, 0x08 };
++
++/* WMT_SET_REG_CMD / WR_EVT / RD_EVT (wmt_core.c:236-258) */
++static u8 wmt_set_reg_cmd[] = {
++	0x01, 0x08, 0x10, 0x00,	/* length */
++	0x00,			/* op: w(1) & r(2) */
++	0x01,			/* type: reg */
++	0x00,			/* reserved */
++	0x01,			/* one register */
++	0x00, 0x00, 0x00, 0x00,	/* address */
++	0x00, 0x00, 0x00, 0x00,	/* value */
++	0xff, 0xff, 0xff, 0xff,	/* mask */
++};
++static const u8 wmt_set_reg_wr_evt[] = {
++	0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01,
++};
++static const u8 wmt_set_reg_rd_evt[] = {
++	0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01,
++	0x00, 0x00, 0x00, 0x00,	/* address */
++	0x00, 0x00, 0x00, 0x00,	/* value */
++};
++
++static int wmt_core_stp_init(void);
++static int wmt_core_stp_deinit(void);
++static int wmt_core_hw_check(void);
++
++/*
++ * Low level WMT transport helpers
++ */
++
++int wmt_core_tx(const u8 *data, u32 size, u32 *written)
++{
++	u32 retry = 0;
++	int ret;
++
++	*written = 0;
++
++	ret = wmt_ctrl_tx_ex(data, size, written, false);
++	while (ret == -EAGAIN && retry < 3) {
++		wmt_warn("no STP window space, retry %u\n", retry + 1);
++		msleep(360);
++		ret = wmt_ctrl_tx_ex(data, size, written, false);
++		retry++;
++	}
++
++	return ret;
++}
++
++int wmt_core_rx(u8 *buf, u32 len, u32 *read_size)
++{
++	struct wmt_ctrl_data data = { };
++
++	if (read_size)
++		*read_size = 0;
++
++	data.ctrl_id = WMT_CTRL_RX;
++	data.data[0] = (unsigned long)buf;
++	data.data[1] = len;
++	data.data[2] = (unsigned long)read_size;
++
++	return wmt_ctrl(&data);
++}
++
++/* wmt_core.c:428-472 */
++int wmt_core_ctrl(enum wmt_ctrl_id id, unsigned long *pa1, unsigned long *pa2)
++{
++	struct wmt_ctrl_data data = { };
++	int ret;
++
++	data.ctrl_id = id;
++	data.data[0] = pa1 ? *pa1 : 0;
++	data.data[1] = pa2 ? *pa2 : 0;
++
++	ret = wmt_ctrl(&data);
++	if (ret) {
++		wmt_err("ctrl %d failed (%d)\n", id, ret);
++		return ret;
++	}
++
++	if (pa1)
++		*pa1 = data.data[0];
++	if (pa2)
++		*pa2 = data.data[1];
++
++	return 0;
++}
++
++/* wmt_core.c:376-426 */
++int wmt_core_func_ctrl_cmd(enum mtk_wcn_wmt_drv type, bool enable)
++{
++	u8 cmd[WMT_HDR_LEN + WMT_FLAG_LEN + WMT_FUNC_CTRL_PARAM_LEN];
++	u8 evt[WMT_HDR_LEN + WMT_STS_LEN];
++	u32 cmd_len = sizeof(cmd);
++	u32 evt_len = sizeof(evt);
++	u32 written = 0, read = 0;
++	int ret;
++
++	cmd[0] = 0x01;			/* PKT_TYPE_CMD */
++	cmd[1] = 0x06;			/* OPCODE_FUNC_CTRL */
++	cmd[2] = WMT_FLAG_LEN + WMT_FUNC_CTRL_PARAM_LEN;
++	cmd[3] = 0x00;
++	cmd[4] = (u8)type;
++	cmd[5] = enable ? 1 : 0;
++
++	ret = wmt_core_tx(cmd, cmd_len, &written);
++	if (ret || written != cmd_len) {
++		wmt_err("func ctrl tx failed (%d, %u/%u)\n", ret, written,
++			cmd_len);
++		return -EIO;
++	}
++
++	ret = wmt_core_rx(evt, evt_len, &read);
++	if (ret || read != evt_len) {
++		wmt_err("func ctrl rx failed (%d, %u/%u)\n", ret, read, evt_len);
++		return -EIO;
++	}
++
++	if (evt[0] != 0x02 /* PKT_TYPE_EVENT */ ||
++	    evt[1] != cmd[1] || evt[4] != 0) {
++		wmt_err("bad func ctrl event %02x %02x %02x %02x %02x\n",
++			evt[0], evt[1], evt[2], evt[3], evt[4]);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++/* wmt_core.c:500-562 */
++int wmt_core_reg_rw_raw(u32 is_write, u32 offset, u32 *val, u32 mask)
++{
++	u8 evt[16] = { };
++	u32 evt_len, written = 0, read = 0;
++	const u8 *exp;
++	u32 tx_addr, rx_addr;
++	int ret;
++
++	wmt_set_reg_cmd[4] = is_write ? 0x1 : 0x2;
++	memcpy(&wmt_set_reg_cmd[8], &offset, 4);
++	memcpy(&wmt_set_reg_cmd[12], val, 4);
++	memcpy(&wmt_set_reg_cmd[16], &mask, 4);
++
++	ret = wmt_core_tx(wmt_set_reg_cmd, sizeof(wmt_set_reg_cmd), &written);
++	if (ret || written != sizeof(wmt_set_reg_cmd)) {
++		wmt_err("reg rw tx failed (%d, %u)\n", ret, written);
++		return -EIO;
++	}
++
++	if (is_write) {
++		exp = wmt_set_reg_wr_evt;
++		evt_len = sizeof(wmt_set_reg_wr_evt);
++	} else {
++		exp = wmt_set_reg_rd_evt;
++		evt_len = sizeof(wmt_set_reg_rd_evt);
++	}
++
++	ret = wmt_core_rx(evt, evt_len, &read);
++	if (ret || read != evt_len) {
++		wmt_err("reg rw rx failed (%d, %u/%u)\n", ret, read, evt_len);
++		return -EIO;
++	}
++
++	/* Event type/opcode must echo the command. */
++	if (evt[0] != exp[0] || evt[1] != exp[1]) {
++		wmt_err("bad register event %02x %02x\n", evt[0], evt[1]);
++		return -EIO;
++	}
++
++	if (is_write)
++		return 0;
++
++	memcpy(&tx_addr, &wmt_set_reg_cmd[8], 4);
++	memcpy(&rx_addr, &evt[8], 4);
++	if (tx_addr != rx_addr) {
++		wmt_err("read address mismatch 0x%08x/0x%08x\n",
++			rx_addr, tx_addr);
++		return -EIO;
++	}
++
++	memcpy(val, &evt[12], 4);
++	return 0;
++}
++
++/* wmt_core.c:598-644 */
++int wmt_core_init_script(const struct wmt_init_script *script, int count)
++{
++	u8 evt[256];
++	u32 written = 0, read = 0;
++	int i, ret;
++
++	for (i = 0; i < count; i++) {
++		ret = wmt_core_tx(script[i].cmd, script[i].cmd_sz, &written);
++		if (ret || written != script[i].cmd_sz) {
++			wmt_err("init script %s tx failed (%d, %u/%u)\n",
++				script[i].str, ret, written, script[i].cmd_sz);
++			return -EIO;
++		}
++
++		memset(evt, 0, sizeof(evt));
++		ret = wmt_core_rx(evt, script[i].evt_sz, &read);
++		if (ret || read != script[i].evt_sz) {
++			wmt_err("init script %s rx failed (%d, %u/%u)\n",
++				script[i].str, ret, read, script[i].evt_sz);
++			return -EIO;
++		}
++
++		/* RF calibration events carry chip data; their contents are
++		 * not compared (wmt_core.c:629-640).
++		 */
++		if (script[i].evt_sz > 1 && evt[1] == 0x14)
++			continue;
++
++		if (memcmp(evt, script[i].evt, script[i].evt_sz)) {
++			wmt_err("init script %s unexpected event\n",
++				script[i].str);
++			return -EIO;
++		}
++	}
++
++	return 0;
++}
++
++/* wmt_core.c:660-667 */
++bool wmt_core_patch_check(u32 patch_ver, u32 hw_ver)
++{
++	if (MAJORNUM(hw_ver) != MAJORNUM(patch_ver)) {
++		wmt_err("hw version 0x%x does not match patch 0x%x\n",
++			hw_ver, patch_ver);
++		return false;
++	}
++
++	return true;
++}
++
++/*
++ * STP bring-up / tear-down around the WMT protocol
++ */
++
++/* wmt_core.c:700-790 */
++static int wmt_core_stp_init(void)
++{
++	struct wmt_hif_conf *hif = wmt_lib_hif();
++	unsigned long pa1 = 0, pa2 = 0;
++	int ret;
++
++	if (!wmt_conf_get())
++		wmt_dbg("no WMT_SOC.cfg, using defaults\n");
++
++	if (!(g_wmt.state & WMT_STAT_STP_OPEN)) {
++		ret = wmt_core_ctrl(WMT_CTRL_STP_OPEN, &pa1, &pa2);
++		if (ret)
++			return ret;
++	}
++
++	/* Disable and un-ready STP while the firmware is reconfigured. */
++	pa1 = WMT_STP_CONF_EN;
++	pa2 = 0;
++	ret = wmt_core_ctrl(WMT_CTRL_STP_CONF, &pa1, &pa2);
++	pa1 = WMT_STP_CONF_RDY;
++	pa2 = 0;
++	ret += wmt_core_ctrl(WMT_CTRL_STP_CONF, &pa1, &pa2);
++
++	/* The firmware always starts in mandatory mode. */
++	pa1 = WMT_STP_CONF_MODE;
++	pa2 = MTKSTP_BTIF_MAND_MODE;
++	ret += wmt_core_ctrl(WMT_CTRL_STP_CONF, &pa1, &pa2);
++
++	pa1 = WMT_STP_CONF_EN;
++	pa2 = 1;
++	ret += wmt_core_ctrl(WMT_CTRL_STP_CONF, &pa1, &pa2);
++	if (ret)
++		return -EIO;
++
++	ret = wmt_core_hw_check();
++	if (ret)
++		return ret;
++
++	wmt_ic_soc_co_clock_ctrl(wmt_lib_co_clock());
++
++	ret = wmt_ic_soc_sw_init(hif);
++	if (ret) {
++		wmt_err("SOC software init failed (%d)\n", ret);
++		return ret;
++	}
++
++	pa1 = WMT_STP_CONF_RDY;
++	pa2 = 1;
++	return wmt_core_ctrl(WMT_CTRL_STP_CONF, &pa1, &pa2);
++}
++
++/* wmt_core.c:792-845 */
++static int wmt_core_stp_deinit(void)
++{
++	struct wmt_hif_conf *hif = wmt_lib_hif();
++	unsigned long pa1, pa2;
++	int ret;
++
++	wmt_ic_soc_sw_deinit(hif);
++
++	pa1 = WMT_STP_CONF_RDY;
++	pa2 = 0;
++	ret = wmt_core_ctrl(WMT_CTRL_STP_CONF, &pa1, &pa2);
++	pa1 = WMT_STP_CONF_EN;
++	pa2 = 0;
++	ret += wmt_core_ctrl(WMT_CTRL_STP_CONF, &pa1, &pa2);
++	pa1 = 0;
++	pa2 = 0;
++	ret += wmt_core_ctrl(WMT_CTRL_STP_CLOSE, &pa1, &pa2);
++
++	return ret;
++}
++
++/*
++ * Chip identification (wmt_core.c:861-940)
++ */
++static int wmt_core_hw_check(void)
++{
++	u32 chip_id = 0;
++	int ret;
++
++	ret = wmt_core_reg_rw_raw(false, GEN_HCR, &chip_id, GEN_HCR_MASK);
++	if (ret) {
++		wmt_err("failed to read chip id (%d)\n", ret);
++		return ret;
++	}
++
++	wmt_info("chip id 0x%x\n", chip_id);
++
++	switch (chip_id) {
++	case 0x6572:
++	case 0x6582:
++	case 0x6592:
++	case 0x8127:
++	case 0x6571:
++	case 0x6752:
++	case 0x0279:
++	case 0x0326:
++	case 0x0321:
++	case 0x0335:
++	case 0x0337:
++	case 0x8163:
++	case 0x6580:
++		break;
++	default:
++		wmt_err("unsupported chip id 0x%x\n", chip_id);
++		return -ENODEV;
++	}
++
++	g_wmt.chip_id = chip_id;
++
++	ret = wmt_ic_soc_ver_check();
++	if (ret) {
++		wmt_err("chip 0x%x version check failed (%d)\n", chip_id, ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++/*
++ * Operation handlers
++ */
++
++static int opfunc_hif_conf(struct wmt_op *op)
++{
++	if (!(op->info_bit & BIT(0)))
++		return -EINVAL;
++
++	memcpy(&g_wmt.hif, &op->data[0], sizeof(g_wmt.hif));
++	return 0;
++}
++
++/* wmt_core.c:947-1029 */
++static int opfunc_pwr_on(struct wmt_op *op)
++{
++	unsigned long pa1 = 0, pa2 = 0;
++	int attempt, ret;
++
++	if (g_wmt.drv_status[WMTDRV_WMT] != DRV_STS_POWER_OFF) {
++		wmt_err("WMT already powered on (status %d)\n",
++			g_wmt.drv_status[WMTDRV_WMT]);
++		return -EALREADY;
++	}
++
++	if (op->info_bit & BIT(0))
++		opfunc_hif_conf(op);
++
++	for (attempt = 0; attempt <= WMT_PWRON_RTY_DFT; attempt++) {
++		ret = wmt_core_ctrl(WMT_CTRL_HW_PWR_ON, &pa1, &pa2);
++		if (ret) {
++			wmt_err("CONSYS power on failed (%d)\n", ret);
++			continue;
++		}
++
++		g_wmt.drv_status[WMTDRV_WMT] = DRV_STS_POWER_ON;
++
++		ret = wmt_core_stp_init();
++		if (!ret) {
++			g_wmt.drv_status[WMTDRV_WMT] = DRV_STS_FUNC_ON;
++			return 0;
++		}
++
++		wmt_err("STP init failed (%d), retry %d\n", ret, attempt);
++		wmt_core_stp_deinit();
++		pa1 = 0;
++		pa2 = 0;
++		wmt_core_ctrl(WMT_CTRL_HW_PWR_OFF, &pa1, &pa2);
++		g_wmt.drv_status[WMTDRV_WMT] = DRV_STS_POWER_OFF;
++	}
++
++	return ret;
++}
++
++/* wmt_core.c:1031-1075 */
++static int opfunc_pwr_off(struct wmt_op *op)
++{
++	unsigned long pa1, pa2;
++	int ret = 0;
++
++	if (g_wmt.drv_status[WMTDRV_WMT] == DRV_STS_POWER_OFF) {
++		wmt_warn("WMT already powered off\n");
++		return -EALREADY;
++	}
++
++	if (g_wmt.drv_status[WMTDRV_WMT] == DRV_STS_FUNC_ON)
++		ret = wmt_core_stp_deinit();
++
++	g_wmt.drv_status[WMTDRV_WMT] = DRV_STS_POWER_ON;
++	pa1 = 0;
++	pa2 = 0;
++	ret |= wmt_core_ctrl(WMT_CTRL_HW_PWR_OFF, &pa1, &pa2);
++	g_wmt.drv_status[WMTDRV_WMT] = DRV_STS_POWER_OFF;
++
++	return ret;
++}
++
++static bool wmt_all_funcs_off(void)
++{
++	int i;
++
++	for (i = 0; i < WMTDRV_WMT; i++)
++		if (g_wmt.drv_status[i] != DRV_STS_POWER_OFF)
++			return false;
++
++	return true;
++}
++
++/* wmt_core.c:1077-1170 */
++static int opfunc_func_on(struct wmt_op *op)
++{
++	unsigned int type = op->data[0];
++	int ret;
++
++	if (type >= WMTDRV_MAX)
++		return -EINVAL;
++
++	if (g_wmt.drv_status[type] == DRV_STS_FUNC_ON) {
++		wmt_warn("function %u already on\n", type);
++		return 0;
++	}
++
++	if (g_wmt.drv_status[WMTDRV_WMT] != DRV_STS_FUNC_ON) {
++		ret = opfunc_pwr_on(op);
++		if (ret)
++			return ret;
++	}
++
++	if (type < WMTDRV_WMT) {
++		ret = wmt_func_on(type);
++		if (ret) {
++			wmt_err("function %u on failed (%d)\n", type, ret);
++			g_wmt.drv_status[type] = DRV_STS_POWER_OFF;
++			if (wmt_all_funcs_off()) {
++				mtk_wcn_wmt_system_state_reset();
++				opfunc_pwr_off(op);
++			}
++			return ret;
++		}
++	}
++
++	g_wmt.drv_status[type] = DRV_STS_FUNC_ON;
++	return 0;
++}
++
++/* wmt_core.c:1172-1265 */
++static int opfunc_func_off(struct wmt_op *op)
++{
++	unsigned int type = op->data[0];
++	int ret = 0;
++
++	if (type >= WMTDRV_MAX)
++		return -EINVAL;
++
++	if (g_wmt.drv_status[type] != DRV_STS_FUNC_ON) {
++		wmt_warn("function %u is not on\n", type);
++		return 0;
++	}
++
++	if (type < WMTDRV_WMT)
++		ret = wmt_func_off(type);
++
++	g_wmt.drv_status[type] = DRV_STS_POWER_OFF;
++
++	if (wmt_all_funcs_off())
++		ret |= opfunc_pwr_off(op);
++
++	return ret;
++}
++
++static int opfunc_reg_rw(struct wmt_op *op)
++{
++	if (g_wmt.drv_status[WMTDRV_WMT] != DRV_STS_FUNC_ON)
++		return -EPERM;
++
++	return wmt_core_reg_rw_raw(op->data[0], op->data[1],
++				   (u32 *)op->data[2], op->data[3]);
++}
++
++/* wmt_core.c:1420-1520 */
++static int opfunc_hw_rst(struct wmt_op *op)
++{
++	unsigned long pa1 = 0, pa2 = 0;
++	int ret;
++
++	g_wmt.drv_status[WMTDRV_FM] = DRV_STS_POWER_OFF;
++	g_wmt.drv_status[WMTDRV_GPS] = DRV_STS_POWER_OFF;
++	g_wmt.drv_status[WMTDRV_LPBK] = DRV_STS_POWER_OFF;
++	g_wmt.drv_status[WMTDRV_STP] = DRV_STS_POWER_OFF;
++	g_wmt.drv_status[WMTDRV_COREDUMP] = DRV_STS_POWER_OFF;
++
++	if (g_wmt.drv_status[WMTDRV_WMT] == DRV_STS_POWER_OFF) {
++		ret = wmt_core_ctrl(WMT_CTRL_HW_PWR_ON, &pa1, &pa2);
++		if (ret)
++			return ret;
++		g_wmt.drv_status[WMTDRV_WMT] = DRV_STS_POWER_ON;
++	}
++
++	if (g_wmt.drv_status[WMTDRV_BT] == DRV_STS_FUNC_ON) {
++		pa1 = BT_PALDO;
++		pa2 = PALDO_OFF;
++		wmt_core_ctrl(WMT_CTRL_SOC_PALDO_CTRL, &pa1, &pa2);
++		g_wmt.drv_status[WMTDRV_BT] = DRV_STS_POWER_OFF;
++	}
++
++	if (g_wmt.drv_status[WMTDRV_WIFI] == DRV_STS_FUNC_ON) {
++		wmt_func_off(WMTDRV_WIFI);
++		g_wmt.drv_status[WMTDRV_WIFI] = DRV_STS_POWER_OFF;
++	}
++
++	g_wmt.drv_status[WMTDRV_WMT] = DRV_STS_POWER_OFF;
++
++	ret = wmt_core_ctrl(WMT_CTRL_HW_RST, &pa1, &pa2);
++	if (ret)
++		wmt_err("hardware reset failed (%d)\n", ret);
++
++	g_wmt.drv_status[WMTDRV_WMT] = DRV_STS_POWER_ON;
++
++	ret = wmt_core_ctrl(WMT_CTRL_STP_CLOSE, &pa1, &pa2);
++	if (ret)
++		wmt_err("STP close after reset failed (%d)\n", ret);
++
++	return ret;
++}
++
++/* wmt_core.c:1522-1531 */
++static int opfunc_sw_rst(struct wmt_op *op)
++{
++	int ret;
++
++	ret = wmt_core_stp_init();
++	if (!ret)
++		g_wmt.drv_status[WMTDRV_WMT] = DRV_STS_FUNC_ON;
++
++	return ret;
++}
++
++/* wmt_core.c:1533-1537 */
++static int opfunc_stp_rst(struct wmt_op *op)
++{
++	unsigned long pa1 = 0, pa2 = 0;
++
++	return wmt_core_ctrl(WMT_CTRL_STP_RST, &pa1, &pa2);
++}
++
++/* wmt_core.c:1539-1590 */
++static int opfunc_therm_ctrl(struct wmt_op *op)
++{
++	u8 cmd[sizeof(wmt_therm_cmd)];
++	u8 evt[16] = { };
++	u32 written = 0, read = 0;
++	int ret;
++
++	memcpy(cmd, wmt_therm_cmd, sizeof(cmd));
++	cmd[4] = op->data[0];
++
++	ret = wmt_core_tx(cmd, sizeof(cmd), &written);
++	if (ret || written != sizeof(cmd))
++		return -EIO;
++
++	ret = wmt_core_rx(evt, sizeof(evt), &read);
++	if (ret || (read != sizeof(wmt_therm_ctrl_evt) &&
++		    read != sizeof(wmt_therm_read_evt)))
++		return -EIO;
++
++	if (read == sizeof(wmt_therm_ctrl_evt)) {
++		op->data[1] = memcmp(evt, wmt_therm_ctrl_evt,
++				     sizeof(wmt_therm_ctrl_evt)) ? 0 : 1;
++	} else {
++		op->data[1] = memcmp(evt, wmt_therm_read_evt,
++				     sizeof(wmt_therm_read_evt) - 1) ?
++			      0xff : evt[5];
++	}
++
++	return 0;
++}
++
++static int opfunc_dsns(struct wmt_op *op)
++{
++	u8 cmd[] = { 0x01, 0x0e, 0x02, 0x00, 0x01, 0x00 };
++	u8 evt[16] = { };
++	u32 written = 0, read = 0;
++	int ret;
++
++	cmd[4] = op->data[0];
++	cmd[5] = op->data[1];
++
++	ret = wmt_core_tx(cmd, sizeof(cmd), &written);
++	if (ret || written != sizeof(cmd))
++		return -EIO;
++
++	ret = wmt_core_rx(evt, sizeof(wmt_dsns_evt), &read);
++	if (ret || read != sizeof(wmt_dsns_evt))
++		return -EIO;
++
++	if (memcmp(evt, wmt_dsns_evt, sizeof(wmt_dsns_evt))) {
++		wmt_err("unexpected desense event\n");
++		return -EIO;
++	}
++
++	return 0;
++}
++
++/* wmt_core.c:1898-1930 */
++static int opfunc_gpio_ctrl(struct wmt_op *op)
++{
++	if (g_wmt.drv_status[WMTDRV_WMT] != DRV_STS_FUNC_ON)
++		return -EPERM;
++
++	return wmt_ic_soc_pin_ctrl(op->data[0], op->data[1], op->data[2]);
++}
++
++static int opfunc_pin_state(struct wmt_op *op)
++{
++	unsigned long pa1 = 0, pa2 = 0;
++
++	return wmt_core_ctrl(WMT_CTRL_HW_STATE_DUMP, &pa1, &pa2);
++}
++
++/* wmt_core.c:2073-2082, reached through mtk_wcn_wmt_assert() */
++static int opfunc_assert(struct wmt_op *op)
++{
++	u32 written = 0;
++	int ret;
++
++	ret = wmt_core_tx(wmt_assert_cmd, sizeof(wmt_assert_cmd), &written);
++	if (ret || written != sizeof(wmt_assert_cmd))
++		return -EIO;
++
++	/* The firmware asserts; no event is returned (wmt_core.c:1720-1723). */
++	return 0;
++}
++
++static int (*const wmt_core_opfunc[WMT_OPID_MAX])(struct wmt_op *op) = {
++	[WMT_OPID_HIF_CONF] = opfunc_hif_conf,
++	[WMT_OPID_PWR_ON] = opfunc_pwr_on,
++	[WMT_OPID_PWR_OFF] = opfunc_pwr_off,
++	[WMT_OPID_FUNC_ON] = opfunc_func_on,
++	[WMT_OPID_FUNC_OFF] = opfunc_func_off,
++	[WMT_OPID_REG_RW] = opfunc_reg_rw,
++	[WMT_OPID_DSNS] = opfunc_dsns,
++	[WMT_OPID_HW_RST] = opfunc_hw_rst,
++	[WMT_OPID_SW_RST] = opfunc_sw_rst,
++	[WMT_OPID_STP_RST] = opfunc_stp_rst,
++	[WMT_OPID_THERM_CTRL] = opfunc_therm_ctrl,
++	[WMT_OPID_GPIO_CTRL] = opfunc_gpio_ctrl,
++	[WMT_OPID_GPIO_STATE] = opfunc_pin_state,
++	[WMT_OPID_ASSERT] = opfunc_assert,
++};
++
++int wmt_core_opid(struct wmt_op *op)
++{
++	if (!op || op->op_id >= WMT_OPID_MAX || !wmt_core_opfunc[op->op_id]) {
++		wmt_err("invalid operation %d\n", op ? op->op_id : -1);
++		return -EINVAL;
++	}
++
++	return wmt_core_opfunc[op->op_id](op);
++}
++
++int wmt_core_init(void)
++{
++	memset(&g_wmt.hif, 0, sizeof(g_wmt.hif));
++	g_wmt.drv_status[WMTDRV_BT] = DRV_STS_POWER_OFF;
++	g_wmt.drv_status[WMTDRV_FM] = DRV_STS_POWER_OFF;
++	g_wmt.drv_status[WMTDRV_GPS] = DRV_STS_POWER_OFF;
++	g_wmt.drv_status[WMTDRV_WIFI] = DRV_STS_POWER_OFF;
++	g_wmt.drv_status[WMTDRV_WMT] = DRV_STS_POWER_OFF;
++	g_wmt.drv_status[WMTDRV_STP] = DRV_STS_POWER_OFF;
++	g_wmt.drv_status[WMTDRV_LPBK] = DRV_STS_POWER_OFF;
++	g_wmt.drv_status[WMTDRV_COREDUMP] = DRV_STS_POWER_OFF;
++	return 0;
++}
++
++void wmt_core_deinit(void)
++{
++	memset(&g_wmt.drv_status, 0, sizeof(g_wmt.drv_status));
++}
+diff --git a/drivers/misc/mediatek/connectivity/wmt/wmt_ctrl.c b/drivers/misc/mediatek/connectivity/wmt/wmt_ctrl.c
+new file mode 100644
+index 000000000..912150d09
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wmt/wmt_ctrl.c
+@@ -0,0 +1,442 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WCN WMT control dispatch.
++ *
++ * Port from Samsung/MTK downstream
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/core/wmt_ctrl.c
++ *
++ * Copyright (C) 2011-2014 MediaTek Inc.
++ *
++ * wmt_ctrl() is the single entry point the WMT core uses to reach the STP
++ * engine, the platform glue and the firmware patch store.
++ */
++
++#include <linux/delay.h>
++#include <linux/module.h>
++
++#include <mtk_wcn_stp.h>
++
++#include "wmt_local.h"
++
++static int wmt_ctrl_hw_pwr_off(struct wmt_ctrl_data *d);
++static int wmt_ctrl_hw_pwr_on(struct wmt_ctrl_data *d);
++static int wmt_ctrl_hw_rst(struct wmt_ctrl_data *d);
++static int wmt_ctrl_stp_close(struct wmt_ctrl_data *d);
++static int wmt_ctrl_stp_open(struct wmt_ctrl_data *d);
++static int wmt_ctrl_stp_conf(struct wmt_ctrl_data *d);
++static int wmt_ctrl_free_patch(struct wmt_ctrl_data *d);
++static int wmt_ctrl_get_patch(struct wmt_ctrl_data *d);
++static int wmt_ctrl_hwidver_set(struct wmt_ctrl_data *d);
++static int wmt_ctrl_stp_rst(struct wmt_ctrl_data *d);
++static int wmt_ctrl_get_wmt_conf(struct wmt_ctrl_data *d);
++static int wmt_ctrl_tx(struct wmt_ctrl_data *d);
++static int wmt_ctrl_rx(struct wmt_ctrl_data *d);
++static int wmt_ctrl_rx_flush(struct wmt_ctrl_data *d);
++static int wmt_ctrl_patch_search(struct wmt_ctrl_data *d);
++static int wmt_ctrl_hw_state_show(struct wmt_ctrl_data *d);
++static int wmt_ctrl_get_patch_num(struct wmt_ctrl_data *d);
++static int wmt_ctrl_get_patch_info(struct wmt_ctrl_data *d);
++static int wmt_ctrl_soc_paldo_ctrl(struct wmt_ctrl_data *d);
++static int wmt_ctrl_soc_wakeup_consys(struct wmt_ctrl_data *d);
++static int wmt_ctrl_evt_err_trg_assert(struct wmt_ctrl_data *d);
++static int wmt_ctrl_gps_sync_set(struct wmt_ctrl_data *d);
++static int wmt_ctrl_gps_lna_set(struct wmt_ctrl_data *d);
++static int wmt_ctrl_others(struct wmt_ctrl_data *d);
++
++/* wmt_ctrl.c:161-197 */
++static int (*const wmt_ctrl_func[WMT_CTRL_MAX])(struct wmt_ctrl_data *d) = {
++	[WMT_CTRL_HW_PWR_OFF] = wmt_ctrl_hw_pwr_off,
++	[WMT_CTRL_HW_PWR_ON] = wmt_ctrl_hw_pwr_on,
++	[WMT_CTRL_HW_RST] = wmt_ctrl_hw_rst,
++	[WMT_CTRL_STP_CLOSE] = wmt_ctrl_stp_close,
++	[WMT_CTRL_STP_OPEN] = wmt_ctrl_stp_open,
++	[WMT_CTRL_STP_CONF] = wmt_ctrl_stp_conf,
++	[WMT_CTRL_FREE_PATCH] = wmt_ctrl_free_patch,
++	[WMT_CTRL_GET_PATCH] = wmt_ctrl_get_patch,
++	[WMT_CTRL_HWIDVER_SET] = wmt_ctrl_hwidver_set,
++	[WMT_CTRL_STP_RST] = wmt_ctrl_stp_rst,
++	[WMT_CTRL_GET_WMT_CONF] = wmt_ctrl_get_wmt_conf,
++	[WMT_CTRL_TX] = wmt_ctrl_tx,
++	[WMT_CTRL_RX] = wmt_ctrl_rx,
++	[WMT_CTRL_RX_FLUSH] = wmt_ctrl_rx_flush,
++	[WMT_CTRL_GPS_SYNC_SET] = wmt_ctrl_gps_sync_set,
++	[WMT_CTRL_GPS_LNA_SET] = wmt_ctrl_gps_lna_set,
++	[WMT_CTRL_PATCH_SEARCH] = wmt_ctrl_patch_search,
++	[WMT_CTRL_HW_STATE_DUMP] = wmt_ctrl_hw_state_show,
++	[WMT_CTRL_GET_PATCH_NUM] = wmt_ctrl_get_patch_num,
++	[WMT_CTRL_GET_PATCH_INFO] = wmt_ctrl_get_patch_info,
++	[WMT_CTRL_SOC_PALDO_CTRL] = wmt_ctrl_soc_paldo_ctrl,
++	[WMT_CTRL_SOC_WAKEUP_CONSYS] = wmt_ctrl_soc_wakeup_consys,
++	[WMT_CTRL_EVT_ERR_TRG_ASSERT] = wmt_ctrl_evt_err_trg_assert,
++};
++
++int wmt_ctrl(struct wmt_ctrl_data *data)
++{
++	if (!data || data->ctrl_id >= WMT_CTRL_MAX)
++		return -EINVAL;
++
++	if (!wmt_ctrl_func[data->ctrl_id])
++		return wmt_ctrl_others(data);
++
++	return wmt_ctrl_func[data->ctrl_id](data);
++}
++
++static int wmt_ctrl_tx(struct wmt_ctrl_data *d)
++{
++	const u8 *data = (const u8 *)d->data[0];
++	u32 size = d->data[1];
++	u32 *written = (u32 *)d->data[2];
++	bool raw = !!d->data[3];
++
++	return wmt_ctrl_tx_ex(data, size, written, raw);
++}
++
++/* wmt_ctrl.c:302-380 */
++int wmt_ctrl_tx_ex(const u8 *data, u32 size, u32 *written, bool raw)
++{
++	int ret;
++
++	if (written)
++		*written = 0;
++
++	if (!size)
++		return -EINVAL;
++
++	if (!(g_wmt.state & WMT_STAT_STP_OPEN) ||
++	    !(g_wmt.state & WMT_STAT_STP_EN)) {
++		wmt_err("STP not open/enabled\n");
++		return -EPIPE;
++	}
++
++	mtk_wcn_stp_flush_rx_queue(WMT_TASK_INDX);
++
++	if (raw)
++		ret = mtk_wcn_stp_send_data_raw(data, size, WMT_TASK_INDX);
++	else
++		ret = mtk_wcn_stp_send_data(data, size, WMT_TASK_INDX);
++
++	if (written)
++		*written = ret > 0 ? ret : 0;
++
++	if (ret != size) {
++		wmt_dbg("tx %d/%u\n", ret, size);
++		if (ret == 0)
++			return -EAGAIN;	/* no STP window space */
++		return ret < 0 ? ret : -EIO;
++	}
++
++	return 0;
++}
++
++/* wmt_ctrl.c:331-425 */
++static int wmt_ctrl_rx(struct wmt_ctrl_data *d)
++{
++	u8 *buf = (u8 *)d->data[0];
++	u32 len = d->data[1];
++	u32 *read_size = (u32 *)d->data[2];
++	int read_len;
++
++	if (read_size)
++		*read_size = 0;
++
++	if (!len)
++		return 0;
++
++	if (!(g_wmt.state & WMT_STAT_STP_OPEN))
++		return -EPIPE;
++
++	wmt_dev_rx_clear();
++	read_len = mtk_wcn_stp_receive_data(buf, len, WMT_TASK_INDX);
++	while (read_len == 0) {
++		if (wmt_dev_wait_rx(WMT_LIB_RX_TIMEOUT)) {
++			wmt_err("WMT rx timeout\n");
++			return -ETIMEDOUT;
++		}
++
++		read_len = mtk_wcn_stp_receive_data(buf, len, WMT_TASK_INDX);
++	}
++
++	if (read_size)
++		*read_size = read_len;
++
++	return 0;
++}
++
++static int wmt_ctrl_rx_flush(struct wmt_ctrl_data *d)
++{
++	mtk_wcn_stp_flush_rx_queue(d->data[0]);
++	return 0;
++}
++
++/* wmt_ctrl.c:427-450 */
++static int wmt_ctrl_hw_pwr_off(struct wmt_ctrl_data *d)
++{
++	if (!test_and_clear_bit(WMT_STAT_PWR, &g_wmt.state)) {
++		wmt_warn("CONSYS already off\n");
++		return 0;
++	}
++
++	return wmt_plat_pwr_ctrl(FUNC_OFF);
++}
++
++/* wmt_ctrl.c:452-467 */
++static int wmt_ctrl_hw_pwr_on(struct wmt_ctrl_data *d)
++{
++	if (test_and_set_bit(WMT_STAT_PWR, &g_wmt.state)) {
++		wmt_warn("CONSYS already on\n");
++		return 0;
++	}
++
++	return wmt_plat_pwr_ctrl(FUNC_ON);
++}
++
++static int wmt_ctrl_hw_rst(struct wmt_ctrl_data *d)
++{
++	return wmt_plat_pwr_ctrl(FUNC_RST);
++}
++
++static int wmt_ctrl_hw_state_show(struct wmt_ctrl_data *d)
++{
++	return wmt_plat_pwr_ctrl(FUNC_STAT);
++}
++
++/* wmt_ctrl.c:506-545 */
++static int wmt_ctrl_stp_close(struct wmt_ctrl_data *d)
++{
++	int ret;
++
++	if (!(g_wmt.state & WMT_STAT_STP_OPEN))
++		return -EALREADY;
++
++	ret = mtk_wcn_stp_register_event_cb(WMT_TASK_INDX, NULL);
++	if (ret)
++		return ret;
++
++	ret = stp_btif_rx_unregister();
++	if (ret)
++		wmt_warn("failed to unregister BTIF rx callback (%d)\n", ret);
++
++	ret = stp_btif_close();
++	if (ret)
++		return ret;
++
++	clear_bit(WMT_STAT_STP_OPEN, &g_wmt.state);
++	return 0;
++}
++
++/* wmt_ctrl.c:547-578 */
++static int wmt_ctrl_stp_open(struct wmt_ctrl_data *d)
++{
++	int ret;
++
++	ret = stp_btif_open();
++	if (ret)
++		return ret;
++
++	ret = stp_btif_rx_register();
++	if (ret) {
++		wmt_err("failed to register BTIF rx callback (%d)\n", ret);
++		return ret;
++	}
++
++	ret = mtk_wcn_stp_register_event_cb(WMT_TASK_INDX,
++					    wmt_dev_rx_event_cb);
++	if (ret)
++		return ret;
++
++	set_bit(WMT_STAT_STP_OPEN, &g_wmt.state);
++	return 0;
++}
++
++/* The downstream handler is empty (wmt_ctrl.c:1005-1008); resetting the STP
++ * state machine is the only meaningful implementation.  [INFERENCE]
++ */
++static int wmt_ctrl_stp_rst(struct wmt_ctrl_data *d)
++{
++	mtk_wcn_stp_flush_context();
++	mtk_wcn_stp_ready(0);
++	return 0;
++}
++
++static int wmt_ctrl_stp_conf_ex(enum wmt_stp_conf_type type, u32 value)
++{
++	switch (type) {
++	case WMT_STP_CONF_EN:
++		return mtk_wcn_stp_enable(value);
++	case WMT_STP_CONF_RDY:
++		return mtk_wcn_stp_ready(value);
++	case WMT_STP_CONF_MODE:
++		mtk_wcn_stp_set_mode(value);
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++/* wmt_ctrl.c:700-740 */
++static int wmt_ctrl_stp_conf(struct wmt_ctrl_data *d)
++{
++	enum wmt_stp_conf_type type = d->data[0];
++	u32 value = d->data[1];
++	int ret;
++
++	if (!(g_wmt.state & WMT_STAT_STP_OPEN))
++		return -EPIPE;
++
++	ret = wmt_ctrl_stp_conf_ex(type, value);
++	if (ret)
++		return ret;
++
++	if (type == WMT_STP_CONF_EN) {
++		if (value)
++			set_bit(WMT_STAT_STP_EN, &g_wmt.state);
++		else
++			clear_bit(WMT_STAT_STP_EN, &g_wmt.state);
++	}
++
++	return 0;
++}
++
++/*
++ * Patch store
++ */
++
++static int wmt_ctrl_patch_search(struct wmt_ctrl_data *d)
++{
++	/* With the multi-patch ABI the launcher has already provided the patch
++	 * list through WMT_IOCTL_SET_PATCH_NUM/SET_PATCH_INFO before power on
++	 * (wmt_ctrl.c:602-616).  The request is still queued on the command
++	 * channel for compatibility with the launcher protocol.
++	 */
++	wmt_dev_cmd_request("srh_patch");
++	return 0;
++}
++
++static int wmt_ctrl_get_patch_num(struct wmt_ctrl_data *d)
++{
++	d->data[0] = wmt_dev_patch_num();
++	return 0;
++}
++
++/* wmt_ctrl.c:640-665 */
++static int wmt_ctrl_get_patch_info(struct wmt_ctrl_data *d)
++{
++	return wmt_dev_patch_info_get(d->data[0], (u8 *)d->data[1],
++				      (u8 *)d->data[2]);
++}
++
++/* wmt_ctrl.c:718-772 */
++static int wmt_ctrl_get_patch(struct wmt_ctrl_data *d)
++{
++	const char *full_name = (const char *)d->data[1];
++	const char *def_name = (const char *)d->data[0];
++	u8 **pp_buf = (u8 **)d->data[2];
++	size_t *p_size = (size_t *)d->data[3];
++	int ret;
++
++	if (!pp_buf || !p_size)
++		return -EINVAL;
++
++	if (full_name && full_name[0]) {
++		ret = wmt_dev_patch_get(full_name, pp_buf, p_size);
++		if (!ret)
++			return 0;
++	}
++
++	if (def_name && def_name[0]) {
++		ret = wmt_dev_patch_get(def_name, pp_buf, p_size);
++		if (!ret)
++			return 0;
++	}
++
++	return -ENOENT;
++}
++
++/* wmt_ctrl.c:690-706 */
++static int wmt_ctrl_free_patch(struct wmt_ctrl_data *d)
++{
++	u32 seq = d->data[0];
++
++	wmt_dev_patch_put();
++	if (seq && seq >= wmt_dev_patch_num())
++		wmt_dev_patch_info_free_all();
++	return 0;
++}
++
++/* wmt_ctrl.c:864-878 */
++static int wmt_ctrl_hwidver_set(struct wmt_ctrl_data *d)
++{
++	wmt_lib_set_chip_info((d->data[0] & 0xffff0000) >> 16,
++			      d->data[0] & 0x0000ffff,
++			      d->data[1] & 0x0000ffff,
++			      (d->data[1] & 0xffff0000) >> 16);
++	return 0;
++}
++
++static int wmt_ctrl_get_wmt_conf(struct wmt_ctrl_data *d)
++{
++	d->data[0] = (unsigned long)wmt_lib_gen_conf();
++	return 0;
++}
++
++/* wmt_ctrl.c:668-690 */
++static int wmt_ctrl_soc_paldo_ctrl(struct wmt_ctrl_data *d)
++{
++	int ret;
++
++	ret = wmt_plat_soc_paldo_ctrl(d->data[0], d->data[1]);
++	if (ret && d->data[0] == PMIC_CHIPID_PALDO)
++		d->data[2] = ret;
++
++	return ret;
++}
++
++static int wmt_ctrl_soc_wakeup_consys(struct wmt_ctrl_data *d)
++{
++	int ret = stp_btif_wakeup();
++
++	if (ret)
++		wmt_err("failed to wake up CONSYS (%d)\n", ret);
++
++	return ret;
++}
++
++/* wmt_ctrl.c:900-930 */
++static int wmt_ctrl_evt_err_trg_assert(struct wmt_ctrl_data *d)
++{
++	wmt_warn("driver %lu reason %lu triggers a firmware assert\n",
++		 d->data[0], d->data[1]);
++
++	if (mtk_wcn_stp_get_wmt_evt_err_trg_assert()) {
++		wmt_info("assert already triggered\n");
++		return 0;
++	}
++
++	mtk_wcn_stp_set_wmt_evt_err_trg_assert(1);
++	/* The firmware-assert-via-EMI mechanism is not ported; recover by
++	 * resetting CONSYS (see wmt_lib_cmb_rst()).
++	 */
++	wmt_lib_schedule_reset(WMTRSTSRC_RESET_STP);
++	return 0;
++}
++
++/* wmt_ctrl.c:960-985 */
++static int wmt_ctrl_gps_sync_set(struct wmt_ctrl_data *d)
++{
++	wmt_plat_gpio_ctrl(PIN_GPS_SYNC,
++			   d->data[0] ? PIN_STA_MUX : PIN_STA_DEINIT);
++	return 0;
++}
++
++static int wmt_ctrl_gps_lna_set(struct wmt_ctrl_data *d)
++{
++	wmt_plat_gpio_ctrl(PIN_GPS_LNA,
++			   d->data[0] ? PIN_STA_OUT_H : PIN_STA_DEINIT);
++	return 0;
++}
++
++static int wmt_ctrl_others(struct wmt_ctrl_data *d)
++{
++	wmt_err("invalid control id %lu\n", d->ctrl_id);
++	return -EINVAL;
++}
+diff --git a/drivers/misc/mediatek/connectivity/wmt/wmt_dev.c b/drivers/misc/mediatek/connectivity/wmt/wmt_dev.c
+new file mode 100644
+index 000000000..c90e7e6d1
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wmt/wmt_dev.c
+@@ -0,0 +1,548 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WCN /dev/stpwmt character device and patch store.
++ *
++ * Port from Samsung/MTK downstream
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/linux/pri/wmt_dev.c
++ *
++ * Copyright (C) 2011-2014 MediaTek Inc.
++ *
++ * The MTK connectivity launcher owns the firmware patch files.  It tells the
++ * driver which patches to download through WMT_IOCTL_SET_PATCH_NUM and
++ * WMT_IOCTL_SET_PATCH_INFO; this file loads the named files from firmware
++ * storage when the WMT power-on sequence asks for them.  No firmware is
++ * embedded in the driver.
++ */
++
++#include <linux/cdev.h>
++#include <linux/compat.h>
++#include <linux/device.h>
++#include <linux/fs.h>
++#include <linux/firmware.h>
++#include <linux/kernel_read_file.h>
++#include <linux/module.h>
++#include <linux/poll.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <linux/vmalloc.h>
++
++#include "wmt_local.h"
++
++/* wmt_dev.c:72-94 */
++#define WMT_IOC_MAGIC		0xa0
++#define WMT_IOCTL_SET_PATCH_NAME	_IOW(WMT_IOC_MAGIC, 4, char *)
++#define WMT_IOCTL_SET_STP_MODE		_IOW(WMT_IOC_MAGIC, 5, int)
++#define WMT_IOCTL_FUNC_ONOFF_CTRL	_IOW(WMT_IOC_MAGIC, 6, int)
++#define WMT_IOCTL_GET_CHIP_INFO		_IOR(WMT_IOC_MAGIC, 12, int)
++#define WMT_IOCTL_SET_PATCH_NUM		_IOW(WMT_IOC_MAGIC, 14, int)
++#define WMT_IOCTL_SET_PATCH_INFO	_IOW(WMT_IOC_MAGIC, 15, char *)
++#define WMT_IOCTL_PORT_NAME		_IOWR(WMT_IOC_MAGIC, 20, char *)
++#define WMT_IOCTL_WMT_CFG_NAME		_IOWR(WMT_IOC_MAGIC, 21, char *)
++#define WMT_IOCTL_WMT_QUERY_CHIPID	_IOR(WMT_IOC_MAGIC, 22, int)
++#define WMT_IOCTL_WMT_TELL_CHIPID	_IOW(WMT_IOC_MAGIC, 23, int)
++
++#define WMT_DRIVER_NAME		"mtk_stp_wmt"
++#define WMT_DEV_MAJOR		190
++#define WMT_DEV_NUM		1
++
++static int wmt_major = WMT_DEV_MAJOR;
++module_param(wmt_major, uint, 0444);
++
++static struct cdev wmt_cdev;
++static struct class *wmt_class;
++
++/*
++ * Firmware file access
++ */
++
++static int wmt_request_firmware_file(const char *name, u8 **buf, size_t *size)
++{
++	const struct firmware *fw;
++	char fw_name[NAME_MAX + 1];
++	int ret;
++
++	strscpy(fw_name, name, sizeof(fw_name));
++
++	/* request_firmware() resolves names relative to /lib/firmware, so drop
++	 * the leading '/' of Android-style absolute paths.
++	 */
++	if (fw_name[0] == '/')
++		memmove(fw_name, fw_name + 1, strlen(fw_name));
++
++	ret = request_firmware(&fw, fw_name, NULL);
++	if (ret)
++		return ret;
++
++	*buf = kmemdup(fw->data, fw->size, GFP_KERNEL);
++	if (!*buf) {
++		release_firmware(fw);
++		return -ENOMEM;
++	}
++
++	*size = fw->size;
++	release_firmware(fw);
++	return 0;
++}
++
++static int wmt_read_file_path(const char *path, u8 **buf, size_t *size)
++{
++	size_t file_size = 0;
++	void *vbuf = NULL;
++	ssize_t ret;
++
++	ret = kernel_read_file_from_path(path, 0, &vbuf, SIZE_MAX, &file_size,
++					 READING_FIRMWARE);
++	if (ret < 0)
++		return ret;
++
++	*buf = kmemdup(vbuf, file_size, GFP_KERNEL);
++	vfree(vbuf);
++	if (!*buf)
++		return -ENOMEM;
++
++	*size = file_size;
++	return 0;
++}
++
++int wmt_dev_read_file(const char *name, u8 **buf, size_t *size)
++{
++	int ret;
++
++	if (!name || !name[0])
++		return -EINVAL;
++
++	*buf = NULL;
++	*size = 0;
++
++	ret = wmt_request_firmware_file(name, buf, size);
++	if (!ret)
++		return 0;
++
++	wmt_dbg("request_firmware(%s) failed (%d), trying the path directly\n",
++		name, ret);
++	return wmt_read_file_path(name, buf, size);
++}
++
++int wmt_dev_patch_get(const char *name, u8 **buf, size_t *size)
++{
++	u8 *file = NULL;
++	size_t file_size = 0;
++	u8 *patch;
++	int ret;
++
++	if (!name || !name[0])
++		return -EINVAL;
++
++	ret = wmt_dev_read_file(name, &file, &file_size);
++	if (ret)
++		return ret;
++
++	/* Reserve BCNT_PATCH_BUF_HEADROOM bytes in front of the image so that
++	 * the per-fragment WMT header can be written in place
++	 * (wmt_ic_soc.c:2000-2030).
++	 */
++	patch = kmalloc(file_size + BCNT_PATCH_BUF_HEADROOM, GFP_KERNEL);
++	if (!patch) {
++		kfree(file);
++		return -ENOMEM;
++	}
++
++	memcpy(patch + BCNT_PATCH_BUF_HEADROOM, file, file_size);
++	kfree(file);
++
++	wmt_dev_patch_put();
++	g_wmt.patch_buf = patch;
++	g_wmt.patch_size = file_size;
++	strscpy(g_wmt.patch_fw_name, name, sizeof(g_wmt.patch_fw_name));
++
++	*buf = patch;
++	*size = file_size;
++	wmt_dbg("loaded %s (%zu bytes)\n", name, file_size);
++	return 0;
++}
++
++void wmt_dev_patch_put(void)
++{
++	kfree(g_wmt.patch_buf);
++	g_wmt.patch_buf = NULL;
++	g_wmt.patch_size = 0;
++	g_wmt.patch_fw_name[0] = '\0';
++}
++
++/*
++ * Patch list provided by the launcher
++ */
++
++int wmt_dev_patch_set_num(u32 num)
++{
++	struct wmt_patch_info *info;
++
++	if (!num || num > MAX_PATCH_NUM)
++		return -EINVAL;
++
++	info = kcalloc(num, sizeof(*info), GFP_KERNEL);
++	if (!info)
++		return -ENOMEM;
++
++	mutex_lock(&g_wmt.patch_lock);
++	kfree(g_wmt.patch_info);
++	g_wmt.patch_info = info;
++	g_wmt.patch_num = num;
++	mutex_unlock(&g_wmt.patch_lock);
++
++	wmt_dbg("patch count set to %u\n", num);
++	return 0;
++}
++
++int wmt_dev_patch_set_info(const struct wmt_patch_info *info)
++{
++	u32 seq;
++
++	if (!info)
++		return -EINVAL;
++
++	seq = info->download_seq;
++	if (!seq || seq > g_wmt.patch_num)
++		return -EINVAL;
++
++	mutex_lock(&g_wmt.patch_lock);
++	memcpy(&g_wmt.patch_info[seq - 1], info, sizeof(*info));
++	g_wmt.patch_info[seq - 1].name[sizeof(info->name) - 1] = '\0';
++	mutex_unlock(&g_wmt.patch_lock);
++
++	wmt_dbg("patch %u: %s\n", seq, g_wmt.patch_info[seq - 1].name);
++	return 0;
++}
++
++u32 wmt_dev_patch_num(void)
++{
++	return g_wmt.patch_num;
++}
++
++int wmt_dev_patch_info_get(u32 seq, u8 *name, u8 addr[4])
++{
++	int ret = 0;
++
++	if (!seq || seq > g_wmt.patch_num || !name || !addr)
++		return -EINVAL;
++
++	mutex_lock(&g_wmt.patch_lock);
++	if (!g_wmt.patch_info) {
++		ret = -ENOENT;
++	} else {
++		memcpy(name, g_wmt.patch_info[seq - 1].name,
++		       sizeof(g_wmt.patch_info[seq - 1].name));
++		memcpy(addr, g_wmt.patch_info[seq - 1].address, 4);
++	}
++	mutex_unlock(&g_wmt.patch_lock);
++
++	return ret;
++}
++
++void wmt_dev_patch_info_free_all(void)
++{
++	mutex_lock(&g_wmt.patch_lock);
++	kfree(g_wmt.patch_info);
++	g_wmt.patch_info = NULL;
++	g_wmt.patch_num = 0;
++	mutex_unlock(&g_wmt.patch_lock);
++}
++
++/*
++ * Kernel -> launcher command channel (read/poll/write)
++ */
++
++void wmt_dev_cmd_request(const char *cmd)
++{
++	strscpy(g_wmt.cmd, cmd, sizeof(g_wmt.cmd));
++	set_bit(WMT_STAT_CMD, &g_wmt.state);
++	wake_up_interruptible(&g_wmt.cmd_wq);
++	wmt_dbg("command '%s' queued\n", cmd);
++}
++
++bool wmt_dev_cmd_pending(void)
++{
++	return test_bit(WMT_STAT_CMD, &g_wmt.state);
++}
++
++const char *wmt_dev_cmd_string(void)
++{
++	return g_wmt.cmd;
++}
++
++void wmt_dev_cmd_ack(int result)
++{
++	clear_bit(WMT_STAT_CMD, &g_wmt.state);
++	if (result)
++		wmt_warn("launcher rejected command '%s'\n", g_wmt.cmd);
++}
++
++/*
++ * STP receive notification (registered on the WMT channel)
++ */
++
++void wmt_dev_rx_event_cb(void)
++{
++	g_wmt.rx_pending = true;
++	wake_up_interruptible(&g_wmt.rx_wq);
++}
++
++void wmt_dev_rx_clear(void)
++{
++	g_wmt.rx_pending = false;
++}
++
++int wmt_dev_wait_rx(u32 timeout_ms)
++{
++	int ret;
++
++	ret = wait_event_interruptible_timeout(g_wmt.rx_wq, g_wmt.rx_pending,
++					       msecs_to_jiffies(timeout_ms));
++	if (ret > 0) {
++		g_wmt.rx_pending = false;
++		return 0;
++	}
++
++	return ret < 0 ? ret : -ETIMEDOUT;
++}
++
++/*
++ * Character device
++ */
++
++static int wmt_open(struct inode *inode, struct file *file)
++{
++	wmt_dbg("open by pid %d\n", current->pid);
++	return 0;
++}
++
++static int wmt_release(struct inode *inode, struct file *file)
++{
++	wmt_dbg("release by pid %d\n", current->pid);
++	return 0;
++}
++
++static ssize_t wmt_read(struct file *file, char __user *buf, size_t count,
++			loff_t *ppos)
++{
++	const char *cmd;
++	size_t len;
++
++	if (!wmt_dev_cmd_pending()) {
++		if (file->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++
++		if (wait_event_interruptible(g_wmt.cmd_wq,
++					     wmt_dev_cmd_pending()))
++			return -ERESTARTSYS;
++	}
++
++	cmd = wmt_dev_cmd_string();
++	len = strnlen(cmd, NAME_MAX);
++	if (count < len)
++		return -EINVAL;
++
++	if (copy_to_user(buf, cmd, len))
++		return -EFAULT;
++
++	return len;
++}
++
++static ssize_t wmt_write(struct file *file, const char __user *buf,
++			 size_t count, loff_t *ppos)
++{
++	char ack[NAME_MAX + 1] = { };
++	size_t len = min(count, (size_t)NAME_MAX);
++
++	if (copy_from_user(ack, buf, len))
++		return -EFAULT;
++
++	wmt_dev_cmd_ack(strncasecmp(ack, "ok", strlen("ok")) ? -1 : 0);
++	return count;
++}
++
++static __poll_t wmt_poll(struct file *file, struct poll_table_struct *wait)
++{
++	__poll_t mask = POLLOUT | POLLWRNORM;
++
++	poll_wait(file, &g_wmt.cmd_wq, wait);
++	if (wmt_dev_cmd_pending())
++		mask |= POLLIN | POLLRDNORM;
++
++	return mask;
++}
++
++static long wmt_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	char name[NAME_MAX + 1] = { };
++	struct wmt_patch_info info;
++	u32 chip_id;
++	int ret = 0;
++
++	switch (cmd) {
++	case WMT_IOCTL_SET_PATCH_NAME:
++		if (copy_from_user(name, (void __user *)arg, NAME_MAX))
++			return -EFAULT;
++		name[NAME_MAX] = '\0';
++		wmt_lib_set_patch_name(name);
++		break;
++
++	case WMT_IOCTL_SET_STP_MODE:
++		ret = wmt_lib_set_hif(arg);
++		break;
++
++	case WMT_IOCTL_FUNC_ONOFF_CTRL:
++		if (arg & 0x80000000)
++			ret = mtk_wcn_wmt_func_on(arg & 0xf) ? 0 : -EIO;
++		else
++			ret = mtk_wcn_wmt_func_off(arg & 0xf) ? 0 : -EIO;
++		break;
++
++	case WMT_IOCTL_GET_CHIP_INFO:
++		if (arg > 2)
++			return -EINVAL;
++		return wmt_lib_get_icinfo(arg);
++
++	case WMT_IOCTL_SET_PATCH_NUM:
++		ret = wmt_dev_patch_set_num(arg);
++		break;
++
++	case WMT_IOCTL_SET_PATCH_INFO:
++		if (copy_from_user(&info, (void __user *)arg, sizeof(info)))
++			return -EFAULT;
++		ret = wmt_dev_patch_set_info(&info);
++		break;
++
++	case WMT_IOCTL_PORT_NAME:
++		/* The STP transport is BTIF on this platform; there is no UART
++		 * port to (re)name.
++		 */
++		ret = -EOPNOTSUPP;
++		break;
++
++	case WMT_IOCTL_WMT_CFG_NAME:
++		if (copy_from_user(name, (void __user *)arg, NAME_MAX))
++			return -EFAULT;
++		name[NAME_MAX] = '\0';
++		ret = wmt_conf_set_cfg_file(name);
++		break;
++
++	case WMT_IOCTL_WMT_QUERY_CHIPID:
++		chip_id = g_wmt.chip_id;
++		if (!chip_id)
++			chip_id = mtk_wcn_consys_soc_chipid_get();
++		return chip_id;
++
++	case WMT_IOCTL_WMT_TELL_CHIPID:
++		if (arg != 0x0321 && arg != 0x0335 && arg != 0x0337)
++			return -EINVAL;
++		g_wmt.chip_id = arg;
++		break;
++
++	default:
++		wmt_warn("unknown ioctl 0x%x\n", cmd);
++		return -EINVAL;
++	}
++
++	return ret;
++}
++
++#ifdef CONFIG_COMPAT
++/* The Android launcher is a 32-bit process on this 64-bit kernel, so the
++ * pointer-sized ioctl numbers differ (wmt_dev.c:63-69).
++ */
++#define COMPAT_WMT_IOCTL_SET_PATCH_NAME	_IOW(WMT_IOC_MAGIC, 4, compat_uptr_t)
++#define COMPAT_WMT_IOCTL_SET_PATCH_INFO	_IOW(WMT_IOC_MAGIC, 15, compat_uptr_t)
++#define COMPAT_WMT_IOCTL_PORT_NAME	_IOWR(WMT_IOC_MAGIC, 20, compat_uptr_t)
++#define COMPAT_WMT_IOCTL_WMT_CFG_NAME	_IOWR(WMT_IOC_MAGIC, 21, compat_uptr_t)
++
++static long wmt_compat_ioctl(struct file *file, unsigned int cmd,
++			     unsigned long arg)
++{
++	switch (cmd) {
++	case COMPAT_WMT_IOCTL_SET_PATCH_NAME:
++		return wmt_ioctl(file, WMT_IOCTL_SET_PATCH_NAME,
++				 (unsigned long)compat_ptr(arg));
++	case COMPAT_WMT_IOCTL_SET_PATCH_INFO:
++		return wmt_ioctl(file, WMT_IOCTL_SET_PATCH_INFO,
++				 (unsigned long)compat_ptr(arg));
++	case COMPAT_WMT_IOCTL_PORT_NAME:
++		return wmt_ioctl(file, WMT_IOCTL_PORT_NAME,
++				 (unsigned long)compat_ptr(arg));
++	case COMPAT_WMT_IOCTL_WMT_CFG_NAME:
++		return wmt_ioctl(file, WMT_IOCTL_WMT_CFG_NAME,
++				 (unsigned long)compat_ptr(arg));
++	default:
++		return wmt_ioctl(file, cmd, arg);
++	}
++}
++#endif
++
++static const struct file_operations wmt_fops = {
++	.owner = THIS_MODULE,
++	.open = wmt_open,
++	.release = wmt_release,
++	.read = wmt_read,
++	.write = wmt_write,
++	.poll = wmt_poll,
++	.unlocked_ioctl = wmt_ioctl,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl = wmt_compat_ioctl,
++#endif
++};
++
++int wmt_dev_stpwmt_register(void)
++{
++	dev_t dev = MKDEV(wmt_major, 0);
++	int ret;
++
++	ret = register_chrdev_region(dev, WMT_DEV_NUM, WMT_DRIVER_NAME);
++	if (ret) {
++		wmt_err("failed to register the char device (%d)\n", ret);
++		return ret;
++	}
++
++	cdev_init(&wmt_cdev, &wmt_fops);
++	wmt_cdev.owner = THIS_MODULE;
++
++	ret = cdev_add(&wmt_cdev, dev, WMT_DEV_NUM);
++	if (ret) {
++		wmt_err("failed to add the char device (%d)\n", ret);
++		goto err_region;
++	}
++
++	wmt_class = class_create("stpwmt");
++	if (IS_ERR(wmt_class)) {
++		ret = PTR_ERR(wmt_class);
++		wmt_class = NULL;
++		goto err_cdev;
++	}
++
++	if (IS_ERR(device_create(wmt_class, NULL, dev, NULL, "stpwmt"))) {
++		ret = -ENODEV;
++		goto err_class;
++	}
++
++	wmt_info("/dev/stpwmt registered (major %d)\n", wmt_major);
++	return 0;
++
++err_class:
++	class_destroy(wmt_class);
++	wmt_class = NULL;
++err_cdev:
++	cdev_del(&wmt_cdev);
++err_region:
++	unregister_chrdev_region(dev, WMT_DEV_NUM);
++	return ret;
++}
++
++void wmt_dev_stpwmt_unregister(void)
++{
++	dev_t dev = MKDEV(wmt_major, 0);
++
++	device_destroy(wmt_class, dev);
++	class_destroy(wmt_class);
++	wmt_class = NULL;
++	cdev_del(&wmt_cdev);
++	unregister_chrdev_region(dev, WMT_DEV_NUM);
++}
+diff --git a/drivers/misc/mediatek/connectivity/wmt/wmt_func.c b/drivers/misc/mediatek/connectivity/wmt/wmt_func.c
+new file mode 100644
+index 000000000..78227fa88
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wmt/wmt_func.c
+@@ -0,0 +1,279 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WCN per-function power control (BT / FM / GPS / WIFI).
++ *
++ * Port from Samsung/MTK downstream
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/core/wmt_func.c
++ *
++ * Copyright (C) 2011-2014 MediaTek Inc.
++ *
++ * Every WCN function is enabled by a WMT FUNC_CTRL command to the firmware.
++ * In addition:
++ *   - BT and Wi-Fi use their own VCN33 rail (BT_PALDO / WIFI_PALDO),
++ *   - in co-clock mode FM and GPS share VCN28 (powered here, not by the
++ *     CONSYS power-on sequence),
++ *   - GPS drives the GPS_SYNC handshake pin towards the modem and enables the
++ *     external LNA through a host pinctrl state.
++ */
++
++#include <linux/delay.h>
++#include <linux/module.h>
++
++#include "wmt_local.h"
++
++/* Downstream ENUM_BT_GPS_ONOFF_STATE_T bit indices (wmt_exp.h:157-165). */
++#define WMT_BT_ON_BIT	0
++#define WMT_GPS_ON_BIT	1
++#define WMT_WIFI_ON_BIT	2
++#define WMT_FM_ON_BIT	3
++
++#define WMT_GPS_ON	BIT(WMT_GPS_ON_BIT)
++#define WMT_FM_ON	BIT(WMT_FM_ON_BIT)
++
++/* stp_core.c:1481-1495 - the SoC co-clock setting is global. */
++static int wmt_func_bt_on(void)
++{
++	unsigned long pa1, pa2;
++	int ret;
++
++	pa1 = BT_PALDO;
++	pa2 = PALDO_ON;
++	ret = wmt_core_ctrl(WMT_CTRL_SOC_PALDO_CTRL, &pa1, &pa2);
++	if (ret) {
++		wmt_err("BT PALDO on failed (%d)\n", ret);
++		return ret;
++	}
++
++	ret = wmt_core_func_ctrl_cmd(WMTDRV_BT, true);
++	if (ret) {
++		wmt_err("BT function on failed (%d)\n", ret);
++		pa1 = BT_PALDO;
++		pa2 = PALDO_OFF;
++		wmt_core_ctrl(WMT_CTRL_SOC_PALDO_CTRL, &pa1, &pa2);
++		return ret;
++	}
++
++	g_wmt.func_on_bits |= BIT(WMT_BT_ON_BIT);
++	return 0;
++}
++
++static int wmt_func_bt_off(void)
++{
++	unsigned long pa1, pa2;
++	int ret, ret2;
++
++	ret = wmt_core_func_ctrl_cmd(WMTDRV_BT, false);
++	if (ret)
++		wmt_err("BT function off failed (%d)\n", ret);
++
++	pa1 = BT_PALDO;
++	pa2 = PALDO_OFF;
++	ret2 = wmt_core_ctrl(WMT_CTRL_SOC_PALDO_CTRL, &pa1, &pa2);
++	if (ret2)
++		wmt_err("BT PALDO off failed (%d)\n", ret2);
++
++	g_wmt.func_on_bits &= ~BIT(WMT_BT_ON_BIT);
++	return ret ? ret : ret2;
++}
++
++/* wmt_func.c:480-540 */
++static int wmt_func_fm_on(void)
++{
++	unsigned long pa1, pa2;
++	int ret;
++
++	if (wmt_lib_co_clock() && !(g_wmt.func_on_bits & WMT_GPS_ON)) {
++		pa1 = FM_PALDO;
++		pa2 = PALDO_ON;
++		wmt_core_ctrl(WMT_CTRL_SOC_PALDO_CTRL, &pa1, &pa2);
++	} else if (wmt_lib_co_clock()) {
++		wmt_info("VCN28 already enabled by GPS\n");
++	}
++
++	ret = wmt_core_func_ctrl_cmd(WMTDRV_FM, true);
++	if (ret) {
++		wmt_err("FM function on failed (%d)\n", ret);
++		return ret;
++	}
++
++	if (wmt_lib_co_clock())
++		g_wmt.func_on_bits |= WMT_FM_ON;
++
++	return 0;
++}
++
++static int wmt_func_fm_off(void)
++{
++	unsigned long pa1, pa2;
++	int ret;
++
++	ret = wmt_core_func_ctrl_cmd(WMTDRV_FM, false);
++
++	if (wmt_lib_co_clock()) {
++		if (g_wmt.func_on_bits & WMT_GPS_ON) {
++			wmt_info("VCN28 still needed by GPS\n");
++		} else {
++			pa1 = FM_PALDO;
++			pa2 = PALDO_OFF;
++			wmt_core_ctrl(WMT_CTRL_SOC_PALDO_CTRL, &pa1, &pa2);
++		}
++		g_wmt.func_on_bits &= ~WMT_FM_ON;
++	}
++
++	return ret;
++}
++
++/* wmt_func.c:590-660 */
++static int wmt_func_gps_pre_ctrl(bool on)
++{
++	const struct wmt_gen_conf *conf = wmt_lib_gen_conf();
++	int ret;
++
++	/* GPS_SYNC handshake with the modem (host SoC side). */
++	wmt_plat_gpio_ctrl(PIN_GPS_SYNC, on ? PIN_STA_MUX : PIN_STA_DEINIT);
++
++	/* GPS_SYNC pin inside the connectivity SoC (wmt_ic_soc.c:1426-1445). */
++	ret = wmt_ic_soc_pin_ctrl(WMT_IC_PIN_GSYNC,
++				  on ? WMT_IC_PIN_MUX : WMT_IC_PIN_GPIO, 1);
++	if (ret)
++		wmt_err("failed to configure GPS_SYNC (%d)\n", ret);
++
++	if (!conf || conf->wmt_gps_lna_enable) {
++		/* Chip-side LNA control through EEDI/EEDO needs the WMT
++		 * register tables that are not ported; the host side LNA pin
++		 * keeps its default state.
++		 */
++		wmt_warn("chip-side GPS LNA control is not supported\n");
++		return 0;
++	}
++
++	wmt_plat_gpio_ctrl(PIN_GPS_LNA,
++			   on ? PIN_STA_OUT_H : PIN_STA_DEINIT);
++	return 0;
++}
++
++static int wmt_func_gps_on(void)
++{
++	unsigned long pa1, pa2;
++	int ret;
++
++	if (wmt_lib_co_clock() && !(g_wmt.func_on_bits & WMT_FM_ON)) {
++		pa1 = GPS_PALDO;
++		pa2 = PALDO_ON;
++		wmt_core_ctrl(WMT_CTRL_SOC_PALDO_CTRL, &pa1, &pa2);
++	} else if (wmt_lib_co_clock()) {
++		wmt_info("VCN28 already enabled by FM\n");
++	}
++
++	ret = wmt_func_gps_pre_ctrl(true);
++	if (ret)
++		return ret;
++
++	ret = wmt_core_func_ctrl_cmd(WMTDRV_GPS, true);
++	if (ret) {
++		wmt_err("GPS function on failed (%d)\n", ret);
++		return ret;
++	}
++
++	if (wmt_lib_co_clock())
++		g_wmt.func_on_bits |= WMT_GPS_ON;
++
++	return 0;
++}
++
++static int wmt_func_gps_off(void)
++{
++	unsigned long pa1, pa2;
++	int ret;
++
++	wmt_func_gps_pre_ctrl(false);
++
++	ret = wmt_core_func_ctrl_cmd(WMTDRV_GPS, false);
++	if (ret)
++		wmt_err("GPS function off failed (%d)\n", ret);
++
++	if (wmt_lib_co_clock()) {
++		if (g_wmt.func_on_bits & WMT_FM_ON) {
++			wmt_info("VCN28 still needed by FM\n");
++		} else {
++			pa1 = GPS_PALDO;
++			pa2 = PALDO_OFF;
++			wmt_core_ctrl(WMT_CTRL_SOC_PALDO_CTRL, &pa1, &pa2);
++		}
++		g_wmt.func_on_bits &= ~WMT_GPS_ON;
++	}
++
++	return ret;
++}
++
++/* wmt_func.c:640-712 */
++static int wmt_func_wifi_on(void)
++{
++	int ret;
++
++	if (!g_wmt.wlan_cb.probe) {
++		wmt_err("no WLAN driver registered\n");
++		g_wmt.wlan_probed = true;
++		return -ENODEV;
++	}
++
++	ret = g_wmt.wlan_cb.probe();
++	if (ret) {
++		wmt_err("WLAN probe failed (%d)\n", ret);
++		return ret;
++	}
++
++	g_wmt.func_on_bits |= BIT(WMT_WIFI_ON_BIT);
++	return 0;
++}
++
++static int wmt_func_wifi_off(void)
++{
++	int ret;
++
++	if (!g_wmt.wlan_cb.remove) {
++		wmt_err("no WLAN driver registered\n");
++		return -ENODEV;
++	}
++
++	ret = g_wmt.wlan_cb.remove();
++	if (ret) {
++		wmt_err("WLAN remove failed (%d)\n", ret);
++		return ret;
++	}
++
++	g_wmt.func_on_bits &= ~BIT(WMT_WIFI_ON_BIT);
++	return 0;
++}
++
++int wmt_func_on(int type)
++{
++	switch (type) {
++	case WMTDRV_BT:
++		return wmt_func_bt_on();
++	case WMTDRV_FM:
++		return wmt_func_fm_on();
++	case WMTDRV_GPS:
++		return wmt_func_gps_on();
++	case WMTDRV_WIFI:
++		return wmt_func_wifi_on();
++	default:
++		return -EINVAL;
++	}
++}
++
++int wmt_func_off(int type)
++{
++	switch (type) {
++	case WMTDRV_BT:
++		return wmt_func_bt_off();
++	case WMTDRV_FM:
++		return wmt_func_fm_off();
++	case WMTDRV_GPS:
++		return wmt_func_gps_off();
++	case WMTDRV_WIFI:
++		return wmt_func_wifi_off();
++	default:
++		return -EINVAL;
++	}
++}
+diff --git a/drivers/misc/mediatek/connectivity/wmt/wmt_ic_soc.c b/drivers/misc/mediatek/connectivity/wmt/wmt_ic_soc.c
+new file mode 100644
+index 000000000..2edb248da
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wmt/wmt_ic_soc.c
+@@ -0,0 +1,710 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WCN SOC_CONSYS firmware bring-up: version detection, WMT init
++ * scripts and firmware patch download.
++ *
++ * Port from Samsung/MTK downstream
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/core/wmt_ic_soc.c
++ *
++ * Copyright (C) 2011-2014 MediaTek Inc.
++ *
++ * The bring-up sequence is the one the downstream driver runs on MT6735/
++ * MT6737T (CFG_WMT_POWER_ON_DLM, CFG_WMT_MULTI_PATCH, CFG_WMT_PATCH_DL_OPTM,
++ * CFG_WMT_FILTER_MODE_SETTING all enabled):
++ *
++ *	query STP defaults -> set STP options -> switch host STP to full mode
++ *	-> power-on DLM patch -> patch download (one PDU fragment chain per
++ *	patch file) -> WMT reset -> RF calibration -> coexistence -> FM strap
++ */
++
++#include <linux/delay.h>
++#include <linux/module.h>
++#include <linux/string.h>
++
++#include "wmt_local.h"
++
++#define DEFAULT_PATCH_FRAG_SIZE	1000
++#define WMT_PATCH_FRAG_1ST	0x1
++#define WMT_PATCH_FRAG_MID	0x2
++#define WMT_PATCH_FRAG_LAST	0x3
++
++/* WMT_STRAP_CONF_CMD / EVT for the FM interface (wmt_ic_soc.c:255-257). */
++static const u8 wmt_query_stp_cmd[] = { 0x01, 0x04, 0x01, 0x00, 0x04 };
++static const u8 wmt_query_stp_evt_default[] = {
++	0x02, 0x04, 0x06, 0x00, 0x00, 0x04, 0x11, 0x00, 0x00, 0x00,
++};
++static const u8 wmt_query_stp_evt[] = {
++	0x02, 0x04, 0x06, 0x00, 0x00, 0x04, 0xdf, 0x0e, 0x68, 0x01,
++};
++static const u8 wmt_set_stp_cmd[] = {
++	0x01, 0x04, 0x05, 0x00, 0x03, 0xdf, 0x0e, 0x68, 0x01,
++};
++static const u8 wmt_set_stp_evt[] = { 0x02, 0x04, 0x02, 0x00, 0x00, 0x03 };
++static const u8 wmt_reset_cmd[] = { 0x01, 0x07, 0x01, 0x00, 0x04 };
++static const u8 wmt_reset_evt[] = { 0x02, 0x07, 0x01, 0x00, 0x00 };
++static const u8 wmt_patch_evt[] = { 0x02, 0x01, 0x01, 0x00, 0x00 };
++static const u8 wmt_strap_fm_cmd[] = { 0x01, 0x05, 0x02, 0x00, 0x02, 0x02 };
++static const u8 wmt_strap_fm_evt[] = { 0x02, 0x05, 0x02, 0x00, 0x00, 0x02 };
++static const u8 wmt_coex_cmd[] = { 0x01, 0x10, 0x02, 0x00, 0x01, 0x00 };
++static const u8 wmt_coex_evt[] = { 0x02, 0x10, 0x01, 0x00, 0x00 };
++static const u8 wmt_co_clock_cmd[] = { 0x01, 0x0a, 0x02, 0x00, 0x08, 0x03 };
++static const u8 wmt_co_clock_evt[] = { 0x02, 0x0a, 0x01, 0x00, 0x00 };
++static const u8 wmt_rf_calibration_cmd[] = { 0x01, 0x14, 0x01, 0x00, 0x01 };
++static const u8 wmt_rf_calibration_evt[] = {
++	0x02, 0x14, 0x02, 0x00, 0x00, 0x01,
++};
++static const u8 wmt_bt_tssi_cmd[] = {
++	0x01, 0x02, 0x04, 0x00, 0x0d, 0x01, 0x1e, 0x00,
++};
++static const u8 wmt_bt_tssi_evt[] = { 0x02, 0x02, 0x01, 0x00, 0x00 };
++static const u8 wmt_power_ctrl_dlm_cmd1[] = {
++	0x01, 0x08, 0x10, 0x00, 0x01, 0x01, 0x00, 0x01,
++	0x60, 0x00, 0x10, 0x80, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x0f, 0x00, 0x00,
++};
++static const u8 wmt_power_ctrl_dlm_cmd2[] = {
++	0x01, 0x08, 0x10, 0x00, 0x01, 0x01, 0x00, 0x01,
++	0x60, 0x00, 0x10, 0x80, 0x00, 0x00, 0x00, 0x00,
++	0xf0, 0x00, 0x00, 0x00,
++};
++static const u8 wmt_power_ctrl_dlm_cmd3[] = {
++	0x01, 0x08, 0x10, 0x00, 0x01, 0x01, 0x00, 0x01,
++	0x60, 0x00, 0x10, 0x80, 0x00, 0x00, 0x00, 0x00,
++	0x08, 0x00, 0x00, 0x00,
++};
++static const u8 wmt_power_ctrl_dlm_evt[] = {
++	0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01,
++};
++static const u8 wmt_set_mcu_clk_en_cmd[] = {
++	0x01, 0x08, 0x10, 0x00, 0x01, 0x01, 0x00, 0x01,
++	0x34, 0x03, 0x00, 0x80, 0x00, 0x00, 0x01, 0x00,
++	0xff, 0xff, 0xff, 0xff,
++};
++static const u8 wmt_set_mcu_clk_138_cmd[] = {
++	0x01, 0x08, 0x10, 0x00, 0x01, 0x01, 0x00, 0x01,
++	0x0c, 0x01, 0x00, 0x80, 0x59, 0x4d, 0x84, 0x00,
++	0xff, 0xff, 0xff, 0xff,
++};
++static const u8 wmt_set_mcu_clk_26_cmd[] = {
++	0x01, 0x08, 0x10, 0x00, 0x01, 0x01, 0x00, 0x01,
++	0x0c, 0x01, 0x00, 0x80, 0x00, 0x4d, 0x84, 0x00,
++	0xff, 0xff, 0xff, 0xff,
++};
++static const u8 wmt_set_mcu_clk_dis_cmd[] = {
++	0x01, 0x08, 0x10, 0x00, 0x01, 0x01, 0x00, 0x01,
++	0x34, 0x03, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
++	0xff, 0xff, 0xff, 0xff,
++};
++static const u8 wmt_set_mcu_clk_evt[] = {
++	0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01,
++};
++
++/* Patch RAM address programming PDUs (wmt_ic_soc.c:214-233). */
++static const u8 wmt_patch_address_cmd[] = {
++	0x01, 0x08, 0x10, 0x00,
++	0x01, 0x01, 0x00, 0x01,
++	0x3c, 0x02, 0x09, 0x02,
++	0x00, 0x00, 0x00, 0x00,
++	0xff, 0xff, 0xff, 0xff,
++};
++static const u8 wmt_patch_address_evt[] = {
++	0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01,
++};
++static const u8 wmt_patch_p_address_cmd[] = {
++	0x01, 0x08, 0x10, 0x00,
++	0x01, 0x01, 0x00, 0x01,
++	0xc4, 0x04, 0x09, 0x02,
++	0x00, 0x3f, 0x00, 0x01,
++	0xff, 0xff, 0xff, 0xff,
++};
++static const u8 wmt_patch_p_address_evt[] = {
++	0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01,
++};
++
++/* wmt_ic_soc.c:508-650 */
++static const struct wmt_init_script query_stp_script[] = {
++	{ wmt_query_stp_cmd, sizeof(wmt_query_stp_cmd),
++	  wmt_query_stp_evt_default, sizeof(wmt_query_stp_evt_default),
++	  "query stp default" },
++};
++static const struct wmt_init_script query_stp_full_script[] = {
++	{ wmt_query_stp_cmd, sizeof(wmt_query_stp_cmd),
++	  wmt_query_stp_evt, sizeof(wmt_query_stp_evt), "query stp" },
++};
++static const struct wmt_init_script set_stp_script[] = {
++	{ wmt_set_stp_cmd, sizeof(wmt_set_stp_cmd),
++	  wmt_set_stp_evt, sizeof(wmt_set_stp_evt), "set stp" },
++};
++static const struct wmt_init_script wmt_reset_script[] = {
++	{ wmt_reset_cmd, sizeof(wmt_reset_cmd),
++	  wmt_reset_evt, sizeof(wmt_reset_evt), "wmt reset" },
++};
++static const struct wmt_init_script calibration_script[] = {
++	{ wmt_rf_calibration_cmd, sizeof(wmt_rf_calibration_cmd),
++	  wmt_rf_calibration_evt, sizeof(wmt_rf_calibration_evt),
++	  "start RF calibration" },
++};
++static const struct wmt_init_script coex_script[] = {
++	{ wmt_coex_cmd, sizeof(wmt_coex_cmd),
++	  wmt_coex_evt, sizeof(wmt_coex_evt), "coex wmt" },
++};
++static const struct wmt_init_script co_clock_script[] = {
++	{ wmt_co_clock_cmd, sizeof(wmt_co_clock_cmd),
++	  wmt_co_clock_evt, sizeof(wmt_co_clock_evt), "osc type" },
++};
++static const struct wmt_init_script power_on_dlm_script[] = {
++	{ wmt_power_ctrl_dlm_cmd1, sizeof(wmt_power_ctrl_dlm_cmd1),
++	  wmt_power_ctrl_dlm_evt, sizeof(wmt_power_ctrl_dlm_evt),
++	  "power on dlm cmd1" },
++	{ wmt_power_ctrl_dlm_cmd2, sizeof(wmt_power_ctrl_dlm_cmd2),
++	  wmt_power_ctrl_dlm_evt, sizeof(wmt_power_ctrl_dlm_evt),
++	  "power on dlm cmd2" },
++	{ wmt_power_ctrl_dlm_cmd3, sizeof(wmt_power_ctrl_dlm_cmd3),
++	  wmt_power_ctrl_dlm_evt, sizeof(wmt_power_ctrl_dlm_evt),
++	  "power on dlm cmd3" },
++};
++static const struct wmt_init_script mcu_clk_high_script[] = {
++	{ wmt_set_mcu_clk_en_cmd, sizeof(wmt_set_mcu_clk_en_cmd),
++	  wmt_set_mcu_clk_evt, sizeof(wmt_set_mcu_clk_evt),
++	  "enable set mcu clk" },
++	{ wmt_set_mcu_clk_138_cmd, sizeof(wmt_set_mcu_clk_138_cmd),
++	  wmt_set_mcu_clk_evt, sizeof(wmt_set_mcu_clk_evt),
++	  "set mcu clk to 138.67MHz" },
++};
++static const struct wmt_init_script mcu_clk_low_script[] = {
++	{ wmt_set_mcu_clk_26_cmd, sizeof(wmt_set_mcu_clk_26_cmd),
++	  wmt_set_mcu_clk_evt, sizeof(wmt_set_mcu_clk_evt),
++	  "set mcu clk to 26MHz" },
++	{ wmt_set_mcu_clk_dis_cmd, sizeof(wmt_set_mcu_clk_dis_cmd),
++	  wmt_set_mcu_clk_evt, sizeof(wmt_set_mcu_clk_evt),
++	  "disable set mcu clk" },
++};
++
++/* wmt_ic_soc.c:790-830 */
++struct wmt_ic_info {
++	u32 hw_ver;
++	const char *chip_name;
++	const char *chip_version;
++	const char *patch_ext;
++	enum mtk_wcn_wmt_hwver e_wmt_hwver;
++	bool psm_support;
++};
++
++static const struct wmt_ic_info wmt_soc_info_table[] = {
++	{
++		.hw_ver = 0x8a00,
++		.chip_name = "SOC_CONSYS",
++		.chip_version = "E1",
++		.patch_ext = "_e1",
++		.e_wmt_hwver = WMTHWVER_E1,
++		.psm_support = true,
++	},
++	{
++		.hw_ver = 0x8a01,
++		.chip_name = "SOC_CONSYS",
++		.chip_version = "E2",
++		.patch_ext = "_e1",
++		.e_wmt_hwver = WMTHWVER_E2,
++		.psm_support = true,
++	},
++	{
++		.hw_ver = 0x8b01,
++		.chip_name = "SOC_CONSYS",
++		.chip_version = "E3",
++		.patch_ext = "_e1",
++		.e_wmt_hwver = WMTHWVER_E3,
++		.psm_support = true,
++	},
++};
++
++static const struct wmt_ic_info *soc_info;
++static int soc_co_clock;	/* WMT_CO_CLOCK_EN / DIS */
++
++/* wmt_ic_soc.c:1560-1605 */
++static const struct wmt_ic_info *wmt_soc_find_info(u32 hw_ver)
++{
++	int i;
++
++	for (i = ARRAY_SIZE(wmt_soc_info_table) - 1; i >= 0; i--)
++		if (hw_ver == wmt_soc_info_table[i].hw_ver)
++			return &wmt_soc_info_table[i];
++
++	for (i = ARRAY_SIZE(wmt_soc_info_table) - 1; i >= 0; i--)
++		if (MAJORNUM(hw_ver) ==
++		    MAJORNUM(wmt_soc_info_table[i].hw_ver))
++			return &wmt_soc_info_table[i];
++
++	wmt_err("no IC info for hw version 0x%x, assuming E1\n", hw_ver);
++	return &wmt_soc_info_table[0];
++}
++
++/* wmt_ic_soc.c:1512-1558 */
++int wmt_ic_soc_ver_check(void)
++{
++	u32 hw_ver = 0, fw_ver = 0;
++	unsigned long pa1, pa2;
++	const struct wmt_ic_info *info;
++	int ret;
++
++	ret = wmt_core_reg_rw_raw(false, GEN_HVR, &hw_ver, GEN_VER_MASK);
++	if (ret) {
++		wmt_err("failed to read hw version (%d)\n", ret);
++		return ret;
++	}
++
++	ret = wmt_core_reg_rw_raw(false, GEN_FVR, &fw_ver, GEN_VER_MASK);
++	if (ret) {
++		wmt_err("failed to read fw version (%d)\n", ret);
++		return ret;
++	}
++
++	info = wmt_soc_find_info(hw_ver);
++	wmt_info("IC %s.%s hw 0x%x fw 0x%x patch ext %s\n",
++		 info->chip_name, info->chip_version, hw_ver, fw_ver,
++		 info->patch_ext);
++
++	pa1 = ((u32)g_wmt.chip_id << 16) | (hw_ver & 0xffff);
++	pa2 = ((u32)info->e_wmt_hwver << 16) | (fw_ver & 0xffff);
++	ret = wmt_core_ctrl(WMT_CTRL_HWIDVER_SET, &pa1, &pa2);
++	if (ret)
++		wmt_warn("failed to store chip information (%d)\n", ret);
++
++	soc_info = info;
++	return 0;
++}
++
++int wmt_ic_soc_co_clock_ctrl(int on)
++{
++	if (on != 0 && on != 1)
++		return -EINVAL;
++
++	soc_co_clock = on;
++	wmt_dbg("co-clock %s\n", on ? "enabled" : "disabled");
++	return 0;
++}
++
++/* wmt_ic_soc.c:1473-1600 (AIF and GPS_SYNC chip-side pin control) */
++int wmt_ic_soc_pin_ctrl(enum wmt_ic_pin_id id, enum wmt_ic_pin_state state,
++			u32 flag)
++{
++	u32 val;
++	int ret = 0;
++
++	switch (id) {
++	case WMT_IC_PIN_AUDIO:
++		/* wmt_ic_soc.c:1308-1420 */
++		switch (state) {
++		case WMT_IC_AIF_2:
++			val = 0x01110000;
++			ret = wmt_core_reg_rw_raw(true, 0x80050078, &val,
++						  0x0fff0000);
++			break;
++		case WMT_IC_AIF_0:
++		case WMT_IC_AIF_1:
++		case WMT_IC_AIF_3:
++			ret = 0;
++			break;
++		default:
++			ret = -EINVAL;
++			break;
++		}
++		break;
++	case WMT_IC_PIN_GSYNC:
++		/* wmt_ic_soc.c:1426-1445 */
++		val = state == WMT_IC_PIN_MUX ? (0x1 << 28) : (0x5 << 28);
++		ret = wmt_core_reg_rw_raw(true, 0x80050078, &val,
++					  0x7 << 28);
++		break;
++	case WMT_IC_PIN_EEDI:
++	case WMT_IC_PIN_EEDO:
++		/* Chip-side GPS LNA control is not ported (wmt_ic_soc.c:1447-1471
++		 * marks these pins TBD in the downstream driver as well).
++		 */
++		wmt_warn("chip-side pin %d control is not supported\n", id);
++		ret = -EOPNOTSUPP;
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++	return ret;
++}
++
++/*
++ * Firmware patch download
++ */
++
++int wmt_ic_soc_patch_info_prepare(void)
++{
++	struct wmt_ctrl_data data = { };
++
++	data.ctrl_id = WMT_CTRL_PATCH_SEARCH;
++	return wmt_ctrl(&data);
++}
++
++/* wmt_ic_soc.c:1937-2188 */
++int wmt_ic_soc_patch_download(u32 index)
++{
++	struct wmt_ctrl_data data = { };
++	u8 patch_name[NAME_MAX + 1] = { };
++	u8 address[4] = { };
++	const struct wmt_patch *hdr;
++	u8 *patch_buf = NULL;
++	size_t patch_size = 0;
++	u8 *pbuf;
++	u32 frag_seq, frag_num, patch_size_per_frag = DEFAULT_PATCH_FRAG_SIZE;
++	u16 hw_ver, sw_ver;
++	u16 frag_size = 0, cmd_len;
++	u32 offset;
++	u32 written = 0, read = 0;
++	u8 evt[16];
++	u8 cmd[sizeof(wmt_patch_address_cmd)];
++	u8 patch_cmd[5] = { 0x01, 0x01, 0x00, 0x00, 0x00 };
++	int ret;
++
++	if (!soc_info)
++		return -EINVAL;
++
++	/* <1> name and patch RAM address of this patch file */
++	data.ctrl_id = WMT_CTRL_GET_PATCH_INFO;
++	data.data[0] = index + 1;
++	data.data[1] = (unsigned long)patch_name;
++	data.data[2] = (unsigned long)address;
++	ret = wmt_ctrl(&data);
++	if (ret)
++		return ret;
++
++	/* <2> load the patch file by the name given by the launcher */
++	data.ctrl_id = WMT_CTRL_GET_PATCH;
++	data.data[0] = 0;
++	data.data[1] = (unsigned long)patch_name;
++	data.data[2] = (unsigned long)&patch_buf;
++	data.data[3] = (unsigned long)&patch_size;
++	ret = wmt_ctrl(&data);
++	if (ret) {
++		wmt_err("failed to load patch %s (%d)\n", patch_name, ret);
++		return ret;
++	}
++
++	if (patch_size < sizeof(*hdr)) {
++		wmt_err("patch %s is too short (%zu)\n", patch_name, patch_size);
++		ret = -EINVAL;
++		goto out_put;
++	}
++
++	hdr = (const struct wmt_patch *)(patch_buf + BCNT_PATCH_BUF_HEADROOM);
++	/* The 16-bit header fields are stored big endian; the downstream
++	 * driver byte-swaps them when reporting (wmt_ic_soc.c:2006-2012).
++	 */
++	hw_ver = (hdr->hw_ver >> 8) | (hdr->hw_ver << 8);
++	sw_ver = (hdr->sw_ver >> 8) | (hdr->sw_ver << 8);
++	wmt_info("patch %s built %.*s, hw 0x%04x, sw 0x%04x, ver 0x%08x, plat %.4s\n",
++		 patch_name, 15, (const char *)hdr->date_time,
++		 hw_ver, sw_ver, hdr->patch_ver, (const char *)hdr->plat);
++
++	if (!wmt_core_patch_check(hw_ver, soc_info->hw_ver))
++		wmt_warn("patch %s hw version does not match the chip\n",
++			 patch_name);
++
++	/* Patch body starts after the 28-byte header; keep the payload
++	 * writable so that the per-fragment WMT header can be prepended.
++	 */
++	patch_size -= sizeof(*hdr);
++	pbuf = patch_buf + BCNT_PATCH_BUF_HEADROOM + sizeof(*hdr) -
++	       sizeof(patch_cmd);
++
++	/* The patch RAM base depends on the SoC (wmt_ic_soc.c:2010-2030). */
++	memcpy(cmd, wmt_patch_address_cmd, sizeof(cmd));
++	if (soc_info->hw_ver == 0x8a00 || soc_info->hw_ver == 0x8a01 ||
++	    soc_info->hw_ver == 0x8b01) {
++		/* MT6735/MT6737T class: patch RAM base 0x02090240 */
++		cmd[8] = 0x40;
++	}
++
++	ret = wmt_core_tx(cmd, sizeof(cmd), &written);
++	if (ret || written != sizeof(cmd)) {
++		wmt_err("patch address command failed (%d)\n", ret);
++		ret = -EIO;
++		goto out_put;
++	}
++	memset(evt, 0, sizeof(evt));
++	ret = wmt_core_rx(evt, sizeof(wmt_patch_address_evt), &read);
++	if (ret || read != sizeof(wmt_patch_address_evt) ||
++	    memcmp(evt, wmt_patch_address_evt,
++		   sizeof(wmt_patch_address_evt))) {
++		wmt_err("patch address event failed (%d)\n", ret);
++		ret = -EIO;
++		goto out_put;
++	}
++
++	memcpy(cmd, wmt_patch_p_address_cmd, sizeof(cmd));
++	if (soc_info->hw_ver == 0x8a00 || soc_info->hw_ver == 0x8a01 ||
++	    soc_info->hw_ver == 0x8b01)
++		cmd[8] = 0xc8;
++	memcpy(&cmd[12], address, sizeof(address));
++	wmt_dbg("patch load address %02x %02x %02x %02x\n",
++		address[0], address[1], address[2], address[3]);
++
++	ret = wmt_core_tx(cmd, sizeof(cmd), &written);
++	if (ret || written != sizeof(cmd)) {
++		wmt_err("part patch address command failed (%d)\n", ret);
++		ret = -EIO;
++		goto out_put;
++	}
++	memset(evt, 0, sizeof(evt));
++	ret = wmt_core_rx(evt, sizeof(wmt_patch_p_address_evt), &read);
++	if (ret || read != sizeof(wmt_patch_p_address_evt) ||
++	    memcmp(evt, wmt_patch_p_address_evt,
++		   sizeof(wmt_patch_p_address_evt))) {
++		wmt_err("part patch address event failed (%d)\n", ret);
++		ret = -EIO;
++		goto out_put;
++	}
++
++	/* <3> send the patch body in DEFAULT_PATCH_FRAG_SIZE fragments */
++	frag_num = patch_size / patch_size_per_frag;
++	frag_num += (frag_num * patch_size_per_frag) == patch_size ? 0 : 1;
++	wmt_dbg("patch size %zu, fragments %u\n", patch_size, frag_num);
++
++	offset = sizeof(patch_cmd);
++	for (frag_seq = 0; frag_seq < frag_num; frag_seq++) {
++		if (frag_seq == frag_num - 1) {
++			frag_size = (u16)(patch_size -
++					  frag_seq * patch_size_per_frag);
++			patch_cmd[4] = WMT_PATCH_FRAG_LAST;
++		} else {
++			frag_size = patch_size_per_frag;
++			patch_cmd[4] = frag_seq == 0 ? WMT_PATCH_FRAG_1ST
++						     : WMT_PATCH_FRAG_MID;
++		}
++
++		cmd_len = 1 + frag_size;
++		memcpy(&patch_cmd[2], &cmd_len, 2);
++		memcpy(pbuf + offset - sizeof(patch_cmd), patch_cmd,
++		       sizeof(patch_cmd));
++
++		ret = wmt_core_tx(pbuf + offset - sizeof(patch_cmd),
++				  frag_size + sizeof(patch_cmd), &written);
++		if (ret || written != frag_size + sizeof(patch_cmd)) {
++			wmt_err("patch fragment %u failed (%d, %u)\n",
++				frag_seq, ret, written);
++			ret = -EIO;
++			break;
++		}
++
++		memset(evt, 0, sizeof(evt));
++		ret = wmt_core_rx(evt, sizeof(wmt_patch_evt), &read);
++		if (ret || read != sizeof(wmt_patch_evt) ||
++		    memcmp(evt, wmt_patch_evt, sizeof(wmt_patch_evt))) {
++			wmt_err("patch fragment %u event failed (%d)\n",
++				frag_seq, ret);
++			ret = -EIO;
++			break;
++		}
++
++		offset += patch_size_per_frag;
++	}
++
++	if (frag_seq != frag_num) {
++		wmt_err("patch %s download failed at fragment %u/%u\n",
++			patch_name, frag_seq, frag_num);
++		ret = -EIO;
++	} else {
++		wmt_info("patch %s download ok\n", patch_name);
++		ret = 0;
++	}
++
++out_put:
++	data.ctrl_id = WMT_CTRL_FREE_PATCH;
++	data.data[0] = index + 1;
++	wmt_ctrl(&data);
++
++	return ret;
++}
++
++/* wmt_ic_soc.c:898-1290 */
++int wmt_ic_soc_sw_init(struct wmt_hif_conf *hif)
++{
++	struct wmt_gen_conf *conf = wmt_lib_gen_conf();
++	u8 strap_cmd[sizeof(wmt_strap_fm_cmd)];
++	u8 strap_evt[sizeof(wmt_strap_fm_evt)];
++	struct wmt_init_script strap_script[1];
++	u8 tssi_cmd[sizeof(wmt_bt_tssi_cmd)];
++	struct wmt_init_script tssi_script[1];
++	unsigned long pa1, pa2;
++	u32 patch_num, i;
++	int ret;
++
++	if (!soc_info || !hif) {
++		wmt_err("SOC not identified yet\n");
++		return -EINVAL;
++	}
++
++	if (hif->hif_type == WMT_HIF_BTIF) {
++		/* 1. query chip STP defaults */
++		ret = wmt_core_init_script(query_stp_script,
++					   ARRAY_SIZE(query_stp_script));
++		if (ret) {
++			wmt_err("query STP defaults failed (%d)\n", ret);
++			return ret;
++		}
++
++		/* 2. configure chip STP options */
++		ret = wmt_core_init_script(set_stp_script,
++					   ARRAY_SIZE(set_stp_script));
++		if (ret) {
++			wmt_err("set STP options failed (%d)\n", ret);
++			return ret;
++		}
++
++		/* 3. switch the host to STP full mode */
++		pa1 = WMT_STP_CONF_MODE;
++		pa2 = MTKSTP_BTIF_FULL_MODE;
++		ret = wmt_core_ctrl(WMT_CTRL_STP_CONF, &pa1, &pa2);
++		pa1 = WMT_STP_CONF_EN;
++		pa2 = 1;
++		ret += wmt_core_ctrl(WMT_CTRL_STP_CONF, &pa1, &pa2);
++		if (ret) {
++			wmt_err("failed to enable STP full mode (%d)\n", ret);
++			return ret;
++		}
++
++		/* 4. the chip needs at least 2 ms to switch */
++		msleep(10);
++
++		/* 5. verify the chip STP options */
++		ret = wmt_core_init_script(query_stp_full_script,
++					   ARRAY_SIZE(query_stp_full_script));
++		if (ret) {
++			wmt_err("query STP options failed (%d)\n", ret);
++			return ret;
++		}
++	}
++
++	/* 6. power-on DLM patch */
++	ret = wmt_core_init_script(power_on_dlm_script,
++				   ARRAY_SIZE(power_on_dlm_script));
++	if (ret)
++		wmt_warn("power-on DLM patch failed (%d)\n", ret);
++
++	/* 7. firmware patch download, one file at a time */
++	ret = wmt_ic_soc_patch_info_prepare();
++	if (ret) {
++		wmt_err("patch info prepare failed (%d)\n", ret);
++		return ret;
++	}
++
++	pa1 = 0;
++	pa2 = 0;
++	ret = wmt_core_ctrl(WMT_CTRL_GET_PATCH_NUM, &pa1, &pa2);
++	patch_num = pa1;
++	wmt_dbg("patch count %u\n", patch_num);
++	if (!patch_num)
++		wmt_warn("no patch registered by userspace, the firmware will run from ROM\n");
++
++	ret = wmt_core_init_script(mcu_clk_high_script,
++				   ARRAY_SIZE(mcu_clk_high_script));
++	if (ret)
++		wmt_warn("failed to raise the MCU clock (%d)\n", ret);
++
++	for (i = 0; i < patch_num; i++) {
++		ret = wmt_ic_soc_patch_download(i);
++		if (ret) {
++			wmt_err("patch %u download failed (%d)\n", i, ret);
++			return ret;
++		}
++
++		ret = wmt_core_init_script(wmt_reset_script,
++					   ARRAY_SIZE(wmt_reset_script));
++		if (ret) {
++			wmt_err("WMT reset after patch failed (%d)\n", ret);
++			return ret;
++		}
++	}
++
++	ret = wmt_core_init_script(mcu_clk_low_script,
++				   ARRAY_SIZE(mcu_clk_low_script));
++	if (ret)
++		wmt_warn("failed to restore the MCU clock (%d)\n", ret);
++
++	/* 8. RF calibration with the BT and Wi-Fi rails enabled */
++	pa1 = BT_PALDO;
++	pa2 = PALDO_ON;
++	wmt_core_ctrl(WMT_CTRL_SOC_PALDO_CTRL, &pa1, &pa2);
++	pa1 = WIFI_PALDO;
++	pa2 = PALDO_ON;
++	wmt_core_ctrl(WMT_CTRL_SOC_PALDO_CTRL, &pa1, &pa2);
++
++	ret = wmt_core_init_script(calibration_script,
++				   ARRAY_SIZE(calibration_script));
++
++	pa1 = BT_PALDO;
++	pa2 = PALDO_OFF;
++	wmt_core_ctrl(WMT_CTRL_SOC_PALDO_CTRL, &pa1, &pa2);
++	pa1 = WIFI_PALDO;
++	pa2 = PALDO_OFF;
++	wmt_core_ctrl(WMT_CTRL_SOC_PALDO_CTRL, &pa1, &pa2);
++
++	if (ret) {
++		wmt_err("RF calibration failed (%d)\n", ret);
++		return ret;
++	}
++
++	/* 9. coexistence configuration */
++	ret = wmt_core_init_script(coex_script, ARRAY_SIZE(coex_script));
++	if (ret) {
++		wmt_err("coexistence setup failed (%d)\n", ret);
++		return ret;
++	}
++
++	/* 10. co-clock oscillator type */
++	if (soc_co_clock) {
++		ret = wmt_core_init_script(co_clock_script,
++					   ARRAY_SIZE(co_clock_script));
++		if (ret) {
++			wmt_err("oscillator type setup failed (%d)\n", ret);
++			return ret;
++		}
++	}
++
++	/* 11. FM strap configuration */
++	memcpy(strap_cmd, wmt_strap_fm_cmd, sizeof(strap_cmd));
++	memcpy(strap_evt, wmt_strap_fm_evt, sizeof(strap_evt));
++	strap_cmd[5] = hif->strap_conf[0];
++	strap_evt[5] = hif->strap_conf[0];
++	strap_script[0].cmd = strap_cmd;
++	strap_script[0].cmd_sz = sizeof(strap_cmd);
++	strap_script[0].evt = strap_evt;
++	strap_script[0].evt_sz = sizeof(strap_evt);
++	strap_script[0].str = "configure FM interface";
++	ret = wmt_core_init_script(strap_script, 1);
++	if (ret) {
++		wmt_err("FM strap configuration failed (%d)\n", ret);
++		return ret;
++	}
++
++	/* 12. BT TSSI source (WMT_SOC.cfg) */
++	if (conf && conf->bt_tssi_from_wifi) {
++		memcpy(tssi_cmd, wmt_bt_tssi_cmd, sizeof(tssi_cmd));
++		tssi_cmd[5] = conf->bt_tssi_from_wifi;
++		tssi_cmd[6] = conf->bt_tssi_target & 0xff;
++		tssi_cmd[7] = (conf->bt_tssi_target >> 8) & 0xff;
++		tssi_script[0].cmd = tssi_cmd;
++		tssi_script[0].cmd_sz = sizeof(tssi_cmd);
++		tssi_script[0].evt = wmt_bt_tssi_evt;
++		tssi_script[0].evt_sz = sizeof(wmt_bt_tssi_evt);
++		tssi_script[0].str = "bt tssi from wifi";
++		ret = wmt_core_init_script(tssi_script, 1);
++		if (ret)
++			wmt_warn("BT TSSI configuration failed (%d)\n", ret);
++	}
++
++	return 0;
++}
++
++int wmt_ic_soc_sw_deinit(struct wmt_hif_conf *hif)
++{
++	soc_info = NULL;
++	return 0;
++}
+diff --git a/drivers/misc/mediatek/connectivity/wmt/wmt_lib.c b/drivers/misc/mediatek/connectivity/wmt/wmt_lib.c
+new file mode 100644
+index 000000000..3860c3244
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wmt/wmt_lib.c
+@@ -0,0 +1,272 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WCN WMT library: driver state, configuration and recovery.
++ *
++ * Port from Samsung/MTK downstream
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/core/wmt_lib.c
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/linux/pri/wmt_exp.c
++ *
++ * Copyright (C) 2011-2014 MediaTek Inc.
++ *
++ * The WMT protocol is strictly request/event, so all exchanges are executed
++ * one at a time under g_wmt.op_lock.  Downstream serialised them through the
++ * mtk_wmtd kernel thread; with the STP power-saving engine not ported a
++ * mutex around the command engine has the same ordering guarantees and
++ * removes the extra thread.
++ */
++
++#include <linux/delay.h>
++#include <linux/module.h>
++#include <linux/string.h>
++#include <linux/workqueue.h>
++
++#include "wmt_local.h"
++
++struct wmt_dev g_wmt;
++
++static struct work_struct wmt_reset_work;
++
++static void wmt_lib_reset_work_fn(struct work_struct *work)
++{
++	wmt_lib_cmb_rst(WMTRSTSRC_RESET_STP);
++}
++
++void wmt_lib_schedule_reset(enum wmt_rst_src src)
++{
++	wmt_dbg("scheduling CONSYS reset (source %d)\n", src);
++	schedule_work(&wmt_reset_work);
++}
++
++/* wmt_lib.c:1417-1443 */
++void wmt_lib_notify_reset(enum wmt_rst_msg msg)
++{
++	int i;
++
++	for (i = 0; i < WMTDRV_MAX; i++) {
++		if (!g_wmt.msgcb[i])
++			continue;
++
++		g_wmt.msgcb[i](WMTDRV_WMT, i, WMTMSG_RESET, &msg,
++			       sizeof(msg));
++		wmt_dbg("reset message sent to driver %d\n", i);
++	}
++}
++
++/* wmt_lib.c:1617-1712 */
++bool wmt_lib_cmb_rst(enum wmt_rst_src src)
++{
++	struct wmt_op op = { };
++	bool ok = false;
++	int retries = 10;
++	int ret;
++
++	if (test_and_set_bit(WMT_STAT_RST_ON, &g_wmt.state)) {
++		wmt_info("reset already in progress\n");
++		return false;
++	}
++
++	mtk_wcn_stp_enable(0);
++	wmt_lib_notify_reset(WMTRSTMSG_RESET_START);
++
++	while (retries--) {
++		op.op_id = WMT_OPID_HW_RST;
++		ret = wmt_lib_run_op(&op);
++		if (ret) {
++			wmt_err("hardware reset failed (%d)\n", ret);
++			continue;
++		}
++
++		op.op_id = WMT_OPID_SW_RST;
++		ret = wmt_lib_run_op(&op);
++		if (ret) {
++			wmt_err("software reset failed (%d)\n", ret);
++			continue;
++		}
++
++		ok = true;
++		break;
++	}
++
++	clear_bit(WMT_STAT_RST_ON, &g_wmt.state);
++	mtk_wcn_stp_set_wmt_evt_err_trg_assert(0);
++
++	if (ok) {
++		wmt_info("CONSYS reset succeeded\n");
++		wmt_lib_notify_reset(WMTRSTMSG_RESET_END);
++	} else {
++		wmt_err("CONSYS reset failed\n");
++		wmt_lib_notify_reset(WMTRSTMSG_RESET_END_FAIL);
++	}
++
++	return ok;
++}
++
++int wmt_lib_run_op(struct wmt_op *op)
++{
++	int ret;
++
++	if (!op)
++		return -EINVAL;
++
++	mutex_lock(&g_wmt.op_lock);
++	ret = wmt_core_opid(op);
++	mutex_unlock(&g_wmt.op_lock);
++
++	return ret;
++}
++
++int wmt_lib_init(void)
++{
++	int ret;
++
++	memset(&g_wmt, 0, sizeof(g_wmt));
++	mutex_init(&g_wmt.op_lock);
++	init_waitqueue_head(&g_wmt.cmd_wq);
++	init_waitqueue_head(&g_wmt.rx_wq);
++
++	strscpy(g_wmt.patch_name, WMT_DEFAULT_PATCH_NAME,
++		sizeof(g_wmt.patch_name));
++	strscpy(g_wmt.cfg_name, WMT_CFG_PREFIX WMT_CFG_NAME,
++		sizeof(g_wmt.cfg_name));
++
++	g_wmt.hif.hif_type = WMT_HIF_BTIF;
++	g_wmt.hif.strap_conf[0] = WMT_FM_COMM;
++	g_wmt.e_hw_ver = WMTHWVER_INVALID;
++
++	INIT_WORK(&wmt_reset_work, wmt_lib_reset_work_fn);
++
++	ret = wmt_conf_read_file();
++	if (ret)
++		wmt_warn("no usable %s, using defaults\n", g_wmt.cfg_name);
++
++	wmt_core_init();
++
++	ret = wmt_plat_init();
++	if (ret) {
++		wmt_err("platform init failed (%d)\n", ret);
++		wmt_lib_deinit();
++		return ret;
++	}
++
++	g_wmt.ready = true;
++
++	wmt_info("WMT driver initialised\n");
++	return 0;
++}
++
++void wmt_lib_deinit(void)
++{
++	struct wmt_op op = { };
++	int i;
++
++	cancel_work_sync(&wmt_reset_work);
++
++	/* Tear the firmware down before releasing the platform resources so
++	 * that the BTIF channel is closed while the transport still exists.
++	 */
++	for (i = 0; i < WMTDRV_WMT; i++) {
++		if (g_wmt.drv_status[i] != DRV_STS_FUNC_ON)
++			continue;
++		op.op_id = WMT_OPID_FUNC_OFF;
++		op.data[0] = i;
++		wmt_lib_run_op(&op);
++	}
++
++	if (g_wmt.drv_status[WMTDRV_WMT] != DRV_STS_POWER_OFF) {
++		op.op_id = WMT_OPID_PWR_OFF;
++		memset(op.data, 0, sizeof(op.data));
++		wmt_lib_run_op(&op);
++	}
++
++	wmt_plat_deinit();
++	wmt_core_deinit();
++	kfree(g_wmt.patch_info);
++	g_wmt.patch_info = NULL;
++	wmt_dev_patch_put();
++	g_wmt.ready = false;
++	mutex_destroy(&g_wmt.op_lock);
++}
++
++struct wmt_hif_conf *wmt_lib_hif(void)
++{
++	return &g_wmt.hif;
++}
++
++struct wmt_gen_conf *wmt_lib_gen_conf(void)
++{
++	return &g_wmt.gen_conf;
++}
++
++/* wmt_lib.c:393-429 */
++int wmt_lib_set_hif(unsigned long cfg)
++{
++	u32 val = cfg & 0xf;
++
++	switch (val) {
++	case STP_BTIF_FULL:
++		g_wmt.hif.hif_type = WMT_HIF_BTIF;
++		break;
++	case STP_SDIO:
++	case STP_UART_FULL:
++	case STP_UART_MAND:
++		wmt_err("HIF mode 0x%x is not supported on this platform\n",
++			val);
++		return -EOPNOTSUPP;
++	default:
++		wmt_err("invalid STP mode 0x%x\n", val);
++		return -EINVAL;
++	}
++
++	val = (cfg & 0xf0) >> 4;
++	if (val == WMT_FM_COMM || val == WMT_FM_I2C)
++		g_wmt.hif.strap_conf[0] = val;
++	else
++		return -EINVAL;
++
++	wmt_info("HIF mode %u, FM interface %u\n", g_wmt.hif.hif_type,
++		 g_wmt.hif.strap_conf[0]);
++	return 0;
++}
++
++void wmt_lib_set_patch_name(const char *name)
++{
++	if (!name)
++		return;
++
++	strscpy(g_wmt.patch_name, name, sizeof(g_wmt.patch_name));
++}
++
++u32 wmt_lib_get_icinfo(enum wmt_chipinfo_type type)
++{
++	switch (type) {
++	case WMTCHIN_CHIPID:
++		return g_wmt.chip_id;
++	case WMTCHIN_HWVER:
++		return g_wmt.hw_ver;
++	case WMTCHIN_MAPPINGHWVER:
++		return g_wmt.e_hw_ver;
++	case WMTCHIN_FWVER:
++		return g_wmt.fw_ver;
++	default:
++		return 0;
++	}
++}
++
++enum mtk_wcn_wmt_hwver wmt_lib_hwver(void)
++{
++	return g_wmt.e_hw_ver;
++}
++
++void wmt_lib_set_chip_info(u32 chip_id, u32 hw_ver, u32 fw_ver,
++			   enum mtk_wcn_wmt_hwver e_hw_ver)
++{
++	g_wmt.chip_id = chip_id;
++	g_wmt.hw_ver = hw_ver;
++	g_wmt.fw_ver = fw_ver;
++	g_wmt.e_hw_ver = e_hw_ver;
++}
++
++u32 wmt_lib_co_clock(void)
++{
++	return g_wmt.gen_conf.co_clock_flag & 0x0f ? 1 : 0;
++}
+diff --git a/drivers/misc/mediatek/connectivity/wmt/wmt_local.h b/drivers/misc/mediatek/connectivity/wmt/wmt_local.h
+new file mode 100644
+index 000000000..3c7ff906f
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wmt/wmt_local.h
+@@ -0,0 +1,555 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * MediaTek WCN WMT/CONSYS core - private definitions.
++ *
++ * Port from Samsung/MTK downstream:
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/core/include/
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/include/
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/mt6735/include/mtk_wcn_consys_hw.h
++ *
++ * Copyright (C) 2011-2014 MediaTek Inc.
++ */
++
++#ifndef _WMT_LOCAL_H_
++#define _WMT_LOCAL_H_
++
++#include <linux/firmware.h>
++#include <linux/limits.h>
++#include <linux/mutex.h>
++#include <linux/spinlock.h>
++#include <linux/timer.h>
++#include <linux/types.h>
++#include <linux/wait.h>
++#include <linux/workqueue.h>
++
++#include <mtk_wcn_consys.h>
++#include <mtk_wcn_stp.h>
++#include <mtk_wcn_wmt.h>
++
++#define WMT_PFX		"WMT: "
++#define WMT_STP_PFX	"STP: "
++
++#define wmt_dbg(fmt, ...)	pr_debug(WMT_PFX fmt, ##__VA_ARGS__)
++#define wmt_info(fmt, ...)	pr_info(WMT_PFX fmt, ##__VA_ARGS__)
++#define wmt_warn(fmt, ...)	pr_warn(WMT_PFX fmt, ##__VA_ARGS__)
++#define wmt_err(fmt, ...)	pr_err(WMT_PFX fmt, ##__VA_ARGS__)
++#define stp_dbg(fmt, ...)	pr_debug(WMT_STP_PFX fmt, ##__VA_ARGS__)
++#define stp_info(fmt, ...)	pr_info(WMT_STP_PFX fmt, ##__VA_ARGS__)
++#define stp_warn(fmt, ...)	pr_warn(WMT_STP_PFX fmt, ##__VA_ARGS__)
++#define stp_err(fmt, ...)	pr_err(WMT_STP_PFX fmt, ##__VA_ARGS__)
++
++/* ------------------------------------------------------------------------- *
++ * STP wire protocol constants
++ * (stp_core.h:118-140, stp_core.c:34)
++ * ------------------------------------------------------------------------- */
++#define STP_DEL_SIZE		2
++#define MTKSTP_CRC_SIZE		2
++#define MTKSTP_HEADER_SIZE	4
++#define MTKSTP_SEQ_SIZE		8
++#define MTKSTP_WINSIZE		7
++#define MTKSTP_TX_TIMEOUT	180	/* ms */
++#define MTKSTP_RETRY_LIMIT	10
++
++#define MTKSTP_UART_FULL_MODE	BIT(0)
++#define MTKSTP_UART_MAND_MODE	BIT(1)
++#define MTKSTP_BTIF_FULL_MODE	BIT(2)
++#define MTKSTP_BTIF_MAND_MODE	BIT(3)
++#define MTKSTP_SDIO_MODE	BIT(4)
++
++/* WMT-LTE coexistence sub-type byte, dropped on non-LTE projects
++ * (stp_core.c:1251-1270).
++ */
++#define WMT_LTE_COEX_FLAG	0x16
++
++/* ------------------------------------------------------------------------- *
++ * WMT wire protocol constants (wmt_core.h:82-91)
++ * ------------------------------------------------------------------------- */
++#define WMT_HDR_LEN		4
++#define WMT_STS_LEN		1
++#define WMT_FLAG_LEN		1
++#define WMT_FUNC_CTRL_PARAM_LEN	1
++#define BCNT_PATCH_BUF_HEADROOM	8
++#define DWCNT_HIF_CONF		4
++#define DWCNT_STRAP_CONF	4
++
++#define WMT_LIB_RX_TIMEOUT	2000	/* ms, wmt_lib.h:69 */
++#define MAX_EACH_WMT_CMD	(WMT_LIB_RX_TIMEOUT + 1000)
++#define MAX_EACH_FUNC_OFF	(WMT_LIB_RX_TIMEOUT + 1000)
++#define MAX_FUNC_ON_TIME	12000
++#define MAX_FUNC_OFF_TIME	12000
++#define MAX_GPIO_CTRL_TIME	2000
++#define WMT_PWRON_RTY_DFT	2
++#define MAX_PATCH_NUM		10
++
++/* Default launcher-supplied patch file name (wmt_core.h:52). */
++#define WMT_DEFAULT_PATCH_NAME	"mt66xx_patch_hdr.bin"
++/* wmt_conf.h:33-34 */
++#define WMT_CFG_PREFIX		"/system/etc/firmware/"
++#define WMT_CFG_NAME		"WMT_SOC.cfg"
++
++/* WMT register space seen from the firmware (wmt_ic.h:54-60). */
++#define GEN_CONFG_BASE		0x80000000
++#define GEN_HVR			(GEN_CONFG_BASE + 0x0)
++#define GEN_FVR			(GEN_CONFG_BASE + 0x4)
++#define GEN_VER_MASK		0x0000ffff
++#define GEN_HCR			(GEN_CONFG_BASE + 0x8)
++#define GEN_HCR_MASK		0x0000ffff
++
++#define MAJORNUM(x)		((x) & 0x00f0)
++#define MINORNUM(x)		((x) & 0x000f)
++
++/* ------------------------------------------------------------------------- *
++ * STP parser states (stp_core.h:229-245)
++ * ------------------------------------------------------------------------- */
++enum stp_parser_state {
++	STP_SYNC = 0,
++	STP_SEQ,
++	STP_ACK,
++	STP_NAK,
++	STP_TYPE,
++	STP_LENGTH,
++	STP_CHECKSUM,
++	STP_DATA,
++	STP_CRC1,
++	STP_CRC2,
++	STP_RESYNC1,
++	STP_RESYNC2,
++	STP_RESYNC3,
++	STP_RESYNC4,
++	STP_FW_MSG,
++};
++
++struct stp_parser {
++	enum stp_parser_state state;
++	u8 seq;
++	u8 ack;
++	u8 nak;
++	u8 type;
++	u16 length;
++	u8 checksum;
++	u16 crc;
++	u8 wmt_subtype;
++};
++
++struct stp_sequence {
++	u8 txseq;		/* last tx pkt's seq + 1 */
++	u8 txack;		/* last tx pkt's ack */
++	u8 rxack;		/* last rx pkt's ack */
++	u8 winspace;		/* current sliding window size */
++	u8 expected_rxseq;	/* last rx pkt's seq + 1 */
++	u8 retry_times;
++};
++
++struct stp_ring {
++	spinlock_t lock;
++	u8 buffer[MTKSTP_BUFFER_SIZE];
++	u32 read_p;
++	u32 write_p;
++};
++
++/* ------------------------------------------------------------------------- *
++ * WMT driver types
++ * ------------------------------------------------------------------------- */
++enum wmt_drv_status {
++	DRV_STS_POWER_OFF = 0,
++	DRV_STS_POWER_ON = 1,
++	DRV_STS_FUNC_ON = 2,
++	DRV_STS_MAX
++};
++
++/* Downstream ENUM_WMT_OPID_T (wmt_core.h:118-153).  Only the operations
++ * implemented by this driver are listed.
++ */
++enum wmt_opid {
++	WMT_OPID_HIF_CONF = 0,
++	WMT_OPID_PWR_ON = 1,
++	WMT_OPID_PWR_OFF = 2,
++	WMT_OPID_FUNC_ON = 3,
++	WMT_OPID_FUNC_OFF = 4,
++	WMT_OPID_REG_RW = 5,
++	WMT_OPID_DSNS = 8,
++	WMT_OPID_HW_RST = 11,
++	WMT_OPID_SW_RST = 12,
++	WMT_OPID_STP_RST = 14,
++	WMT_OPID_THERM_CTRL = 15,
++	WMT_OPID_GPIO_CTRL = 17,
++	WMT_OPID_GPIO_STATE = 19,
++	WMT_OPID_ASSERT = 30,
++	WMT_OPID_MAX
++};
++
++struct wmt_op {
++	enum wmt_opid op_id;
++	unsigned long data[4];
++	u32 info_bit;
++	int result;
++};
++
++/* Downstream ENUM_WMT_CTRL_T (wmt_ctrl.h:47-76). */
++enum wmt_ctrl_id {
++	WMT_CTRL_HW_PWR_OFF = 0,
++	WMT_CTRL_HW_PWR_ON = 1,
++	WMT_CTRL_HW_RST = 2,
++	WMT_CTRL_STP_CLOSE = 3,
++	WMT_CTRL_STP_OPEN = 4,
++	WMT_CTRL_STP_CONF = 5,
++	WMT_CTRL_FREE_PATCH = 6,
++	WMT_CTRL_GET_PATCH = 7,
++	WMT_CTRL_GET_PATCH_NAME = 8,
++	WMT_CTRL_HWIDVER_SET = 9,
++	WMT_CTRL_STP_RST = 10,
++	WMT_CTRL_GET_WMT_CONF = 11,
++	WMT_CTRL_TX = 12,
++	WMT_CTRL_RX = 13,
++	WMT_CTRL_RX_FLUSH = 14,
++	WMT_CTRL_GPS_SYNC_SET = 15,
++	WMT_CTRL_GPS_LNA_SET = 16,
++	WMT_CTRL_PATCH_SEARCH = 17,
++	WMT_CTRL_HW_STATE_DUMP = 20,
++	WMT_CTRL_GET_PATCH_NUM = 21,
++	WMT_CTRL_GET_PATCH_INFO = 22,
++	WMT_CTRL_SOC_PALDO_CTRL = 23,
++	WMT_CTRL_SOC_WAKEUP_CONSYS = 24,
++	WMT_CTRL_EVT_ERR_TRG_ASSERT = 27,
++	WMT_CTRL_MAX
++};
++
++#define DWCNT_CTRL_DATA		16
++
++struct wmt_ctrl_data {
++	unsigned long ctrl_id;
++	unsigned long data[DWCNT_CTRL_DATA];
++};
++
++/* Downstream WMT_STP_CONF_TYPE (wmt_core.h:329-334). */
++enum wmt_stp_conf_type {
++	WMT_STP_CONF_EN = 0,
++	WMT_STP_CONF_RDY = 1,
++	WMT_STP_CONF_MODE = 2,
++};
++
++enum wmt_hif_type {
++	WMT_HIF_UART = 0,
++	WMT_HIF_SDIO = 1,
++	WMT_HIF_BTIF = 2,
++	WMT_HIF_MAX
++};
++
++/* Downstream STP HIF selector values used by WMT_IOCTL_SET_STP_MODE
++ * (wmt_dev.h:22-25).
++ */
++#define STP_UART_FULL	0x01
++#define STP_UART_MAND	0x02
++#define STP_BTIF_FULL	0x03
++#define STP_SDIO	0x04
++
++enum wmt_fm_mode {
++	WMT_FM_INVALID = 0,
++	WMT_FM_I2C = 1,
++	WMT_FM_COMM = 2,
++};
++
++struct wmt_hif_conf {
++	u32 hif_type;
++	u32 hif_conf[DWCNT_HIF_CONF];
++	u32 strap_conf[DWCNT_STRAP_CONF];
++};
++
++/* Parsed subset of WMT_SOC.cfg (wmt_core.h:156-207).  Fields that only
++ * affect the deferred coexistence features are recognised but not stored.
++ */
++struct wmt_gen_conf {
++	bool cfg_exist;
++	u8 co_clock_flag;
++	u8 wmt_gps_lna_pin;
++	u8 wmt_gps_lna_enable;
++	u8 bt_tssi_from_wifi;
++	u16 bt_tssi_target;
++};
++
++/* Downstream WMT_PATCH (wmt_core.h:343-349), 28 bytes on the wire. */
++struct wmt_patch {
++	u8 date_time[16];
++	u8 plat[4];
++	u16 hw_ver;
++	u16 sw_ver;
++	u32 patch_ver;
++} __packed;
++
++struct wmt_patch_info {
++	u32 download_seq;
++	u8 address[4];
++	u8 name[256];
++};
++
++enum wmt_chipinfo_type {
++	WMTCHIN_CHIPID = 0,
++	WMTCHIN_HWVER,
++	WMTCHIN_MAPPINGHWVER,
++	WMTCHIN_FWVER,
++};
++
++enum wmt_pin_id {
++	PIN_BGF_EINT = 0,
++	PIN_I2S_GRP = 1,
++	PIN_GPS_SYNC = 2,
++	PIN_GPS_LNA = 3,
++	PIN_ID_MAX
++};
++
++enum wmt_pin_state {
++	PIN_STA_INIT = 0,
++	PIN_STA_OUT_L = 1,
++	PIN_STA_OUT_H = 2,
++	PIN_STA_IN_L = 3,
++	PIN_STA_MUX = 4,
++	PIN_STA_EINT_EN = 5,
++	PIN_STA_EINT_DIS = 6,
++	PIN_STA_DEINIT = 7,
++};
++
++enum wmt_paldo_type {
++	BT_PALDO = 0,
++	WIFI_PALDO = 1,
++	FM_PALDO = 2,
++	GPS_PALDO = 3,
++	PMIC_CHIPID_PALDO = 4,
++	WIFI_5G_PALDO = 5,
++	PALDO_TYPE_MAX
++};
++
++enum wmt_paldo_op {
++	PALDO_OFF = 0,
++	PALDO_ON = 1,
++};
++
++enum wmt_func_state {
++	FUNC_ON = 0,
++	FUNC_OFF = 1,
++	FUNC_RST = 2,
++	FUNC_STAT = 3,
++};
++
++enum wmt_wl_op {
++	WL_OP_GET = 0,
++	WL_OP_PUT = 1,
++};
++
++/* Downstream ENUM_WMT_IC_PIN_ID / _STATE (wmt_core.h:242-268). */
++enum wmt_ic_pin_id {
++	WMT_IC_PIN_AUDIO = 0,
++	WMT_IC_PIN_EEDI = 1,
++	WMT_IC_PIN_EEDO = 2,
++	WMT_IC_PIN_GSYNC = 3,
++	WMT_IC_PIN_MAX
++};
++
++enum wmt_ic_pin_state {
++	WMT_IC_PIN_EN = 0,
++	WMT_IC_PIN_DIS = 1,
++	WMT_IC_AIF_0 = 2,
++	WMT_IC_AIF_1 = 3,
++	WMT_IC_AIF_2 = 4,
++	WMT_IC_AIF_3 = 5,
++	WMT_IC_PIN_MUX = 6,
++	WMT_IC_PIN_GPIO = 7,
++	WMT_IC_PIN_GPIO_HIGH = 8,
++	WMT_IC_PIN_GPIO_LOW = 9,
++	WMT_IC_PIN_STATE_MAX
++};
++
++enum wmt_rst_src {
++	WMTRSTSRC_RESET_BT = 0,
++	WMTRSTSRC_RESET_FM = 1,
++	WMTRSTSRC_RESET_GPS = 2,
++	WMTRSTSRC_RESET_WIFI = 3,
++	WMTRSTSRC_RESET_STP = 4,
++	WMTRSTSRC_RESET_TEST = 5,
++	WMTRSTSRC_RESET_MAX
++};
++
++enum wmt_rst_msg {
++	WMTRSTMSG_RESET_START = 0,
++	WMTRSTMSG_RESET_END = 1,
++	WMTRSTMSG_RESET_END_FAIL = 2,
++};
++
++/* WMT_STAT bits (wmt_lib.h:112-124). */
++#define WMT_STAT_PWR		BIT(0)
++#define WMT_STAT_STP_OPEN	BIT(2)
++#define WMT_STAT_STP_EN		BIT(3)
++#define WMT_STAT_STP_RDY	BIT(4)
++#define WMT_STAT_RX		BIT(5)
++#define WMT_STAT_CMD		BIT(6)
++#define WMT_STAT_RST_ON		BIT(7)
++
++struct wmt_init_script {
++	const u8 *cmd;
++	u32 cmd_sz;
++	const u8 *evt;
++	u32 evt_sz;
++	const char *str;
++};
++
++/* Global WMT driver state (single instance, as downstream gDevWmt). */
++struct wmt_dev {
++	struct mutex op_lock;		/* serialises the WMT command engine */
++	unsigned long state;
++
++	struct wmt_hif_conf hif;
++	struct wmt_gen_conf gen_conf;
++
++	u32 chip_id;
++	u32 hw_ver;
++	u32 fw_ver;
++	enum mtk_wcn_wmt_hwver e_hw_ver;
++
++	enum wmt_drv_status drv_status[WMTDRV_MAX];
++	mtk_wcn_wmt_msgcb msgcb[WMTDRV_MAX];
++	struct mtk_wcn_wmt_wlan_cb wlan_cb;
++	bool wlan_probed;
++
++	char patch_name[NAME_MAX + 1];	/* default patch, WMT_IOCTL_SET_PATCH_NAME */
++	char cfg_name[NAME_MAX + 1];	/* WMT_SOC.cfg path, WMT_IOCTL_WMT_CFG_NAME */
++	struct wmt_patch_info *patch_info;
++	u32 patch_num;
++	u8 *patch_buf;			/* loaded patch file + headroom */
++	size_t patch_size;
++	char patch_fw_name[NAME_MAX + 1];
++
++	/* kernel -> launcher command channel (/dev/stpwmt read/poll/write) */
++	char cmd[NAME_MAX + 1];
++	struct mutex patch_lock;
++	wait_queue_head_t cmd_wq;
++	wait_queue_head_t rx_wq;
++	bool rx_pending;
++
++	bool wifi_resetting;
++	bool ready;
++	unsigned long func_on_bits;
++};
++
++extern struct wmt_dev g_wmt;
++
++/* ------------------------------------------------------------------------- *
++ * STP engine (stp_core.c)
++ * ------------------------------------------------------------------------- */
++int stp_drv_init(void);
++void stp_drv_exit(void);
++int mtk_wcn_stp_enable(int value);
++int mtk_wcn_stp_ready(int value);
++int mtk_wcn_stp_send_data_raw(const u8 *buffer, u32 length, u8 type);
++void mtk_wcn_stp_flush_rx_queue(u32 type);
++void mtk_wcn_stp_flush_context(void);
++void mtk_wcn_stp_set_mode(u32 mode);
++void mtk_wcn_stp_set_bluez(bool bluez);
++void mtk_wcn_stp_set_if_tx_type(enum mtk_wcn_stp_tx_if type);
++bool mtk_wcn_stp_is_btif_fullset_mode(void);
++bool mtk_wcn_stp_is_btif_mand_mode(void);
++int mtk_wcn_stp_set_wmt_last_close(u32 value);
++u32 mtk_wcn_stp_get_wmt_evt_err_trg_assert(void);
++void mtk_wcn_stp_set_wmt_evt_err_trg_assert(u32 value);
++
++/* ------------------------------------------------------------------------- *
++ * STP <-> BTIF transport binding (stp_btif.c)
++ * ------------------------------------------------------------------------- */
++int stp_btif_open(void);
++int stp_btif_close(void);
++int stp_btif_rx_register(void);
++int stp_btif_rx_unregister(void);
++int stp_btif_wakeup(void);
++
++/* ------------------------------------------------------------------------- *
++ * WMT core / control / function / IC (wmt_core.c, wmt_ctrl.c, wmt_func.c,
++ * wmt_ic_soc.c)
++ * ------------------------------------------------------------------------- */
++int wmt_core_init(void);
++void wmt_core_deinit(void);
++int wmt_core_opid(struct wmt_op *op);
++int wmt_core_ctrl(enum wmt_ctrl_id id, unsigned long *pa1, unsigned long *pa2);
++int wmt_core_func_ctrl_cmd(enum mtk_wcn_wmt_drv type, bool enable);
++int wmt_core_reg_rw_raw(u32 is_write, u32 offset, u32 *val, u32 mask);
++int wmt_core_init_script(const struct wmt_init_script *script, int count);
++int wmt_core_tx(const u8 *data, u32 size, u32 *written);
++int wmt_core_rx(u8 *buf, u32 len, u32 *read_size);
++bool wmt_core_patch_check(u32 patch_ver, u32 hw_ver);
++
++int wmt_ctrl(struct wmt_ctrl_data *data);
++int wmt_ctrl_tx_ex(const u8 *data, u32 size, u32 *written, bool raw);
++
++int wmt_ic_soc_sw_init(struct wmt_hif_conf *hif);
++int wmt_ic_soc_sw_deinit(struct wmt_hif_conf *hif);
++int wmt_ic_soc_ver_check(void);
++int wmt_ic_soc_pin_ctrl(enum wmt_ic_pin_id id, enum wmt_ic_pin_state state,
++			u32 flag);
++int wmt_ic_soc_co_clock_ctrl(int on);
++int wmt_ic_soc_patch_info_prepare(void);
++int wmt_ic_soc_patch_download(u32 index);
++
++/* Per-function power control (wmt_func.c). */
++int wmt_func_on(int type);
++int wmt_func_off(int type);
++
++/* ------------------------------------------------------------------------- *
++ * WMT platform glue (consys_mt6735.c)
++ * ------------------------------------------------------------------------- */
++int wmt_plat_init(void);
++void wmt_plat_deinit(void);
++int wmt_plat_pwr_ctrl(enum wmt_func_state state);
++int wmt_plat_gpio_ctrl(enum wmt_pin_id id, enum wmt_pin_state state);
++int wmt_plat_soc_paldo_ctrl(enum wmt_paldo_type type, enum wmt_paldo_op op);
++int wmt_plat_wake_lock_ctrl(enum wmt_wl_op op);
++int wmt_plat_consys_driver_register(void);
++void wmt_plat_consys_driver_unregister(void);
++
++/* ------------------------------------------------------------------------- *
++ * WMT library / state machine (wmt_lib.c)
++ * ------------------------------------------------------------------------- */
++int wmt_lib_init(void);
++void wmt_lib_deinit(void);
++int wmt_lib_run_op(struct wmt_op *op);
++struct wmt_hif_conf *wmt_lib_hif(void);
++struct wmt_gen_conf *wmt_lib_gen_conf(void);
++u32 wmt_lib_get_icinfo(enum wmt_chipinfo_type type);
++enum mtk_wcn_wmt_hwver wmt_lib_hwver(void);
++int wmt_lib_set_hif(unsigned long cfg);
++void wmt_lib_set_patch_name(const char *name);
++u32 wmt_lib_co_clock(void);
++void wmt_lib_set_chip_info(u32 chip_id, u32 hw_ver, u32 fw_ver,
++			   enum mtk_wcn_wmt_hwver e_hw_ver);
++void wmt_lib_notify_reset(enum wmt_rst_msg msg);
++bool wmt_lib_cmb_rst(enum wmt_rst_src src);
++void wmt_lib_schedule_reset(enum wmt_rst_src src);
++
++/* ------------------------------------------------------------------------- *
++ * WMT char devices (wmt_dev.c, wmt_chrdev_wifi.c)
++ * ------------------------------------------------------------------------- */
++void wmt_dev_rx_event_cb(void);
++void wmt_dev_rx_clear(void);
++int wmt_dev_wait_rx(u32 timeout_ms);
++int wmt_dev_patch_search(void);
++u32 wmt_dev_patch_num(void);
++int wmt_dev_patch_info_get(u32 seq, u8 *name, u8 addr[4]);
++int wmt_dev_patch_set_num(u32 num);
++int wmt_dev_patch_set_info(const struct wmt_patch_info *info);
++int wmt_dev_read_file(const char *name, u8 **buf, size_t *size);
++int wmt_dev_patch_get(const char *name, u8 **buf, size_t *size);
++void wmt_dev_patch_put(void);
++void wmt_dev_patch_info_free_all(void);
++void wmt_dev_cmd_request(const char *cmd);
++bool wmt_dev_cmd_pending(void);
++const char *wmt_dev_cmd_string(void);
++void wmt_dev_cmd_ack(int result);
++int wmt_dev_stpwmt_register(void);
++void wmt_dev_stpwmt_unregister(void);
++int wmt_wifi_chrdev_register(void);
++void wmt_wifi_chrdev_unregister(void);
++
++/* ------------------------------------------------------------------------- *
++ * WMT_SOC.cfg parser (wmt_conf.c)
++ * ------------------------------------------------------------------------- */
++int wmt_conf_read_file(void);
++int wmt_conf_set_cfg_file(const char *name);
++const struct wmt_gen_conf *wmt_conf_get(void);
++
++#endif /* _WMT_LOCAL_H_ */
+diff --git a/drivers/misc/mediatek/connectivity/wmt/wmt_main.c b/drivers/misc/mediatek/connectivity/wmt/wmt_main.c
+new file mode 100644
+index 000000000..b71017e4b
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wmt/wmt_main.c
+@@ -0,0 +1,77 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WCN WMT/CONSYS core module lifecycle.
++ *
++ * Port from Samsung/MTK downstream
++ *   drivers/misc/mediatek/connectivity/common/conn_soc/linux/pri/wmt_dev.c
++ *
++ * Copyright (C) 2011-2014 MediaTek Inc.
++ *
++ * Bring-up order matters:
++ *   1. register the CONSYS platform driver so that its device (and its
++ *      power domain, clocks and regulators) is bound before the STP/WMT
++ *      stack starts using it,
++ *   2. initialise the STP engine,
++ *   3. initialise the WMT library (configuration, platform, CONSYS shared
++ *      memory),
++ *   4. expose /dev/stpwmt and /dev/wmtWifi.
++ */
++
++#include <linux/module.h>
++
++#include "wmt_local.h"
++
++static int __init wmt_module_init(void)
++{
++	int ret;
++
++	ret = wmt_plat_consys_driver_register();
++	if (ret) {
++		wmt_err("failed to register the CONSYS driver (%d)\n", ret);
++		return ret;
++	}
++
++	ret = stp_drv_init();
++	if (ret)
++		goto err_consys;
++
++	ret = wmt_lib_init();
++	if (ret)
++		goto err_stp;
++
++	ret = wmt_dev_stpwmt_register();
++	if (ret)
++		goto err_lib;
++
++	ret = mtk_wcn_wmt_wifi_init();
++	if (ret)
++		goto err_stpwmt;
++
++	return 0;
++
++err_stpwmt:
++	wmt_dev_stpwmt_unregister();
++err_lib:
++	wmt_lib_deinit();
++err_stp:
++	stp_drv_exit();
++err_consys:
++	wmt_plat_consys_driver_unregister();
++	return ret;
++}
++
++static void __exit wmt_module_exit(void)
++{
++	mtk_wcn_wmt_wifi_exit();
++	wmt_dev_stpwmt_unregister();
++	wmt_lib_deinit();
++	stp_drv_exit();
++	wmt_plat_consys_driver_unregister();
++}
++
++module_init(wmt_module_init);
++module_exit(wmt_module_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("MediaTek Inc WCN");
++MODULE_DESCRIPTION("MediaTek WCN WMT/CONSYS core driver (STP, WMT, MT6735 CONSYS)");

@@ -1,0 +1,605 @@
+diff --git a/drivers/phy/mediatek/phy-mtk-tphy.c b/drivers/phy/mediatek/phy-mtk-tphy.c
+index 37b4720d7..3e44310bd 100644
+--- a/drivers/phy/mediatek/phy-mtk-tphy.c
++++ b/drivers/phy/mediatek/phy-mtk-tphy.c
+@@ -77,6 +77,14 @@
+ #define P2C_RG_USB20_GPIO_CTL		BIT(9)
+ #define P2C_USB20_GPIO_MODE		BIT(8)
+ #define P2C_U2_GPIO_CTR_MSK	(P2C_RG_USB20_GPIO_CTL | P2C_USB20_GPIO_MODE)
++/* DP/DM 100k pull configuration, used for charger detection */
++#define P2C_RG_USB20_DP_100K_MODE	BIT(18)
++#define P2C_RG_USB20_DM_100K_EN		BIT(17)
++#define P2C_USB20_DP_100K_EN		BIT(16)
++
++#define U3P_USBPHYACR7		0x01c
++/* Cleared so that the PMIC can run charger type detection */
++#define PA7_RG_PUPD_BIST_EN		BIT(12)
+ 
+ #define U3P_U2PHYA_RESV		0x030
+ #define P2R_RG_U2PLL_FBDIV_26M		0x1bb13b
+@@ -115,8 +123,48 @@
+ #define P2C_FORCE_IDDIG		BIT(9)
+ #define P2C_RG_VBUSVALID		BIT(5)
+ #define P2C_RG_SESSEND			BIT(4)
++#define P2C_RG_BVALID			BIT(3)
+ #define P2C_RG_AVALID			BIT(2)
+ #define P2C_RG_IDDIG			BIT(1)
++#define P2C_RG_IDPULLUP			BIT(0)
++
++/*
++ * MT6735 U2PHYDTM1 bus state ("no VBUS sensing IP").  Byte 0 of the
++ * register holds the six bus-state values presented to the controller and
++ * byte 1 the matching force enables.  The vendor driver names all six
++ * byte-0 bits in its comments (usb20_host.c:387-390, 489-490) and writes
++ * them as raw byte masks; P2C_RG_IDPULLUP and P2C_RG_BVALID have no
++ * upstream documentation but are part of every value written, so name
++ * them above and derive the values below from the bit names.
++ */
++#define MTK_U2PHYDTM1_BUS_STATE		GENMASK(5, 0)
++#define MTK_U2PHYDTM1_BUS_SIGNALS	(P2C_RG_AVALID | P2C_RG_BVALID | \
++					 P2C_RG_SESSEND | P2C_RG_VBUSVALID)
++#define MTK_U2PHYDTM1_FORCE_BUS		GENMASK(13, 10)
++#define MTK_U2PHYDTM1_FORCE_ALL		GENMASK(13, 8)
++
++/* Bus-state byte values written by the vendor driver */
++#define MTK_U2PHYDTM1_VAL_IDLE		(P2C_RG_IDPULLUP | P2C_RG_SESSEND)
++#define MTK_U2PHYDTM1_VAL_HOST		(P2C_RG_IDPULLUP | P2C_RG_AVALID | \
++					 P2C_RG_BVALID | P2C_RG_VBUSVALID)
++#define MTK_U2PHYDTM1_VAL_DEVICE	(MTK_U2PHYDTM1_VAL_HOST | P2C_RG_IDDIG)
++
++/*
++ * Private PHY_MODE_USB_HOST submodes understood by the MT6735 T-PHY.
++ * drivers/usb/musb/mediatek.c interleaves the controller session-bit
++ * dance with these to reproduce the vendor sequences exactly; the glue
++ * keeps its own copy of the values on purpose, this is not an ABI.
++ */
++#define MTK_PHY_SUBMODE_SESSION_RESTART	1
++#define MTK_PHY_SUBMODE_FORCE_IDLE	2
++#define MTK_PHY_SUBMODE_FORCE_HOST	3
++
++/* MT6735 HS transmit eye tuning (usb20_phy.c:646-652, 661-667) */
++#define MTK_U2_HS_VRT_HOST		2
++#define MTK_U2_HS_VRT_DEVICE		7
++#define MTK_U2_HS_TERM_HOST		2
++#define MTK_U2_HS_TERM_DEVICE		7
++#define MTK_U2_HS_SQTH			1
+ 
+ #define U3P_U2PHYBC12C		0x080
+ #define P2C_RG_CHGDT_EN		BIT(0)
+@@ -286,12 +334,14 @@ enum mtk_phy_version {
+  *                            that is pointed at in the device tree node for this PHY
+  * @slew_ref_clk_mhz:         Default reference clock (in MHz) for slew rate calibration
+  * @slew_rate_coefficient:    Coefficient for slew rate calibration
++ * @mt6735_u2_quirk:          Apply the MT6735 USB2 PHY bus-force and HS eye tuning
+  * @version:                  PHY IP Version
+  */
+ struct mtk_phy_pdata {
+ 	bool avoid_rx_sen_degradation;
+ 	bool sw_pll_48m_to_26m;
+ 	bool sw_efuse_supported;
++	bool mt6735_u2_quirk;
+ 	u8 slew_ref_clock_mhz;
+ 	u8 slew_rate_coefficient;
+ 	enum mtk_phy_version version;
+@@ -889,6 +939,95 @@ static void u2_phy_instance_power_on(struct mtk_tphy *tphy,
+ 	mtk_phy_set_bits(com + U3P_U2PHYDTM1, P2C_FORCE_ENTER_DEVICE_MODE);
+ }
+ 
++/*
++ * MT6735 parity helpers.  The MT6735 USB2 PHY has no VBUS/ID sensing path
++ * the MUSB controller can rely on ("no VBUS sensing IP"), so the vendor
++ * glue forces the U2PHYDTM1 bus state and re-samples it after a VBUS
++ * error.  Values and sequences are ported from the vendor driver and
++ * verified against the ROM build (musb_session_restart @ 0xc03b58bc):
++ *   usb20_phy.c:402-404    (device force, also 628-630)
++ *   usb20_host.c:284-298   (session restart)
++ *   usb20_host.c:480-493   (host entry idle + host force)
++ *   usb20_host.c:511-513   (device entry idle)
++ */
++static void mtk_u2_phy_force_bus(struct mtk_phy_instance *instance, u32 val)
++{
++	struct u2phy_banks *u2_banks = &instance->u2_banks;
++	void __iomem *com = u2_banks->com;
++
++	mtk_phy_update_bits(com + U3P_U2PHYDTM1, MTK_U2PHYDTM1_BUS_STATE, val);
++	mtk_phy_set_bits(com + U3P_U2PHYDTM1, MTK_U2PHYDTM1_FORCE_ALL);
++}
++
++/*
++ * musb_session_restart() (usb20_host.c:284-298): hold the four bus signals
++ * at session end for 5 ms so the controller's OTG state machine leaves its
++ * VBUS wait state, then release the forces so the PHY re-samples VBUS.
++ * The ROM build does exactly:
++ *   SET8(0x6d, 0x3c); SET8(0x6c, 0x10); CLR8(0x6c, 0x2c);
++ *   mdelay(5);
++ *   CLR8(0x6d, 0x3c); CLR8(0x6c, 0x3c)
++ * The surrounding MUSB_DEVCTL session-bit dance lives in the glue, which
++ * cannot reach the register from here (usb20_host.c:287-288, 297-298).
++ */
++static void mtk_u2_phy_session_restart(struct mtk_phy_instance *instance)
++{
++	struct u2phy_banks *u2_banks = &instance->u2_banks;
++	void __iomem *com = u2_banks->com;
++
++	mtk_phy_set_bits(com + U3P_U2PHYDTM1, MTK_U2PHYDTM1_FORCE_BUS);
++	mtk_phy_update_bits(com + U3P_U2PHYDTM1, MTK_U2PHYDTM1_BUS_SIGNALS,
++			    P2C_RG_SESSEND);
++	mdelay(5);
++	mtk_phy_clear_bits(com + U3P_U2PHYDTM1, MTK_U2PHYDTM1_FORCE_BUS);
++	mtk_phy_clear_bits(com + U3P_U2PHYDTM1, MTK_U2PHYDTM1_BUS_SIGNALS);
++}
++
++/*
++ * MT6735 HS eye tuning: VRT_SEL/TERM_SEL/SQ_TH are 2/2/1 in host mode
++ * (usb_phy_set_host_mode(), usb20_phy.c:658-668) and 7/7/1 in device mode
++ * (usb_phy_recover(), usb20_phy.c:646-652; ROM usb_phy_set_host_mode @
++ * 0xc03b5260).  The device values can be overridden from the device tree.
++ */
++static void mtk_u2_phy_eye_tuning(struct mtk_phy_instance *instance, bool host)
++{
++	struct u2phy_banks *u2_banks = &instance->u2_banks;
++	void __iomem *com = u2_banks->com;
++	u32 vrt, term;
++
++	if (host) {
++		vrt = MTK_U2_HS_VRT_HOST;
++		term = MTK_U2_HS_TERM_HOST;
++	} else {
++		vrt = instance->eye_vrt ? instance->eye_vrt : MTK_U2_HS_VRT_DEVICE;
++		term = instance->eye_term ? instance->eye_term : MTK_U2_HS_TERM_DEVICE;
++	}
++
++	mtk_phy_update_field(com + U3P_USBPHYACR1, PA1_RG_VRT_SEL, vrt);
++	mtk_phy_update_field(com + U3P_USBPHYACR1, PA1_RG_TERM_SEL, term);
++	mtk_phy_update_field(com + U3P_USBPHYACR6, PA6_RG_U2_SQTH, MTK_U2_HS_SQTH);
++}
++
++/*
++ * Charger-detection wiring from the vendor power sequences: DP 100k mode
++ * on with the DP/DM 100k pulls off (usb_phy_poweron(), usb20_phy.c:387-390)
++ * and PUPD_BIST_EN cleared so the PMIC can run charger type detection on
++ * DP/DM (usb_phy_recover(), usb20_phy.c:592).
++ */
++static void mtk_u2_phy_charger_setup(struct mtk_phy_instance *instance)
++{
++	struct u2phy_banks *u2_banks = &instance->u2_banks;
++	void __iomem *com = u2_banks->com;
++
++	/* DP 100k mode on, DP/DM 100k pulls off for charger detection */
++	mtk_phy_clear_bits(com + U3P_U2PHYACR4,
++			   P2C_USB20_DP_100K_EN | P2C_RG_USB20_DM_100K_EN);
++	mtk_phy_set_bits(com + U3P_U2PHYACR4, P2C_RG_USB20_DP_100K_MODE);
++
++	/* Let the PMIC run charger type detection on DP/DM */
++	mtk_phy_clear_bits(com + U3P_USBPHYACR7, PA7_RG_PUPD_BIST_EN);
++}
++
+ static void u2_phy_instance_power_off(struct mtk_tphy *tphy,
+ 	struct mtk_phy_instance *instance)
+ {
+@@ -928,11 +1067,28 @@ static void u2_phy_instance_exit(struct mtk_tphy *tphy,
+ 
+ static void u2_phy_instance_set_mode(struct mtk_tphy *tphy,
+ 				     struct mtk_phy_instance *instance,
+-				     enum phy_mode mode)
++				     enum phy_mode mode, int submode)
+ {
+ 	struct u2phy_banks *u2_banks = &instance->u2_banks;
+ 	u32 tmp;
+ 
++	if (tphy->pdata->mt6735_u2_quirk) {
++		switch (submode) {
++		case MTK_PHY_SUBMODE_SESSION_RESTART:
++			mtk_u2_phy_session_restart(instance);
++			return;
++		case MTK_PHY_SUBMODE_FORCE_IDLE:
++			mtk_u2_phy_force_bus(instance, MTK_U2PHYDTM1_VAL_IDLE);
++			return;
++		case MTK_PHY_SUBMODE_FORCE_HOST:
++			mtk_u2_phy_force_bus(instance, MTK_U2PHYDTM1_VAL_HOST);
++			mtk_u2_phy_eye_tuning(instance, true);
++			return;
++		default:
++			break;
++		}
++	}
++
+ 	tmp = readl(u2_banks->com + U3P_U2PHYDTM1);
+ 	switch (mode) {
+ 	case PHY_MODE_USB_DEVICE:
+@@ -949,6 +1105,31 @@ static void u2_phy_instance_set_mode(struct mtk_tphy *tphy,
+ 		return;
+ 	}
+ 	writel(tmp, u2_banks->com + U3P_U2PHYDTM1);
++
++	if (!tphy->pdata->mt6735_u2_quirk)
++		return;
++
++	switch (mode) {
++	case PHY_MODE_USB_HOST:
++		/* Vendor host entry: idle, settle, then host (usb20_host.c:480-493) */
++		mtk_u2_phy_force_bus(instance, MTK_U2PHYDTM1_VAL_IDLE);
++		mdelay(5);
++		mtk_u2_phy_force_bus(instance, MTK_U2PHYDTM1_VAL_HOST);
++		mtk_u2_phy_eye_tuning(instance, true);
++		break;
++	case PHY_MODE_USB_DEVICE:
++	case PHY_MODE_USB_OTG:
++		/*
++		 * The board ID pin is used as a GPIO interrupt, so the PHY
++		 * cannot sample it.  Park the PHY as a B-device; the glue
++		 * drives PHY_MODE_USB_HOST once the ID pin is grounded.
++		 */
++		mtk_u2_phy_force_bus(instance, MTK_U2PHYDTM1_VAL_DEVICE);
++		mtk_u2_phy_eye_tuning(instance, false);
++		break;
++	default:
++		break;
++	}
+ }
+ 
+ static void pcie_phy_instance_init(struct mtk_tphy *tphy,
+@@ -1409,7 +1590,13 @@ static int mtk_phy_power_on(struct phy *phy)
+ 
+ 	if (instance->type == PHY_TYPE_USB2) {
+ 		u2_phy_instance_power_on(tphy, instance);
++		if (tphy->pdata->mt6735_u2_quirk) {
++			mtk_u2_phy_charger_setup(instance);
++			mtk_u2_phy_force_bus(instance, MTK_U2PHYDTM1_VAL_DEVICE);
++		}
+ 		hs_slew_rate_calibrate(tphy, instance);
++		if (tphy->pdata->mt6735_u2_quirk)
++			mtk_u2_phy_eye_tuning(instance, false);
+ 	} else if (instance->type == PHY_TYPE_PCIE) {
+ 		pcie_phy_instance_power_on(tphy, instance);
+ 	}
+@@ -1448,7 +1635,7 @@ static int mtk_phy_set_mode(struct phy *phy, enum phy_mode mode, int submode)
+ 	struct mtk_tphy *tphy = dev_get_drvdata(phy->dev.parent);
+ 
+ 	if (instance->type == PHY_TYPE_USB2)
+-		u2_phy_instance_set_mode(tphy, instance, mode);
++		u2_phy_instance_set_mode(tphy, instance, mode, submode);
+ 
+ 	return 0;
+ }
+@@ -1528,6 +1715,19 @@ static const struct mtk_phy_pdata tphy_v1_pdata = {
+ 	.version = MTK_PHY_V1,
+ };
+ 
++/*
++ * MT6735/MT6737T USB2 PHY: 48MHz frequency-meter reference and 28x
++ * coefficient (FRA/PARA, usb20_phy.c:27-28, used by hs_slew_rate_cal()
++ * usb20_phy.c:240-281), plus the bus-force and HS eye tuning the vendor
++ * glue applies.
++ */
++static const struct mtk_phy_pdata mt6735_pdata = {
++	.slew_ref_clock_mhz = 48,
++	.slew_rate_coefficient = 28,
++	.mt6735_u2_quirk = true,
++	.version = MTK_PHY_V1,
++};
++
+ static const struct mtk_phy_pdata tphy_v2_pdata = {
+ 	.avoid_rx_sen_degradation = false,
+ 	.sw_efuse_supported = true,
+@@ -1555,6 +1755,7 @@ static const struct mtk_phy_pdata mt8195_pdata = {
+ };
+ 
+ static const struct of_device_id mtk_tphy_id_table[] = {
++	{ .compatible = "mediatek,mt6735-tphy", .data = &mt6735_pdata },
+ 	{ .compatible = "mediatek,mt2701-u3phy", .data = &tphy_v1_pdata },
+ 	{ .compatible = "mediatek,mt2712-u3phy", .data = &tphy_v2_pdata },
+ 	{ .compatible = "mediatek,mt8173-u3phy", .data = &mt8173_pdata },
+diff --git a/drivers/usb/musb/mediatek.c b/drivers/usb/musb/mediatek.c
+index c6cbe718b..7b7a18232 100644
+--- a/drivers/usb/musb/mediatek.c
++++ b/drivers/usb/musb/mediatek.c
+@@ -8,7 +8,9 @@
+  */
+ 
+ #include <linux/clk.h>
++#include <linux/delay.h>
+ #include <linux/dma-mapping.h>
++#include <linux/gpio/consumer.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+@@ -22,6 +24,18 @@
+ #define USB_L1INTM		0x00a4
+ #define MTK_MUSB_TXFUNCADDR	0x0480
+ 
++#define MTK_ID_DEBOUNCE_MS	400
++
++/*
++ * Private PHY_MODE_USB_HOST submodes understood by the MT6735 T-PHY
++ * (drivers/phy/mediatek/phy-mtk-tphy.c).  The vendor driver interleaves
++ * the MUSB_DEVCTL session-bit dance with these bus forces; keep the values
++ * in sync with the PHY driver's copies.
++ */
++#define MTK_PHY_SUBMODE_SESSION_RESTART	1	/* musb_session_restart() */
++#define MTK_PHY_SUBMODE_FORCE_IDLE	2	/* "USB MAC OFF" */
++#define MTK_PHY_SUBMODE_FORCE_HOST	3	/* "USB MAC ON and Host Mode" */
++
+ /* MediaTek controller toggle enable and status reg */
+ #define MUSB_RXTOG		0x80
+ #define MUSB_RXTOGEN		0x82
+@@ -50,6 +64,12 @@ struct mtk_glue {
+ 	struct clk_bulk_data clks[MTK_MUSB_CLKS_NUM];
+ 	enum usb_role role;
+ 	struct usb_role_switch *role_sw;
++	struct regulator *vbus;
++	bool vbus_on;
++	struct gpio_desc *id_gpio;
++	int id_irq;
++	struct delayed_work id_work;
++	struct work_struct vbus_work;
+ };
+ 
+ static int mtk_musb_clks_get(struct mtk_glue *glue)
+@@ -63,46 +83,95 @@ static int mtk_musb_clks_get(struct mtk_glue *glue)
+ 	return devm_clk_bulk_get(dev, MTK_MUSB_CLKS_NUM, glue->clks);
+ }
+ 
++/*
++ * Host VBUS is supplied by the PMIC/charger boost on this board; model it
++ * as an optional regulator so MUSB's set_vbus() hook can drive it.
++ */
++static void mtk_musb_vbus_set(struct mtk_glue *glue, int on)
++{
++	int ret;
++
++	if (!glue->vbus)
++		return;
++
++	if (on && !glue->vbus_on) {
++		ret = regulator_enable(glue->vbus);
++		if (ret) {
++			dev_err(glue->dev, "failed to enable VBUS: %d\n", ret);
++			return;
++		}
++		glue->vbus_on = true;
++	} else if (!on && glue->vbus_on) {
++		regulator_disable(glue->vbus);
++		glue->vbus_on = false;
++	}
++}
++
++/*
++ * The MT6735 controller can wedge its VBUS state machine on a short VBUS
++ * drop; force the PHY through session-end and let it resample, as the
++ * vendor glue does (usb20_host.c:284-302).  Runs from a workqueue because
++ * phy_set_mode_ext() takes the PHY mutex.
++ */
++static void mtk_musb_vbus_work(struct work_struct *work)
++{
++	struct mtk_glue *glue = container_of(work, struct mtk_glue, vbus_work);
++	struct musb *musb = glue->musb;
++	u8 devctl;
++
++	if (!musb || glue->role != USB_ROLE_HOST)
++		return;
++
++	devctl = musb_readb(musb->mregs, MUSB_DEVCTL);
++	musb_writeb(musb->mregs, MUSB_DEVCTL,
++		    devctl & ~MUSB_DEVCTL_SESSION);
++
++	phy_set_mode_ext(glue->phy, PHY_MODE_USB_HOST,
++			 MTK_PHY_SUBMODE_SESSION_RESTART);
++
++	devctl = musb_readb(musb->mregs, MUSB_DEVCTL);
++	musb_writeb(musb->mregs, MUSB_DEVCTL, devctl | MUSB_DEVCTL_SESSION);
++}
++
+ static int mtk_otg_switch_set(struct mtk_glue *glue, enum usb_role role)
+ {
+ 	struct musb *musb = glue->musb;
+-	u8 devctl = readb(musb->mregs + MUSB_DEVCTL);
+ 	enum usb_role new_role;
++	int ret;
+ 
+ 	if (role == glue->role)
+ 		return 0;
+ 
+ 	switch (role) {
+ 	case USB_ROLE_HOST:
+-		musb->xceiv->otg->state = OTG_STATE_A_WAIT_VRISE;
+ 		glue->phy_mode = PHY_MODE_USB_HOST;
+ 		new_role = USB_ROLE_HOST;
+-		if (glue->role == USB_ROLE_NONE)
+-			phy_power_on(glue->phy);
+ 
+-		devctl |= MUSB_DEVCTL_SESSION;
+-		musb_writeb(musb->mregs, MUSB_DEVCTL, devctl);
+-		MUSB_HST_MODE(musb);
++		/* Force IDDIG low / VBUSVALID before starting the session */
++		phy_set_mode(glue->phy, glue->phy_mode);
++		ret = musb_set_host(musb);
++		if (ret)
++			dev_warn(glue->dev, "failed to enter host mode: %d\n", ret);
++		mtk_musb_vbus_set(glue, 1);
+ 		break;
+ 	case USB_ROLE_DEVICE:
+-		musb->xceiv->otg->state = OTG_STATE_B_IDLE;
+ 		glue->phy_mode = PHY_MODE_USB_DEVICE;
+ 		new_role = USB_ROLE_DEVICE;
+-		devctl &= ~MUSB_DEVCTL_SESSION;
+-		musb_writeb(musb->mregs, MUSB_DEVCTL, devctl);
+-		if (glue->role == USB_ROLE_NONE)
+-			phy_power_on(glue->phy);
+ 
+-		MUSB_DEV_MODE(musb);
++		mtk_musb_vbus_set(glue, 0);
++		phy_set_mode(glue->phy, glue->phy_mode);
++		ret = musb_set_peripheral(musb);
++		if (ret)
++			dev_warn(glue->dev,
++				 "failed to enter peripheral mode: %d\n", ret);
+ 		break;
+ 	case USB_ROLE_NONE:
+ 		glue->phy_mode = PHY_MODE_USB_OTG;
+ 		new_role = USB_ROLE_NONE;
+-		devctl &= ~MUSB_DEVCTL_SESSION;
+-		musb_writeb(musb->mregs, MUSB_DEVCTL, devctl);
+-		if (glue->role != USB_ROLE_NONE)
+-			phy_power_off(glue->phy);
+ 
++		mtk_musb_vbus_set(glue, 0);
++		phy_set_mode(glue->phy, glue->phy_mode);
++		musb_set_peripheral(musb);
+ 		break;
+ 	default:
+ 		dev_err(glue->dev, "Invalid State\n");
+@@ -110,7 +179,6 @@ static int mtk_otg_switch_set(struct mtk_glue *glue, enum usb_role role)
+ 	}
+ 
+ 	glue->role = new_role;
+-	phy_set_mode(glue->phy, glue->phy_mode);
+ 
+ 	return 0;
+ }
+@@ -127,6 +195,43 @@ static enum usb_role musb_usb_role_sx_get(struct usb_role_switch *sw)
+ 	return glue->role;
+ }
+ 
++/*
++ * Micro-B OTG ID pin.  The vendor driver reads the IDDIG pad as a GPIO
++ * with an EINT (ID_PIN_USE_EX_EINT, usb20_host.c:439-566) and debounces
++ * the resulting role change by 400ms, because the controller itself does
++ * not report ID changes reliably.
++ */
++static void mtk_id_work(struct work_struct *work)
++{
++	struct mtk_glue *glue = container_of(work, struct mtk_glue, id_work.work);
++	bool host;
++
++	if (!glue->musb || !glue->role_sw)
++		return;
++
++	host = gpiod_get_value_cansleep(glue->id_gpio);
++	usb_role_switch_set_role(glue->role_sw,
++				 host ? USB_ROLE_HOST : USB_ROLE_DEVICE);
++}
++
++static irqreturn_t mtk_id_irq(int irq, void *data)
++{
++	struct mtk_glue *glue = data;
++
++	mod_delayed_work(system_wq, &glue->id_work,
++			 msecs_to_jiffies(MTK_ID_DEBOUNCE_MS));
++
++	return IRQ_HANDLED;
++}
++
++static void mtk_musb_set_vbus(struct musb *musb, int is_on)
++{
++	struct device *dev = musb->controller;
++	struct mtk_glue *glue = dev_get_drvdata(dev->parent);
++
++	mtk_musb_vbus_set(glue, is_on);
++}
++
+ static int mtk_otg_switch_init(struct mtk_glue *glue)
+ {
+ 	struct usb_role_switch_desc role_sx_desc = { 0 };
+@@ -183,6 +288,13 @@ static irqreturn_t mtk_musb_interrupt(int irq, void *dev_id)
+ 	if (l1_ints & (TX_INT_STATUS | RX_INT_STATUS | USBCOM_INT_STATUS))
+ 		retval = generic_interrupt(irq, musb);
+ 
++	if ((musb->int_usb & MUSB_INTR_VBUSERROR) && is_host_active(musb)) {
++		struct mtk_glue *glue =
++			dev_get_drvdata(musb->controller->parent);
++
++		schedule_work(&glue->vbus_work);
++	}
++
+ #if defined(CONFIG_USB_INVENTRA_DMA)
+ 	if (l1_ints & DMA_INT_STATUS)
+ 		retval = dma_controller_irq(irq, musb->dma_controller);
+@@ -290,8 +402,39 @@ static int mtk_musb_init(struct musb *musb)
+ #endif
+ 	musb_writel(musb->mregs, USB_L1INTM, TX_INT_STATUS | RX_INT_STATUS |
+ 		    USBCOM_INT_STATUS | DMA_INT_STATUS);
++
++	INIT_WORK(&glue->vbus_work, mtk_musb_vbus_work);
++	INIT_DELAYED_WORK(&glue->id_work, mtk_id_work);
++
++	if (glue->id_gpio) {
++		glue->id_irq = gpiod_to_irq(glue->id_gpio);
++		if (glue->id_irq < 0) {
++			ret = glue->id_irq;
++			dev_err(glue->dev, "failed to get ID pin IRQ: %d\n", ret);
++			goto err_id_irq;
++		}
++
++		ret = devm_request_threaded_irq(glue->dev, glue->id_irq, NULL,
++						mtk_id_irq,
++						IRQF_TRIGGER_RISING |
++						IRQF_TRIGGER_FALLING |
++						IRQF_ONESHOT,
++						"usb-id", glue);
++		if (ret) {
++			dev_err(glue->dev, "failed to request ID pin IRQ: %d\n",
++				ret);
++			goto err_id_irq;
++		}
++
++		schedule_delayed_work(&glue->id_work,
++				      msecs_to_jiffies(MTK_ID_DEBOUNCE_MS));
++	}
++
+ 	return 0;
+ 
++err_id_irq:
++	cancel_work_sync(&glue->vbus_work);
++	phy_power_off(glue->phy);
+ err_phy_power_on:
+ 	phy_exit(glue->phy);
+ err_phy_init:
+@@ -336,6 +479,12 @@ static int mtk_musb_exit(struct musb *musb)
+ 	struct device *dev = musb->controller;
+ 	struct mtk_glue *glue = dev_get_drvdata(dev->parent);
+ 
++	glue->musb = NULL;
++	cancel_work_sync(&glue->vbus_work);
++	if (glue->id_irq > 0)
++		devm_free_irq(glue->dev, glue->id_irq, glue);
++	cancel_delayed_work_sync(&glue->id_work);
++	mtk_musb_vbus_set(glue, 0);
+ 	mtk_otg_switch_exit(glue);
+ 	phy_power_off(glue->phy);
+ 	phy_exit(glue->phy);
+@@ -360,6 +509,7 @@ static const struct musb_platform_ops mtk_musb_ops = {
+ 	.clearw = mtk_musb_clearw,
+ 	.busctl_offset = mtk_musb_busctl_offset,
+ 	.set_mode = mtk_musb_set_mode,
++	.set_vbus = mtk_musb_set_vbus,
+ };
+ 
+ #define MTK_MUSB_MAX_EP_NUM	8
+@@ -451,6 +601,26 @@ static int mtk_musb_probe(struct platform_device *pdev)
+ 				"Error 'dr_mode' property\n");
+ 	}
+ 
++	glue->vbus = devm_regulator_get_optional(dev, "vbus");
++	if (IS_ERR(glue->vbus)) {
++		ret = PTR_ERR(glue->vbus);
++		if (ret != -ENODEV)
++			return dev_err_probe(dev, ret,
++					"failed to get VBUS regulator\n");
++		glue->vbus = NULL;
++	}
++
++	/*
++	 * ID pin detection is only meaningful for dual-role operation; the
++	 * T-PHY is parked as a B-device until the pin is grounded.
++	 */
++	if (pdata->mode == USB_DR_MODE_OTG) {
++		glue->id_gpio = devm_gpiod_get_optional(dev, "id", GPIOD_IN);
++		if (IS_ERR(glue->id_gpio))
++			return dev_err_probe(dev, PTR_ERR(glue->id_gpio),
++					"failed to get ID gpio\n");
++	}
++
+ 	glue->phy = devm_of_phy_get_by_index(dev, np, 0);
+ 	if (IS_ERR(glue->phy))
+ 		return dev_err_probe(dev, PTR_ERR(glue->phy),

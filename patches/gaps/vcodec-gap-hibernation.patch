@@ -1,0 +1,135 @@
+diff --git a/drivers/misc/mediatek/vcodec/vcodec-vdec.c b/drivers/misc/mediatek/vcodec/vcodec-vdec.c
+index bf48b93c5..3c37b19c1 100644
+--- a/drivers/misc/mediatek/vcodec/vcodec-vdec.c
++++ b/drivers/misc/mediatek/vcodec/vcodec-vdec.c
+@@ -16,9 +16,11 @@
+ #include <linux/device.h>
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
++#include <linux/irq.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/pm.h>
+ #include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/reset.h>
+@@ -147,6 +149,43 @@ static const struct vcodec_engine_ops vcodec_vdec_ops = {
+ 	.disable_irq = vcodec_vdec_disable_irq,
+ };
+ 
++/*
++ * Hibernation restore: the boot loader or the kernel that loaded the image
++ * may have reset the MT6735 interrupt polarity registers, so re-apply the
++ * level-low trigger of the decoder line.  The irq core runs all
++ * ->restore_noirq callbacks before resume_device_irqs(), so the line is
++ * still masked here and cannot fire while it is being reconfigured.
++ *
++ * Port from Samsung/MTK downstream
++ * drivers/misc/mediatek/videocodec/mt6735/videocodec_kernel_driver_D1.c:2375-2390
++ * (vcodec_pm_restore_noirq), which issues
++ * mt_irq_set_sens(VDEC_IRQ_ID, MT_LEVEL_SENSITIVE) and
++ * mt_irq_set_polarity(VDEC_IRQ_ID, MT_POLARITY_LOW).
++ * IRQ_TYPE_LEVEL_LOW is the irq-core spelling of that pair: on the
++ * mediatek,mt6735-sysirq parent that the codec interrupt is routed through
++ * it sets the INTPOL bit and hands IRQ_TYPE_LEVEL_HIGH to the GIC, as the
++ * downstream MTK interrupt controller code does
++ * (drivers/irqchip/irq-mtk-sysirq.c: mtk_sysirq_set_type()).
++ *
++ * The ROM logs nothing and always returns 0; a failure is reported here for
++ * debuggability but, like the ROM, not propagated to abort the restore.
++ */
++static int __maybe_unused vcodec_vdec_restore_noirq(struct device *dev)
++{
++	struct vcodec_vdec *vdec = dev_get_drvdata(dev);
++	int ret;
++
++	ret = irq_set_irq_type(vdec->irq, IRQ_TYPE_LEVEL_LOW);
++	if (ret)
++		dev_err(dev, "failed to restore VDEC IRQ polarity: %d\n", ret);
++
++	return 0;
++}
++
++static const struct dev_pm_ops vcodec_vdec_pm_ops = {
++	.restore_noirq = pm_sleep_ptr(vcodec_vdec_restore_noirq),
++};
++
+ /*
+  * Downstream videocodec_kernel_driver_D1.c:541-594 (dec_isr): a valid
+  * decoder interrupt requires the VDEC GCON "active" bit to be clear and the
+@@ -325,6 +364,7 @@ static struct platform_driver vcodec_vdec_driver = {
+ 	.driver = {
+ 		.name = "mtk-vcodec-vdec",
+ 		.of_match_table = vcodec_vdec_of_match,
++		.pm = &vcodec_vdec_pm_ops,
+ 		.suppress_bind_attrs = true,
+ 	},
+ };
+diff --git a/drivers/misc/mediatek/vcodec/vcodec-venc.c b/drivers/misc/mediatek/vcodec/vcodec-venc.c
+index 75cfd9291..eed217dc9 100644
+--- a/drivers/misc/mediatek/vcodec/vcodec-venc.c
++++ b/drivers/misc/mediatek/vcodec/vcodec-venc.c
+@@ -16,9 +16,11 @@
+ #include <linux/clk.h>
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
++#include <linux/irq.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/pm.h>
+ #include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
+ 
+@@ -188,6 +190,42 @@ static const struct vcodec_engine_ops vcodec_venc_ops = {
+ 	.disable_irq = vcodec_venc_disable_irq,
+ };
+ 
++/*
++ * Hibernation restore: re-apply the level-low trigger of the encoder line.
++ * The boot loader or the kernel that loaded the image may have reset the
++ * MT6735 interrupt polarity registers.  resume_device_irqs() runs after all
++ * ->restore_noirq callbacks, so the line is still masked here.
++ *
++ * Port from Samsung/MTK downstream
++ * drivers/misc/mediatek/videocodec/mt6735/videocodec_kernel_driver_D1.c:2375-2390
++ * (vcodec_pm_restore_noirq), which issues
++ * mt_irq_set_sens(VENC_IRQ_ID, MT_LEVEL_SENSITIVE) and
++ * mt_irq_set_polarity(VENC_IRQ_ID, MT_POLARITY_LOW).
++ * IRQ_TYPE_LEVEL_LOW is the irq-core spelling of that pair: on the
++ * mediatek,mt6735-sysirq parent that the codec interrupt is routed through
++ * it sets the INTPOL bit and hands IRQ_TYPE_LEVEL_HIGH to the GIC, as the
++ * downstream MTK interrupt controller code does
++ * (drivers/irqchip/irq-mtk-sysirq.c: mtk_sysirq_set_type()).
++ *
++ * The ROM logs nothing and always returns 0; a failure is reported here for
++ * debuggability but, like the ROM, not propagated to abort the restore.
++ */
++static int __maybe_unused vcodec_venc_restore_noirq(struct device *dev)
++{
++	struct vcodec_venc *venc = dev_get_drvdata(dev);
++	int ret;
++
++	ret = irq_set_irq_type(venc->irq, IRQ_TYPE_LEVEL_LOW);
++	if (ret)
++		dev_err(dev, "failed to restore VENC IRQ polarity: %d\n", ret);
++
++	return 0;
++}
++
++static const struct dev_pm_ops vcodec_venc_pm_ops = {
++	.restore_noirq = pm_sleep_ptr(vcodec_venc_restore_noirq),
++};
++
+ static int vcodec_venc_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -286,6 +324,7 @@ static struct platform_driver vcodec_venc_driver = {
+ 	.driver = {
+ 		.name = "mtk-vcodec-venc",
+ 		.of_match_table = vcodec_venc_of_match,
++		.pm = &vcodec_venc_pm_ops,
+ 	},
+ };
+ 

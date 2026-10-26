@@ -1,0 +1,3254 @@
+diff --git a/drivers/misc/mediatek/connectivity/fm/Makefile b/drivers/misc/mediatek/connectivity/fm/Makefile
+index c14b9e503..80c9a20a5 100644
+--- a/drivers/misc/mediatek/connectivity/fm/Makefile
++++ b/drivers/misc/mediatek/connectivity/fm/Makefile
+@@ -3,3 +3,9 @@
+ # The object list is maintained by the FM driver.
+ #
+ ccflags-y += -I$(srctree)/drivers/misc/mediatek/connectivity/include
++
++obj-$(CONFIG_MTK_WCN_FM) += mtk_wcn_fm.o
++
++mtk_wcn_fm-y := mtk_wcn_fm_link.o \
++		mtk_wcn_fm_chip.o \
++		mtk_wcn_fm_v4l2.o
+diff --git a/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm.h b/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm.h
+new file mode 100644
+index 000000000..b32c16fda
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm.h
+@@ -0,0 +1,408 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * MediaTek WCN FM radio driver - internal interface.
++ *
++ * Port from Samsung/MTK downstream:
++ *   drivers/misc/mediatek/fmradio/core/fm_link.c
++ *   drivers/misc/mediatek/fmradio/core/fm_main.c
++ *   drivers/misc/mediatek/fmradio/inc/fm_link.h
++ *   drivers/misc/mediatek/fmradio/inc/fm_main.h
++ *   drivers/misc/mediatek/fmradio/inc/fm_config.h
++ *   drivers/misc/mediatek/fmradio/mt6627/pub/mt6627_fm_cmd.c
++ *   drivers/misc/mediatek/fmradio/mt6627/pub/mt6627_fm_lib.c
++ *   drivers/misc/mediatek/fmradio/mt6627/pub/mt6627_fm_rds.c
++ *   drivers/misc/mediatek/fmradio/mt6627/inc/mt6627_fm_reg.h
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ */
++
++#ifndef _MTK_WCN_FM_H_
++#define _MTK_WCN_FM_H_
++
++#include <linux/kfifo.h>
++#include <linux/mutex.h>
++#include <linux/rfkill.h>
++#include <linux/types.h>
++#include <linux/wait.h>
++#include <linux/workqueue.h>
++#include <linux/videodev2.h>
++
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-dev.h>
++#include <media/v4l2-device.h>
++
++#include "mtk_wcn_stp.h"
++#include "mtk_wcn_wmt.h"
++
++#define MTK_WCN_FM_DRIVER_NAME	"mtk_wcn_fm"
++#define MTK_WCN_FM_CARD_NAME	"MT6627 FM Receiver"
++
++/*
++ * FM <-> firmware protocol (downstream inc/fm_link.h:29-62)
++ */
++#define FM_PKT_TYPE_CMD		0x01	/* fm_link.h:30 */
++#define FM_PKT_TYPE_EVENT	0x04	/* fm_link.h:31 */
++
++#define FM_STP_TEST_OPCODE		0x00
++#define FSPI_ENABLE_OPCODE		0x01
++#define FSPI_MUX_SEL_OPCODE		0x02
++#define FSPI_READ_OPCODE		0x03
++#define FSPI_WRITE_OPCODE		0x04
++#define FI2C_READ_OPCODE		0x05
++#define FI2C_WRITE_OPCODE		0x06
++#define FM_ENABLE_OPCODE		0x07
++#define FM_RESET_OPCODE			0x08
++#define FM_TUNE_OPCODE			0x09
++#define FM_SEEK_OPCODE			0x0a
++#define FM_SCAN_OPCODE			0x0b
++#define RDS_RX_ENABLE_OPCODE		0x0c
++#define RDS_RX_DATA_OPCODE		0x0d
++#define FM_RAMPDOWN_OPCODE		0x0e
++#define FM_MCUCLK_SEL_OPCODE		0x0f
++#define FM_MODEMCLK_SEL_OPCODE		0x10
++#define RDS_TX_OPCODE			0x11
++#define FM_PATCH_DOWNLOAD_OPCODE	0x12
++#define FM_COEFF_DOWNLOAD_OPCODE	0x13
++#define FM_HWCOEFF_DOWNLOAD_OPCODE	0x14
++#define FM_ROM_DOWNLOAD_OPCODE		0x15
++#define FM_SOFT_MUTE_TUNE_OPCODE	0x17
++#define FM_HOST_READ_OPCODE		0x18
++#define FM_HOST_WRITE_OPCODE		0x19
++#define CSPI_WRITE_OPCODE		0x20
++#define CSPI_READ_OPCODE		0x21
++
++/*
++ * Firmware completion bits, one per event opcode (downstream fm_link.h:64-97).
++ *
++ * Opcodes 0x20/0x21/0x11 do not fit the (1 << opcode) scheme used for the
++ * other opcodes, so downstream assigns them explicit bits; the same values
++ * are kept here because the event parser must set the bit the waiting
++ * command expects.
++ */
++#define FM_EVT_BIT(op)		(1ULL << (op))
++#define FM_EVT_CSPI_READ	(1ULL << 22)	/* fm_link.h:87 */
++#define FM_EVT_SM_TUNE		(1ULL << 23)	/* fm_link.h:88 */
++#define FM_EVT_HOST_READ	(1ULL << 24)	/* fm_link.h:89 */
++#define FM_EVT_HOST_WRITE	(1ULL << 25)	/* fm_link.h:90 */
++#define FM_EVT_CSPI_WRITE	(1ULL << 26)	/* fm_link.h:91 */
++#define FM_EVT_CQI_DONE		(1ULL << 27)	/* fm_link.h:92 */
++#define FM_EVT_TUNE_DONE	(1ULL << 28)	/* fm_link.h:93 */
++#define FM_EVT_SEEK_DONE	(1ULL << 29)	/* fm_link.h:94 */
++#define FM_EVT_SCAN_DONE	(1ULL << 30)	/* fm_link.h:95 */
++
++/* fm_link.h:175-180 */
++#define FM_RX_BUF_SIZE		256
++#define FM_TX_BUF_SIZE		1024
++#define FM_SW_RETRY_CNT		1
++#define FM_SW_RETRY_CNT_MAX	5
++
++/* Per-command timeouts in seconds (downstream inc/fm_link.h:181-204). */
++#define FM_EN_TIMEOUT		3
++#define FM_FSPI_RD_TIMEOUT	3
++#define FM_FSPI_WR_TIMEOUT	3
++#define FM_TUNE_TIMEOUT		3
++#define FM_SM_TUNE_TIMEOUT	6
++#define FM_SEEK_TIMEOUT		15
++#define FM_RAMPDOWN_TIMEOUT	3
++#define FM_PATCH_TIMEOUT	3
++#define FM_COEFF_TIMEOUT	3
++
++/* Firmware primitive opcodes (downstream mt6627/inc/mt6627_fm_cmd.h:21-43) */
++#define FM_BOP_BASE			0x80
++#define FM_WRITE_BASIC_OP		(FM_BOP_BASE + 0x00)
++#define FM_UDELAY_BASIC_OP		(FM_BOP_BASE + 0x01)
++#define FM_RD_UNTIL_BASIC_OP		(FM_BOP_BASE + 0x02)
++#define FM_MODIFY_BASIC_OP		(FM_BOP_BASE + 0x03)
++#define FM_MSLEEP_BASIC_OP		(FM_BOP_BASE + 0x04)
++#define FM_TOP_WRITE_BASIC_OP		(FM_BOP_BASE + 0x05)
++#define FM_TOP_RD_UNTIL_BASIC_OP	(FM_BOP_BASE + 0x06)
++#define FM_TOP_MODIFY_BASIC_OP		(FM_BOP_BASE + 0x07)
++
++#define FM_WRITE_BASIC_OP_SIZE		3
++#define FM_UDELAY_BASIC_OP_SIZE		4
++#define FM_RD_UNTIL_BASIC_OP_SIZE	5
++#define FM_MODIFY_BASIC_OP_SIZE		5
++#define FM_MSLEEP_BASIC_OP_SIZE		4
++#define FM_TOP_WRITE_BOP_SIZE		7
++#define FM_TOP_RD_UNTIL_BOP_SIZE	11
++#define FM_TOP_MODIFY_BOP_SIZE		11
++
++/*
++ * MT6627 register map (downstream mt6627/inc/mt6627_fm_reg.h:17-49)
++ */
++#define FM_MAIN_CG1_CTRL	0x60
++#define FM_MAIN_CG2_CTRL	0x61
++#define FM_MAIN_HWVER		0x62
++#define FM_MAIN_CTRL		0x63
++#define FM_CHANNEL_SET		0x65
++#define FM_MAIN_CFG1		0x66
++#define FM_MAIN_CFG2		0x67
++#define FM_MAIN_INTR		0x69
++#define FM_MAIN_INTRMASK	0x6A
++#define FM_MAIN_EXTINTRMASK	0x6B
++#define FM_RSSI_IND		0x6C
++#define FM_RSSI_TH		0x6D
++#define FM_MAIN_RESET		0x6E
++#define FM_MAIN_CHANDETSTAT	0x6F
++#define FM_RDS_CFG0		0x80
++#define FM_RDS_INFO		0x81
++#define FM_RDS_DATA_REG		0x82
++#define FM_RDS_GOODBK_CNT	0x83
++#define FM_RDS_BADBK_CNT	0x84
++#define FM_ADDR_PAMD		0xB4
++#define FM_RDS_POINTER		0xF0
++
++/* FM_MAIN_CTRL bits (mt6627_fm_reg.h:72-81) */
++#define FM_MAIN_CTRL_TUNE	0x0001
++#define FM_MAIN_CTRL_SEEK	0x0002
++#define FM_MAIN_CTRL_SCAN	0x0004
++#define FM_MAIN_CTRL_CQI_READ	0x0008
++#define FM_MAIN_CTRL_RDS_MASK	0x0010
++#define FM_MAIN_CTRL_MUTE	0x0020
++#define FM_MAIN_CTRL_RDS_BRST	0x0040
++#define FM_MAIN_CTRL_RAMP_DOWN	0x0100
++
++/* FM_MAIN_INTR bits (mt6627_fm_reg.h:84-91) */
++#define FM_INTR_STC_DONE	0x0001
++#define FM_INTR_IQCAL_DONE	0x0002
++#define FM_INTR_DESENSE_HIT	0x0004
++#define FM_INTR_CHNL_CHG	0x0008
++#define FM_INTR_SW_INTR		0x0010
++#define FM_INTR_RDS		0x0020
++
++/* FM_MAIN_CG2_CTRL bits (mt6627_fm_reg.h:94-97) */
++#define FM_CG2_ANTENNA_TYPE	0x0010	/* 0: long antenna, 1: short antenna */
++#define FM_CG2_ANALOG_I2S	0x0080	/* 0: lineout, 1: I2S */
++#define FM_CG2_DE_EMPHASIS	0x1000	/* 0: 50us, 1: 75us */
++
++/*
++ * Registers used by the MT6627 sequences.  Downstream addresses them with
++ * numeric literals inside mt6627_fm_cmd.c / mt6627_fm_lib.c; the names below
++ * only exist to keep the ported sequences readable.
++ */
++#define FM_REG_0F_RF_MODE	0x0F	/* mt6627_fm_lib.c:983 */
++#define FM_REG_RF_PLL_DIV	0x21	/* mt6627_fm_cmd.c:437 */
++#define FM_REG_RF_CLK26M	0x23	/* mt6627_fm_cmd.c:447 */
++#define FM_REG_RF_26		0x26	/* cap array read, mt6627_fm_lib.c:1408 */
++#define FM_REG_RF_30		0x30	/* TDD/FDD cell mode, mt6627_fm_lib.c:988 */
++#define FM_REG_RF_01		0x01	/* fine tune, mt6627_fm_cmd.c:490 */
++#define FM_REG_RF_03		0x03
++#define FM_REG_RF_15		0x15
++#define FM_REG_RF_16		0x16
++#define FM_REG_RF_17		0x17
++#define FM_REG_RF_34		0x34
++#define FM_REG_RF_35		0x35
++#define FM_REG_SDM_COEFF0_H	0xD8	/* mt6627_fm_cmd.c:439 */
++#define FM_REG_SDM_COEFF0_L	0xD9
++#define FM_REG_SDM_COEFF1_H	0xDA
++#define FM_REG_SDM_COEFF1_L	0xDB
++#define FM_REG_DSP_CLK		0x70	/* mt6627_fm_cmd.c:211 */
++#define FM_REG_AUDIO_MONO	0x75	/* mt6627_fm_lib.c:1388 */
++#define FM_REG_VOLUME		0x7D	/* mt6627_fm_lib.c:1306 */
++#define FM_REG_AUDIO_CTRL0	0x9B	/* I2S TX mode, mt6627_fm_lib.c:1023 */
++#define FM_REG_AUDIO_CTRL1	0x9C	/* mute, mt6627_fm_lib.c:344 */
++#define FM_REG_DSP_PATCH_CTRL	0x90	/* mt6627_fm_lib.c:423 */
++#define FM_REG_DSP_PATCH_DATA	0x92	/* mt6627_fm_lib.c:422 */
++#define FM_REG_DSP_MEM_CTRL	0xE1	/* mt6627_fm_lib.c:549 */
++#define FM_REG_DSP_MEM_ADDR	0xE2
++#define FM_REG_DSP_MEM_DATA	0xE3
++
++/* Top (CSPI) registers (mt6627_fm_cmd.c) */
++#define FM_TOP_REG_DIG_TOP	0x0A10	/* mt6627_fm_cmd.c:189 */
++#define FM_TOP_REG_CLK_CTRL	0x0050	/* mt6627_fm_cmd.c:202 */
++#define FM_TOP_REG_MTCMOS	0x0060	/* mt6627_fm_cmd.c:191 */
++#define FM_TOP_REG_CSPI_DUMMY	0x0068	/* mt6627_fm_cmd.c:199 */
++#define FM_TOP_REG_AUD_DRV	0x0000	/* mt6627_fm_cmd.c:209 */
++
++/* Host (WCN top) registers (mt6627_fm_lib.c) */
++#define FM_HOST_REG_CSPI_CFG	0x8013000C	/* mt6627_fm_lib.c:693 */
++#define FM_HOST_REG_AUDIO_CTRL	0x80101054	/* mt6627_fm_lib.c:851 */
++
++/* Chip identification (mt6627_fm_lib.c:739-750) */
++#define FM_MT6627_CHIP_ID	0x6627
++#define FM_MT6625_CHIP_ID	0x6625
++
++/* DSP image download (mt6627_fm_lib.c:67, 664-667) */
++#define FM_MT6627_PATCH_SEG_LEN		512
++#define FM_MT6627_PATCH_BUF_SIZE	(4096 * 6)
++#define FM_MT6627_ROM_VER_MIN		1
++#define FM_MT6627_ROM_VER_MAX		5
++
++/*
++ * Defaults from mt6627/inc/mt6627_fm.h:20-31 and
++ * mt6627/inc/mt6627_fm_cust_cfg.h:46-60.
++ */
++#define FM_MT6627_SEEK_SPACE_DEFAULT	2	/* 100 kHz, fm_config.h:48-52 */
++#define FM_MT6627_DEEMPHASIS_DEFAULT	0	/* 0: 50us (cust_cfg.h:54) */
++
++/* Soft mute gain / blending defaults (mt6627_fm_lib.c:855-860) */
++#define FM_MT6627_SMG_DEFAULT		0x15
++#define FM_MT6627_SMG_MAX		0x15
++#define FM_MT6627_BLEND_RSSI_DEFAULT	0x164
++#define FM_MT6627_BLEND_PAMD_DEFAULT	0x19a
++#define FM_MT6627_BLEND_VALUE_DEFAULT	0x2
++
++/* Bands, in 10 kHz units (downstream inc/fm_config.h:24-41) */
++#define FM_BAND_UE		1	/* 87.5 - 108.0 MHz */
++#define FM_BAND_JAPAN		2	/* 76.0 -  90.0 MHz */
++#define FM_BAND_JAPANW		3	/* 76.0 - 108.0 MHz */
++#define FM_BAND_SPECIAL		4
++#define FM_BAND_DEFAULT		FM_BAND_UE	/* fm_config.h:29 */
++#define FM_UE_FREQ_MIN		8750	/* fm_config.h:35 */
++#define FM_UE_FREQ_MAX		10800	/* fm_config.h:36 */
++#define FM_JP_FREQ_MIN		7600	/* fm_config.h:37 */
++#define FM_JP_FREQ_MAX		9000	/* fm_config.h:26 (90 MHz) */
++#define FM_SPECIAL_FREQ_MIN	8750	/* fm_config.h:40 */
++#define FM_SPECIAL_FREQ_MAX	10800	/* fm_config.h:41 */
++
++/* Seek direction / space encoding (fm_config.h:47-62, mt6627_fm_cmd.c:691) */
++#define FM_SEEK_UP		0
++#define FM_SEEK_DOWN		1
++#define FM_SPACE_50K		1
++#define FM_SPACE_100K		2
++#define FM_SPACE_200K		4
++
++/* V4L2 frequency unit is 62.5 Hz; internal frequency unit is 10 kHz. */
++#define FM_KHZ10_TO_V4L2(f)	((f) * 160)
++#define FM_V4L2_TO_KHZ10(f)	((f) / 160)
++
++/* WMT reset payload (downstream wmt_exp.h:185-191) */
++#define FM_WMTRSTMSG_RESET_START	0x0
++#define FM_WMTRSTMSG_RESET_END		0x1
++#define FM_WMTRSTMSG_RESET_END_FAIL	0x2
++
++/*
++ * Driver-private V4L2 controls.  Userspace ABI: the numeric values are
++ * stable and must not change.
++ */
++#define V4L2_CID_USER_MTK_WCN_FM_BASE	(V4L2_CID_USER_BASE + 0x11f0)
++#define V4L2_CID_MTK_WCN_FM_BAND		(V4L2_CID_USER_MTK_WCN_FM_BASE + 0)
++#define V4L2_CID_MTK_WCN_FM_ANTENNA		(V4L2_CID_USER_MTK_WCN_FM_BASE + 1)
++#define V4L2_CID_MTK_WCN_FM_SOFTMUTE_GAIN	(V4L2_CID_USER_MTK_WCN_FM_BASE + 2)
++#define V4L2_CID_MTK_WCN_FM_BLEND		(V4L2_CID_USER_MTK_WCN_FM_BASE + 3)
++
++/* Maximum number of raw RDS records buffered for read(). */
++#define MTK_WCN_FM_RDS_FIFO_RECORDS	32
++
++/**
++ * struct mtk_wcn_fm_rds_block - one RDS group as delivered by the firmware
++ *
++ * Mirrors downstream rds_packet_t (inc/fm_rds.h:32-39): the firmware packs
++ * the four blocks of a group plus the correct-bit counter and CRC.
++ */
++struct mtk_wcn_fm_rds_block {
++	__u16 blk_a;
++	__u16 blk_b;
++	__u16 blk_c;
++	__u16 blk_d;
++	__u16 cbc;
++	__u16 crc;
++};
++
++/**
++ * struct mtk_wcn_fm_rds_data - payload of an RDS_RX_DATA event
++ *
++ * Mirrors downstream rds_rx_t (inc/fm_rds.h:41-45): two demodulator samples
++ * followed by up to MAX_RDS_RX_GROUP_CNT (12) groups.  sizeof() is 148 bytes,
++ * the same size as downstream rds_rx_t and rds_raw_t.data[].
++ */
++struct mtk_wcn_fm_rds_data {
++	__u16 sin;
++	__u16 cos;
++	struct mtk_wcn_fm_rds_block group[12];
++};
++
++struct mtk_wcn_fm_hw_info {
++	int chip_id;		/* 0x6627 / 0x6625 */
++	int eco_ver;		/* WMT hardware version + 1 */
++	int rom_ver;		/* DSP ROM version reported by the firmware */
++	int patch_ver;		/* patch version, word at coeff offset 38 */
++};
++
++struct mtk_wcn_fm_dev {
++	struct device *dev;
++	struct v4l2_device v4l2_dev;
++	struct video_device vdev;
++	struct v4l2_ctrl_handler ctrl_handler;
++
++	/* Serialises ioctls, power transitions and control writes. */
++	struct mutex lock;
++	/* Serialises access to cmd_buf and the single outstanding command. */
++	struct mutex cmd_lock;
++	u8 cmd_buf[FM_TX_BUF_SIZE];
++
++	/* Event completion: bits are set by the STP receive work. */
++	spinlock_t evt_lock;
++	u64 evt_bits;
++	wait_queue_head_t evt_wq;
++
++	/* STP receive path. */
++	struct work_struct rx_work;
++	struct work_struct rst_work;
++	u8 rx_buf[FM_RX_BUF_SIZE];
++	u8 rx_payload[FM_RX_BUF_SIZE];
++	u8 parser_state;
++	u8 parser_opcode;
++	u16 parser_len;
++	u16 parser_pos;
++
++	/* Results of the last command, downstream fm_res_ctx members used. */
++	u16 fspi_rd;
++	u16 seek_result;
++	u32 cspi_rd;
++
++	/* RDS data delivered to userspace through read()/poll(). */
++	struct kfifo rds_fifo;
++	wait_queue_head_t rds_wq;
++
++	struct rfkill *rfkill;
++
++	/* Antenna switch GPIO (downstream "fmradio_ant_sel"). */
++	int ant_sel_gpio;
++	bool ant_sel_valid;
++
++	bool link_ready;
++	bool resetting;
++	bool powered;
++	bool opened;
++
++	u16 cur_freq;		/* 10 kHz units */
++	u8 band;
++	u8 antenna;		/* 0: long, 1: short */
++	u8 deemphasis;		/* 0: 50us, 1: 75us */
++	u8 vol;			/* 0..15 */
++	bool mute;
++	bool mono;		/* true: forced mono, false: automatic */
++	bool rds_on;
++	u8 smg;			/* soft mute gain, 0..0x15 */
++	bool blend;
++
++	struct mtk_wcn_fm_hw_info hw;
++};
++
++/* mtk_wcn_fm_link.c */
++int mtk_wcn_fm_link_init(struct mtk_wcn_fm_dev *fm);
++void mtk_wcn_fm_link_exit(struct mtk_wcn_fm_dev *fm);
++int mtk_wcn_fm_cmd_tx(struct mtk_wcn_fm_dev *fm, const u8 *buf, u16 len,
++		      u64 mask, unsigned int timeout_s);
++
++/* mtk_wcn_fm_chip.c */
++int mtk_wcn_fm_chip_power_up(struct mtk_wcn_fm_dev *fm);
++int mtk_wcn_fm_chip_power_down(struct mtk_wcn_fm_dev *fm);
++int mtk_wcn_fm_chip_tune(struct mtk_wcn_fm_dev *fm, u16 freq);
++int mtk_wcn_fm_chip_seek(struct mtk_wcn_fm_dev *fm, u16 min_freq,
++			 u16 max_freq, u16 space, u8 dir, bool wrap,
++			 u16 *result);
++int mtk_wcn_fm_chip_rampdown(struct mtk_wcn_fm_dev *fm);
++int mtk_wcn_fm_chip_status(struct mtk_wcn_fm_dev *fm, s32 *dbm, bool *stereo);
++int mtk_wcn_fm_chip_mute(struct mtk_wcn_fm_dev *fm, bool mute);
++int mtk_wcn_fm_chip_vol_set(struct mtk_wcn_fm_dev *fm, u8 vol);
++int mtk_wcn_fm_chip_vol_get(struct mtk_wcn_fm_dev *fm, u8 *vol);
++int mtk_wcn_fm_chip_rds(struct mtk_wcn_fm_dev *fm, bool on);
++int mtk_wcn_fm_chip_antenna(struct mtk_wcn_fm_dev *fm, u8 type);
++int mtk_wcn_fm_chip_deemphasis(struct mtk_wcn_fm_dev *fm, u8 deemphasis);
++int mtk_wcn_fm_chip_mono(struct mtk_wcn_fm_dev *fm, bool mono);
++int mtk_wcn_fm_chip_smg(struct mtk_wcn_fm_dev *fm, u8 value);
++int mtk_wcn_fm_chip_blend(struct mtk_wcn_fm_dev *fm, bool on);
++
++#endif /* _MTK_WCN_FM_H_ */
+diff --git a/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_chip.c b/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_chip.c
+new file mode 100644
+index 000000000..601c01864
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_chip.c
+@@ -0,0 +1,1644 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WCN FM radio - MT6627 chip layer.
++ *
++ * Port from Samsung/MTK downstream:
++ *   drivers/misc/mediatek/fmradio/mt6627/pub/mt6627_fm_cmd.c
++ *   drivers/misc/mediatek/fmradio/mt6627/pub/mt6627_fm_lib.c
++ *   drivers/misc/mediatek/fmradio/mt6627/pub/mt6627_fm_rds.c
++ *
++ * All register writes below are the exact sequences of the downstream
++ * driver; the file:line citations point at the downstream statement each
++ * step was taken from.  Register level commands travel to the FM firmware
++ * on the STP FM channel (see mtk_wcn_fm_link.c).
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ */
++
++#include <linux/delay.h>
++#include <linux/firmware.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++
++#include "mtk_wcn_fm.h"
++
++/*
++ * DSP images.  Downstream open()s /etc/firmware/mt6627/mt6627_fm_vN_*.bin
++ * (mt6627_fm_lib.c:46-57); request_firmware() resolves the same names below
++ * the kernel firmware search path, so userspace has to install the
++ * downstream files as /lib/firmware/mt6627/mt6627_fm_vN_{patch,coeff}.bin
++ * (or point CONFIG_EXTRA_FIRMWARE_DIR at /etc/firmware).
++ */
++static const char *const mtk_wcn_fm_patch_names[FM_MT6627_ROM_VER_MAX] = {
++	"mt6627/mt6627_fm_v1_patch.bin",
++	"mt6627/mt6627_fm_v2_patch.bin",
++	"mt6627/mt6627_fm_v3_patch.bin",
++	"mt6627/mt6627_fm_v4_patch.bin",
++	"mt6627/mt6627_fm_v5_patch.bin",
++};
++
++static const char *const mtk_wcn_fm_coeff_names[FM_MT6627_ROM_VER_MAX] = {
++	"mt6627/mt6627_fm_v1_coeff.bin",
++	"mt6627/mt6627_fm_v2_coeff.bin",
++	"mt6627/mt6627_fm_v3_coeff.bin",
++	"mt6627/mt6627_fm_v4_coeff.bin",
++	"mt6627/mt6627_fm_v5_coeff.bin",
++};
++
++/* Downstream mt6627_fm_lib.c:1296-1300. */
++static const u16 mtk_wcn_fm_vol_tbl[16] = {
++	0x0000, 0x0519, 0x066A, 0x0814, 0x0A2B, 0x0CCD, 0x101D, 0x1449,
++	0x198A, 0x2027, 0x287A, 0x32F5, 0x4027, 0x50C3, 0x65AD, 0x7FFF,
++};
++
++/* Downstream mt6627_fm_lib.c:2005-2007. */
++static const u16 mtk_wcn_fm_tdd_mask[4] = { 0x0001, 0x0010, 0x0100, 0x1000 };
++
++/* Downstream mt6627_fm_lib.c:1366 (FM_BF_STEREO). */
++#define FM_RSSI_IND_STEREO	0x1000
++
++/* DSP coefficient addresses used by the soft mute / blending controls. */
++#define FM_COEFF_SMG		0x31D8	/* mt6627_fm_lib.c:1605 */
++#define FM_COEFF_BLEND_RSSI	0x3154	/* mt6627_fm_lib.c:1641 */
++#define FM_COEFF_BLEND_PAMD	0x3155	/* mt6627_fm_lib.c:1646 */
++#define FM_COEFF_BLEND_VALUE	0x3157	/* mt6627_fm_lib.c:1651 */
++
++/*
++ * 0x83/0x84 double as the DSP ROM code version and ready flag while the
++ * ASIP is held in ROM mode (mt6627_fm_lib.c:463-479).
++ */
++#define FM_REG_DSP_ROM_READY	0x84
++#define FM_REG_DSP_ROM_VERSION	0x83
++
++/*
++ * Channel side parameters, generated from mt6627_fm_lib.c:1903-1949.
++ * 861 entries, 50 kHz steps from 6500 to 10800 (10 kHz units); the index is
++ * (freq - 6500) / 5, downstream mt6627_fm_lib.c:2106-2128.
++ */
++static const u8 mtk_wcn_fm_chan_para[] = {
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,	/* 6500~6595 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 6600~6695 */
++	2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2, 0, 0, 0, 0, 0,	/* 6700~6795 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 6800~6895 */
++	0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 6900~6995 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 7000~7095 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,	/* 7100~7195 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2, 0,	/* 7200~7295 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 7300~7395 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 7400~7495 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 7500~7595 */
++	1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,	/* 7600~7695 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 7700~7795 */
++	8, 0, 2, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 7800~7895 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,	/* 7900~7995 */
++	0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0,	/* 8000~8095 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 8100~8195 */
++	0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 8200~8295 */
++	0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 8300~8395 */
++	1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 8400~8495 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 8500~8595 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 8600~8695 */
++	0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 8700~8795 */
++	0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 8800~8895 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 8900~8995 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 9000~9095 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 9100~9195 */
++	0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 9200~9295 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0,	/* 9300~9395 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 9400~9495 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 9500~9595 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 9600~9695 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 9700~9795 */
++	0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 9800~9895 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0,	/* 9900~9995 */
++	0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 10000~10095 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 10100~10195 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,	/* 10200~10295 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 10300~10395 */
++	8, 0, 2, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 10400~10495 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 10500~10595 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 10600~10695 */
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0,	/* 10700~10795 */
++	0,	/* 10800 */
++};
++
++/* Downstream mt6627_fm_lib.c:1958-2003: TDD cell mode per 4 x 50 kHz channel. */
++static const u16 mtk_wcn_fm_tdd_list[] = {
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 6500~6595 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 6600~6695 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 6700~6795 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 6800~6895 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 6900~6995 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 7000~7095 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 7100~7195 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 7200~7295 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 7300~7395 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 7400~7495 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 7500~7595 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 7600~7695 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 7700~7795 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 7800~7895 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 7900~7995 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 8000~8095 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 8100~8195 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 8200~8295 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 8300~8395 */
++	0x0101, 0x0000, 0x0000, 0x0000, 0x0000,	/* 8400~8495 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 8500~8595 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 8600~8695 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 8700~8795 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 8800~8895 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 8900~8995 */
++	0x0000, 0x0000, 0x0101, 0x0101, 0x0101,	/* 9000~9095 */
++	0x0101, 0x0000, 0x0000, 0x0000, 0x0000,	/* 9100~9195 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 9200~9295 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 9300~9395 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 9400~9495 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 9500~9595 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 9600~9695 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0100,	/* 9700~9795 */
++	0x0101, 0x0101, 0x0101, 0x0101, 0x0101,	/* 9800~9895 */
++	0x0101, 0x0101, 0x0001, 0x0000, 0x0000,	/* 9900~9995 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 10000~10095 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 10100~10195 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 10200~10295 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 10300~10395 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 10400~10495 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0000,	/* 10500~10595 */
++	0x0000, 0x0000, 0x0000, 0x0000, 0x0100,	/* 10600~10695 */
++	0x0101, 0x0101, 0x0101, 0x0101, 0x0101,	/* 10700~10795 */
++	0x0001,	/* 10800 */
++};
++
++/* The channel tables must cover 6500..10800 kHz in 50 kHz steps. */
++static_assert(ARRAY_SIZE(mtk_wcn_fm_chan_para) == 861);
++static_assert(ARRAY_SIZE(mtk_wcn_fm_tdd_list) == 216);
++
++/* The RDS event payload is downstream rds_rx_t verbatim (148 bytes). */
++static_assert(sizeof(struct mtk_wcn_fm_rds_data) == 148);
++
++/*
++ * Firmware primitive builders (downstream mt6627_fm_cmd.c:30-164)
++ */
++struct mtk_wcn_fm_pkt {
++	u8 *buf;
++	int cap;
++	int len;
++	int err;
++};
++
++static void mtk_wcn_fm_pkt_init(struct mtk_wcn_fm_pkt *pkt, u8 *buf, int cap,
++				u8 opcode)
++{
++	pkt->buf = buf;
++	pkt->cap = cap;
++	pkt->len = 4;
++	pkt->err = 0;
++	buf[0] = FM_PKT_TYPE_CMD;
++	buf[1] = opcode;
++	buf[2] = 0;
++	buf[3] = 0;
++}
++
++static void mtk_wcn_fm_pkt_add(struct mtk_wcn_fm_pkt *pkt, int written)
++{
++	if (pkt->err)
++		return;
++	if (written < 0)
++		pkt->err = written;
++	else
++		pkt->len += written;
++}
++
++/* mt6627_fm_cmd.c:30-47 */
++static int mtk_wcn_fm_bop_write(u8 addr, u16 value, u8 *buf, int size)
++{
++	if (size < FM_WRITE_BASIC_OP_SIZE + 2)
++		return -ENOSPC;
++
++	buf[0] = FM_WRITE_BASIC_OP;
++	buf[1] = FM_WRITE_BASIC_OP_SIZE;
++	buf[2] = addr;
++	buf[3] = value & 0xff;
++	buf[4] = (value >> 8) & 0xff;
++
++	return FM_WRITE_BASIC_OP_SIZE + 2;
++}
++
++/* mt6627_fm_cmd.c:49-67 */
++static int mtk_wcn_fm_bop_udelay(u32 value, u8 *buf, int size)
++{
++	if (size < FM_UDELAY_BASIC_OP_SIZE + 2)
++		return -ENOSPC;
++
++	buf[0] = FM_UDELAY_BASIC_OP;
++	buf[1] = FM_UDELAY_BASIC_OP_SIZE;
++	buf[2] = value & 0xff;
++	buf[3] = (value >> 8) & 0xff;
++	buf[4] = (value >> 16) & 0xff;
++	buf[5] = (value >> 24) & 0xff;
++
++	return FM_UDELAY_BASIC_OP_SIZE + 2;
++}
++
++/* mt6627_fm_cmd.c:69-89 */
++static int mtk_wcn_fm_bop_rd_until(u8 addr, u16 mask, u16 value, u8 *buf,
++				   int size)
++{
++	if (size < FM_RD_UNTIL_BASIC_OP_SIZE + 2)
++		return -ENOSPC;
++
++	buf[0] = FM_RD_UNTIL_BASIC_OP;
++	buf[1] = FM_RD_UNTIL_BASIC_OP_SIZE;
++	buf[2] = addr;
++	buf[3] = mask & 0xff;
++	buf[4] = (mask >> 8) & 0xff;
++	buf[5] = value & 0xff;
++	buf[6] = (value >> 8) & 0xff;
++
++	return FM_RD_UNTIL_BASIC_OP_SIZE + 2;
++}
++
++/* mt6627_fm_cmd.c:91-111 */
++static int mtk_wcn_fm_bop_modify(u8 addr, u16 mask_and, u16 mask_or, u8 *buf,
++				 int size)
++{
++	if (size < FM_MODIFY_BASIC_OP_SIZE + 2)
++		return -ENOSPC;
++
++	buf[0] = FM_MODIFY_BASIC_OP;
++	buf[1] = FM_MODIFY_BASIC_OP_SIZE;
++	buf[2] = addr;
++	buf[3] = mask_and & 0xff;
++	buf[4] = (mask_and >> 8) & 0xff;
++	buf[5] = mask_or & 0xff;
++	buf[6] = (mask_or >> 8) & 0xff;
++
++	return FM_MODIFY_BASIC_OP_SIZE + 2;
++}
++
++/* mt6627_fm_cmd.c:113-135 */
++static int mtk_wcn_fm_bop_top_write(u16 addr, u32 value, u8 *buf, int size)
++{
++	if (size < FM_TOP_WRITE_BOP_SIZE + 2)
++		return -ENOSPC;
++
++	buf[0] = FM_TOP_WRITE_BASIC_OP;
++	buf[1] = FM_TOP_WRITE_BOP_SIZE;
++	buf[2] = 0x04;	/* top register space */
++	buf[3] = addr & 0xff;
++	buf[4] = (addr >> 8) & 0xff;
++	buf[5] = value & 0xff;
++	buf[6] = (value >> 8) & 0xff;
++	buf[7] = (value >> 16) & 0xff;
++	buf[8] = (value >> 24) & 0xff;
++
++	return FM_TOP_WRITE_BOP_SIZE + 2;
++}
++
++/* mt6627_fm_cmd.c:137-164 */
++static int mtk_wcn_fm_bop_top_rd_until(u16 addr, u32 mask, u32 value, u8 *buf,
++				       int size)
++{
++	int i;
++
++	if (size < FM_TOP_RD_UNTIL_BOP_SIZE + 2)
++		return -ENOSPC;
++
++	buf[0] = FM_TOP_RD_UNTIL_BASIC_OP;
++	buf[1] = FM_TOP_RD_UNTIL_BOP_SIZE;
++	buf[2] = 0x04;	/* top register space */
++	buf[3] = addr & 0xff;
++	buf[4] = (addr >> 8) & 0xff;
++	for (i = 0; i < 4; i++) {
++		buf[5 + i] = (mask >> (8 * i)) & 0xff;
++		buf[9 + i] = (value >> (8 * i)) & 0xff;
++	}
++
++	return FM_TOP_RD_UNTIL_BOP_SIZE + 2;
++}
++
++/*
++ * Register access primitives
++ */
++static int mtk_wcn_fm_send(struct mtk_wcn_fm_dev *fm, struct mtk_wcn_fm_pkt *pkt,
++			   u64 mask, unsigned int timeout_s)
++{
++	u16 payload = pkt->len - 4;
++
++	if (pkt->err)
++		return pkt->err;
++
++	pkt->buf[2] = payload & 0xff;
++	pkt->buf[3] = (payload >> 8) & 0xff;
++
++	return mtk_wcn_fm_cmd_tx(fm, pkt->buf, pkt->len, mask, timeout_s);
++}
++
++/* mt6627_get_reg(), mt6627_fm_cmd.c:839-852 */
++static int mtk_wcn_fm_reg_read(struct mtk_wcn_fm_dev *fm, u8 addr, u16 *val)
++{
++	u8 *buf = fm->cmd_buf;
++	int ret;
++
++	mutex_lock(&fm->cmd_lock);
++	buf[0] = FM_PKT_TYPE_CMD;
++	buf[1] = FSPI_READ_OPCODE;
++	buf[2] = 0x01;
++	buf[3] = 0x00;
++	buf[4] = addr;
++	ret = mtk_wcn_fm_cmd_tx(fm, buf, 5, FM_EVT_BIT(FSPI_READ_OPCODE),
++				FM_FSPI_RD_TIMEOUT);
++	if (!ret && val)
++		*val = fm->fspi_rd;
++	mutex_unlock(&fm->cmd_lock);
++
++	return ret;
++}
++
++/* mt6627_set_reg(), mt6627_fm_cmd.c:854-870 */
++static int mtk_wcn_fm_reg_write(struct mtk_wcn_fm_dev *fm, u8 addr, u16 val)
++{
++	u8 *buf = fm->cmd_buf;
++	int ret;
++
++	mutex_lock(&fm->cmd_lock);
++	buf[0] = FM_PKT_TYPE_CMD;
++	buf[1] = FSPI_WRITE_OPCODE;
++	buf[2] = 0x03;
++	buf[3] = 0x00;
++	buf[4] = addr;
++	buf[5] = val & 0xff;
++	buf[6] = (val >> 8) & 0xff;
++	ret = mtk_wcn_fm_cmd_tx(fm, buf, 7, FM_EVT_BIT(FSPI_WRITE_OPCODE),
++				FM_FSPI_WR_TIMEOUT);
++	mutex_unlock(&fm->cmd_lock);
++
++	return ret;
++}
++
++/* mt6627_set_bits_reg(), mt6627_fm_cmd.c:872-888 */
++static int mtk_wcn_fm_reg_set_bits(struct mtk_wcn_fm_dev *fm, u8 addr,
++				   u16 bits, u16 mask)
++{
++	struct mtk_wcn_fm_pkt pkt;
++	int ret;
++
++	mutex_lock(&fm->cmd_lock);
++	/* Opcode 0x11 is not an FM opcode: the firmware echoes it back as the
++	 * event opcode, which is what the command waits for.
++	 */
++	mtk_wcn_fm_pkt_init(&pkt, fm->cmd_buf, sizeof(fm->cmd_buf), 0x11);
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_modify(addr, mask, bits,
++						      pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	ret = mtk_wcn_fm_send(fm, &pkt, FM_EVT_BIT(0x11), FM_FSPI_WR_TIMEOUT);
++	mutex_unlock(&fm->cmd_lock);
++
++	return ret;
++}
++
++/* mt6627_top_set_reg(), mt6627_fm_cmd.c:909-929 */
++static int mtk_wcn_fm_top_write(struct mtk_wcn_fm_dev *fm, u16 addr, u32 val)
++{
++	u8 *buf = fm->cmd_buf;
++	int i;
++	int ret;
++
++	mutex_lock(&fm->cmd_lock);
++	buf[0] = FM_PKT_TYPE_CMD;
++	buf[1] = CSPI_WRITE_OPCODE;
++	buf[2] = 0x07;
++	buf[3] = 0x00;
++	buf[4] = 0x04;	/* top register space; 0x02 selects the FM space */
++	buf[5] = addr & 0xff;
++	buf[6] = (addr >> 8) & 0xff;
++	for (i = 0; i < 4; i++)
++		buf[7 + i] = (val >> (8 * i)) & 0xff;
++	ret = mtk_wcn_fm_cmd_tx(fm, buf, 11, FM_EVT_CSPI_WRITE,
++				FM_FSPI_WR_TIMEOUT);
++	mutex_unlock(&fm->cmd_lock);
++
++	return ret;
++}
++
++/* mt6627_host_get_reg(), mt6627_fm_cmd.c:932-949 */
++static int mtk_wcn_fm_host_read(struct mtk_wcn_fm_dev *fm, u32 addr, u32 *val)
++{
++	u8 *buf = fm->cmd_buf;
++	int i;
++	int ret;
++
++	mutex_lock(&fm->cmd_lock);
++	buf[0] = FM_PKT_TYPE_CMD;
++	buf[1] = FM_HOST_READ_OPCODE;
++	buf[2] = 0x04;
++	buf[3] = 0x00;
++	for (i = 0; i < 4; i++)
++		buf[4 + i] = (addr >> (8 * i)) & 0xff;
++	ret = mtk_wcn_fm_cmd_tx(fm, buf, 8, FM_EVT_HOST_READ,
++				FM_FSPI_RD_TIMEOUT);
++	if (!ret && val)
++		*val = fm->cspi_rd;
++	mutex_unlock(&fm->cmd_lock);
++
++	return ret;
++}
++
++/* mt6627_host_set_reg(), mt6627_fm_cmd.c:951-972 */
++static int mtk_wcn_fm_host_write(struct mtk_wcn_fm_dev *fm, u32 addr, u32 val)
++{
++	u8 *buf = fm->cmd_buf;
++	int i;
++	int ret;
++
++	mutex_lock(&fm->cmd_lock);
++	buf[0] = FM_PKT_TYPE_CMD;
++	buf[1] = FM_HOST_WRITE_OPCODE;
++	buf[2] = 0x08;
++	buf[3] = 0x00;
++	for (i = 0; i < 4; i++)
++		buf[4 + i] = (addr >> (8 * i)) & 0xff;
++	for (i = 0; i < 4; i++)
++		buf[8 + i] = (val >> (8 * i)) & 0xff;
++	ret = mtk_wcn_fm_cmd_tx(fm, buf, 12, FM_EVT_HOST_WRITE,
++				FM_FSPI_WR_TIMEOUT);
++	mutex_unlock(&fm->cmd_lock);
++
++	return ret;
++}
++
++/* DSP coefficient memory write, mt6627_fm_lib.c:942-951 */
++static int mtk_wcn_fm_coeff_write(struct mtk_wcn_fm_dev *fm, u16 addr, u16 value)
++{
++	int ret;
++
++	ret = mtk_wcn_fm_reg_write(fm, FM_REG_DSP_MEM_ADDR, addr);
++	if (ret)
++		return ret;
++	ret = mtk_wcn_fm_reg_write(fm, FM_REG_DSP_MEM_DATA, value);
++	if (ret)
++		return ret;
++
++	return mtk_wcn_fm_reg_write(fm, FM_REG_DSP_MEM_CTRL, 0x0002);
++}
++
++/*
++ * Channel parameter / TDD helpers (mt6627_fm_lib.c:1895-2128)
++ */
++static bool mtk_wcn_fm_tdd_chan_check(u16 freq)
++{
++	u32 pos;
++
++	if (freq < 6500 || freq > 10800)
++		return false;
++
++	pos = (freq - 6500) / 5;
++	return mtk_wcn_fm_tdd_list[pos / 4] & mtk_wcn_fm_tdd_mask[pos % 4];
++}
++
++static u16 mtk_wcn_fm_chan_para_get(u16 freq)
++{
++	u32 pos;
++
++	if (freq < 6500)
++		return 0;
++
++	pos = (freq - 6500) / 5;
++	if (pos >= ARRAY_SIZE(mtk_wcn_fm_chan_para))
++		pos = ARRAY_SIZE(mtk_wcn_fm_chan_para) - 1;
++
++	return mtk_wcn_fm_chan_para[pos];
++}
++
++/*
++ * Power up / power down (mt6627_fm_lib.c:664-940)
++ */
++/* mt6627_pwrup_clock_on(), mt6627_fm_cmd.c:172-221 */
++static int mtk_wcn_fm_send_pwrup_clock_on(struct mtk_wcn_fm_dev *fm)
++{
++	struct mtk_wcn_fm_pkt pkt;
++	u16 de_emphasis = fm->deemphasis & 0x1;
++	int ret;
++
++	mutex_lock(&fm->cmd_lock);
++	mtk_wcn_fm_pkt_init(&pkt, fm->cmd_buf, sizeof(fm->cmd_buf),
++			    FM_ENABLE_OPCODE);
++	/* turn on the top clock */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_DIG_TOP,
++							   0xffffffff,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	/* enable MTCMOS */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_MTCMOS,
++							   0x00000030,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_MTCMOS,
++							   0x00000035,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_rd_until(FM_TOP_REG_MTCMOS,
++							     0x0000000a, 0xa,
++							     pkt.buf + pkt.len,
++							     pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_MTCMOS,
++							   0x00000015,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_MTCMOS,
++							   0x00000005,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_udelay(10, pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_MTCMOS,
++							   0x00000045,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	/* CSPI FM slave dummy count */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_CSPI_DUMMY,
++							   0x0000003f,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	/* enable the digital OSC */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_CLK_CTRL,
++							   0x00000001,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_udelay(3000, pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	/* route the OSC clock to FM, release HW clock gating */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_CLK_CTRL,
++							   0x00000003,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_CLK_CTRL,
++							   0x00000007,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	/* I2S current driving */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_AUD_DRV,
++							   0x00000000,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	/* enable DSP auto clock gating */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_write(FM_REG_DSP_CLK, 0x0040,
++						      pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	/* de-emphasis setting */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_modify(FM_MAIN_CG2_CTRL,
++						       (u16)~FM_CG2_DE_EMPHASIS,
++						       de_emphasis << 12,
++						       pkt.buf + pkt.len,
++						       pkt.cap - pkt.len));
++	ret = mtk_wcn_fm_send(fm, &pkt, FM_EVT_BIT(FM_ENABLE_OPCODE),
++			      FM_EN_TIMEOUT);
++	mutex_unlock(&fm->cmd_lock);
++
++	return ret;
++}
++
++/* mt6627_pwrup_digital_init(), mt6627_fm_cmd.c:422-468 */
++static int mtk_wcn_fm_send_pwrup_digital_init(struct mtk_wcn_fm_dev *fm)
++{
++	struct mtk_wcn_fm_pkt pkt;
++	int ret;
++
++	mutex_lock(&fm->cmd_lock);
++	mtk_wcn_fm_pkt_init(&pkt, fm->cmd_buf, sizeof(fm->cmd_buf),
++			    FM_ENABLE_OPCODE);
++	/* FM RF & ADPLL divider setting */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_write(FM_REG_RF_PLL_DIV, 0xe000,
++						      pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_write(FM_REG_SDM_COEFF0_H,
++						      0x03f0, pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_write(FM_REG_SDM_COEFF0_L,
++						      0x3f04, pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_write(FM_REG_SDM_COEFF1_H,
++						      0x0014, pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_write(FM_REG_SDM_COEFF1_L,
++						      0x2a38, pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	/* 26 MHz reference clock */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_write(FM_REG_RF_CLK26M, 0x4000,
++						      pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	/* FM digital init: interrupt masks */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_write(FM_MAIN_INTRMASK, 0x0021,
++						      pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_write(FM_MAIN_EXTINTRMASK,
++						      0x0021, pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_CLK_CTRL,
++							   0x0000000f,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	/* release ASIP reset, disable ASIP power down */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_modify(FM_MAIN_CG2_CTRL,
++						       0xfffd, 0x0002,
++						       pkt.buf + pkt.len,
++						       pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_modify(FM_MAIN_CG2_CTRL,
++						       0xfffe, 0x0000,
++						       pkt.buf + pkt.len,
++						       pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_udelay(100000,
++						      pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	/* poll 0x64[4:0] == 2 (DSP ready) */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_rd_until(0x64, 0x001f, 0x0002,
++							 pkt.buf + pkt.len,
++							 pkt.cap - pkt.len));
++	ret = mtk_wcn_fm_send(fm, &pkt, FM_EVT_BIT(FM_ENABLE_OPCODE),
++			      FM_EN_TIMEOUT);
++	mutex_unlock(&fm->cmd_lock);
++
++	return ret;
++}
++
++/* mt6627_pwrup_fine_tune(), mt6627_fm_cmd.c:476-504 */
++static int mtk_wcn_fm_send_pwrup_fine_tune(struct mtk_wcn_fm_dev *fm)
++{
++	struct mtk_wcn_fm_pkt pkt;
++	int ret;
++
++	mutex_lock(&fm->cmd_lock);
++	mtk_wcn_fm_pkt_init(&pkt, fm->cmd_buf, sizeof(fm->cmd_buf),
++			    FM_ENABLE_OPCODE);
++	/* let the host control the RF registers */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_CLK_CTRL,
++							   0x00000007,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_write(FM_REG_RF_01, 0xbee8,
++						      pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_write(FM_REG_RF_03, 0xf6ed,
++						      pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_write(FM_REG_RF_15, 0x0d80,
++						      pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_write(FM_REG_RF_16, 0x0068,
++						      pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_write(FM_REG_RF_17, 0x092a,
++						      pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_write(FM_REG_RF_34, 0x807f,
++						      pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_write(FM_REG_RF_35, 0x311e,
++						      pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	/* hand the RF registers back to the DSP */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_CLK_CTRL,
++							   0x0000000f,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	ret = mtk_wcn_fm_send(fm, &pkt, FM_EVT_BIT(FM_ENABLE_OPCODE),
++			      FM_EN_TIMEOUT);
++	mutex_unlock(&fm->cmd_lock);
++
++	return ret;
++}
++
++/* mt6627_pwrdown(), mt6627_fm_cmd.c:512-551 */
++static int mtk_wcn_fm_send_pwrdown(struct mtk_wcn_fm_dev *fm)
++{
++	struct mtk_wcn_fm_pkt pkt;
++	int i;
++	int ret;
++
++	mutex_lock(&fm->cmd_lock);
++	mtk_wcn_fm_pkt_init(&pkt, fm->cmd_buf, sizeof(fm->cmd_buf),
++			    FM_ENABLE_OPCODE);
++	/* audio output to I2S TX mode off */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_modify(FM_REG_AUDIO_CTRL0,
++						       0xfff8, 0x0000,
++						       pkt.buf + pkt.len,
++						       pkt.cap - pkt.len));
++	/* disable HW clock control */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_CLK_CTRL,
++							   0x0000330f,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	/* reset ASIP */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_write(FM_MAIN_CG2_CTRL, 0x0001,
++						      pkt.buf + pkt.len,
++						      pkt.cap - pkt.len));
++	/* digital core + register file reset */
++	for (i = 0; i < 4; i++)
++		mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_modify(FM_MAIN_RESET,
++							       0xfff8, 0x0000,
++							       pkt.buf + pkt.len,
++							       pkt.cap - pkt.len));
++	/* disable all clocks */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_CLK_CTRL,
++							   0x00000000,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	/* reset the RF register file */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_CLK_CTRL,
++							   0x00004000,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_CLK_CTRL,
++							   0x00000000,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	/* MTCMOS power off */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_MTCMOS,
++							   0x00000005,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_MTCMOS,
++							   0x00000015,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_MTCMOS,
++							   0x00000035,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_write(FM_TOP_REG_MTCMOS,
++							   0x00000030,
++							   pkt.buf + pkt.len,
++							   pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_top_rd_until(FM_TOP_REG_MTCMOS,
++							     0x0000000a, 0x0,
++							     pkt.buf + pkt.len,
++							     pkt.cap - pkt.len));
++	ret = mtk_wcn_fm_send(fm, &pkt, FM_EVT_BIT(FM_ENABLE_OPCODE),
++			      FM_EN_TIMEOUT);
++	mutex_unlock(&fm->cmd_lock);
++
++	return ret;
++}
++
++/* mt6627_get_rom_version(), mt6627_fm_lib.c:447-485 */
++static int mtk_wcn_fm_get_rom_version(struct mtk_wcn_fm_dev *fm)
++{
++	unsigned long deadline = jiffies + 10 * HZ;
++	u16 tmp = 0;
++	int ret;
++
++	/* DSP ROM code version request enable (0x61 b15 = 1) */
++	ret = mtk_wcn_fm_reg_set_bits(fm, FM_MAIN_CG2_CTRL, 0x8000, 0x7fff);
++	if (ret)
++		return ret;
++	/* release ASIP reset (0x61 b1 = 1) */
++	ret = mtk_wcn_fm_reg_set_bits(fm, FM_MAIN_CG2_CTRL, 0x0002, 0xfffd);
++	if (ret)
++		return ret;
++	/* enable ASIP power (0x61 b0 = 0) */
++	ret = mtk_wcn_fm_reg_set_bits(fm, FM_MAIN_CG2_CTRL, 0x0000, 0xfffe);
++	if (ret)
++		return ret;
++
++	do {
++		usleep_range(1000, 1500);
++		ret = mtk_wcn_fm_reg_read(fm, FM_REG_DSP_ROM_READY, &tmp);
++		if (ret)
++			return ret;
++	} while (tmp != 0x0001 && time_before(jiffies, deadline));
++
++	if (tmp != 0x0001) {
++		dev_err(fm->dev, "DSP ROM version never became ready\n");
++		return -ETIMEDOUT;
++	}
++
++	/* DSP code version is reported in 0x83[15:8] */
++	ret = mtk_wcn_fm_reg_read(fm, FM_REG_DSP_ROM_VERSION, &tmp);
++	if (ret)
++		return ret;
++	tmp >>= 8;
++
++	/* request disable (0x61 b15 = 0) */
++	ret = mtk_wcn_fm_reg_set_bits(fm, FM_MAIN_CG2_CTRL, 0x0000, 0x7fff);
++	if (ret)
++		return ret;
++	/* reset ASIP (0x61[1:0] = 1) */
++	ret = mtk_wcn_fm_reg_set_bits(fm, FM_MAIN_CG2_CTRL, 0x0001, 0xfffc);
++	if (ret)
++		return ret;
++
++	return tmp;
++}
++
++/*
++ * Load a DSP image for the running DSP ROM version.  Downstream's patch
++ * lookup requires an exact match (mt6627_get_patch_path() returns 1 on the
++ * fallback and mt6627_PowerUp() treats that as an error,
++ * mt6627_fm_lib.c:487-513, 775-784), while the coefficient lookup falls back
++ * to the newest file and then disables the patch selector
++ * (mt6627_fm_lib.c:515-547, 806-809).
++ */
++static int mtk_wcn_fm_fw_request(struct mtk_wcn_fm_dev *fm,
++				 const char *const *names, int rom_ver,
++				 bool allow_fallback,
++				 const struct firmware **fw, bool *exact)
++{
++	int i, ret;
++
++	*exact = false;
++	if (rom_ver >= FM_MT6627_ROM_VER_MIN &&
++	    rom_ver <= FM_MT6627_ROM_VER_MAX) {
++		ret = request_firmware(fw, names[rom_ver - 1], fm->dev);
++		if (!ret) {
++			*exact = true;
++			return 0;
++		}
++	}
++
++	if (!allow_fallback)
++		return -ENOENT;
++
++	for (i = FM_MT6627_ROM_VER_MAX - 1; i >= 0; i--) {
++		ret = request_firmware(fw, names[i], fm->dev);
++		if (!ret) {
++			dev_warn(fm->dev,
++				 "no image for DSP ROM v%d, using %s\n",
++				 rom_ver, names[i]);
++			return 0;
++		}
++	}
++
++	return -ENOENT;
++}
++
++/* mt6627_DspPatch(), mt6627_fm_lib.c:549-662 */
++static int mtk_wcn_fm_dsp_patch(struct mtk_wcn_fm_dev *fm, const u8 *img,
++				size_t len, bool is_patch)
++{
++	u8 opcode = is_patch ? FM_PATCH_DOWNLOAD_OPCODE :
++			       FM_COEFF_DOWNLOAD_OPCODE;
++	u64 mask = FM_EVT_BIT(opcode);
++	unsigned int timeout = is_patch ? FM_PATCH_TIMEOUT : FM_COEFF_TIMEOUT;
++	u8 seg_num, seg_id;
++	int seg_len, ret;
++	u16 pkt_len;
++
++	if (!img || !len)
++		return -EINVAL;
++	if (len > U8_MAX * FM_MT6627_PATCH_SEG_LEN)
++		return -EFBIG;
++
++	seg_num = len / FM_MT6627_PATCH_SEG_LEN + 1;
++
++	for (seg_id = 0; seg_id < seg_num; seg_id++) {
++		seg_len = ((seg_id + 1) < seg_num) ? FM_MT6627_PATCH_SEG_LEN :
++						     (len % FM_MT6627_PATCH_SEG_LEN);
++
++		mutex_lock(&fm->cmd_lock);
++		fm->cmd_buf[0] = FM_PKT_TYPE_CMD;
++		fm->cmd_buf[1] = opcode;
++		fm->cmd_buf[4] = seg_num;
++		fm->cmd_buf[5] = seg_id;
++		if (seg_len > (sizeof(fm->cmd_buf) - 6)) {
++			mutex_unlock(&fm->cmd_lock);
++			return -ENOSPC;
++		}
++		memcpy(&fm->cmd_buf[6], img + seg_id * FM_MT6627_PATCH_SEG_LEN,
++		       seg_len);
++		pkt_len = 6 + seg_len;
++		fm->cmd_buf[2] = (pkt_len - 4) & 0xff;
++		fm->cmd_buf[3] = ((pkt_len - 4) >> 8) & 0xff;
++		ret = mtk_wcn_fm_cmd_tx(fm, fm->cmd_buf, pkt_len, mask, timeout);
++		mutex_unlock(&fm->cmd_lock);
++		if (ret) {
++			dev_err(fm->dev, "DSP image segment %d/%d failed (%d)\n",
++				seg_id + 1, seg_num, ret);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * Full power up.  Sequence order and every value come from
++ * mt6627_PowerUp(), mt6627_fm_lib.c:664-863.
++ */
++static int mtk_wcn_fm_power_up_seq(struct mtk_wcn_fm_dev *fm)
++{
++	const struct firmware *patch = NULL, *coeff = NULL;
++	bool exact = false;
++	u8 *img = NULL;
++	size_t len;
++	u16 chip_id = 0;
++	int rom_ver, ret;
++
++	/* step 1: common SPI parameter */
++	ret = mtk_wcn_fm_host_write(fm, FM_HOST_REG_CSPI_CFG, 0x0000801f);
++	if (ret) {
++		dev_err(fm->dev, "cannot configure CSPI (%d)\n", ret);
++		return ret;
++	}
++
++	/* step 2: FM digital clock on */
++	ret = mtk_wcn_fm_send_pwrup_clock_on(fm);
++	if (ret) {
++		dev_err(fm->dev, "clock on sequence failed (%d)\n", ret);
++		return ret;
++	}
++
++	/* read back the chip id */
++	ret = mtk_wcn_fm_reg_read(fm, FM_MAIN_HWVER, &chip_id);
++	if (ret) {
++		dev_err(fm->dev, "cannot read chip id (%d)\n", ret);
++		return ret;
++	}
++	if (chip_id != FM_MT6627_CHIP_ID && chip_id != FM_MT6625_CHIP_ID) {
++		dev_err(fm->dev, "unexpected FM chip id 0x%04x\n", chip_id);
++		return -EIO;
++	}
++	fm->hw.chip_id = chip_id;
++	fm->hw.eco_ver = mtk_wcn_wmt_hwver_get() + 1;
++	dev_info(fm->dev, "MT6627 FM: chip 0x%04x, ECO %d\n", chip_id,
++		 fm->hw.eco_ver);
++
++	rom_ver = mtk_wcn_fm_get_rom_version(fm);
++	if (rom_ver < 0) {
++		dev_err(fm->dev, "cannot read DSP ROM version (%d)\n", rom_ver);
++		return rom_ver;
++	}
++	fm->hw.rom_ver = rom_ver;
++
++	/* step 3: download the DSP patch (exact ROM version required) */
++	ret = mtk_wcn_fm_fw_request(fm, mtk_wcn_fm_patch_names, rom_ver, false,
++				    &patch, &exact);
++	if (ret) {
++		dev_err(fm->dev,
++			"DSP patch mt6627/mt6627_fm_v%d_patch.bin not available\n",
++			rom_ver);
++		return ret;
++	}
++	ret = mtk_wcn_fm_dsp_patch(fm, patch->data, patch->size, true);
++	release_firmware(patch);
++	if (ret)
++		return ret;
++
++	/* ... and the DSP coefficients (fallback allowed) */
++	ret = mtk_wcn_fm_fw_request(fm, mtk_wcn_fm_coeff_names, rom_ver, true,
++				    &coeff, &exact);
++	if (ret) {
++		dev_err(fm->dev,
++			"DSP coefficient mt6627/mt6627_fm_v%d_coeff.bin not available\n",
++			rom_ver);
++		return ret;
++	}
++
++	img = kmalloc(FM_MT6627_PATCH_BUF_SIZE, GFP_KERNEL);
++	if (!img) {
++		release_firmware(coeff);
++		return -ENOMEM;
++	}
++	len = min_t(size_t, coeff->size, FM_MT6627_PATCH_BUF_SIZE);
++	memcpy(img, coeff->data, len);
++	release_firmware(coeff);
++
++	if (!exact) {
++		/* Unknown ROM version: the downstream driver clears the patch
++		 * selector words so the DSP keeps running on its ROM code
++		 * (mt6627_fm_lib.c:807-809).
++		 */
++		if (len > 5) {
++			img[4] = 0x00;
++			img[5] = 0x00;
++		}
++	}
++	if (len >= 40)
++		fm->hw.patch_ver = img[38] | (img[39] << 8);
++
++	ret = mtk_wcn_fm_dsp_patch(fm, img, len, false);
++	kfree(img);
++	if (ret)
++		return ret;
++
++	/* Downstream reports the ROM version incremented by one after the
++	 * coefficient download (mt6627_fm_lib.c:800).
++	 */
++	fm->hw.rom_ver = rom_ver + 1;
++	dev_info(fm->dev, "MT6627 FM: ROM v%d, patch 0x%04x\n", fm->hw.rom_ver,
++		 fm->hw.patch_ver);
++
++	ret = mtk_wcn_fm_reg_write(fm, FM_REG_DSP_PATCH_DATA, 0x0000);
++	if (ret)
++		return ret;
++	ret = mtk_wcn_fm_reg_write(fm, FM_REG_DSP_PATCH_CTRL, 0x0040);
++	if (ret)
++		return ret;
++	ret = mtk_wcn_fm_reg_write(fm, FM_REG_DSP_PATCH_CTRL, 0x0000);
++	if (ret)
++		return ret;
++
++	/* step 4: FM digital init */
++	ret = mtk_wcn_fm_send_pwrup_digital_init(fm);
++	if (ret) {
++		dev_err(fm->dev, "digital init failed (%d)\n", ret);
++		return ret;
++	}
++
++	/* step 5: RF fine tune */
++	ret = mtk_wcn_fm_send_pwrup_fine_tune(fm);
++	if (ret) {
++		dev_err(fm->dev, "RF fine tune failed (%d)\n", ret);
++		return ret;
++	}
++
++	/* enable the connectivity SoC FM 2-wire RX audio path */
++	ret = mtk_wcn_fm_reg_write(fm, FM_REG_AUDIO_CTRL0, 0xf9ab);
++	if (ret)
++		return ret;
++	ret = mtk_wcn_fm_host_write(fm, FM_HOST_REG_AUDIO_CTRL, 0x00003f35);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++int mtk_wcn_fm_chip_power_up(struct mtk_wcn_fm_dev *fm)
++{
++	int ret;
++
++	if (fm->powered)
++		return 0;
++
++	/* mt6627_pwron(), mt6627_fm_lib.c:98-115 */
++	if (!mtk_wcn_wmt_func_on(WMTDRV_FM)) {
++		dev_err(fm->dev, "WMT cannot power on the FM function\n");
++		return -EIO;
++	}
++
++	if (!mtk_wcn_stp_is_ready()) {
++		dev_err(fm->dev, "STP is not ready after powering on FM\n");
++		ret = -ENODEV;
++		goto err_func_off;
++	}
++
++	ret = mtk_wcn_fm_power_up_seq(fm);
++	if (ret)
++		goto err_func_off;
++
++	fm->powered = true;
++
++	return 0;
++
++err_func_off:
++	mtk_wcn_wmt_func_off(WMTDRV_FM);
++	return ret;
++}
++
++/* mt6627_PowerDown(), mt6627_fm_lib.c:865-940 */
++int mtk_wcn_fm_chip_power_down(struct mtk_wcn_fm_dev *fm)
++{
++	u32 host_reg;
++	u16 intr;
++	int ret = 0, err;
++
++	if (!fm->powered)
++		return 0;
++
++	/*
++	 * SW workaround for MCUFA: clear a pending STC interrupt before the
++	 * ramp down, otherwise the DSP cannot switch MCUFA back.
++	 */
++	err = mtk_wcn_fm_reg_read(fm, FM_MAIN_INTR, &intr);
++	if (!err && (intr & FM_INTR_STC_DONE))
++		mtk_wcn_fm_reg_write(fm, FM_MAIN_INTR, intr);
++
++	/* set the audio output to I2S RX mode */
++	err = mtk_wcn_fm_host_read(fm, FM_HOST_REG_AUDIO_CTRL, &host_reg);
++	if (!err) {
++		host_reg &= 0xffff9fff;
++		err = mtk_wcn_fm_host_write(fm, FM_HOST_REG_AUDIO_CTRL,
++					    host_reg);
++	}
++	if (err) {
++		dev_warn(fm->dev, "audio path shutdown failed (%d)\n", err);
++		ret = err;
++	}
++
++	err = mtk_wcn_fm_send_pwrdown(fm);
++	if (err) {
++		dev_warn(fm->dev, "power down sequence failed (%d)\n", err);
++		if (!ret)
++			ret = err;
++	} else {
++		err = mtk_wcn_fm_reg_write(fm, FM_MAIN_EXTINTRMASK, 0x0000);
++		if (err && !ret)
++			ret = err;
++	}
++
++	/* mt6627_pwroff(), mt6627_fm_lib.c:117-126 */
++	if (!mtk_wcn_wmt_func_off(WMTDRV_FM)) {
++		dev_err(fm->dev, "WMT cannot power off the FM function\n");
++		if (!ret)
++			ret = -EIO;
++	}
++
++	fm->powered = false;
++	fm->rds_on = false;
++
++	return ret;
++}
++
++/*
++ * Tune / seek (mt6627_fm_lib.c:953-1136 and 1146-1179)
++ */
++/* mt6627_tune(), mt6627_fm_cmd.c:595-630 */
++static int mtk_wcn_fm_send_tune(struct mtk_wcn_fm_dev *fm)
++{
++	struct mtk_wcn_fm_pkt pkt;
++	int ret;
++
++	mutex_lock(&fm->cmd_lock);
++	mtk_wcn_fm_pkt_init(&pkt, fm->cmd_buf, sizeof(fm->cmd_buf),
++			    FM_TUNE_OPCODE);
++	/* start the hardware tune and wait for the STC interrupt */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_modify(FM_MAIN_CTRL, 0xfff8,
++						       FM_MAIN_CTRL_TUNE,
++						       pkt.buf + pkt.len,
++						       pkt.cap - pkt.len));
++	ret = mtk_wcn_fm_send(fm, &pkt,
++			      FM_EVT_BIT(FM_TUNE_OPCODE) | FM_EVT_TUNE_DONE,
++			      FM_TUNE_TIMEOUT);
++	mutex_unlock(&fm->cmd_lock);
++
++	return ret;
++}
++
++int mtk_wcn_fm_chip_rampdown(struct mtk_wcn_fm_dev *fm)
++{
++	struct mtk_wcn_fm_pkt pkt;
++	int ret;
++
++	/* mt6627_RampDown(), mt6627_fm_lib.c:384-445 */
++	ret = mtk_wcn_fm_top_write(fm, FM_TOP_REG_CLK_CTRL, 0x00000007);
++	if (ret)
++		return ret;
++	ret = mtk_wcn_fm_reg_set_bits(fm, FM_REG_0F_RF_MODE, 0x0000, 0xf800);
++	if (ret)
++		return ret;
++	ret = mtk_wcn_fm_top_write(fm, FM_TOP_REG_CLK_CTRL, 0x0000000f);
++	if (ret)
++		return ret;
++	ret = mtk_wcn_fm_reg_write(fm, FM_MAIN_INTRMASK, 0x0000);
++	if (ret)
++		return ret;
++	ret = mtk_wcn_fm_reg_write(fm, FM_MAIN_EXTINTRMASK, 0x0000);
++	if (ret)
++		return ret;
++
++	mutex_lock(&fm->cmd_lock);
++	mtk_wcn_fm_pkt_init(&pkt, fm->cmd_buf, sizeof(fm->cmd_buf),
++			    FM_RAMPDOWN_OPCODE);
++	/* clear the DSP state */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_modify(FM_MAIN_CTRL, 0xfff0,
++						       0x0000,
++						       pkt.buf + pkt.len,
++						       pkt.cap - pkt.len));
++	/* enter ramp down, the firmware waits for STC_DONE */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_modify(FM_MAIN_CTRL, 0xffff,
++						       FM_MAIN_CTRL_RAMP_DOWN,
++						       pkt.buf + pkt.len,
++						       pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_rd_until(FM_MAIN_INTR,
++							 FM_INTR_STC_DONE,
++							 FM_INTR_STC_DONE,
++							 pkt.buf + pkt.len,
++							 pkt.cap - pkt.len));
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_modify(FM_MAIN_CTRL,
++						       (u16)~FM_MAIN_CTRL_RAMP_DOWN,
++						       0x0000, pkt.buf + pkt.len,
++						       pkt.cap - pkt.len));
++	/* write 1 to clear the STC_DONE status flag */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_modify(FM_MAIN_INTR, 0xffff,
++						       FM_INTR_STC_DONE,
++						       pkt.buf + pkt.len,
++						       pkt.cap - pkt.len));
++	ret = mtk_wcn_fm_send(fm, &pkt, FM_EVT_BIT(FM_RAMPDOWN_OPCODE),
++			      FM_RAMPDOWN_TIMEOUT);
++	mutex_unlock(&fm->cmd_lock);
++	if (ret)
++		return ret;
++
++	ret = mtk_wcn_fm_reg_write(fm, FM_MAIN_EXTINTRMASK, 0x0021);
++	if (ret)
++		return ret;
++
++	return mtk_wcn_fm_reg_write(fm, FM_MAIN_INTRMASK, 0x0021);
++}
++
++int mtk_wcn_fm_chip_tune(struct mtk_wcn_fm_dev *fm, u16 freq)
++{
++	u16 chan_para, freq_reg;
++	int ret;
++
++	if (freq < 6500 || freq > 10800)
++		return -EINVAL;
++
++	/* mt6627_SetFreq(), mt6627_fm_lib.c:953-1136 */
++	ret = mtk_wcn_fm_top_write(fm, FM_TOP_REG_CLK_CTRL, 0x00000007);
++	if (ret)
++		return ret;
++	ret = mtk_wcn_fm_reg_set_bits(fm, FM_REG_0F_RF_MODE, 0x0455, 0xf800);
++	if (ret)
++		return ret;
++
++	if (mtk_wcn_fm_tdd_chan_check(freq))
++		ret = mtk_wcn_fm_reg_set_bits(fm, FM_REG_RF_30, 0x0008, 0xfff3);
++	else
++		ret = mtk_wcn_fm_reg_set_bits(fm, FM_REG_RF_30, 0x0000, 0xfff3);
++	if (ret)
++		return ret;
++
++	ret = mtk_wcn_fm_top_write(fm, FM_TOP_REG_CLK_CTRL, 0x0000000f);
++	if (ret)
++		return ret;
++
++	chan_para = mtk_wcn_fm_chan_para_get(freq);
++	freq_reg = (freq - 6400) * 2 / 10;
++
++	ret = mtk_wcn_fm_reg_set_bits(fm, FM_CHANNEL_SET, freq_reg, 0xfc00);
++	if (ret)
++		return ret;
++	ret = mtk_wcn_fm_reg_set_bits(fm, FM_CHANNEL_SET, chan_para << 12,
++				      0x0fff);
++	if (ret)
++		return ret;
++
++	/* enable the connectivity SoC FM 2-wire RX audio path */
++	ret = mtk_wcn_fm_reg_write(fm, FM_REG_AUDIO_CTRL0, 0xf9ab);
++	if (ret)
++		return ret;
++	ret = mtk_wcn_fm_host_write(fm, FM_HOST_REG_AUDIO_CTRL, 0x00003f35);
++	if (ret)
++		return ret;
++
++	ret = mtk_wcn_fm_send_tune(fm);
++	if (ret) {
++		dev_err(fm->dev, "tune to %u failed (%d)\n", freq, ret);
++		return ret;
++	}
++
++	fm->cur_freq = freq;
++
++	/*
++	 * Re-apply the user soft mute gain / blending settings after the tune;
++	 * the DSP reloads its coefficient memory (mt6627_fm_lib.c:1073-1118).
++	 */
++	if (fm->smg != FM_MT6627_SMG_DEFAULT) {
++		ret = mtk_wcn_fm_coeff_write(fm, FM_COEFF_SMG, fm->smg);
++		if (ret)
++			return ret;
++	}
++	if (!fm->blend) {
++		ret = mtk_wcn_fm_coeff_write(fm, FM_COEFF_BLEND_RSSI, 0);
++		if (ret)
++			return ret;
++		ret = mtk_wcn_fm_coeff_write(fm, FM_COEFF_BLEND_PAMD, 0);
++		if (ret)
++			return ret;
++		ret = mtk_wcn_fm_coeff_write(fm, FM_COEFF_BLEND_VALUE, 0);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/* mt6627_seek(), mt6627_fm_cmd.c:696-746 */
++static int mtk_wcn_fm_send_seek(struct mtk_wcn_fm_dev *fm, u16 min_freq,
++				u16 max_freq, u16 space, u8 dir, bool wrap)
++{
++	struct mtk_wcn_fm_pkt pkt;
++	u16 max_reg, min_reg, spacing;
++	int ret;
++
++	max_reg = (max_freq - 6400) * 2 / 10;
++	min_reg = (min_freq - 6400) * 2 / 10;
++
++	switch (space) {
++	case FM_SPACE_50K:
++		spacing = 0x1000;
++		break;
++	case FM_SPACE_200K:
++		spacing = 0x4000;
++		break;
++	case FM_SPACE_100K:
++	default:
++		spacing = 0x2000;
++		break;
++	}
++
++	mutex_lock(&fm->cmd_lock);
++	mtk_wcn_fm_pkt_init(&pkt, fm->cmd_buf, sizeof(fm->cmd_buf),
++			    FM_SEEK_OPCODE);
++	/* seek direction: 0x66[10] = 1 for seek down */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_modify(FM_MAIN_CFG1, 0xfbff,
++						       dir ? 0x0400 : 0x0000,
++						       pkt.buf + pkt.len,
++						       pkt.cap - pkt.len));
++	/* channel spacing: 0x66[14:12] */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_modify(FM_MAIN_CFG1, 0x8fff,
++						       spacing,
++						       pkt.buf + pkt.len,
++						       pkt.cap - pkt.len));
++	/* 0x66[11]: wrap around at the band edge.  Downstream seek always sets
++	 * this bit (mt6627_fm_cmd.c:728) while the scan variant clears it
++	 * (mt6627_fm_cmd.c:795); the requested V4L2 wrap flag selects which.
++	 */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_modify(FM_MAIN_CFG1, 0xf7ff,
++						       wrap ? 0x0800 : 0x0000,
++						       pkt.buf + pkt.len,
++						       pkt.cap - pkt.len));
++	/* 0x66[9:0] upper bound */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_modify(FM_MAIN_CFG1, 0xfc00,
++						       max_reg,
++						       pkt.buf + pkt.len,
++						       pkt.cap - pkt.len));
++	/* 0x67[9:0] lower bound */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_modify(FM_MAIN_CFG2, 0xfc00,
++						       min_reg,
++						       pkt.buf + pkt.len,
++						       pkt.cap - pkt.len));
++	/* enable the hardware controlled seek sequence */
++	mtk_wcn_fm_pkt_add(&pkt, mtk_wcn_fm_bop_modify(FM_MAIN_CTRL, 0xfff8,
++						       FM_MAIN_CTRL_SEEK,
++						       pkt.buf + pkt.len,
++						       pkt.cap - pkt.len));
++	ret = mtk_wcn_fm_send(fm, &pkt,
++			      FM_EVT_BIT(FM_SEEK_OPCODE) | FM_EVT_SEEK_DONE,
++			      FM_SEEK_TIMEOUT);
++	mutex_unlock(&fm->cmd_lock);
++
++	return ret;
++}
++
++/*
++ * mt6627_Seek(), mt6627_fm_lib.c:1146-1179.  Downstream never wired this
++ * helper into the basic interface (the assignment is inside #if 0), so the
++ * post-seek ramp down / unmute below is ported from the disabled code and is
++ * unverified on hardware.
++ */
++int mtk_wcn_fm_chip_seek(struct mtk_wcn_fm_dev *fm, u16 min_freq,
++			 u16 max_freq, u16 space, u8 dir, bool wrap,
++			 u16 *result)
++{
++	u16 ctrl = 0;
++	int ret;
++
++	if (min_freq >= max_freq)
++		return -EINVAL;
++
++	ret = mtk_wcn_fm_chip_rampdown(fm);
++	if (ret)
++		return ret;
++
++	ret = mtk_wcn_fm_reg_read(fm, FM_MAIN_CTRL, &ctrl);
++	if (ret)
++		return ret;
++
++	ret = mtk_wcn_fm_chip_mute(fm, true);
++	if (ret)
++		return ret;
++
++	ret = mtk_wcn_fm_send_seek(fm, min_freq, max_freq, space, dir, wrap);
++	if (ret)
++		return ret;
++
++	if (fm->seek_result < min_freq || fm->seek_result > max_freq) {
++		dev_warn(fm->dev, "seek returned out of range frequency %u\n",
++			 fm->seek_result);
++		return -ERANGE;
++	}
++
++	*result = fm->seek_result;
++	fm->cur_freq = fm->seek_result;
++
++	ret = mtk_wcn_fm_chip_rampdown(fm);
++	if (ret)
++		dev_warn(fm->dev, "post-seek ramp down failed (%d)\n", ret);
++
++	/* restore the mute state the caller had before the seek */
++	if (!(ctrl & FM_MAIN_CTRL_MUTE))
++		ret = mtk_wcn_fm_chip_mute(fm, false);
++
++	return ret;
++}
++
++/*
++ * Status / audio controls
++ */
++/* mt6627_GetCurRSSI() and mt6627_GetMonoStereo(), mt6627_fm_lib.c:1277-1294,
++ * 1364-1379.
++ */
++int mtk_wcn_fm_chip_status(struct mtk_wcn_fm_dev *fm, s32 *dbm, bool *stereo)
++{
++	u16 reg;
++	int ret;
++
++	ret = mtk_wcn_fm_reg_read(fm, FM_RSSI_IND, &reg);
++	if (ret)
++		return ret;
++
++	if (dbm) {
++		u16 rssi = reg & 0x03ff;
++
++		*dbm = (rssi > 511) ? (((rssi - 1024) * 6) >> 4) :
++				      ((rssi * 6) >> 4);
++	}
++	if (stereo)
++		*stereo = !!(reg & FM_RSSI_IND_STEREO);
++
++	return 0;
++}
++
++/* mt6627_Mute(), mt6627_fm_lib.c:333-351 */
++int mtk_wcn_fm_chip_mute(struct mtk_wcn_fm_dev *fm, bool mute)
++{
++	u16 reg;
++	int ret;
++
++	ret = mtk_wcn_fm_reg_read(fm, FM_REG_AUDIO_CTRL1, &reg);
++	if (ret)
++		return ret;
++
++	reg &= 0xfffc;
++	if (mute)
++		reg |= 0x0003;
++
++	ret = mtk_wcn_fm_reg_write(fm, FM_REG_AUDIO_CTRL1, reg);
++	if (!ret)
++		fm->mute = mute;
++
++	return ret;
++}
++
++/* mt6627_SetVol(), mt6627_fm_lib.c:1301-1320 */
++int mtk_wcn_fm_chip_vol_set(struct mtk_wcn_fm_dev *fm, u8 vol)
++{
++	int ret;
++
++	vol = min_t(u8, vol, 15);
++	ret = mtk_wcn_fm_reg_write(fm, FM_REG_VOLUME, mtk_wcn_fm_vol_tbl[vol]);
++	if (!ret)
++		fm->vol = vol;
++
++	return ret;
++}
++
++/* mt6627_GetVol(), mt6627_fm_lib.c:1321-1349 */
++int mtk_wcn_fm_chip_vol_get(struct mtk_wcn_fm_dev *fm, u8 *vol)
++{
++	u16 reg;
++	int i, ret;
++
++	ret = mtk_wcn_fm_reg_read(fm, FM_REG_VOLUME, &reg);
++	if (ret)
++		return ret;
++
++	*vol = 0;
++	for (i = 0; i < ARRAY_SIZE(mtk_wcn_fm_vol_tbl); i++) {
++		if (mtk_wcn_fm_vol_tbl[i] == reg) {
++			*vol = i;
++			break;
++		}
++	}
++
++	return 0;
++}
++
++/* mt6627_SetAntennaType(), mt6627_fm_lib.c:303-318 */
++int mtk_wcn_fm_chip_antenna(struct mtk_wcn_fm_dev *fm, u8 type)
++{
++	u16 reg;
++	int ret;
++
++	ret = mtk_wcn_fm_reg_read(fm, FM_MAIN_CG2_CTRL, &reg);
++	if (ret)
++		return ret;
++
++	if (type)
++		reg |= FM_CG2_ANTENNA_TYPE;
++	else
++		reg &= ~FM_CG2_ANTENNA_TYPE;
++
++	ret = mtk_wcn_fm_reg_write(fm, FM_MAIN_CG2_CTRL, reg);
++	if (!ret)
++		fm->antenna = type ? 1 : 0;
++
++	return ret;
++}
++
++/*
++ * De-emphasis.  Downstream programs 0x61[12] while powering up
++ * (mt6627_fm_cmd.c:213) and exposes the value through the search threshold
++ * ioctl (mt6627_fm_lib.c:1740-1747); the chip accepts the same modify
++ * operation at run time.
++ */
++int mtk_wcn_fm_chip_deemphasis(struct mtk_wcn_fm_dev *fm, u8 deemphasis)
++{
++	int ret;
++
++	ret = mtk_wcn_fm_reg_set_bits(fm, FM_MAIN_CG2_CTRL,
++				      (deemphasis ? 1 : 0) << 12,
++				      (u16)~FM_CG2_DE_EMPHASIS);
++	if (!ret)
++		fm->deemphasis = deemphasis ? 1 : 0;
++
++	return ret;
++}
++
++/*
++ * mt6627_SetMonoStereo(), mt6627_fm_lib.c:1380-1395.  @mono forces mono,
++ * otherwise the chip decides automatically.
++ */
++int mtk_wcn_fm_chip_mono(struct mtk_wcn_fm_dev *fm, bool mono)
++{
++	int ret;
++
++	ret = mtk_wcn_fm_top_write(fm, FM_TOP_REG_CLK_CTRL, 0x00000007);
++	if (ret)
++		return ret;
++	ret = mtk_wcn_fm_reg_set_bits(fm, FM_REG_AUDIO_MONO,
++				      mono ? 0x0008 : 0x0000,
++				      (u16)~0x0008);
++	if (ret)
++		return ret;
++
++	return mtk_wcn_fm_top_write(fm, FM_TOP_REG_CLK_CTRL, 0x0000000f);
++}
++
++/* mt6627_soft_mute_control(), mt6627_fm_lib.c:1597-1628 */
++int mtk_wcn_fm_chip_smg(struct mtk_wcn_fm_dev *fm, u8 value)
++{
++	int ret;
++
++	if (value > FM_MT6627_SMG_MAX)
++		return -EINVAL;
++
++	/* 0 disables the soft mute gain, 0x15 restores the default level */
++	ret = mtk_wcn_fm_coeff_write(fm, FM_COEFF_SMG, value ? value : 0x1);
++	if (!ret)
++		fm->smg = value;
++
++	return ret;
++}
++
++/* mt6627_blending_control(), mt6627_fm_lib.c:1630-1718 */
++int mtk_wcn_fm_chip_blend(struct mtk_wcn_fm_dev *fm, bool on)
++{
++	u16 rssi = on ? FM_MT6627_BLEND_RSSI_DEFAULT : 0;
++	u16 pamd = on ? FM_MT6627_BLEND_PAMD_DEFAULT : 0;
++	u16 blend = on ? FM_MT6627_BLEND_VALUE_DEFAULT : 0;
++	int ret;
++
++	ret = mtk_wcn_fm_coeff_write(fm, FM_COEFF_BLEND_RSSI, rssi);
++	if (ret)
++		return ret;
++	ret = mtk_wcn_fm_coeff_write(fm, FM_COEFF_BLEND_PAMD, pamd);
++	if (ret)
++		return ret;
++	ret = mtk_wcn_fm_coeff_write(fm, FM_COEFF_BLEND_VALUE, blend);
++	if (!ret)
++		fm->blend = on;
++
++	return ret;
++}
++
++/* mt6627_RDS_enable() / mt6627_RDS_disable(), mt6627_fm_rds.c:45-93 */
++int mtk_wcn_fm_chip_rds(struct mtk_wcn_fm_dev *fm, bool on)
++{
++	u16 ctrl;
++	int ret;
++
++	if (on)
++		ret = mtk_wcn_fm_reg_write(fm, FM_RDS_CFG0, 6);
++	else
++		ret = 0;
++	if (ret)
++		return ret;
++
++	ret = mtk_wcn_fm_reg_read(fm, FM_MAIN_CTRL, &ctrl);
++	if (ret)
++		return ret;
++
++	if (on)
++		ctrl |= FM_MAIN_CTRL_RDS_MASK;
++	else
++		ctrl &= ~FM_MAIN_CTRL_RDS_MASK;
++
++	ret = mtk_wcn_fm_reg_write(fm, FM_MAIN_CTRL, ctrl);
++	if (!ret)
++		fm->rds_on = on;
++
++	return ret;
++}
+diff --git a/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_link.c b/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_link.c
+new file mode 100644
+index 000000000..14075f7f4
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_link.c
+@@ -0,0 +1,371 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WCN FM radio - STP link layer.
++ *
++ * Port from Samsung/MTK downstream drivers/misc/mediatek/fmradio/core/fm_link.c
++ * and drivers/misc/mediatek/fmradio/core/fm_eint.c.
++ *
++ * The FM function of the connectivity SoC is driven over the STP FM channel
++ * (FM_TASK_INDX): commands are framed as
++ *
++ *	[0x01][opcode][length:le16][payload]
++ *
++ * and firmware events as
++ *
++ *	[0x04][opcode][length:le16][payload].
++ *
++ * Every command waits for the event carrying the matching opcode (or a
++ * derived completion bit such as FLAG_TUNE_DONE), retrying once like the
++ * downstream driver does.
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ */
++
++#include <linux/delay.h>
++#include <linux/kfifo.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++
++#include "mtk_wcn_fm.h"
++
++/* Single FM instance, as downstream g_fm_struct (core/fm_main.c:26). */
++static struct mtk_wcn_fm_dev *mtk_wcn_fm_instance;
++
++enum mtk_wcn_fm_parser_state {
++	FM_RX_PKT_TYPE = 0,
++	FM_RX_OPCODE,
++	FM_RX_LEN_LO,
++	FM_RX_LEN_HI,
++	FM_RX_PAYLOAD,
++};
++
++static void mtk_wcn_fm_evt_set(struct mtk_wcn_fm_dev *fm, u64 bits)
++{
++	spin_lock(&fm->evt_lock);
++	fm->evt_bits |= bits;
++	spin_unlock(&fm->evt_lock);
++	wake_up_interruptible(&fm->evt_wq);
++}
++
++static int mtk_wcn_fm_wait_event(struct mtk_wcn_fm_dev *fm, u64 mask,
++				 unsigned int timeout_s)
++{
++	long left;
++
++	left = wait_event_interruptible_timeout(fm->evt_wq,
++						(READ_ONCE(fm->evt_bits) & mask) != 0,
++						msecs_to_jiffies(timeout_s * 1000));
++	if (left > 0) {
++		spin_lock(&fm->evt_lock);
++		fm->evt_bits &= ~mask;
++		spin_unlock(&fm->evt_lock);
++		return 0;
++	}
++
++	return left ? -ERESTARTSYS : -ETIMEDOUT;
++}
++
++/**
++ * mtk_wcn_fm_cmd_tx - hand a command packet to the FM firmware and wait
++ * @fm: driver state
++ * @buf: command packet, built with the header already filled in
++ * @len: packet length including the 4 byte header
++ * @mask: event bits that complete the command
++ * @timeout_s: per-attempt timeout in seconds
++ *
++ * The caller must hold fm->cmd_lock, which protects the single outstanding
++ * command (downstream cmd_buf_lock in mt6627_fm_lib.c:158).
++ *
++ * Return: 0 on completion, negative errno on failure.
++ */
++int mtk_wcn_fm_cmd_tx(struct mtk_wcn_fm_dev *fm, const u8 *buf, u16 len,
++		      u64 mask, unsigned int timeout_s)
++{
++	int ret;
++	int retry = FM_SW_RETRY_CNT;
++
++	if (!fm->link_ready)
++		return -ENODEV;
++	if (!buf || !len || !mask)
++		return -EINVAL;
++
++	spin_lock(&fm->evt_lock);
++	fm->evt_bits &= ~mask;
++	spin_unlock(&fm->evt_lock);
++
++	do {
++		ret = mtk_wcn_stp_send_data(buf, len, FM_TASK_INDX);
++		if (ret <= 0) {
++			dev_err(fm->dev, "STP send failed (%d)\n", ret);
++			return -EIO;
++		}
++
++		ret = mtk_wcn_fm_wait_event(fm, mask, timeout_s);
++		if (ret != -ETIMEDOUT)
++			return ret;
++
++		dev_warn(fm->dev, "event 0x%02x timed out (%us)\n", buf[1],
++			 timeout_s);
++	} while (retry-- > 0);
++
++	return ret;
++}
++
++static void mtk_wcn_fm_rds_push(struct mtk_wcn_fm_dev *fm, const u8 *payload,
++				u16 len)
++{
++	struct mtk_wcn_fm_rds_data data;
++
++	if (len > sizeof(data)) {
++		dev_warn_ratelimited(fm->dev,
++				     "oversized RDS event (%u bytes)\n", len);
++		return;
++	}
++
++	memset(&data, 0, sizeof(data));
++	memcpy(&data, payload, len);
++
++	if (kfifo_in(&fm->rds_fifo, &data, sizeof(data)) != sizeof(data))
++		dev_warn_ratelimited(fm->dev, "RDS fifo overrun\n");
++
++	wake_up_interruptible(&fm->rds_wq);
++}
++
++/*
++ * Event payload handling, downstream fm_event_parser() switch on opcode
++ * (core/fm_link.c:304-408).
++ */
++static void mtk_wcn_fm_dispatch(struct mtk_wcn_fm_dev *fm, const u8 *payload,
++				u16 len)
++{
++	u8 opcode = fm->parser_opcode;
++	u64 bits = 0;
++
++	if (!len) {
++		/* core/fm_link.c:294-300 */
++		if (opcode == CSPI_WRITE_OPCODE)
++			bits = FM_EVT_CSPI_WRITE;
++		else if (opcode < 32)
++			bits = FM_EVT_BIT(opcode);
++		goto out;
++	}
++
++	switch (opcode) {
++	case FM_TUNE_OPCODE:
++		/* core/fm_link.c:307-312: payload[0] == 1 means tuned */
++		if (len == 1 && payload[0] == 1)
++			bits = FM_EVT_TUNE_DONE;
++		break;
++	case FM_SEEK_OPCODE:
++		/* core/fm_link.c:323-329 */
++		if (len >= 2)
++			fm->seek_result = payload[0] | (payload[1] << 8);
++		bits = FM_EVT_SEEK_DONE;
++		break;
++	case FSPI_READ_OPCODE:
++		/* core/fm_link.c:353-358 */
++		if (len >= 2)
++			fm->fspi_rd = payload[0] | (payload[1] << 8);
++		bits = FM_EVT_BIT(opcode);
++		break;
++	case CSPI_READ_OPCODE:
++	case FM_HOST_READ_OPCODE:
++		/* core/fm_link.c:360-381 */
++		if (len >= 4)
++			fm->cspi_rd = payload[0] | (payload[1] << 8) |
++				      (payload[2] << 16) |
++				      ((u32)payload[3] << 24);
++		bits = (opcode == CSPI_READ_OPCODE) ? FM_EVT_CSPI_READ :
++						      FM_EVT_HOST_READ;
++		break;
++	case RDS_RX_DATA_OPCODE:
++		/* core/fm_link.c:383-403 */
++		mtk_wcn_fm_rds_push(fm, payload, len);
++		bits = FM_EVT_BIT(opcode);
++		break;
++	default:
++		/* core/fm_link.c:405-407 */
++		if (opcode < 32)
++			bits = FM_EVT_BIT(opcode);
++		break;
++	}
++
++out:
++	if (bits)
++		mtk_wcn_fm_evt_set(fm, bits);
++}
++
++/*
++ * Packet parser.  The state is kept across calls because the STP transport
++ * may deliver a frame in several chunks (downstream kept it in a function
++ * static, core/fm_link.c:231).
++ */
++static void mtk_wcn_fm_parse(struct mtk_wcn_fm_dev *fm, const u8 *buf, int len)
++{
++	int i;
++
++	for (i = 0; i < len; i++) {
++		u8 ch = buf[i];
++
++		switch (fm->parser_state) {
++		case FM_RX_PKT_TYPE:
++			if (ch == FM_PKT_TYPE_EVENT)
++				fm->parser_state = FM_RX_OPCODE;
++			else
++				dev_warn_ratelimited(fm->dev,
++						     "bad event packet type 0x%02x\n",
++						     ch);
++			break;
++		case FM_RX_OPCODE:
++			fm->parser_opcode = ch;
++			fm->parser_state = FM_RX_LEN_LO;
++			break;
++		case FM_RX_LEN_LO:
++			fm->parser_len = ch;
++			fm->parser_state = FM_RX_LEN_HI;
++			break;
++		case FM_RX_LEN_HI:
++			fm->parser_len |= (u16)ch << 8;
++			fm->parser_pos = 0;
++			if (fm->parser_len > sizeof(fm->rx_payload)) {
++				dev_warn_ratelimited(fm->dev,
++						     "oversized event 0x%02x (%u bytes)\n",
++						     fm->parser_opcode,
++						     fm->parser_len);
++				fm->parser_state = FM_RX_PKT_TYPE;
++			} else if (!fm->parser_len) {
++				mtk_wcn_fm_dispatch(fm, NULL, 0);
++				fm->parser_state = FM_RX_PKT_TYPE;
++			} else {
++				fm->parser_state = FM_RX_PAYLOAD;
++			}
++			break;
++		case FM_RX_PAYLOAD:
++			fm->rx_payload[fm->parser_pos++] = ch;
++			if (fm->parser_pos == fm->parser_len) {
++				mtk_wcn_fm_dispatch(fm, fm->rx_payload,
++						    fm->parser_len);
++				fm->parser_state = FM_RX_PKT_TYPE;
++			}
++			break;
++		}
++	}
++}
++
++static void mtk_wcn_fm_rx_work(struct work_struct *work)
++{
++	struct mtk_wcn_fm_dev *fm = container_of(work, struct mtk_wcn_fm_dev,
++						 rx_work);
++	int len;
++	int i;
++
++	for (i = 0; i < 16; i++) {
++		len = mtk_wcn_stp_receive_data(fm->rx_buf, sizeof(fm->rx_buf),
++					       FM_TASK_INDX);
++		if (len <= 0)
++			break;
++
++		mtk_wcn_fm_parse(fm, fm->rx_buf, len);
++	}
++}
++
++/*
++ * STP channel callback (downstream fm_request_eint() registers
++ * fm_eint_handler(), core/fm_eint.c:34-39; the handler only schedules work,
++ * core/fm_main.c:2267-2275).
++ */
++static void mtk_wcn_fm_stp_event_cb(void)
++{
++	struct mtk_wcn_fm_dev *fm = mtk_wcn_fm_instance;
++
++	if (fm && fm->link_ready)
++		schedule_work(&fm->rx_work);
++}
++
++/*
++ * WMT message callback (downstream WCNfm_wholechip_rst_cb(),
++ * core/fm_link.c:34-63).  The connectivity SoC reset destroys the FM
++ * firmware state, so the driver has to re-run the power up sequence and
++ * restore the user visible state.
++ */
++static void mtk_wcn_fm_wmt_msgcb(enum mtk_wcn_wmt_drv src,
++				 enum mtk_wcn_wmt_drv dst,
++				 enum mtk_wcn_wmt_msg msg, void *data, u32 len)
++{
++	struct mtk_wcn_fm_dev *fm = mtk_wcn_fm_instance;
++	u32 rst;
++
++	if (!fm || src != WMTDRV_WMT || dst != WMTDRV_FM ||
++	    msg != WMTMSG_RESET)
++		return;
++
++	if (!data || len < sizeof(rst)) {
++		dev_warn(fm->dev, "malformed WMT reset message\n");
++		return;
++	}
++	memcpy(&rst, data, sizeof(rst));
++
++	switch (rst) {
++	case FM_WMTRSTMSG_RESET_START:
++		fm->resetting = true;
++		break;
++	case FM_WMTRSTMSG_RESET_END:
++		fm->resetting = false;
++		schedule_work(&fm->rst_work);
++		break;
++	default:
++		break;
++	}
++}
++
++int mtk_wcn_fm_link_init(struct mtk_wcn_fm_dev *fm)
++{
++	int ret;
++
++	if (mtk_wcn_fm_instance)
++		return -EBUSY;
++
++	mtk_wcn_fm_instance = fm;
++	fm->parser_state = FM_RX_PKT_TYPE;
++	INIT_WORK(&fm->rx_work, mtk_wcn_fm_rx_work);
++
++	ret = mtk_wcn_stp_register_event_cb(FM_TASK_INDX,
++					    mtk_wcn_fm_stp_event_cb);
++	if (ret) {
++		dev_err(fm->dev, "cannot register STP event callback (%d)\n",
++			ret);
++		mtk_wcn_fm_instance = NULL;
++		return ret;
++	}
++
++	ret = mtk_wcn_wmt_msgcb_reg(WMTDRV_FM, mtk_wcn_fm_wmt_msgcb);
++	if (ret) {
++		dev_err(fm->dev, "cannot register WMT callback (%d)\n", ret);
++		mtk_wcn_stp_register_event_cb(FM_TASK_INDX, NULL);
++		mtk_wcn_fm_instance = NULL;
++		return ret;
++	}
++
++	fm->link_ready = true;
++	dev_dbg(fm->dev, "FM link established\n");
++
++	return 0;
++}
++
++void mtk_wcn_fm_link_exit(struct mtk_wcn_fm_dev *fm)
++{
++	if (!fm->link_ready)
++		return;
++
++	fm->link_ready = false;
++	mtk_wcn_wmt_msgcb_unreg(WMTDRV_FM);
++	/* The STP API has no dedicated unregister call: registering a NULL
++	 * callback clears the slot (downstream stp_exp.c:173-186 does exactly
++	 * that, see also gps/stp_chrdev_gps.c:449).
++	 */
++	mtk_wcn_stp_register_event_cb(FM_TASK_INDX, NULL);
++	cancel_work_sync(&fm->rx_work);
++	mtk_wcn_fm_instance = NULL;
++
++	dev_dbg(fm->dev, "FM link released\n");
++}
+diff --git a/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_v4l2.c b/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_v4l2.c
+new file mode 100644
+index 000000000..721b438a2
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_v4l2.c
+@@ -0,0 +1,793 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WCN FM radio - V4L2 radio device, power management, rfkill.
++ *
++ * Port from Samsung/MTK downstream drivers/misc/mediatek/fmradio/core/
++ * fm_module.c (char device, ioctl semantics, antenna switch GPIO) and
++ * fm_main.c (power up/down and control flows).  The downstream character
++ * device is replaced by a V4L2 radio device exporting the same hardware
++ * operations.
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ */
++
++#include <linux/gpio.h>
++#include <linux/kfifo.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_gpio.h>
++#include <linux/platform_device.h>
++#include <linux/rfkill.h>
++#include <linux/slab.h>
++
++#include <media/v4l2-event.h>
++#include <media/v4l2-ioctl.h>
++
++#include "mtk_wcn_fm.h"
++
++#define MTK_WCN_FM_RDS_FIFO_SIZE \
++	(sizeof(struct mtk_wcn_fm_rds_data) * MTK_WCN_FM_RDS_FIFO_RECORDS)
++
++/* Downstream FM_UE_FREQ_MIN / FM_UE_FREQ_MAX etc., in 10 kHz units. */
++static void mtk_wcn_fm_band_range(u8 band, u16 *min, u16 *max)
++{
++	switch (band) {
++	case FM_BAND_JAPAN:
++		*min = FM_JP_FREQ_MIN;
++		*max = FM_JP_FREQ_MAX;
++		break;
++	case FM_BAND_JAPANW:
++		*min = FM_JP_FREQ_MIN;
++		*max = FM_UE_FREQ_MAX;
++		break;
++	case FM_BAND_SPECIAL:
++		*min = FM_SPECIAL_FREQ_MIN;
++		*max = FM_SPECIAL_FREQ_MAX;
++		break;
++	case FM_BAND_UE:
++	default:
++		*min = FM_UE_FREQ_MIN;
++		*max = FM_UE_FREQ_MAX;
++		break;
++	}
++}
++
++/*
++ * Power management
++ */
++/*
++ * Bring the FM function up: WMT function on, MT6627 power up sequence and
++ * the initial tune.  Downstream does the same on FM_IOCTL_POWERUP, which
++ * calls fm_powerup() and then fm_tune() (core/fm_module.c:131-158).
++ */
++static int mtk_wcn_fm_power_on(struct mtk_wcn_fm_dev *fm)
++{
++	u16 min, max;
++	int ret;
++
++	if (fm->powered)
++		return 0;
++
++	/* Drop RDS records left over from a previous session
++	 * (mt6627_RDS_Init_Data(), mt6627_fm_rds.c:231-240).
++	 */
++	kfifo_reset(&fm->rds_fifo);
++
++	ret = mtk_wcn_fm_chip_power_up(fm);
++	if (ret)
++		return ret;
++
++	mtk_wcn_fm_band_range(fm->band, &min, &max);
++	if (fm->cur_freq < min || fm->cur_freq > max)
++		fm->cur_freq = min;
++
++	ret = mtk_wcn_fm_chip_tune(fm, fm->cur_freq);
++	if (ret) {
++		mtk_wcn_fm_chip_power_down(fm);
++		return ret;
++	}
++
++	/* FM antenna switch: downstream drives it high while powered
++	 * (core/fm_module.c:151-152).
++	 */
++	if (fm->ant_sel_valid)
++		gpio_set_value_cansleep(fm->ant_sel_gpio, 1);
++
++	return 0;
++}
++
++/* fm_powerdown(), core/fm_main.c:612-636. */
++static void mtk_wcn_fm_power_off(struct mtk_wcn_fm_dev *fm)
++{
++	if (!fm->powered)
++		return;
++
++	/* pwrdown_flow() disables RDS before the chip power down sequence
++	 * (core/fm_main.c:592-601).
++	 */
++	if (fm->rds_on)
++		mtk_wcn_fm_chip_rds(fm, false);
++
++	/* core/fm_module.c:164-165 */
++	if (fm->ant_sel_valid)
++		gpio_set_value_cansleep(fm->ant_sel_gpio, 0);
++
++	mtk_wcn_fm_chip_power_down(fm);
++
++	/* Wake up readers blocked in read()/poll(). */
++	wake_up_interruptible_all(&fm->rds_wq);
++}
++
++/*
++ * Restore the FM function after a connectivity SoC reset
++ * (fm_subsys_reset_work_func(), core/fm_main.c:2188-2265).  The WMT reset
++ * notification is only generated for whole chip resets, where the FM function
++ * has already been switched off by WMT, so the chip is brought up again from
++ * scratch and the user visible state is re-applied from the control values.
++ */
++static void mtk_wcn_fm_reset_work(struct work_struct *work)
++{
++	struct mtk_wcn_fm_dev *fm = container_of(work, struct mtk_wcn_fm_dev,
++						 rst_work);
++	bool restored = false;
++
++	mutex_lock(&fm->lock);
++	if (fm->powered) {
++		dev_warn(fm->dev, "connectivity reset, restoring FM state\n");
++		fm->powered = false;
++		if (!mtk_wcn_fm_chip_power_up(fm) &&
++		    !mtk_wcn_fm_chip_tune(fm, fm->cur_freq))
++			restored = true;
++		else
++			dev_err(fm->dev, "FM restore after reset failed\n");
++	}
++	mutex_unlock(&fm->lock);
++
++	/* Re-apply volume, mute, RDS, de-emphasis, antenna and DSP settings. */
++	if (restored)
++		v4l2_ctrl_handler_setup(&fm->ctrl_handler);
++}
++
++/*
++ * rfkill
++ */
++static int mtk_wcn_fm_rfkill_set_block(void *data, bool blocked)
++{
++	struct mtk_wcn_fm_dev *fm = data;
++	bool apply = false;
++
++	mutex_lock(&fm->lock);
++	if (blocked) {
++		if (fm->opened)
++			mtk_wcn_fm_power_off(fm);
++	} else if (fm->opened && !fm->powered) {
++		if (!mtk_wcn_fm_power_on(fm))
++			apply = true;
++	}
++	mutex_unlock(&fm->lock);
++
++	if (apply)
++		v4l2_ctrl_handler_setup(&fm->ctrl_handler);
++
++	return 0;
++}
++
++static const struct rfkill_ops mtk_wcn_fm_rfkill_ops = {
++	.set_block = mtk_wcn_fm_rfkill_set_block,
++};
++
++/*
++ * V4L2 controls
++ */
++static int mtk_wcn_fm_s_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct mtk_wcn_fm_dev *fm = container_of(ctrl->handler,
++						 struct mtk_wcn_fm_dev,
++						 ctrl_handler);
++	u16 min, max;
++	int ret = 0;
++
++	/*
++	 * Values programmed while the chip is off are stored by the control
++	 * framework and written by v4l2_ctrl_handler_setup() after the next
++	 * power up.
++	 */
++	if (!fm->powered)
++		return 0;
++
++	mutex_lock(&fm->lock);
++	switch (ctrl->id) {
++	case V4L2_CID_AUDIO_MUTE:
++		ret = mtk_wcn_fm_chip_mute(fm, ctrl->val);
++		break;
++	case V4L2_CID_AUDIO_VOLUME:
++		ret = mtk_wcn_fm_chip_vol_set(fm, ctrl->val);
++		break;
++	case V4L2_CID_TUNE_DEEMPHASIS:
++		ret = mtk_wcn_fm_chip_deemphasis(fm,
++						 ctrl->val == V4L2_DEEMPHASIS_75_uS);
++		break;
++	case V4L2_CID_RDS_RECEPTION:
++		ret = mtk_wcn_fm_chip_rds(fm, ctrl->val);
++		break;
++	case V4L2_CID_MTK_WCN_FM_BAND:
++		if (ctrl->val == fm->band)
++			break;
++		fm->band = ctrl->val;
++		mtk_wcn_fm_band_range(fm->band, &min, &max);
++		if (fm->cur_freq < min || fm->cur_freq > max) {
++			fm->cur_freq = min;
++			ret = mtk_wcn_fm_chip_tune(fm, fm->cur_freq);
++		}
++		break;
++	case V4L2_CID_MTK_WCN_FM_ANTENNA:
++		ret = mtk_wcn_fm_chip_antenna(fm, ctrl->val);
++		break;
++	case V4L2_CID_MTK_WCN_FM_SOFTMUTE_GAIN:
++		ret = mtk_wcn_fm_chip_smg(fm, ctrl->val);
++		break;
++	case V4L2_CID_MTK_WCN_FM_BLEND:
++		ret = mtk_wcn_fm_chip_blend(fm, ctrl->val);
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++	mutex_unlock(&fm->lock);
++
++	return ret;
++}
++
++static const struct v4l2_ctrl_ops mtk_wcn_fm_ctrl_ops = {
++	.s_ctrl = mtk_wcn_fm_s_ctrl,
++};
++
++/*
++ * V4L2 ioctls
++ */
++static int mtk_wcn_fm_querycap(struct file *file, void *priv,
++			       struct v4l2_capability *cap)
++{
++	strscpy(cap->driver, MTK_WCN_FM_DRIVER_NAME, sizeof(cap->driver));
++	strscpy(cap->card, MTK_WCN_FM_CARD_NAME, sizeof(cap->card));
++	strscpy(cap->bus_info, "platform:mt_fmradio_mt6627",
++		sizeof(cap->bus_info));
++
++	return 0;
++}
++
++static int mtk_wcn_fm_g_tuner(struct file *file, void *priv,
++			      struct v4l2_tuner *tuner)
++{
++	struct mtk_wcn_fm_dev *fm = video_drvdata(file);
++	s32 dbm = 0;
++	bool stereo = false;
++	u16 min, max;
++	int ret;
++
++	if (tuner->index)
++		return -EINVAL;
++
++	mtk_wcn_fm_band_range(fm->band, &min, &max);
++
++	strscpy(tuner->name, "FM", sizeof(tuner->name));
++	tuner->type = V4L2_TUNER_RADIO;
++	tuner->capability = V4L2_TUNER_CAP_LOW | V4L2_TUNER_CAP_STEREO |
++			    V4L2_TUNER_CAP_RDS |
++			    V4L2_TUNER_CAP_HWSEEK_BOUNDED |
++			    V4L2_TUNER_CAP_HWSEEK_WRAP |
++			    V4L2_TUNER_CAP_HWSEEK_PROG_LIM;
++	tuner->rangelow = min * 160;
++	tuner->rangehigh = max * 160;
++	tuner->audmode = fm->mono ? V4L2_TUNER_MODE_MONO :
++				    V4L2_TUNER_MODE_STEREO;
++	tuner->afc = 0;
++
++	mutex_lock(&fm->lock);
++	if (!fm->powered) {
++		mutex_unlock(&fm->lock);
++		return -EIO;
++	}
++	ret = mtk_wcn_fm_chip_status(fm, &dbm, &stereo);
++	mutex_unlock(&fm->lock);
++	if (ret)
++		return ret;
++
++	/* V4L2 signal strength is 0..65535; the RSSI is reported in dBm
++	 * (mt6627_GetCurRSSI(), mt6627_fm_lib.c:1277-1294).
++	 */
++	tuner->signal = (clamp_t(s32, dbm, -128, 127) + 128) * 257;
++	tuner->rxsubchans = V4L2_TUNER_SUB_MONO;
++	if (stereo)
++		tuner->rxsubchans |= V4L2_TUNER_SUB_STEREO;
++	if (fm->rds_on)
++		tuner->rxsubchans |= V4L2_TUNER_SUB_RDS;
++
++	return 0;
++}
++
++/* fm_monostereo_set(), core/fm_main.c:1242-1258: 1 forces mono, 0 is auto. */
++static int mtk_wcn_fm_s_tuner(struct file *file, void *priv,
++			      const struct v4l2_tuner *tuner)
++{
++	struct mtk_wcn_fm_dev *fm = video_drvdata(file);
++	bool mono;
++	int ret;
++
++	if (tuner->index)
++		return -EINVAL;
++
++	/* Any mode other than mono keeps the chip's automatic selection. */
++	mono = tuner->audmode == V4L2_TUNER_MODE_MONO;
++
++	mutex_lock(&fm->lock);
++	if (!fm->powered) {
++		mutex_unlock(&fm->lock);
++		return -EIO;
++	}
++	ret = mtk_wcn_fm_chip_mono(fm, mono);
++	if (!ret)
++		fm->mono = mono;
++	mutex_unlock(&fm->lock);
++
++	return ret;
++}
++
++static int mtk_wcn_fm_g_frequency(struct file *file, void *priv,
++				  struct v4l2_frequency *f)
++{
++	struct mtk_wcn_fm_dev *fm = video_drvdata(file);
++
++	if (f->tuner || f->type != V4L2_TUNER_RADIO)
++		return -EINVAL;
++
++	mutex_lock(&fm->lock);
++	if (!fm->powered) {
++		mutex_unlock(&fm->lock);
++		return -EIO;
++	}
++	f->frequency = FM_KHZ10_TO_V4L2(fm->cur_freq);
++	mutex_unlock(&fm->lock);
++
++	return 0;
++}
++
++/* fm_tune(), core/fm_main.c:1609-1695. */
++static int mtk_wcn_fm_s_frequency(struct file *file, void *priv,
++				  const struct v4l2_frequency *f)
++{
++	struct mtk_wcn_fm_dev *fm = video_drvdata(file);
++	u16 freq;
++	u16 min, max;
++	int ret;
++
++	if (f->tuner || f->type != V4L2_TUNER_RADIO)
++		return -EINVAL;
++
++	freq = FM_V4L2_TO_KHZ10(f->frequency);
++	mtk_wcn_fm_band_range(fm->band, &min, &max);
++	if (freq < min || freq > max)
++		return -EINVAL;
++
++	mutex_lock(&fm->lock);
++	if (!fm->powered)
++		ret = -EIO;
++	else
++		ret = mtk_wcn_fm_chip_tune(fm, freq);
++	mutex_unlock(&fm->lock);
++
++	return ret;
++}
++
++/* Seek resolution in Hz, mapped to the chip encoding (mt6627_fm_cmd.c:691). */
++static int mtk_wcn_fm_seek_space(u32 spacing, u16 *space)
++{
++	switch (spacing) {
++	case 0:
++		*space = FM_MT6627_SEEK_SPACE_DEFAULT;
++		return 0;
++	case 50000:
++		*space = FM_SPACE_50K;
++		return 0;
++	case 100000:
++		*space = FM_SPACE_100K;
++		return 0;
++	case 200000:
++		*space = FM_SPACE_200K;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int mtk_wcn_fm_s_hw_freq_seek(struct file *file, void *priv,
++				     const struct v4l2_hw_freq_seek *seek)
++{
++	struct mtk_wcn_fm_dev *fm = video_drvdata(file);
++	u16 min, max, space, result;
++	int ret;
++
++	if (seek->tuner || seek->type != V4L2_TUNER_RADIO)
++		return -EINVAL;
++	if (file->f_flags & O_NONBLOCK)
++		return -EAGAIN;
++
++	mtk_wcn_fm_band_range(fm->band, &min, &max);
++	if (seek->rangelow)
++		min = max_t(u16, min, FM_V4L2_TO_KHZ10(seek->rangelow));
++	if (seek->rangehigh)
++		max = min_t(u16, max, FM_V4L2_TO_KHZ10(seek->rangehigh));
++	if (min >= max)
++		return -EINVAL;
++
++	ret = mtk_wcn_fm_seek_space(seek->spacing, &space);
++	if (ret)
++		return ret;
++
++	mutex_lock(&fm->lock);
++	if (!fm->powered)
++		ret = -EIO;
++	else
++		ret = mtk_wcn_fm_chip_seek(fm, min, max, space,
++					   seek->seek_upward ? FM_SEEK_UP :
++							       FM_SEEK_DOWN,
++					   seek->wrap_around, &result);
++	mutex_unlock(&fm->lock);
++
++	return ret;
++}
++
++static int mtk_wcn_fm_subscribe_event(struct v4l2_fh *fh,
++				      const struct v4l2_event_subscription *sub)
++{
++	switch (sub->type) {
++	case V4L2_EVENT_CTRL:
++		return v4l2_ctrl_subscribe_event(fh, sub);
++	default:
++		return -EINVAL;
++	}
++}
++
++static const struct v4l2_ioctl_ops mtk_wcn_fm_ioctl_ops = {
++	.vidioc_querycap	= mtk_wcn_fm_querycap,
++	.vidioc_g_tuner		= mtk_wcn_fm_g_tuner,
++	.vidioc_s_tuner		= mtk_wcn_fm_s_tuner,
++	.vidioc_g_frequency	= mtk_wcn_fm_g_frequency,
++	.vidioc_s_frequency	= mtk_wcn_fm_s_frequency,
++	.vidioc_s_hw_freq_seek	= mtk_wcn_fm_s_hw_freq_seek,
++	.vidioc_subscribe_event	= mtk_wcn_fm_subscribe_event,
++	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
++};
++
++/*
++ * File operations
++ */
++static int mtk_wcn_fm_fops_open(struct file *file)
++{
++	struct mtk_wcn_fm_dev *fm = video_drvdata(file);
++	int ret;
++
++	ret = v4l2_fh_open(file);
++	if (ret)
++		return ret;
++
++	/* The downstream driver tolerates multiple openers but only powers
++	 * the chip for the first one (fm->ref, core/fm_main.c:254-330).
++	 */
++	if (!v4l2_fh_is_singular_file(file))
++		return 0;
++
++	mutex_lock(&fm->lock);
++	if (rfkill_blocked(fm->rfkill)) {
++		ret = -ERFKILL;
++	} else {
++		ret = mtk_wcn_fm_power_on(fm);
++		if (!ret)
++			fm->opened = true;
++	}
++	mutex_unlock(&fm->lock);
++
++	if (ret) {
++		v4l2_fh_release(file);
++		return ret;
++	}
++
++	/* Program volume, mute, RDS, de-emphasis, antenna and DSP settings. */
++	ret = v4l2_ctrl_handler_setup(&fm->ctrl_handler);
++	if (ret) {
++		mutex_lock(&fm->lock);
++		fm->opened = false;
++		mtk_wcn_fm_power_off(fm);
++		mutex_unlock(&fm->lock);
++		v4l2_fh_release(file);
++	}
++
++	return ret;
++}
++
++static int mtk_wcn_fm_fops_release(struct file *file)
++{
++	struct mtk_wcn_fm_dev *fm = video_drvdata(file);
++
++	if (v4l2_fh_is_singular_file(file)) {
++		mutex_lock(&fm->lock);
++		if (fm->opened) {
++			fm->opened = false;
++			mtk_wcn_fm_power_off(fm);
++		}
++		mutex_unlock(&fm->lock);
++	}
++
++	return v4l2_fh_release(file);
++}
++
++/*
++ * RDS capture.  The firmware pushes raw RDS groups on the FM channel, which
++ * the link layer stores as records of sizeof(struct mtk_wcn_fm_rds_data);
++ * read() hands whole records to userspace.
++ */
++static ssize_t mtk_wcn_fm_fops_read(struct file *file, char __user *buf,
++				    size_t count, loff_t *ppos)
++{
++	struct mtk_wcn_fm_dev *fm = video_drvdata(file);
++	unsigned int copied = 0;
++	size_t want;
++	int ret;
++
++	if (count < sizeof(struct mtk_wcn_fm_rds_data))
++		return -EINVAL;
++
++	if (kfifo_is_empty(&fm->rds_fifo)) {
++		if (file->f_flags & O_NONBLOCK)
++			return -EWOULDBLOCK;
++
++		ret = wait_event_interruptible(fm->rds_wq,
++					       !kfifo_is_empty(&fm->rds_fifo) ||
++					       !fm->powered);
++		if (ret)
++			return ret;
++		if (!fm->powered)
++			return -EIO;
++	}
++
++	want = min_t(size_t, count, kfifo_len(&fm->rds_fifo));
++	want -= want % sizeof(struct mtk_wcn_fm_rds_data);
++	if (!want)
++		return -EAGAIN;
++
++	if (kfifo_to_user(&fm->rds_fifo, buf, want, &copied))
++		return -EFAULT;
++
++	return copied;
++}
++
++static __poll_t mtk_wcn_fm_fops_poll(struct file *file,
++				     struct poll_table_struct *pts)
++{
++	struct mtk_wcn_fm_dev *fm = video_drvdata(file);
++	__poll_t req = poll_requested_events(pts);
++	__poll_t ret = v4l2_ctrl_poll(file, pts);
++
++	if (req & (EPOLLIN | EPOLLRDNORM)) {
++		poll_wait(file, &fm->rds_wq, pts);
++		if (!kfifo_is_empty(&fm->rds_fifo))
++			ret |= EPOLLIN | EPOLLRDNORM;
++		if (!fm->powered)
++			ret |= EPOLLHUP;
++	}
++
++	return ret;
++}
++
++static const struct v4l2_file_operations mtk_wcn_fm_fops = {
++	.owner		= THIS_MODULE,
++	.open		= mtk_wcn_fm_fops_open,
++	.release	= mtk_wcn_fm_fops_release,
++	.read		= mtk_wcn_fm_fops_read,
++	.poll		= mtk_wcn_fm_fops_poll,
++	.unlocked_ioctl	= video_ioctl2,
++};
++
++/*
++ * Platform driver
++ */
++static void mtk_wcn_fm_kfifo_free(void *data)
++{
++	struct mtk_wcn_fm_dev *fm = data;
++
++	kfifo_free(&fm->rds_fifo);
++}
++
++static int mtk_wcn_fm_probe(struct platform_device *pdev)
++{
++	struct mtk_wcn_fm_dev *fm;
++	int ret;
++
++	fm = devm_kzalloc(&pdev->dev, sizeof(*fm), GFP_KERNEL);
++	if (!fm)
++		return -ENOMEM;
++
++	fm->dev = &pdev->dev;
++	mutex_init(&fm->lock);
++	mutex_init(&fm->cmd_lock);
++	spin_lock_init(&fm->evt_lock);
++	init_waitqueue_head(&fm->evt_wq);
++	init_waitqueue_head(&fm->rds_wq);
++	INIT_WORK(&fm->rst_work, mtk_wcn_fm_reset_work);
++
++	fm->band = FM_BAND_DEFAULT;
++	fm->antenna = 0;
++	fm->deemphasis = FM_MT6627_DEEMPHASIS_DEFAULT;
++	fm->vol = 15;
++	fm->smg = FM_MT6627_SMG_DEFAULT;
++	fm->blend = true;
++	fm->cur_freq = FM_UE_FREQ_MIN;
++	fm->ant_sel_gpio = -1;
++
++	ret = kfifo_alloc(&fm->rds_fifo, MTK_WCN_FM_RDS_FIFO_SIZE, GFP_KERNEL);
++	if (ret)
++		return ret;
++	ret = devm_add_action_or_reset(&pdev->dev, mtk_wcn_fm_kfifo_free, fm);
++	if (ret)
++		return ret;
++
++	/* Antenna switch GPIO, downstream "fmradio_ant_sel"
++	 * (core/fm_module.c:1382-1393, DTS node mt_fmradio_mt6627).
++	 */
++	ret = of_get_named_gpio(pdev->dev.of_node, "fmradio_ant_sel", 0);
++	if (ret >= 0) {
++		fm->ant_sel_gpio = ret;
++		ret = devm_gpio_request_one(&pdev->dev, fm->ant_sel_gpio,
++					    GPIOF_OUT_INIT_LOW, "fm_ant_sel");
++		if (ret) {
++			dev_warn(&pdev->dev, "no fm_ant_sel control (%d)\n",
++				 ret);
++			fm->ant_sel_gpio = -1;
++		} else {
++			fm->ant_sel_valid = true;
++			dev_dbg(&pdev->dev, "fm_ant_sel GPIO %d\n",
++				fm->ant_sel_gpio);
++		}
++	} else {
++		fm->ant_sel_gpio = -1;
++		dev_dbg(&pdev->dev, "no fm_ant_sel GPIO\n");
++	}
++
++	ret = v4l2_device_register(&pdev->dev, &fm->v4l2_dev);
++	if (ret) {
++		dev_err(&pdev->dev, "cannot register v4l2_device (%d)\n", ret);
++		return ret;
++	}
++
++	v4l2_ctrl_handler_init(&fm->ctrl_handler, 8);
++	v4l2_ctrl_new_std(&fm->ctrl_handler, &mtk_wcn_fm_ctrl_ops,
++			  V4L2_CID_AUDIO_MUTE, 0, 1, 1, 0);
++	v4l2_ctrl_new_std(&fm->ctrl_handler, &mtk_wcn_fm_ctrl_ops,
++			  V4L2_CID_AUDIO_VOLUME, 0, 15, 1, fm->vol);
++	v4l2_ctrl_new_std_menu(&fm->ctrl_handler, &mtk_wcn_fm_ctrl_ops,
++			       V4L2_CID_TUNE_DEEMPHASIS,
++			       V4L2_DEEMPHASIS_75_uS,
++			       1 << V4L2_DEEMPHASIS_DISABLED,
++			       V4L2_DEEMPHASIS_50_uS);
++	v4l2_ctrl_new_std(&fm->ctrl_handler, &mtk_wcn_fm_ctrl_ops,
++			  V4L2_CID_RDS_RECEPTION, 0, 1, 1, 0);
++	v4l2_ctrl_new_std_menu(&fm->ctrl_handler, &mtk_wcn_fm_ctrl_ops,
++			       V4L2_CID_MTK_WCN_FM_BAND, FM_BAND_SPECIAL,
++			       1 << 0 /* FM_BAND_UNKNOWN is not selectable */,
++			       FM_BAND_DEFAULT);
++	v4l2_ctrl_new_std_menu(&fm->ctrl_handler, &mtk_wcn_fm_ctrl_ops,
++			       V4L2_CID_MTK_WCN_FM_ANTENNA, 1, 0, 0);
++	v4l2_ctrl_new_std(&fm->ctrl_handler, &mtk_wcn_fm_ctrl_ops,
++			  V4L2_CID_MTK_WCN_FM_SOFTMUTE_GAIN, 0,
++			  FM_MT6627_SMG_MAX, 1, FM_MT6627_SMG_DEFAULT);
++	v4l2_ctrl_new_std(&fm->ctrl_handler, &mtk_wcn_fm_ctrl_ops,
++			  V4L2_CID_MTK_WCN_FM_BLEND, 0, 1, 1, 1);
++	if (fm->ctrl_handler.error) {
++		ret = fm->ctrl_handler.error;
++		dev_err(&pdev->dev, "cannot create controls (%d)\n", ret);
++		goto err_ctrl;
++	}
++	fm->v4l2_dev.ctrl_handler = &fm->ctrl_handler;
++
++	strscpy(fm->vdev.name, MTK_WCN_FM_DRIVER_NAME, sizeof(fm->vdev.name));
++	fm->vdev.v4l2_dev = &fm->v4l2_dev;
++	fm->vdev.fops = &mtk_wcn_fm_fops;
++	fm->vdev.ioctl_ops = &mtk_wcn_fm_ioctl_ops;
++	fm->vdev.release = video_device_release_empty;
++	fm->vdev.device_caps = V4L2_CAP_RADIO | V4L2_CAP_TUNER |
++			       V4L2_CAP_HW_FREQ_SEEK | V4L2_CAP_RDS_CAPTURE |
++			       V4L2_CAP_READWRITE;
++	video_set_drvdata(&fm->vdev, fm);
++
++	/*
++	 * rfkill must exist before the radio device becomes visible, because
++	 * open() queries the block state.
++	 */
++	fm->rfkill = rfkill_alloc(MTK_WCN_FM_DRIVER_NAME, &pdev->dev,
++				  RFKILL_TYPE_FM, &mtk_wcn_fm_rfkill_ops, fm);
++	if (!fm->rfkill) {
++		ret = -ENOMEM;
++		goto err_ctrl;
++	}
++	ret = rfkill_register(fm->rfkill);
++	if (ret) {
++		rfkill_destroy(fm->rfkill);
++		fm->rfkill = NULL;
++		goto err_ctrl;
++	}
++
++	ret = video_register_device(&fm->vdev, VFL_TYPE_RADIO, -1);
++	if (ret) {
++		dev_err(&pdev->dev, "cannot register radio device (%d)\n",
++			ret);
++		goto err_rfkill;
++	}
++
++	/* Register the STP event callback and the WMT message callback. */
++	ret = mtk_wcn_fm_link_init(fm);
++	if (ret)
++		goto err_video;
++
++	platform_set_drvdata(pdev, fm);
++
++	dev_info(&pdev->dev, "MT6627 FM radio on %s\n",
++		 video_device_node_name(&fm->vdev));
++
++	return 0;
++
++err_video:
++	video_unregister_device(&fm->vdev);
++err_rfkill:
++	rfkill_unregister(fm->rfkill);
++	rfkill_destroy(fm->rfkill);
++err_ctrl:
++	v4l2_ctrl_handler_free(&fm->ctrl_handler);
++	v4l2_device_unregister(&fm->v4l2_dev);
++
++	return ret;
++}
++
++static void mtk_wcn_fm_remove(struct platform_device *pdev)
++{
++	struct mtk_wcn_fm_dev *fm = platform_get_drvdata(pdev);
++
++	if (!fm)
++		return;
++
++	mutex_lock(&fm->lock);
++	if (fm->opened) {
++		fm->opened = false;
++		mtk_wcn_fm_power_off(fm);
++	}
++	mutex_unlock(&fm->lock);
++
++	/* Stop the reset worker before the WMT/STP callbacks go away. */
++	cancel_work_sync(&fm->rst_work);
++	mtk_wcn_fm_link_exit(fm);
++
++	rfkill_unregister(fm->rfkill);
++	rfkill_destroy(fm->rfkill);
++	video_unregister_device(&fm->vdev);
++	v4l2_ctrl_handler_free(&fm->ctrl_handler);
++	v4l2_device_unregister(&fm->v4l2_dev);
++}
++
++static const struct of_device_id mtk_wcn_fm_of_match[] = {
++	{ .compatible = "mediatek,mt_mt6627_fmradio" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, mtk_wcn_fm_of_match);
++
++static struct platform_driver mtk_wcn_fm_driver = {
++	.probe	= mtk_wcn_fm_probe,
++	.remove	= mtk_wcn_fm_remove,
++	.driver	= {
++		.name		= MTK_WCN_FM_DRIVER_NAME,
++		.of_match_table	= mtk_wcn_fm_of_match,
++	},
++};
++module_platform_driver(mtk_wcn_fm_driver);
++
++MODULE_DESCRIPTION("MediaTek WCN MT6627 FM radio driver");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("platform:" MTK_WCN_FM_DRIVER_NAME);

@@ -1,0 +1,161 @@
+diff --git a/drivers/misc/mediatek/ccci/ccci_core.c b/drivers/misc/mediatek/ccci/ccci_core.c
+index e90d18851..c2c4194a5 100644
+--- a/drivers/misc/mediatek/ccci/ccci_core.c
++++ b/drivers/misc/mediatek/ccci/ccci_core.c
+@@ -16,6 +16,8 @@
+ #include <linux/ccci.h>
+ #include <linux/init.h>
+ #include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
+ #include <linux/random.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+@@ -711,6 +713,45 @@ static void ccci_md_class_dev_unregister(struct ccci_md *md)
+ 	md->dev = NULL;
+ }
+ 
++/*
++ * Map the INFRA_AO register window referenced by the modem node's
++ * "mediatek,infracfg-ao" phandle. Both the MPU/RMPU remap programming and the
++ * CLDMA hardware reset need it; it is optional because the CCIF-only
++ * transports never touch those registers.
++ */
++static void ccci_md_map_infra_ao(struct ccci_md *md, struct device *parent)
++{
++	struct device_node *np, *ao;
++	struct resource res;
++
++	if (!parent || !parent->of_node)
++		return;
++
++	np = parent->of_node;
++	ao = of_parse_phandle(np, "mediatek,infracfg-ao", 0);
++	if (!ao) {
++		ccci_md_dbg(md, "no mediatek,infracfg-ao phandle\n");
++		return;
++	}
++	if (of_address_to_resource(ao, 0, &res)) {
++		ccci_md_warn(md, "infracfg-ao node has no reg\n");
++		of_node_put(ao);
++		return;
++	}
++	of_node_put(ao);
++
++	md->infra_ao = devm_ioremap(parent, res.start, resource_size(&res));
++	if (!md->infra_ao) {
++		ccci_md_warn(md, "cannot map INFRA_AO %pa+0x%llx\n", &res.start,
++			     (unsigned long long)resource_size(&res));
++		return;
++	}
++	md->infra_ao_phys = res.start;
++	md->infra_ao_size = resource_size(&res);
++	ccci_md_dbg(md, "INFRA_AO %pa size 0x%zx\n", &md->infra_ao_phys,
++		    md->infra_ao_size);
++}
++
+ int ccci_md_register(const struct ccci_md_cfg *cfg, struct device *parent)
+ {
+ 	struct ccci_md *md;
+@@ -732,6 +773,8 @@ int ccci_md_register(const struct ccci_md_cfg *cfg, struct device *parent)
+ 	if (ret)
+ 		goto err_free;
+ 
++	ccci_md_map_infra_ao(md, parent);
++
+ 	strscpy(md->name, cfg->name ? cfg->name : "md", sizeof(md->name));
+ 	strscpy(md->fw_name, cfg->firmware_name ? cfg->firmware_name :
+ 		(cfg->md_id == CCCI_MD_SYS3 ? "md3img" : "md1img"),
+diff --git a/drivers/misc/mediatek/ccci/ccci_priv.h b/drivers/misc/mediatek/ccci/ccci_priv.h
+index 9c474c709..b936ebd5e 100644
+--- a/drivers/misc/mediatek/ccci/ccci_priv.h
++++ b/drivers/misc/mediatek/ccci/ccci_priv.h
+@@ -484,6 +484,16 @@ struct ccci_md {
+ 	char boot_info[192];
+ 	char version[16];
+ 	bool registered;
++
++	/*
++	 * INFRA_AO register window (MT6735 0x10001000). Used by the MPU/RMPU
++	 * remap programming (MD1/MD3 BANKn_MAPx, offset 0x300) and by the
++	 * CLDMA hardware reset (INFRA_RST0/1, offset 0x030). Resolved from
++	 * the modem DT node's "mediatek,infracfg-ao" phandle.
++	 */
++	void __iomem *infra_ao;
++	phys_addr_t infra_ao_phys;
++	size_t infra_ao_size;
+ };
+ 
+ /* ------------------------------------------------------------------ */
+diff --git a/include/linux/ccci.h b/include/linux/ccci.h
+index 84fdab351..8ce56c621 100644
+--- a/include/linux/ccci.h
++++ b/include/linux/ccci.h
+@@ -15,6 +15,7 @@
+ #define __LINUX_CCCI_H
+ 
+ #include <linux/types.h>
++#include <linux/io.h>
+ #include <linux/skbuff.h>
+ #include <linux/netdevice.h>
+ #include <linux/device.h>
+@@ -295,4 +296,59 @@ struct ccci_md_hw_ops {
+ int ccci_register_md_hw_ops(unsigned int md_id, const struct ccci_md_hw_ops *ops);
+ void ccci_unregister_md_hw_ops(unsigned int md_id);
+ 
++
++/* ------------------------------------------------------------------ */
++/* Gap-closure API                                                     */
++/*                                                                     */
++/* Coordinator-owned scaffold (frozen): the declarations below are     */
++/* implemented by the CCCI gap-closure leaves. They are appended per   */
++/* CCCI contract section 5 and do not modify any earlier declaration. */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Modem MPU/RMPU: program the DSP region protection, called from the
++ * kernel RPC service IPC_RPC_DSP_EMI_MPU_SETTING. Returns 0 when the
++ * platform has no DSP region (nothing to protect).
++ */
++int ccci_md_set_dsp_mpu_protection(unsigned int md_id);
++
++/*
++ * ROM aee_dump_ccci_debug_info(): hand the CCCI debug record inside the
++ * modem shared memory to an exception-dump consumer. MD ids are 1-based
++ * here because that is the AEE convention (ROM ccci_core.c:580).
++ */
++int aee_dump_ccci_debug_info(int md_id, void **addr, int *size);
++
++/*
++ * CLDMA hardware reset and exception-mode ring switch. The INFRA_AO
++ * window comes from the modem device tree node ("mediatek,infracfg-ao").
++ */
++void ccci_cldma_set_infra_ao(struct ccci_cldma *cd, void __iomem *infra_ao);
++int ccci_cldma_hw_reset(struct ccci_cldma *cd);
++int ccci_cldma_set_exception_mode(struct ccci_cldma *cd, bool on);
++
++/*
++ * Kernel RPC service registration. A handler fills the response argument
++ * vector and returns 0, or returns a negative errno. The RPC engine owns
++ * the wire format (downstream struct rpc_buffer/rpc_pkt).
++ */
++#define CCCI_RPC_MAX_ARGS	6
++struct ccci_rpc_arg {
++	void *buf;
++	unsigned int len;
++};
++
++struct ccci_rpc_msg {
++	u32 op_id;
++	u32 arg_count;
++	struct ccci_rpc_arg args[CCCI_RPC_MAX_ARGS];
++};
++
++typedef int (*ccci_rpc_handler_t)(int md_id, const struct ccci_rpc_msg *req,
++				  struct ccci_rpc_msg *rsp);
++
++int ccci_rpc_register_service(u32 op_id, const char *name,
++			      ccci_rpc_handler_t handler);
++int ccci_rpc_unregister_service(u32 op_id);
++
+ #endif /* __LINUX_CCCI_H */

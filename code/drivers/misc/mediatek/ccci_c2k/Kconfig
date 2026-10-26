@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# C2K (MD3) dual-modem support for the MT6735/MT6737T CCCI subsystem
+#
+
+config MTK_CCCI_C2K
+	bool "MediaTek C2K (MD3) dual-modem support"
+	depends on MTK_CCCI
+	help
+	  Support the second (C2K/CDMA) modem instance of the MediaTek
+	  MT6735/MT6737T CCCI subsystem.  On this platform MD3 is a CCIF modem
+	  driven through the CCCI core; the driver supplies the C2K hardware
+	  bring-up (boot slave, INFRA_AO C2K control, C2K sysreset, sleep clock
+	  selection), the C2K channel map, IRAT coordination with MD1 and the
+	  /sys/kernel/c2k interface.
+

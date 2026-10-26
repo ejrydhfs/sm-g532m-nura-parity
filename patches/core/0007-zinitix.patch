@@ -1,0 +1,1370 @@
+diff --git a/Documentation/devicetree/bindings/input/touchscreen/zinitix,bt400.yaml b/Documentation/devicetree/bindings/input/touchscreen/zinitix,bt400.yaml
+index f1ce837b1..22b753f87 100644
+--- a/Documentation/devicetree/bindings/input/touchscreen/zinitix,bt400.yaml
++++ b/Documentation/devicetree/bindings/input/touchscreen/zinitix,bt400.yaml
+@@ -74,11 +74,15 @@ properties:
+       as GPIO_ACTIVE_LOW
+ 
+   zinitix,mode:
+-    description: Mode of reporting touch points. Some modes may not work
+-      with a particular ts firmware for unknown reasons. Available modes are
+-      1 and 2. Mode 2 is the default and preferred.
++    description: |
++      Mode of reporting touch points. Some modes may not work with a
++      particular ts firmware for unknown reasons. Mode 0 reports 6-byte
++      coordinates (x, y, width, sub_status); mode 2 adds minor_width and
++      angle to each coordinate. Mode 2 is the default and preferred,
++      except for the BT541 firmware used on the Samsung Galaxy J2 Prime
++      (bt541_GP.fw), which serves mode 0.
+     $ref: /schemas/types.yaml#/definitions/uint32
+-    enum: [1, 2]
++    enum: [0, 2]
+ 
+   linux,keycodes:
+     description:
+diff --git a/drivers/input/touchscreen/zinitix.c b/drivers/input/touchscreen/zinitix.c
+index 716d6fa60..ac0ae8526 100644
+--- a/drivers/input/touchscreen/zinitix.c
++++ b/drivers/input/touchscreen/zinitix.c
+@@ -1,6 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ 
+ #include <linux/delay.h>
++#include <linux/firmware.h>
++#include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
+ #include <linux/input.h>
+ #include <linux/input/mt.h>
+@@ -102,6 +104,42 @@
+ #define ZINITIX_I2C_CHECKSUM_WCNT		0x016a
+ #define ZINITIX_I2C_CHECKSUM_RESULT		0x016c
+ 
++/*
++ * BT541 registers and firmware-update sequence.
++ *
++ * Taken from the Samsung/MediaTek downstream driver
++ * drivers/input/touchscreen/bt541/bt541_ts.c as shipped for the
++ * SM-G532M (grandpplte) kernel; see the parity report for line
++ * references.  The same register layout is used by the ROM kernel.
++ */
++#define ZINITIX_BT541_ICON_STATUS_REG		0x00AA
++
++#define ZINITIX_IUM_SET_TIMEOUT_REG		0x002E
++#define ZINITIX_IUM_SET_TIMEOUT_VALUE		64 /* 1.7 s */
++#define ZINITIX_CHIP_CODE_REG			0xcc00
++#define ZINITIX_CLK_SPEED_REG			0xc201
++#define ZINITIX_CLK_SPEED_400KHZ		0x00be
++#define ZINITIX_NVM_VPP_REG			0xc003
++#define ZINITIX_NVM_WP_REG			0xc104
++#define ZINITIX_VENDOR_CMD_ENABLE_REG		0xc000
++#define ZINITIX_INTN_CLEAR_REG			0xc004
++#define ZINITIX_NVM_INIT_REG			0xc002
++#define ZINITIX_PROGRAM_START_REG		0xc001
++
++#define ZINITIX_FW_SECTOR_SIZE			8
++#define ZINITIX_FW_SECTION_OFFSET		0x80 /* IUM/calibration page */
++#define ZINITIX_FW_MAX_SIZE			0x10000
++#define ZINITIX_FW_VERSION_OFF			0x34
++#define ZINITIX_FW_MINOR_VERSION_OFF		0x38
++#define ZINITIX_FW_REGDATA_VERSION_OFF		0x3c
++#define ZINITIX_FW_SIZE_WORD0_OFF		0x61
++#define ZINITIX_FW_SIZE_WORD1_OFF		0x65
++#define ZINITIX_FW_HDR_SIZE			0x70
++
++/* The ROM embeds this blob via CONFIG_EXTRA_FIRMWARE. */
++#define ZINITIX_BT541_FW_NAME			"tsp_zinitix/bt541_GP.fw"
++#define ZINITIX_BT541_PAGE_SIZE			64
++
+ /* Interrupt & status register flags */
+ 
+ #define BIT_PT_CNT_CHANGE			BIT(0)
+@@ -129,27 +167,58 @@
+ #define SUB_BIT_WAIT				BIT(5)
+ 
+ #define DEFAULT_TOUCH_POINT_MODE		2
++#define DEFAULT_X_RESOLUTION			539
++#define DEFAULT_Y_RESOLUTION			959
+ #define MAX_SUPPORTED_FINGER_NUM		5
+ #define MAX_SUPPORTED_BUTTON_NUM		8
+ 
+-#define CHIP_ON_DELAY				15 // ms
+-#define FIRMWARE_ON_DELAY			40 // ms
++/*
++ * Number of fingers the BT541 firmware on the SM-G532M reports.  The
++ * downstream driver configures the controller for two fingers
++ * (MAX_SUPPORTED_FINGER_NUM, bt541_ts.c) and the ROM's ts_read_coord()
++ * reads a 16-byte point report (see the parity report).
++ */
++#define ZINITIX_BT541_FINGER_NUM		2
++
++/* Timings from the downstream driver (bt541_ts.c:111-117). */
++#define CHIP_OFF_DELAY				50 /* ms */
++#define CHIP_ON_DELAY				20 /* ms */
++#define FIRMWARE_ON_DELAY			60 /* ms */
++
++#define BT541_CLEAR_INT_RETRIES			5
++
++/*
++ * Touch point report read from ZINITIX_POINT_STATUS_REG.
++ *
++ * In touch mode 0 each coordinate is 6 bytes (x, y, width, sub_status),
++ * matching struct coord in the downstream BT541 driver when
++ * TOUCH_POINT_MODE == 0 (bt541_ts.c).  In touch mode 2 the firmware
++ * appends minor_width and angle to every coordinate (8 bytes in total);
++ * those two fields are not exposed through the input interface.
++ * Coordinates are therefore addressed with a stride of
++ * bt541->coord_size.  The mode 0 layout is the one proven for the
++ * bt541_GP.fw firmware by the ROM disassembly (see the parity report).
++ */
++#define ZINITIX_COORD_SIZE_MODE0	6
++#define ZINITIX_COORD_SIZE_MODE2	8
++#define ZINITIX_EVENT_HDR_SIZE		4 /* status, finger_cnt, time_stamp */
+ 
+ struct point_coord {
+ 	__le16	x;
+ 	__le16	y;
+ 	u8	width;
+ 	u8	sub_status;
+-	// currently unused, but needed as padding:
+-	u8	minor_width;
+-	u8	angle;
+ };
+ 
+ struct touch_event {
+ 	__le16	status;
++	/*
++	 * Finger count; the mode 2 report path treats this byte as an
++	 * activity bitmask of the slots to look at.
++	 */
+ 	u8	finger_mask;
+ 	u8	time_stamp;
+-	struct point_coord point_coord[MAX_SUPPORTED_FINGER_NUM];
++	u8	coord[MAX_SUPPORTED_FINGER_NUM * ZINITIX_COORD_SIZE_MODE2];
+ };
+ 
+ struct bt541_ts_data {
+@@ -157,14 +226,23 @@ struct bt541_ts_data {
+ 	struct input_dev *input_dev;
+ 	struct touchscreen_properties prop;
+ 	struct regulator_bulk_data supplies[2];
++	struct gpio_desc *reset_gpio;
+ 	u32 zinitix_mode;
+ 	u32 keycodes[MAX_SUPPORTED_BUTTON_NUM];
++	bool key_state[MAX_SUPPORTED_BUTTON_NUM];
+ 	int num_keycodes;
+-	bool have_versioninfo;
++	u8 fingers;
++	u8 coord_size;
+ 	u16 chip_revision;
+ 	u16 firmware_version;
++	u16 fw_minor_version;
+ 	u16 regdata_version;
+ 	u16 icon_status_reg;
++	u16 page_size;
++	bool supports_i2c_checksum;
++	bool is_bt541;
++	bool firmware_checked;
++	bool powered;
+ };
+ 
+ static int zinitix_read_data(struct i2c_client *client,
+@@ -209,25 +287,137 @@ static int zinitix_write_cmd(struct i2c_client *client, u16 reg)
+ 	return 0;
+ }
+ 
+-static u16 zinitix_get_u16_reg(struct bt541_ts_data *bt541, u16 vreg)
++static int zinitix_read_u16(struct bt541_ts_data *bt541, u16 reg, u16 *value)
+ {
+-	struct i2c_client *client = bt541->client;
+-	int error;
+ 	__le16 val;
++	int error;
++
++	error = zinitix_read_data(bt541->client, reg, &val, sizeof(val));
++	if (error)
++		return error;
++
++	*value = le16_to_cpu(val);
++
++	return 0;
++}
++
++/*
++ * Write a register followed by an arbitrary payload. Used for the flash
++ * programming command (BT541_WRITE_FLASH), which takes 8 data bytes.
++ */
++static int zinitix_write_data(struct i2c_client *client, u16 reg,
++			      const void *values, size_t length)
++{
++	u8 packet[2 + ZINITIX_FW_SECTOR_SIZE];
++	int ret;
++
++	if (WARN_ON(length > ZINITIX_FW_SECTOR_SIZE))
++		return -EINVAL;
++
++	packet[0] = reg & 0xff;
++	packet[1] = reg >> 8;
++	memcpy(&packet[2], values, length);
++
++	ret = i2c_master_send(client, packet, length + 2);
++	if (ret != length + 2)
++		return ret < 0 ? ret : -EIO;
++
++	return 0;
++}
+ 
+-	error = zinitix_read_data(client, vreg, (void *)&val, 2);
++/*
++ * The controller can checksum the payload of the following I2C read.  The
++ * read is accepted only when the arithmetic sum of the 16-bit words matches
++ * ZINITIX_I2C_CHECKSUM_RESULT, as the downstream driver does in
++ * i2c_checksum().
++ */
++static int zinitix_check_checksum(struct bt541_ts_data *bt541,
++				  const void *data, size_t length)
++{
++	const __le16 *words = data;
++	s16 sum = 0;
++	u16 result;
++	int error;
++	size_t i;
++
++	for (i = 0; i < length / 2; i++)
++		sum += (s16)le16_to_cpu(words[i]);
++
++	error = zinitix_read_u16(bt541, ZINITIX_I2C_CHECKSUM_RESULT, &result);
+ 	if (error)
+-		return U8_MAX;
++		return error;
++
++	if (sum != (s16)result) {
++		dev_err(&bt541->client->dev,
++			"I2C checksum mismatch: %d != %d\n", sum, (s16)result);
++		return -EIO;
++	}
+ 
+-	return le16_to_cpu(val);
++	return 0;
++}
++
++static int zinitix_update_firmware(struct bt541_ts_data *bt541, bool force);
++
++static int zinitix_read_versions(struct bt541_ts_data *bt541)
++{
++	int error;
++
++	error = zinitix_read_u16(bt541, ZINITIX_CHIP_REVISION,
++				 &bt541->chip_revision);
++	if (error)
++		return error;
++	error = zinitix_read_u16(bt541, ZINITIX_FIRMWARE_VERSION,
++				 &bt541->firmware_version);
++	if (error)
++		return error;
++	error = zinitix_read_u16(bt541, ZINITIX_MINOR_FW_VERSION,
++				 &bt541->fw_minor_version);
++	if (error)
++		return error;
++	error = zinitix_read_u16(bt541, ZINITIX_DATA_VERSION_REG,
++				 &bt541->regdata_version);
++	if (error)
++		return error;
++
++	dev_dbg(&bt541->client->dev,
++		"chip revision %04x firmware version %04x.%04x regdata version %04x\n",
++		bt541->chip_revision, bt541->firmware_version,
++		bt541->fw_minor_version, bt541->regdata_version);
++
++	return 0;
+ }
+ 
+ static int zinitix_init_touch(struct bt541_ts_data *bt541)
+ {
+ 	struct i2c_client *client = bt541->client;
++	bool checksum_bad = false;
++	u16 checksum = 0;
++	u16 int_flags;
++	u16 reg;
+ 	int i;
+ 	int error;
+-	u16 int_flags;
++
++	/*
++	 * The controller computes a firmware checksum during the power-on
++	 * sequence; 0x55aa means the image is intact.  A bad checksum makes
++	 * the downstream init_touch() fail and fall back to a forced firmware
++	 * upgrade, so do the same here.  This is a BT541-specific register.
++	 */
++	if (bt541->is_bt541) {
++		for (i = 0; i < BT541_CLEAR_INT_RETRIES; i++) {
++			error = zinitix_read_u16(bt541, ZINITIX_CHECKSUM_RESULT,
++						 &checksum);
++			if (!error && checksum == 0x55aa)
++				break;
++			usleep_range(10000, 11000);
++		}
++		if (error || checksum != 0x55aa) {
++			dev_warn(&client->dev,
++				 "Firmware checksum invalid (%04x), will try to update\n",
++				 checksum);
++			checksum_bad = true;
++		}
++	}
+ 
+ 	error = zinitix_write_cmd(client, ZINITIX_SWRESET_CMD);
+ 	if (error) {
+@@ -235,28 +425,18 @@ static int zinitix_init_touch(struct bt541_ts_data *bt541)
+ 		return error;
+ 	}
+ 
++	error = zinitix_read_versions(bt541);
++	if (error)
++		return error;
++
+ 	/*
+-	 * Read and cache the chip revision and firmware version the first time
+-	 * we get here.
++	 * Determine the "icon" status register which varies by the chip.
++	 * The BT541 uses the BT5xx register; the downstream driver
++	 * hardcodes 0x00aa (bt541_ts.c:259-260).
+ 	 */
+-	if (!bt541->have_versioninfo) {
+-		bt541->chip_revision = zinitix_get_u16_reg(bt541,
+-						ZINITIX_CHIP_REVISION);
+-		bt541->firmware_version = zinitix_get_u16_reg(bt541,
+-						ZINITIX_FIRMWARE_VERSION);
+-		bt541->regdata_version = zinitix_get_u16_reg(bt541,
+-						ZINITIX_DATA_VERSION_REG);
+-		bt541->have_versioninfo = true;
+-
+-		dev_dbg(&client->dev,
+-			"chip revision %04x firmware version %04x regdata version %04x\n",
+-			bt541->chip_revision, bt541->firmware_version,
+-			bt541->regdata_version);
+-
+-		/*
+-		 * Determine the "icon" status register which varies by the
+-		 * chip.
+-		 */
++	if (bt541->is_bt541) {
++		bt541->icon_status_reg = ZINITIX_BT541_ICON_STATUS_REG;
++	} else {
+ 		switch (bt541->chip_revision & ZINITIX_CHIP_BTX0X_MASK) {
+ 		case ZINITIX_CHIP_BT4X2:
+ 			bt541->icon_status_reg = ZINITIX_BT4X2_ICON_STATUS_REG;
+@@ -276,6 +456,26 @@ static int zinitix_init_touch(struct bt541_ts_data *bt541)
+ 		}
+ 	}
+ 
++	/*
++	 * Optional firmware update.  Without a firmware file this is a no-op
++	 * and the image already in the controller is kept.  Returns 1 when a
++	 * new image was written.
++	 */
++	error = zinitix_update_firmware(bt541, checksum_bad);
++	if (error < 0)
++		return error;
++	if (checksum_bad && error == 0) {
++		dev_err(&client->dev,
++			"Firmware checksum invalid and no firmware to update with\n");
++		return -EIO;
++	}
++	if (error == 1) {
++		/* A new image was installed; refresh its version info. */
++		error = zinitix_read_versions(bt541);
++		if (error)
++			return error;
++	}
++
+ 	error = zinitix_write_u16(client, ZINITIX_INT_ENABLE_FLAG, 0x0);
+ 	if (error) {
+ 		dev_err(&client->dev,
+@@ -295,7 +495,7 @@ static int zinitix_init_touch(struct bt541_ts_data *bt541)
+ 		return error;
+ 
+ 	error = zinitix_write_u16(client, ZINITIX_SUPPORTED_FINGER_NUM,
+-				  MAX_SUPPORTED_FINGER_NUM);
++				  bt541->fingers);
+ 	if (error)
+ 		return error;
+ 
+@@ -314,6 +514,32 @@ static int zinitix_init_touch(struct bt541_ts_data *bt541)
+ 	if (error)
+ 		return error;
+ 
++	if (bt541->is_bt541) {
++		/* IUM timeout, 64 * 1/64 s = 1.7 s (bt541_ts.c:118). */
++		error = zinitix_write_u16(client, ZINITIX_IUM_SET_TIMEOUT_REG,
++					  ZINITIX_IUM_SET_TIMEOUT_VALUE);
++		if (error)
++			dev_warn(&client->dev, "Failed to set IUM timeout\n");
++
++		/* Check whether the firmware supports I2C payload checksums. */
++		error = zinitix_read_u16(bt541, ZINITIX_INTERNAL_FLAG_02,
++					 &reg);
++		if (!error)
++			bt541->supports_i2c_checksum = !!(reg & BIT(15));
++		dev_dbg(&client->dev, "I2C checksum %s\n",
++			bt541->supports_i2c_checksum ? "enabled" : "disabled");
++
++		/*
++		 * Soft calibration.  The downstream resume path
++		 * (mini_init_touch(), bt541_ts.c:2900-2902) sends it on
++		 * every power-up before re-enabling the interrupt.
++		 */
++		error = zinitix_write_cmd(client, ZINITIX_CALIBRATE_CMD);
++		if (error)
++			dev_warn(&client->dev,
++				 "Failed to run soft calibration\n");
++	}
++
+ 	int_flags = BIT_PT_CNT_CHANGE | BIT_DOWN | BIT_MOVE | BIT_UP;
+ 	if (bt541->num_keycodes)
+ 		int_flags |= BIT_ICON_EVENT;
+@@ -357,63 +583,515 @@ static int zinitix_init_regulators(struct bt541_ts_data *bt541)
+ 		return error;
+ 	}
+ 
++	/*
++	 * The BT541 is powered from a 3.0 V rail (downstream gets "vgp1" and
++	 * calls regulator_set_voltage(..., 3000000, 3000000)).  Ignore errors
++	 * for regulators with a fixed or dummy supply.
++	 */
++	if (bt541->is_bt541 && bt541->supplies[1].consumer) {
++		error = regulator_set_voltage(bt541->supplies[1].consumer,
++					      3000000, 3000000);
++		if (error)
++			dev_dbg(dev, "Failed to set VDD to 3.0 V: %d\n",
++				error);
++	}
++
++	bt541->reset_gpio = devm_gpiod_get_optional(dev, "reset",
++						    GPIOD_OUT_LOW);
++	if (IS_ERR(bt541->reset_gpio)) {
++		dev_err(dev, "Failed to get reset GPIO: %ld\n",
++			PTR_ERR(bt541->reset_gpio));
++		return PTR_ERR(bt541->reset_gpio);
++	}
++
+ 	return 0;
+ }
+ 
++static void zinitix_reset_assert(struct bt541_ts_data *bt541, bool assert)
++{
++	if (bt541->reset_gpio)
++		gpiod_set_value_cansleep(bt541->reset_gpio, assert ? 0 : 1);
++}
++
+ static int zinitix_send_power_on_sequence(struct bt541_ts_data *bt541)
+ {
+-	int error;
+ 	struct i2c_client *client = bt541->client;
++	u16 chip_code;
++	int error;
++	int retry;
+ 
+-	error = zinitix_write_u16(client, 0xc000, 0x0001);
++	/*
++	 * Retry the sequence a few times like the downstream driver does;
++	 * the controller occasionally does not accept the vendor command
++	 * after a cold power-up.
++	 */
++	for (retry = 0; retry < 3; retry++) {
++		error = zinitix_write_u16(client, ZINITIX_VENDOR_CMD_ENABLE_REG,
++					  0x0001);
++		if (error) {
++			dev_err(&client->dev,
++				"Failed to send power sequence (vendor cmd enable)\n");
++			goto next;
++		}
++		udelay(10);
++
++		error = zinitix_read_u16(bt541, ZINITIX_CHIP_CODE_REG,
++					 &chip_code);
++		if (error) {
++			if (bt541->is_bt541) {
++				dev_err(&client->dev,
++					"Failed to read chip code\n");
++				goto next;
++			}
++			/* Not present on the older BT4xx parts. */
++			error = 0;
++		} else {
++			dev_dbg(&client->dev, "chip code = 0x%04x\n",
++				chip_code);
++		}
++		udelay(10);
++
++		error = zinitix_write_cmd(client, ZINITIX_INTN_CLEAR_REG);
++		if (error) {
++			dev_err(&client->dev,
++				"Failed to send power sequence (intn clear)\n");
++			goto next;
++		}
++		udelay(10);
++
++		error = zinitix_write_u16(client, ZINITIX_NVM_INIT_REG, 0x0001);
++		if (error) {
++			dev_err(&client->dev,
++				"Failed to send power sequence (nvm init)\n");
++			goto next;
++		}
++		mdelay(2);
++
++		error = zinitix_write_u16(client, ZINITIX_PROGRAM_START_REG,
++					  0x0001);
++		if (error) {
++			dev_err(&client->dev,
++				"Failed to send power sequence (program start)\n");
++			goto next;
++		}
++		msleep(FIRMWARE_ON_DELAY);
++
++		error = zinitix_write_u16(client, ZINITIX_IUM_SET_TIMEOUT_REG,
++					  ZINITIX_IUM_SET_TIMEOUT_VALUE);
++		if (error)
++			dev_warn(&client->dev, "Failed to set IUM timeout\n");
++
++		return 0;
++
++next:
++		dev_dbg(&client->dev, "Power sequence retry %d\n", retry + 1);
++		msleep(CHIP_ON_DELAY);
++	}
++
++	dev_err(&client->dev, "Failed to send power sequence\n");
++
++	return error;
++}
++
++static int zinitix_power_on(struct bt541_ts_data *bt541)
++{
++	int error;
++
++	if (bt541->powered)
++		return 0;
++
++	error = regulator_bulk_enable(ARRAY_SIZE(bt541->supplies),
++				      bt541->supplies);
+ 	if (error) {
+-		dev_err(&client->dev,
+-			"Failed to send power sequence(vendor cmd enable)\n");
++		dev_err(&bt541->client->dev,
++			"Failed to enable regulators: %d\n", error);
+ 		return error;
+ 	}
+-	udelay(10);
++	bt541->powered = true;
+ 
+-	error = zinitix_write_cmd(client, 0xc004);
+-	if (error) {
++	msleep(CHIP_ON_DELAY);
++	zinitix_reset_assert(bt541, false);
++	msleep(CHIP_ON_DELAY);
++
++	return 0;
++}
++
++static int zinitix_power_off(struct bt541_ts_data *bt541)
++{
++	int error;
++
++	if (!bt541->powered)
++		return 0;
++
++	/* Put the controller to sleep before removing power. */
++	zinitix_write_cmd(bt541->client, ZINITIX_SLEEP_CMD);
++	zinitix_reset_assert(bt541, true);
++
++	error = regulator_bulk_disable(ARRAY_SIZE(bt541->supplies),
++				       bt541->supplies);
++	if (error)
++		dev_err(&bt541->client->dev,
++			"Failed to disable regulators: %d\n", error);
++	bt541->powered = false;
++
++	msleep(CHIP_OFF_DELAY);
++
++	return error;
++}
++
++static void zinitix_power_cycle(struct bt541_ts_data *bt541)
++{
++	zinitix_power_off(bt541);
++	zinitix_power_on(bt541);
++}
++
++/*
++ * Read flash contents.  The controller needs a longer setup time for
++ * flash reads than for normal register reads (the downstream
++ * read_firmware_data() sleeps 1 ms between the address and the data
++ * transfer, bt541_ts.c).
++ */
++static int zinitix_read_flash(struct bt541_ts_data *bt541, void *values,
++			      size_t length)
++{
++	__le16 reg_le = cpu_to_le16(ZINITIX_READ_FLASH);
++	int ret;
++
++	ret = i2c_master_send(bt541->client, (u8 *)&reg_le, sizeof(reg_le));
++	if (ret != sizeof(reg_le))
++		return ret < 0 ? ret : -EIO;
++
++	usleep_range(1000, 1100);
++
++	ret = i2c_master_recv(bt541->client, values, length);
++	if (ret != length)
++		return ret < 0 ? ret : -EIO;
++
++	return 0;
++}
++
++static int zinitix_write_flash_page(struct bt541_ts_data *bt541,
++				    const u8 *data, u32 size, u32 *addr)
++{
++	unsigned int i;
++
++	for (i = 0; i < bt541->page_size / ZINITIX_FW_SECTOR_SIZE; i++) {
++		if (*addr + ZINITIX_FW_SECTOR_SIZE > size)
++			return -EINVAL;
++
++		if (zinitix_write_data(bt541->client, ZINITIX_WRITE_FLASH,
++				       data + *addr,
++				       ZINITIX_FW_SECTOR_SIZE)) {
++			dev_err(&bt541->client->dev,
++				"Failed to write firmware at 0x%x\n", *addr);
++			return -EIO;
++		}
++
++		*addr += ZINITIX_FW_SECTOR_SIZE;
++		udelay(100);
++	}
++
++	msleep(30);
++
++	return 0;
++}
++
++/*
++ * Flash a complete firmware image.  Ported from ts_upgrade_firmware() in
++ * the downstream driver, including the write-protect window around the
++ * calibration page at 0x80.  The read-back verification skips that page
++ * because the controller stores per-panel calibration data there.
++ *
++ * Returns 0 if the new image was written and verified, negative on error.
++ */
++static int zinitix_flash_firmware(struct bt541_ts_data *bt541,
++				  const u8 *fw, size_t fw_size)
++{
++	struct i2c_client *client = bt541->client;
++	u32 fw_header_size;
++	u32 size;
++	u32 addr;
++	u8 *verify_data;
++	u16 checksum = 0;
++	u16 chip_code;
++	int error;
++	int i;
++
++	fw_header_size = (fw[ZINITIX_FW_SIZE_WORD0_OFF] << 16) |
++			 (fw[ZINITIX_FW_SIZE_WORD0_OFF + 1] << 8) |
++			 fw[ZINITIX_FW_SIZE_WORD0_OFF + 2];
++	fw_header_size += (fw[ZINITIX_FW_SIZE_WORD1_OFF] << 16) |
++			  (fw[ZINITIX_FW_SIZE_WORD1_OFF + 1] << 8) |
++			  fw[ZINITIX_FW_SIZE_WORD1_OFF + 2];
++
++	size = fw_size;
++	if (fw_header_size && fw_header_size <= ZINITIX_FW_MAX_SIZE)
++		size = fw_header_size;
++
++	if (size > fw_size || size % bt541->page_size) {
+ 		dev_err(&client->dev,
+-			"Failed to send power sequence (intn clear)\n");
+-		return error;
++			"Invalid firmware size %u (image %zu, page %u)\n",
++			size, fw_size, bt541->page_size);
++		return -EINVAL;
+ 	}
++
++	verify_data = kzalloc(size, GFP_KERNEL);
++	if (!verify_data)
++		return -ENOMEM;
++
++	zinitix_power_cycle(bt541);
++
++	error = zinitix_write_u16(client, ZINITIX_VENDOR_CMD_ENABLE_REG,
++				  0x0001);
++	if (error)
++		goto err_power_off;
+ 	udelay(10);
+ 
+-	error = zinitix_write_u16(client, 0xc002, 0x0001);
+-	if (error) {
+-		dev_err(&client->dev,
+-			"Failed to send power sequence (nvm init)\n");
+-		return error;
++	error = zinitix_read_u16(bt541, ZINITIX_CHIP_CODE_REG, &chip_code);
++	if (error)
++		goto err_power_off;
++	dev_dbg(&client->dev, "upgrade chip code = 0x%04x\n", chip_code);
++	udelay(10);
++
++	error = zinitix_write_u16(client, ZINITIX_CLK_SPEED_REG,
++				  ZINITIX_CLK_SPEED_400KHZ);
++	if (error)
++		goto err_power_off;
++
++	error = zinitix_write_cmd(client, ZINITIX_INTN_CLEAR_REG);
++	if (error)
++		goto err_power_off;
++	udelay(10);
++
++	error = zinitix_write_u16(client, ZINITIX_NVM_INIT_REG, 0x0001);
++	if (error)
++		goto err_power_off;
++	usleep_range(5000, 6000);
++
++	error = zinitix_write_u16(client, ZINITIX_NVM_VPP_REG, 0x0001);
++	if (error)
++		goto err_power_off;
++
++	error = zinitix_write_u16(client, ZINITIX_NVM_WP_REG, 0x0001);
++	if (error)
++		goto err_power_off;
++
++	error = zinitix_write_cmd(client, ZINITIX_INIT_FLASH);
++	if (error)
++		goto err_power_off;
++
++	dev_info(&client->dev, "Writing firmware image (%u bytes)\n", size);
++
++	for (addr = 0; addr < size; ) {
++		if (addr == ZINITIX_FW_SECTION_OFFSET) {
++			/* Allow writing the calibration page. */
++			error = zinitix_write_u16(client, ZINITIX_NVM_WP_REG,
++						  0x0000);
++			if (error)
++				goto err_power_off;
++			usleep_range(10000, 11000);
++
++			error = zinitix_write_flash_page(bt541, fw, size, &addr);
++			if (error)
++				goto err_power_off;
++
++			error = zinitix_write_u16(client, ZINITIX_NVM_WP_REG,
++						  0x0001);
++			if (error)
++				goto err_power_off;
++			usleep_range(10000, 11000);
++		} else {
++			error = zinitix_write_flash_page(bt541, fw, size, &addr);
++			if (error)
++				goto err_power_off;
++		}
+ 	}
+-	mdelay(2);
+ 
+-	error = zinitix_write_u16(client, 0xc001, 0x0001);
+-	if (error) {
++	error = zinitix_write_u16(client, ZINITIX_NVM_VPP_REG, 0x0000);
++	if (error)
++		goto err_power_off;
++
++	error = zinitix_write_u16(client, ZINITIX_NVM_WP_REG, 0x0000);
++	if (error)
++		goto err_power_off;
++
++	error = zinitix_write_cmd(client, ZINITIX_INIT_FLASH);
++	if (error)
++		goto err_power_off;
++
++	dev_info(&client->dev, "Verifying firmware image\n");
++
++	for (addr = 0; addr < size; ) {
++		for (i = 0; i < bt541->page_size / ZINITIX_FW_SECTOR_SIZE; i++) {
++			error = zinitix_read_flash(bt541, verify_data + addr,
++						   ZINITIX_FW_SECTOR_SIZE);
++			if (error) {
++				dev_err(&client->dev,
++					"Failed to read firmware at 0x%x\n",
++					addr);
++				goto err_power_off;
++			}
++			addr += ZINITIX_FW_SECTOR_SIZE;
++		}
++	}
++
++	/* The calibration page is not part of the image verification. */
++	if (ZINITIX_FW_SECTION_OFFSET + bt541->page_size <= size)
++		memcpy(verify_data + ZINITIX_FW_SECTION_OFFSET,
++		       fw + ZINITIX_FW_SECTION_OFFSET, bt541->page_size);
++
++	if (memcmp(fw, verify_data, size)) {
++		dev_err(&client->dev, "Firmware verification failed\n");
++		error = -EIO;
++		goto err_power_off;
++	}
++
++	/* Restart from the new image and confirm its checksum. */
++	zinitix_power_cycle(bt541);
++
++	error = zinitix_send_power_on_sequence(bt541);
++	if (error)
++		goto err_power_off;
++
++	for (i = 0; i < BT541_CLEAR_INT_RETRIES; i++) {
++		if (!zinitix_read_u16(bt541, ZINITIX_CHECKSUM_RESULT,
++				      &checksum) && checksum == 0x55aa)
++			break;
++		usleep_range(10000, 11000);
++	}
++
++	if (checksum != 0x55aa) {
+ 		dev_err(&client->dev,
+-			"Failed to send power sequence (program start)\n");
+-		return error;
++			"Firmware update done but checksum is %04x\n", checksum);
++		error = -EIO;
++		goto err_power_off;
+ 	}
+-	msleep(FIRMWARE_ON_DELAY);
++
++	dev_info(&client->dev, "Firmware update finished\n");
++	kfree(verify_data);
+ 
+ 	return 0;
++
++err_power_off:
++	kfree(verify_data);
++	zinitix_power_off(bt541);
++
++	return error;
++}
++
++static bool zinitix_fw_needs_update(struct bt541_ts_data *bt541, const u8 *fw)
++{
++	u16 version = fw[ZINITIX_FW_VERSION_OFF] |
++		      (fw[ZINITIX_FW_VERSION_OFF + 1] << 8);
++	u16 minor = fw[ZINITIX_FW_MINOR_VERSION_OFF] |
++		    (fw[ZINITIX_FW_MINOR_VERSION_OFF + 1] << 8);
++	u16 regdata = fw[ZINITIX_FW_REGDATA_VERSION_OFF] |
++		      (fw[ZINITIX_FW_REGDATA_VERSION_OFF + 1] << 8);
++
++	dev_info(&bt541->client->dev,
++		 "Current firmware %04x.%04x regdata %04x, image %04x.%04x regdata %04x\n",
++		 bt541->firmware_version, bt541->fw_minor_version,
++		 bt541->regdata_version, version, minor, regdata);
++
++	if (bt541->firmware_version > 0xff)
++		return true;
++	if (bt541->firmware_version < version)
++		return true;
++	if (bt541->firmware_version > version)
++		return false;
++	if (bt541->fw_minor_version < minor)
++		return true;
++	if (bt541->fw_minor_version > minor)
++		return false;
++
++	return bt541->regdata_version < regdata;
++}
++
++/*
++ * Try to load and install the BT541 firmware.  Returns 1 if a new image was
++ * written, 0 if no update was necessary or possible, negative on failure.
++ *
++ * The firmware blob itself is not part of the kernel tree; the ROM builds
++ * it in through CONFIG_EXTRA_FIRMWARE with the same file name.
++ */
++static int zinitix_update_firmware(struct bt541_ts_data *bt541, bool force)
++{
++	const struct firmware *fw;
++	bool need_update;
++	int error;
++	int retry;
++
++	if (!bt541->is_bt541)
++		return 0;
++
++	/* Try once per boot unless a broken image forces a rewrite. */
++	if (bt541->firmware_checked && !force)
++		return 0;
++	bt541->firmware_checked = true;
++
++	error = request_firmware(&fw, ZINITIX_BT541_FW_NAME,
++				 &bt541->client->dev);
++	if (error) {
++		dev_info(&bt541->client->dev,
++			 "Firmware %s not available (%d), keeping on-chip image\n",
++			 ZINITIX_BT541_FW_NAME, error);
++		return 0;
++	}
++
++	if (fw->size < ZINITIX_FW_HDR_SIZE) {
++		dev_err(&bt541->client->dev,
++			"Firmware image too small (%zu bytes)\n", fw->size);
++		error = -EINVAL;
++		goto out;
++	}
++
++	need_update = force || zinitix_fw_needs_update(bt541, fw->data);
++	if (!need_update) {
++		dev_info(&bt541->client->dev,
++			 "On-chip firmware is up to date\n");
++		error = 0;
++		goto out;
++	}
++
++	for (retry = 0; retry < 3; retry++) {
++		error = zinitix_flash_firmware(bt541, fw->data, fw->size);
++		if (!error)
++			break;
++		dev_warn(&bt541->client->dev,
++			 "Firmware update failed, retry %d\n", retry + 1);
++	}
++
++	if (!error)
++		error = 1;
++
++out:
++	release_firmware(fw);
++
++	return error;
++}
++
++/*
++ * Return coordinate slot @i of a touch report.  The slot stride depends
++ * on the touch mode (see struct point_coord); the buffer is 2-byte
++ * aligned by construction, so the packed 6-byte prefix can be accessed
++ * directly.
++ */
++static const struct point_coord *
++zinitix_coord(const struct bt541_ts_data *bt541,
++	      const struct touch_event *event, int i)
++{
++	return (const struct point_coord *)&event->coord[i * bt541->coord_size];
+ }
+ 
+ static void zinitix_report_finger(struct bt541_ts_data *bt541, int slot,
+ 				  const struct point_coord *p)
+ {
+ 	u16 x, y;
+-
+-	if (unlikely(!(p->sub_status &
+-		       (SUB_BIT_UP | SUB_BIT_DOWN | SUB_BIT_MOVE)))) {
+-		dev_dbg(&bt541->client->dev, "unknown finger event %#02x\n",
+-			p->sub_status);
+-		return;
+-	}
++	u8 width;
+ 
+ 	x = le16_to_cpu(p->x);
+ 	y = le16_to_cpu(p->y);
++	width = p->width ? p->width : 1;
+ 
+ 	input_mt_slot(bt541->input_dev, slot);
+ 	if (input_mt_report_slot_state(bt541->input_dev, MT_TOOL_FINGER,
+@@ -421,7 +1099,9 @@ static void zinitix_report_finger(struct bt541_ts_data *bt541, int slot,
+ 		touchscreen_report_pos(bt541->input_dev,
+ 				       &bt541->prop, x, y, true);
+ 		input_report_abs(bt541->input_dev,
+-				 ABS_MT_TOUCH_MAJOR, p->width);
++				 ABS_MT_TOUCH_MAJOR, width);
++		input_report_abs(bt541->input_dev,
++				 ABS_MT_WIDTH_MAJOR, width);
+ 		dev_dbg(&bt541->client->dev, "finger %d %s (%u, %u)\n",
+ 			slot, p->sub_status & SUB_BIT_DOWN ? "down" : "move",
+ 			x, y);
+@@ -431,13 +1111,57 @@ static void zinitix_report_finger(struct bt541_ts_data *bt541, int slot,
+ 	}
+ }
+ 
++/*
++ * The icon status register contains down events in bits 0..7 and up
++ * events in bits 8..15 (bt541_ts.c BIT_O_ICONx_DOWN/UP).  The downstream
++ * handler processes all down bits and then all up bits, so a fast tap
++ * can raise both in a single event; handle each transition in that same
++ * order and only report real state changes.
++ */
+ static void zinitix_report_keys(struct bt541_ts_data *bt541, u16 icon_events)
+ {
+ 	int i;
+ 
+-	for (i = 0; i < bt541->num_keycodes; i++)
+-		input_report_key(bt541->input_dev,
+-				 bt541->keycodes[i], icon_events & BIT(i));
++	for (i = 0; i < bt541->num_keycodes; i++) {
++		if ((icon_events & BIT(i)) && !bt541->key_state[i]) {
++			bt541->key_state[i] = true;
++			input_report_key(bt541->input_dev, bt541->keycodes[i],
++					 1);
++			dev_dbg(&bt541->client->dev, "key %d down\n", i);
++		}
++	}
++
++	for (i = 0; i < bt541->num_keycodes; i++) {
++		if ((icon_events & BIT(8 + i)) && bt541->key_state[i]) {
++			bt541->key_state[i] = false;
++			input_report_key(bt541->input_dev, bt541->keycodes[i],
++					 0);
++			dev_dbg(&bt541->client->dev, "key %d up\n", i);
++		}
++	}
++}
++
++/* Release every key and contact; used when the device is powered down. */
++static void zinitix_release_all(struct bt541_ts_data *bt541)
++{
++	int i;
++
++	for (i = 0; i < bt541->num_keycodes; i++) {
++		if (!bt541->key_state[i])
++			continue;
++
++		bt541->key_state[i] = false;
++		input_report_key(bt541->input_dev, bt541->keycodes[i], 0);
++	}
++
++	for (i = 0; i < bt541->fingers; i++) {
++		input_mt_slot(bt541->input_dev, i);
++		input_mt_report_slot_state(bt541->input_dev,
++					   MT_TOOL_FINGER, false);
++	}
++
++	input_mt_sync_frame(bt541->input_dev);
++	input_sync(bt541->input_dev);
+ }
+ 
+ static irqreturn_t zinitix_ts_irq_handler(int irq, void *bt541_handler)
+@@ -445,22 +1169,60 @@ static irqreturn_t zinitix_ts_irq_handler(int irq, void *bt541_handler)
+ 	struct bt541_ts_data *bt541 = bt541_handler;
+ 	struct i2c_client *client = bt541->client;
+ 	struct touch_event touch_event;
++	const struct point_coord *p;
+ 	unsigned long finger_mask;
++	size_t event_size;
+ 	__le16 icon_events;
+-	int error;
++	u16 status = 0;
++	int error = 0;
++	int attempt;
+ 	int i;
+ 
+-	memset(&touch_event, 0, sizeof(struct touch_event));
++	event_size = ZINITIX_EVENT_HDR_SIZE +
++		     bt541->fingers * bt541->coord_size;
+ 
+-	error = zinitix_read_data(bt541->client, ZINITIX_POINT_STATUS_REG,
+-				  &touch_event, sizeof(struct touch_event));
+-	if (error) {
+-		dev_err(&client->dev, "Failed to read in touchpoint struct\n");
++	/*
++	 * A failed or checksummed read can happen when the controller is
++	 * updating its point registers; retry a few times like the
++	 * downstream driver before giving up on this interrupt.
++	 */
++	for (attempt = 0; attempt < BT541_CLEAR_INT_RETRIES; attempt++) {
++		memset(&touch_event, 0, event_size);
++		error = 0;
++
++		if (bt541->supports_i2c_checksum &&
++		    zinitix_write_u16(client, ZINITIX_I2C_CHECKSUM_WCNT,
++				      event_size / 2))
++			continue;
++
++		error = zinitix_read_data(client, ZINITIX_POINT_STATUS_REG,
++					  &touch_event, event_size);
++		if (error)
++			continue;
++
++		if (bt541->supports_i2c_checksum &&
++		    zinitix_check_checksum(bt541, &touch_event, event_size))
++			continue;
++
++		status = le16_to_cpu(touch_event.status);
++		if (status == 0xffff || status == 0x1)
++			continue;
++
++		break;
++	}
++
++	if (attempt == BT541_CLEAR_INT_RETRIES) {
++		dev_err(&client->dev, "Failed to read touchpoint data: %d\n",
++			error);
+ 		goto out;
+ 	}
+ 
+-	if (le16_to_cpu(touch_event.status) & BIT_ICON_EVENT) {
+-		error = zinitix_read_data(bt541->client, bt541->icon_status_reg,
++	/* Periodical interrupt without a new event. */
++	if (status == 0)
++		goto out;
++
++	if (status & BIT_ICON_EVENT) {
++		error = zinitix_read_data(client, bt541->icon_status_reg,
+ 					  &icon_events, sizeof(icon_events));
+ 		if (error) {
+ 			dev_err(&client->dev, "Failed to read icon events\n");
+@@ -470,20 +1232,38 @@ static irqreturn_t zinitix_ts_irq_handler(int irq, void *bt541_handler)
+ 		zinitix_report_keys(bt541, le16_to_cpu(icon_events));
+ 	}
+ 
+-	finger_mask = touch_event.finger_mask;
+-	for_each_set_bit(i, &finger_mask, MAX_SUPPORTED_FINGER_NUM) {
+-		const struct point_coord *p = &touch_event.point_coord[i];
++	if (bt541->zinitix_mode == 2) {
++		/*
++		 * In mode 2 the second header byte marks the active slots;
++		 * keep the mainline iteration for that layout.
++		 */
++		finger_mask = touch_event.finger_mask;
++		for_each_set_bit(i, &finger_mask, bt541->fingers) {
++			p = zinitix_coord(bt541, &touch_event, i);
++
++			/* Only process contacts that are actually reported */
++			if (p->sub_status & SUB_BIT_EXIST)
++				zinitix_report_finger(bt541, i, p);
++		}
++	} else {
++		/*
++		 * Mode 0 has a finger count in that byte; walk every slot
++		 * and trust the per-coordinate status, like the downstream
++		 * handler does (bt541_ts.c bt541_touch_work()).
++		 */
++		for (i = 0; i < bt541->fingers; i++) {
++			p = zinitix_coord(bt541, &touch_event, i);
+ 
+-		/* Only process contacts that are actually reported */
+-		if (p->sub_status & SUB_BIT_EXIST)
+-			zinitix_report_finger(bt541, i, p);
++			if (p->sub_status & SUB_BIT_EXIST)
++				zinitix_report_finger(bt541, i, p);
++		}
+ 	}
+ 
+ 	input_mt_sync_frame(bt541->input_dev);
+ 	input_sync(bt541->input_dev);
+ 
+ out:
+-	zinitix_write_cmd(bt541->client, ZINITIX_CLEAR_INT_STATUS_CMD);
++	zinitix_write_cmd(client, ZINITIX_CLEAR_INT_STATUS_CMD);
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -491,50 +1271,58 @@ static int zinitix_start(struct bt541_ts_data *bt541)
+ {
+ 	int error;
+ 
+-	error = regulator_bulk_enable(ARRAY_SIZE(bt541->supplies),
+-				      bt541->supplies);
+-	if (error) {
+-		dev_err(&bt541->client->dev,
+-			"Failed to enable regulators: %d\n", error);
++	error = zinitix_power_on(bt541);
++	if (error)
+ 		return error;
+-	}
+-
+-	msleep(CHIP_ON_DELAY);
+ 
+ 	error = zinitix_send_power_on_sequence(bt541);
+ 	if (error) {
+ 		dev_err(&bt541->client->dev,
+ 			"Error while sending power-on sequence: %d\n", error);
+-		return error;
++		goto err_power_off;
+ 	}
+ 
+ 	error = zinitix_init_touch(bt541);
+ 	if (error) {
+-		dev_err(&bt541->client->dev,
+-			"Error while configuring touch IC\n");
+-		return error;
++		int ret;
++
++		/*
++		 * The downstream driver retries initialization and falls
++		 * back to a forced firmware upgrade, so do the same when a
++		 * firmware image is available.
++		 */
++		dev_warn(&bt541->client->dev,
++			 "Failed to configure touch IC, trying firmware update\n");
++		ret = zinitix_update_firmware(bt541, true);
++		if (ret > 0)
++			error = zinitix_init_touch(bt541);
++		else if (ret < 0)
++			error = ret;
++
++		if (error) {
++			dev_err(&bt541->client->dev,
++				"Failed to configure touch IC: %d\n", error);
++			goto err_power_off;
++		}
+ 	}
+ 
+ 	enable_irq(bt541->client->irq);
+ 
+ 	return 0;
++
++err_power_off:
++	zinitix_power_off(bt541);
++
++	return error;
+ }
+ 
+ static int zinitix_stop(struct bt541_ts_data *bt541)
+ {
+-	int error;
+-
+ 	disable_irq(bt541->client->irq);
+ 
+-	error = regulator_bulk_disable(ARRAY_SIZE(bt541->supplies),
+-				       bt541->supplies);
+-	if (error) {
+-		dev_err(&bt541->client->dev,
+-			"Failed to disable regulators: %d\n", error);
+-		return error;
+-	}
++	zinitix_release_all(bt541);
+ 
+-	return 0;
++	return zinitix_power_off(bt541);
+ }
+ 
+ static int zinitix_input_open(struct input_dev *dev)
+@@ -586,14 +1374,25 @@ static int zinitix_init_input_dev(struct bt541_ts_data *bt541)
+ 	input_set_abs_params(input_dev, ABS_MT_WIDTH_MAJOR, 0, 255, 0, 0);
+ 	input_set_abs_params(input_dev, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
+ 
++	/*
++	 * Provide the resolution of the panel used on this platform as a
++	 * fallback.  The downstream driver defaults to 539x959 when the
++	 * device tree does not provide it (bt541_ts.c:6416-6432).
++	 */
++	input_set_abs_params(input_dev, ABS_MT_POSITION_X, 0,
++			     DEFAULT_X_RESOLUTION, 0, 0);
++	input_set_abs_params(input_dev, ABS_MT_POSITION_Y, 0,
++			     DEFAULT_Y_RESOLUTION, 0, 0);
++
++	if (!device_property_present(&bt541->client->dev, "touchscreen-size-x") ||
++	    !device_property_present(&bt541->client->dev, "touchscreen-size-y"))
++		dev_warn(&bt541->client->dev,
++			 "touchscreen-size-x/y missing, using %dx%d\n",
++			 DEFAULT_X_RESOLUTION, DEFAULT_Y_RESOLUTION);
++
+ 	touchscreen_parse_properties(input_dev, true, &bt541->prop);
+-	if (!bt541->prop.max_x || !bt541->prop.max_y) {
+-		dev_err(&bt541->client->dev,
+-			"Touchscreen-size-x and/or touchscreen-size-y not set in dts\n");
+-		return -EINVAL;
+-	}
+ 
+-	error = input_mt_init_slots(input_dev, MAX_SUPPORTED_FINGER_NUM,
++	error = input_mt_init_slots(input_dev, bt541->fingers,
+ 				    INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
+ 	if (error) {
+ 		dev_err(&bt541->client->dev,
+@@ -629,6 +1428,16 @@ static int zinitix_ts_probe(struct i2c_client *client)
+ 	bt541->client = client;
+ 	i2c_set_clientdata(client, bt541);
+ 
++	/*
++	 * The BT541 has a fixed icon status register and a flash layout that
++	 * is described by the downstream driver.  Only enable the optional
++	 * firmware update path for it.
++	 */
++	bt541->is_bt541 = of_device_is_compatible(client->dev.of_node,
++						  "zinitix,bt541");
++	if (bt541->is_bt541)
++		bt541->page_size = ZINITIX_BT541_PAGE_SIZE;
++
+ 	error = zinitix_init_regulators(bt541);
+ 	if (error) {
+ 		dev_err(&client->dev,
+@@ -670,34 +1479,63 @@ static int zinitix_ts_probe(struct i2c_client *client)
+ 		}
+ 	}
+ 
+-	error = zinitix_init_input_dev(bt541);
+-	if (error) {
+-		dev_err(&client->dev,
+-			"Failed to initialize input device: %d\n", error);
+-		return error;
+-	}
+-
+ 	error = device_property_read_u32(&client->dev, "zinitix,mode",
+ 					 &bt541->zinitix_mode);
+ 	if (error < 0) {
+-		/* fall back to mode 2 */
+-		bt541->zinitix_mode = DEFAULT_TOUCH_POINT_MODE;
+-	}
+-
+-	if (bt541->zinitix_mode != 2) {
+ 		/*
+-		 * If there are devices that don't support mode 2, support
+-		 * for other modes (0, 1) will be needed.
++		 * The BT541 firmware used on the SM-G532M reports in touch
++		 * mode 0 (ROM ts_read_coord(), see the parity report); the
++		 * other controllers default to the preferred mode 2.
+ 		 */
++		bt541->zinitix_mode = bt541->is_bt541 ? 0
++						     : DEFAULT_TOUCH_POINT_MODE;
++	}
++
++	switch (bt541->zinitix_mode) {
++	case 0:
++		bt541->coord_size = ZINITIX_COORD_SIZE_MODE0;
++		break;
++	case 2:
++		bt541->coord_size = ZINITIX_COORD_SIZE_MODE2;
++		break;
++	default:
+ 		dev_err(&client->dev,
+-			"Malformed zinitix,mode property, must be 2 (supplied: %d)\n",
++			"Unsupported zinitix,mode %u (must be 0 or 2)\n",
+ 			bt541->zinitix_mode);
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * The downstream driver runs this controller with two fingers
++	 * (bt541_ts.c MAX_SUPPORTED_FINGER_NUM); keep the mainline count
++	 * for the other chips.
++	 */
++	bt541->fingers = bt541->is_bt541 ? ZINITIX_BT541_FINGER_NUM
++					: MAX_SUPPORTED_FINGER_NUM;
++
++	error = zinitix_init_input_dev(bt541);
++	if (error) {
++		dev_err(&client->dev,
++			"Failed to initialize input device: %d\n", error);
++		return error;
++	}
++
+ 	return 0;
+ }
+ 
++static void zinitix_ts_shutdown(struct i2c_client *client)
++{
++	struct bt541_ts_data *bt541 = i2c_get_clientdata(client);
++
++	dev_dbg(&client->dev, "Shutting down touch controller\n");
++
++	if (!bt541)
++		return;
++
++	disable_irq(client->irq);
++	zinitix_power_off(bt541);
++}
++
+ static int zinitix_suspend(struct device *dev)
+ {
+ 	struct i2c_client *client = to_i2c_client(dev);
+@@ -754,6 +1592,7 @@ MODULE_DEVICE_TABLE(of, zinitix_of_match);
+ 
+ static struct i2c_driver zinitix_ts_driver = {
+ 	.probe = zinitix_ts_probe,
++	.shutdown = zinitix_ts_shutdown,
+ 	.driver = {
+ 		.name = "Zinitix-TS",
+ 		.pm = pm_sleep_ptr(&zinitix_pm_ops),

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# MediaTek GPS (MT3326 / MT6627 GPS function) over STP.
+
+config MTK_WCN_GPS
+	tristate "MediaTek WCN GPS driver"
+	depends on MTK_WCN_WMT
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	select RFKILL
+	help
+	  Driver for the MediaTek connectivity subsystem GPS function.  The
+	  GPS function is powered through WMT and exchanges NMEA/MTK binary
+	  frames with the connectivity SoC over the STP GPS channel.
+
+	  Two mutually exclusive userspace interfaces are provided: the
+	  standard GNSS character device (when CONFIG_GNSS is enabled) and
+	  the vendor /dev/stpgps character device used by the Android GPS
+	  HAL of the SM-G532M ROM.
+
+	  The module is called mtk_wcn_gps.

@@ -1,0 +1,1814 @@
+diff --git a/sound/soc/codecs/mt6331.c b/sound/soc/codecs/mt6331.c
+index 825b2fb60..27d2cfa33 100644
+--- a/sound/soc/codecs/mt6331.c
++++ b/sound/soc/codecs/mt6331.c
+@@ -51,6 +51,20 @@
+ #define MT6331_DL1_STREAM_NAME		"MultiMedia1_PLayback"
+ #define MT6331_DL2_STREAM_NAME		"MultiMedia2_PLayback"
+ #define MT6331_UL1_STREAM_NAME		"MultiMedia1_Capture"
++/*
++ * Voice codec DAIs.  The vendor machine driver pairs Voice_MD1/Voice_MD2
++ * with the codec voice DAIs (AudDrv_Def.h:280-281), and the vendor codec
++ * gives them the AIF1 ops, i.e. they drive the same PMIC DAC/ADC as the
++ * multimedia DAIs (mt_soc_codec_63xx.c:1417-1455).  The BT voice links use
++ * MT_SOC_CODEC_DUMMY_NAME in the vendor machine driver and therefore do not
++ * reach the codec.
++ */
++#define MT6331_VOICE_MD1_DAI_NAME	"mt-soc-codec-voicemd1-dai"
++#define MT6331_VOICE_MD2_DAI_NAME	"mt-soc-codec-voicemd2-dai"
++#define MT6331_VOICE_MD1_STREAM_NAME	"Voice_MD1_PLayback"
++#define MT6331_VOICE_MD1_CAPTURE_NAME	"Voice_MD1_Capture"
++#define MT6331_VOICE_MD2_STREAM_NAME	"Voice_MD2_PLayback"
++#define MT6331_VOICE_MD2_CAPTURE_NAME	"Voice_MD2_Capture"
+ 
+ /* Vendor trim indexes (mt_soc_pcm_common.h:204-206) */
+ #define MT6331_HP_TRIM_INDEX		8	/* 0 dB */
+@@ -1214,6 +1228,16 @@ static const struct snd_soc_dapm_widget mt6331_dapm_widgets[] = {
+ 			    SND_SOC_NOPM, 0, 0),
+ 	SND_SOC_DAPM_AIF_IN("AIF_RX2", MT6331_DL2_STREAM_NAME, 0,
+ 			    SND_SOC_NOPM, 0, 0),
++	/*
++	 * Voice DAIs share the AIF1 digital interface (mt6323_aif1_dai_ops in
++	 * mt_soc_codec_63xx.c:1417-1455) but need their own DAPM AIF widgets
++	 * in this port: DAPM links a DAI to the widgets whose stream name
++	 * contains the DAI stream name (soc-dapm.c:4445).
++	 */
++	SND_SOC_DAPM_AIF_IN("AIF_RX_VOICE_MD1", MT6331_VOICE_MD1_STREAM_NAME, 0,
++			    SND_SOC_NOPM, 0, 0),
++	SND_SOC_DAPM_AIF_IN("AIF_RX_VOICE_MD2", MT6331_VOICE_MD2_STREAM_NAME, 0,
++			    SND_SOC_NOPM, 0, 0),
+ 	SND_SOC_DAPM_DAC_E("DAC", NULL, SND_SOC_NOPM, 0, 0,
+ 			   mt6331_dac_event,
+ 			   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
+@@ -1254,12 +1278,18 @@ static const struct snd_soc_dapm_widget mt6331_dapm_widgets[] = {
+ 			   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
+ 	SND_SOC_DAPM_AIF_OUT("AIF1TX", MT6331_UL1_STREAM_NAME, 0,
+ 			     SND_SOC_NOPM, 0, 0),
++	SND_SOC_DAPM_AIF_OUT("AIF_TX_VOICE_MD1", MT6331_VOICE_MD1_CAPTURE_NAME, 0,
++			     SND_SOC_NOPM, 0, 0),
++	SND_SOC_DAPM_AIF_OUT("AIF_TX_VOICE_MD2", MT6331_VOICE_MD2_CAPTURE_NAME, 0,
++			     SND_SOC_NOPM, 0, 0),
+ };
+ 
+ static const struct snd_soc_dapm_route mt6331_dapm_routes[] = {
+ 	/* Downlink: DAC -> headphone / earpiece / speaker */
+ 	{ "DAC", NULL, "AIF_RX" },
+ 	{ "DAC", NULL, "AIF_RX2" },
++	{ "DAC", NULL, "AIF_RX_VOICE_MD1" },
++	{ "DAC", NULL, "AIF_RX_VOICE_MD2" },
+ 	{ "Headphone Amp", NULL, "DAC" },
+ 	{ "Earpiece Amp", NULL, "DAC" },
+ 	{ "Speaker Amp", NULL, "DAC" },
+@@ -1280,6 +1310,8 @@ static const struct snd_soc_dapm_route mt6331_dapm_routes[] = {
+ 	{ "ADC", NULL, "PGA L" },
+ 	{ "ADC", NULL, "PGA R" },
+ 	{ "AIF1TX", NULL, "ADC" },
++	{ "AIF_TX_VOICE_MD1", NULL, "ADC" },
++	{ "AIF_TX_VOICE_MD2", NULL, "ADC" },
+ };
+ 
+ /* ------------------------------------------------------------------ */
+@@ -1467,6 +1499,58 @@ static struct snd_soc_dai_driver mt6331_dai_driver[] = {
+ 				   SNDRV_PCM_FMTBIT_S24_LE,
+ 		},
+ 		.ops = &mt6331_dai_ops,
++	}, {
++		/*
++		 * Voice codec DAIs, AudDrv_Def.h:280-281.  The vendor machine
++		 * driver pairs Voice_MD1/Voice_MD2 with these DAIs and the
++		 * vendor codec gives both the AIF1 ops
++		 * (mt_soc_codec_63xx.c:1417-1455), so they use the same PMIC
++		 * interface and DAPM DAC/ADC path as the multimedia DAIs.  The
++		 * AFE side of the interface is programmed by the voice FE DAI
++		 * (mt6735-dai-voice.c); only the PMIC rate and DAPM belong
++		 * here.
++		 */
++		.name = MT6331_VOICE_MD1_DAI_NAME,
++		.playback = {
++			.stream_name = MT6331_VOICE_MD1_STREAM_NAME,
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = SNDRV_PCM_RATE_8000_48000,
++			.formats = SNDRV_PCM_FMTBIT_S16_LE |
++				   SNDRV_PCM_FMTBIT_S24_LE,
++		},
++		.capture = {
++			.stream_name = MT6331_VOICE_MD1_CAPTURE_NAME,
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = SNDRV_PCM_RATE_8000_48000,
++			.formats = SNDRV_PCM_FMTBIT_S16_LE |
++				   SNDRV_PCM_FMTBIT_S24_LE,
++		},
++		.ops = &mt6331_dai_ops,
++		.symmetric_rate = 1,
++		.symmetric_channels = 1,
++	}, {
++		.name = MT6331_VOICE_MD2_DAI_NAME,
++		.playback = {
++			.stream_name = MT6331_VOICE_MD2_STREAM_NAME,
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = SNDRV_PCM_RATE_8000_48000,
++			.formats = SNDRV_PCM_FMTBIT_S16_LE |
++				   SNDRV_PCM_FMTBIT_S24_LE,
++		},
++		.capture = {
++			.stream_name = MT6331_VOICE_MD2_CAPTURE_NAME,
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = SNDRV_PCM_RATE_8000_48000,
++			.formats = SNDRV_PCM_FMTBIT_S16_LE |
++				   SNDRV_PCM_FMTBIT_S24_LE,
++		},
++		.ops = &mt6331_dai_ops,
++		.symmetric_rate = 1,
++		.symmetric_channels = 1,
+ 	},
+ };
+ 
+diff --git a/sound/soc/mediatek/mt6735/Makefile b/sound/soc/mediatek/mt6735/Makefile
+index bcf2f0cf2..4d89dfe1d 100644
+--- a/sound/soc/mediatek/mt6735/Makefile
++++ b/sound/soc/mediatek/mt6735/Makefile
+@@ -3,6 +3,7 @@ snd-soc-mt6735-afe-objs := \
+ 	mt6735-afe-pcm.o \
+ 	mt6735-afe-clk.o \
+ 	mt6735-dai-pcm.o \
++	mt6735-dai-voice.o \
+ 	mt6735-dai-i2s.o
+ 
+ obj-$(CONFIG_SND_SOC_MT6735) += snd-soc-mt6735-afe.o
+diff --git a/sound/soc/mediatek/mt6735/mt6735-afe-common.h b/sound/soc/mediatek/mt6735/mt6735-afe-common.h
+index 0e968fbec..eb109b63f 100644
+--- a/sound/soc/mediatek/mt6735/mt6735-afe-common.h
++++ b/sound/soc/mediatek/mt6735/mt6735-afe-common.h
+@@ -21,11 +21,17 @@
+ #include "mt6735-afe-clk.h"
+ #include "mt6735-afe-regs.h"
+ 
+-/* Memory interfaces implemented by this driver. */
++/*
++ * Memory interfaces implemented by this driver.  The values are the memory
++ * interface (digital block) numbers used by the downstream driver, because
++ * AFE_DAC_CON0 enables block N with bit N + 1
++ * (SetMemoryPathEnable(), mt_soc_afe_control.c:1995-1997).
++ */
+ enum {
+ 	MT6735_AFE_MEMIF_DL1 = 0,
+ 	MT6735_AFE_MEMIF_DL2,
+ 	MT6735_AFE_MEMIF_VUL,
++	MT6735_AFE_MEMIF_DAI,		/* Soc_Aud_Digital_Block_MEM_DAI = 3 */
+ 	MT6735_AFE_MEMIF_NUM,
+ };
+ 
+@@ -39,17 +45,55 @@ enum {
+ /*
+  * DAI ids.  The three PCM DAIs must use their memory interface number as
+  * id because the PCM pointer calculation indexes afe->memif[] with it.
++ * The BT SCO DAI (MT6735_AFE_DAI_BTCVSD) is the fourth MEM_DAI user but it
++ * is appended after the I2S0 DAI, so mt6735_afe_dai_memif_id() translates
++ * its id to MT6735_AFE_MEMIF_DAI.
+  */
+ enum {
+ 	MT6735_AFE_DAI_DL1 = 0,
+ 	MT6735_AFE_DAI_DL2,
+ 	MT6735_AFE_DAI_VUL,
+ 	MT6735_AFE_DAI_I2S0,
++	MT6735_AFE_DAI_BTCVSD,
++	MT6735_AFE_DAI_VOICE_MD1,
++	MT6735_AFE_DAI_VOICE_MD2,
++	MT6735_AFE_DAI_VOICE_MD1_BT,
++	MT6735_AFE_DAI_VOICE_MD2_BT,
+ 	MT6735_AFE_DAI_NUM,
+ };
+ 
+ #define MT6735_AFE_PCM_DAI_NUM	3
+ 
++/* Voice and BT SCO DAIs, registered from mt6735-dai-voice.c. */
++#define MT6735_AFE_VOICE_DAI_NUM	5
++#define MT6735_AFE_VOICE_DAI_IDX(dai_id)	\
++	((dai_id) - MT6735_AFE_DAI_BTCVSD)
++
++/* Supported voice parameters, mt_soc_pcm_voice_md1.c:87-101 */
++#define MT6735_VOICE_FORMATS	SNDRV_PCM_FMTBIT_S16_LE
++#define MT6735_VOICE_RATES	(SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000)
++#define MT6735_VOICE_RATE_MIN	8000
++#define MT6735_VOICE_RATE_MAX	16000
++#define MT6735_VOICE_BUFFER_MAX	(36 * 1024)	/* MAX_BUFFER_SIZE, mt_soc_pcm_common.h:132 */
++#define MT6735_VOICE_MD2_BUFFER_MAX	(16 * 1024)	/* MAX_BUFFER_SIZE_MD2, mt_soc_pcm_voice_md2.c:74 */
++
++/* BT SCO (BT_DAI_MAX_BUFFER_SIZE, mt_soc_pcm_common.h:119) */
++#define MT6735_BTCVSD_BUFFER_MAX	(16 * 1024)
++#define MT6735_BTCVSD_PERIODS_MAX	4	/* SOC_NORMAL_USE_PERIODS_MAX, mt_soc_pcm_common.h:194 */
++
++/*
++ * Per-DAI state for the voice and BT SCO DAIs.  The AFE has one modem PCM
++ * interface (or one DAI_BT block) per DAI, so the state is per DAI and not
++ * per substream.
++ */
++struct mt6735_voice_state {
++	unsigned int rate;
++	unsigned int prepared_rate;
++	int users;
++	bool prepared;		/* PCM interface / DAI_BT registers programmed */
++	bool running;		/* PCM interface or DAI_BT enabled */
++};
++
+ /* Supported PCM parameters (mt_soc_pcm_common.h:168-201). */
+ #define MT6735_AFE_FORMATS	(SNDRV_PCM_FMTBIT_S16_LE | \
+ 				 SNDRV_PCM_FMTBIT_S24_LE)
+@@ -126,6 +170,12 @@ struct mt6735_afe_priv {
+ 	unsigned int i2s_sysclk;
+ 
+ 	unsigned int spurious_irqs;
++
++	/* Voice/BT SCO front ends, mt6735-dai-voice.c */
++	struct mt6735_voice_state voice[MT6735_AFE_VOICE_DAI_NUM];
++	unsigned int voice_afe_users;	/* EnableAfe() reference count */
++	unsigned int daibt_users;	/* AFE_DAIBT_CON0 users */
++	bool daibt_merge_on;		/* AFE_MRGIF_CON programmed */
+ };
+ 
+ static inline struct mt6735_afe_priv *mt6735_afe_priv(struct mtk_base_afe *afe)
+@@ -141,5 +191,7 @@ int mt6735_afe_irq_update(struct mtk_base_afe *afe, int irq);
+ /* DAI drivers */
+ extern const struct snd_soc_dai_driver mt6735_afe_pcm_dais[MT6735_AFE_PCM_DAI_NUM];
+ extern const struct snd_soc_dai_driver mt6735_afe_i2s_dai;
++extern const struct snd_soc_dai_driver
++	mt6735_afe_voice_dais[MT6735_AFE_VOICE_DAI_NUM];
+ 
+ #endif /* _MT6735_AFE_COMMON_H_ */
+diff --git a/sound/soc/mediatek/mt6735/mt6735-afe-pcm.c b/sound/soc/mediatek/mt6735/mt6735-afe-pcm.c
+index 728140374..08426d483 100644
+--- a/sound/soc/mediatek/mt6735/mt6735-afe-pcm.c
++++ b/sound/soc/mediatek/mt6735/mt6735-afe-pcm.c
+@@ -99,6 +99,42 @@ static const struct mtk_base_memif_data mt6735_afe_memif_data[MT6735_AFE_MEMIF_N
+ 		.pbuf_reg = -1,
+ 		.minlen_reg = -1,
+ 	},
++	[MT6735_AFE_MEMIF_DAI] = {
++		.id = MT6735_AFE_MEMIF_DAI,
++		.name = "DAI",
++		/*
++		 * BT SCO capture buffer, mt_soc_pcm_bt_dai.c:228-240.  The
++		 * sample rate field is AFE_DAC_CON0[25:24] with a dense
++		 * 8k/16k/32k encoding (SetSampleRate(MEM_DAI),
++		 * mt_soc_afe_control.c:1099-1112); there is no channel field
++		 * for this interface (SetChannels() has no MEM_DAI case,
++		 * mt_soc_afe_control.c:1129-1160).
++		 */
++		.reg_ofs_base = AFE_DAI_BASE,
++		.reg_ofs_cur = AFE_DAI_CUR,
++		.reg_ofs_end = AFE_DAI_END,
++		.reg_ofs_base_msb = -1,
++		.reg_ofs_cur_msb = -1,
++		.reg_ofs_end_msb = -1,
++		.fs_reg = AFE_DAC_CON0,
++		.fs_shift = AFE_DAC_CON0_DAI_FS_SHIFT,
++		.fs_maskbit = AFE_DAC_CON0_DAI_FS_MASK,
++		.mono_reg = -1,
++		.mono_shift = 0,
++		.quad_ch_reg = -1,
++		.int_odd_flag_reg = -1,
++		.enable_reg = AFE_DAC_CON0,		/* mt_soc_afe_control.c:1995-1997 */
++		.enable_shift = MT6735_AFE_MEMIF_DAI + 1,
++		.hd_reg = AFE_MEMIF_PBUF_SIZE,		/* mt_soc_afe_control.c:2343-2346 */
++		.hd_shift = AFE_MEMIF_PBUF_DAI_FMT_SHIFT,
++		.hd_align_reg = -1,
++		.agent_disable_reg = -1,
++		.msb_reg = -1,
++		.msb_end_reg = -1,
++		.ch_num_reg = -1,
++		.pbuf_reg = -1,
++		.minlen_reg = -1,
++	},
+ 	[MT6735_AFE_MEMIF_VUL] = {
+ 		.id = MT6735_AFE_MEMIF_VUL,
+ 		.name = "VUL",
+@@ -134,6 +170,8 @@ static const int mt6735_afe_memif_irq[MT6735_AFE_MEMIF_NUM] = {
+ 	[MT6735_AFE_MEMIF_DL1] = MT6735_AFE_IRQ1,
+ 	[MT6735_AFE_MEMIF_DL2] = MT6735_AFE_IRQ1,
+ 	[MT6735_AFE_MEMIF_VUL] = MT6735_AFE_IRQ2,
++	/* irq_add_user(..., IRQ2), mt_soc_pcm_bt_dai.c:127-129 */
++	[MT6735_AFE_MEMIF_DAI] = MT6735_AFE_IRQ2,
+ };
+ 
+ /*
+@@ -196,6 +234,7 @@ static bool mt6735_afe_volatile_reg(struct device *dev, unsigned int reg)
+ 	case AFE_DL1_CUR:
+ 	case AFE_DL2_CUR:
+ 	case AFE_VUL_CUR:
++	case AFE_DAI_CUR:
+ 	case AFE_IRQ_MCU_STATUS:
+ 	case AFE_IRQ_MCU_CLR:
+ 	case AFE_IRQ_MCU_CNT1:
+@@ -232,7 +271,12 @@ static const struct regmap_config mt6735_afe_regmap_config = {
+ void mt6735_afe_update_power(struct mtk_base_afe *afe)
+ {
+ 	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
+-	bool enabled = false;
++	/*
++	 * The modem PCM interfaces and DAI_BT have no memory interface, so
++	 * their EnableAfe() calls are tracked separately
++	 * (mt6735-dai-voice.c, EnableAfe() mt_soc_afe_control.c:951-1032).
++	 */
++	bool enabled = priv->voice_afe_users > 0;
+ 	int i;
+ 
+ 	for (i = 0; i < MT6735_AFE_MEMIF_NUM; i++)
+@@ -356,19 +400,53 @@ static irqreturn_t mt6735_afe_irq_handler(int irq, void *data)
+ 		}
+ 	}
+ 
+-	if ((status & AFE_IRQ_STATUS_IRQ2) &&
+-	    priv->memif_enabled[MT6735_AFE_MEMIF_VUL] &&
+-	    afe->memif[MT6735_AFE_MEMIF_VUL].substream)
+-		snd_pcm_period_elapsed(afe->memif[MT6735_AFE_MEMIF_VUL].substream);
++	/*
++	 * IRQ2 serves the capture interfaces: VUL and the BT SCO DAI memory
++	 * interface, which share the line (mt_soc_pcm_bt_dai.c:124-129).
++	 */
++	if (status & AFE_IRQ_STATUS_IRQ2) {
++		for (i = MT6735_AFE_MEMIF_VUL; i <= MT6735_AFE_MEMIF_DAI; i++) {
++			if (!priv->memif_enabled[i] || !afe->memif[i].substream)
++				continue;
++			snd_pcm_period_elapsed(afe->memif[i].substream);
++		}
++	}
+ 
+ 	regmap_write(afe->regmap, AFE_IRQ_MCU_CLR, status);
+ 
+ 	return IRQ_HANDLED;
+ }
+ 
++/*
++ * Map a CPU DAI id to the memory interface it drives.  DL1/DL2/VUL are the
++ * memory interface with the same id; the BT SCO DAI was appended after the
++ * memif-less I2S0 DAI, so it needs an explicit translation.  The I2S0 and
++ * voice DAIs have no memory interface: the modem PCM interfaces move data
++ * between the modem and the AFE without AP memory, so their stream position
++ * never advances (mt_soc_pcm_voice_md1.c:253-257 leaves the ALSA buffer
++ * untouched).
++ */
++static int mt6735_afe_dai_memif_id(unsigned int dai_id)
++{
++	switch (dai_id) {
++	case MT6735_AFE_DAI_DL1:
++		return MT6735_AFE_MEMIF_DL1;
++	case MT6735_AFE_DAI_DL2:
++		return MT6735_AFE_MEMIF_DL2;
++	case MT6735_AFE_DAI_VUL:
++		return MT6735_AFE_MEMIF_VUL;
++	case MT6735_AFE_DAI_BTCVSD:
++		return MT6735_AFE_MEMIF_DAI;
++	default:
++		return -1;
++	}
++}
++
+ /*
+  * The hardware reports the DMA read (playback) / write (capture) pointer,
+  * mtk_pcm_pointer() in mt_soc_pcm_dl1.c:189-235 does the same computation.
++ * The same AFE_DAI_BASE/AFE_DAI_CUR pair drives the BT SCO capture buffer
++ * (mt_soc_pcm_bt_dai.c:175-210).
+  */
+ static snd_pcm_uframes_t mt6735_afe_pcm_pointer(struct snd_soc_component *component,
+ 					       struct snd_pcm_substream *substream)
+@@ -377,7 +455,7 @@ static snd_pcm_uframes_t mt6735_afe_pcm_pointer(struct snd_soc_component *compon
+ 	struct mtk_base_afe *afe = snd_soc_component_get_drvdata(component);
+ 	const struct mtk_base_memif_data *data;
+ 	unsigned int hw_ptr = 0, hw_base = 0;
+-	int memif_id = snd_soc_rtd_to_cpu(rtd, 0)->id;
++	int memif_id = mt6735_afe_dai_memif_id(snd_soc_rtd_to_cpu(rtd, 0)->id);
+ 
+ 	if (memif_id < 0 || memif_id >= afe->memif_size)
+ 		return 0;
+@@ -402,6 +480,13 @@ static int mt6735_afe_pcm_new(struct snd_soc_component *component,
+ 	struct mtk_base_afe *afe = snd_soc_component_get_drvdata(component);
+ 	size_t size = afe->mtk_afe_hardware->buffer_bytes_max;
+ 
++	/*
++	 * The BT SCO interface only addresses BT_DAI_MAX_BUFFER_SIZE
++	 * (mt_soc_pcm_common.h:119, mt_soc_pcm_bt_dai.c:69-78).
++	 */
++	if (snd_soc_rtd_to_cpu(rtd, 0)->id == MT6735_AFE_DAI_BTCVSD)
++		size = MT6735_BTCVSD_BUFFER_MAX;
++
+ 	snd_pcm_set_managed_buffer_all(rtd->pcm, SNDRV_DMA_TYPE_DEV, afe->dev,
+ 				       0, size);
+ 
+@@ -545,6 +630,12 @@ static int mt6735_afe_pcm_dev_probe(struct platform_device *pdev)
+ 
+ 	memcpy(dais, mt6735_afe_pcm_dais, sizeof(mt6735_afe_pcm_dais));
+ 	dais[MT6735_AFE_DAI_I2S0] = mt6735_afe_i2s_dai;
++	/*
++	 * Voice and BT SCO DAIs are contiguous from MT6735_AFE_DAI_BTCVSD and
++	 * keep the order and .id of mt6735_afe_voice_dais[].
++	 */
++	memcpy(&dais[MT6735_AFE_DAI_BTCVSD], mt6735_afe_voice_dais,
++	       sizeof(mt6735_afe_voice_dais));
+ 
+ 	ret = devm_snd_soc_register_component(dev, &mt6735_afe_component,
+ 					      dais, MT6735_AFE_DAI_NUM);
+diff --git a/sound/soc/mediatek/mt6735/mt6735-afe-regs.h b/sound/soc/mediatek/mt6735/mt6735-afe-regs.h
+index 3f92e7876..530fcb236 100644
+--- a/sound/soc/mediatek/mt6735/mt6735-afe-regs.h
++++ b/sound/soc/mediatek/mt6735/mt6735-afe-regs.h
+@@ -92,6 +92,7 @@
+ #define AFE_CONN1			0x0024		/* AudDrv_Afe.h:433 */
+ #define AFE_CONN2			0x0028		/* AudDrv_Afe.h:434 */
+ #define AFE_CONN3			0x002c		/* AudDrv_Afe.h:435 */
++#define AFE_CONN4			0x0030		/* AudDrv_Afe.h:436 */
+ #define AFE_CONN_24BIT			0x006c		/* AudDrv_Afe.h:458 */
+ 
+ /*
+@@ -119,6 +120,51 @@
+ #define AFE_CONN_DL1_L_TO_O00		BIT(5)		/* mConnectionReg[I05][O00] :293, bits :187 */
+ #define AFE_CONN_DL1_R_TO_O01		BIT(22)		/* mConnectionReg[I06][O01] :295, bits :189 */
+ 
++/*
++ * Voice and BT SCO routes.  AFE input nodes used here:
++ *
++ *	I02 - DAI_BT data from the BT controller (MRGIF/DAIBT input)
++ *	I03/I04 - AFE ADDA ADC (I2S_IN_ADC) left/right
++ *	I09 - MODEM_PCM_2 (external modem) downlink data
++ *	I14 - MODEM_PCM_1 (internal modem) downlink data
++ *
++ * AFE output nodes:
++ *
++ *	O02 - DAI_BT data to the BT controller
++ *	O03/O04 - AFE ADDA DAC (I2S_OUT_DAC) left/right
++ *	O07/O08 - MODEM_PCM_2 (external modem) uplink
++ *	O11 - MEM_DAI memory interface (BT SCO capture buffer)
++ *	O17/O18 - MODEM_PCM_1 (internal modem) uplink
++ *
++ * Each macro is named after the AFE_CONNx register it belongs to; the
++ * (input, output) pair, register and bit come from the mConnectionTable /
++ * mConnectionReg / mConnectionbits tables of mt_soc_afe_connection.c.
++ */
++#define AFE_CONN1_I09_TO_O02		BIT(9)		/* mConnectionReg[I09][O02] :301-302, mConnectionbits[I09][O02] :195-196 */
++#define AFE_CONN1_I09_TO_O03		BIT(25)		/* mConnectionReg[I09][O03] :301-302, mConnectionbits[I09][O03] :195-196 */
++
++#define AFE_CONN2_I03_TO_O07		BIT(26)		/* mConnectionReg[I03][O07] :289-290, mConnectionbits[I03][O07] :183-184 */
++#define AFE_CONN2_I04_TO_O08		BIT(29)		/* mConnectionReg[I04][O08] :291-292, mConnectionbits[I04][O08] :185-186 */
++#define AFE_CONN2_I09_TO_O04		BIT(9)		/* mConnectionReg[I09][O04] :301-302, mConnectionbits[I09][O04] :195-196 */
++
++#define AFE_CONN3_I14_TO_O02		BIT(22)		/* mConnectionReg[I14][O02] :311-312, mConnectionbits[I14][O02] :205-206 */
++#define AFE_CONN3_I14_TO_O03		BIT(27)		/* mConnectionReg[I14][O03] :311-312, mConnectionbits[I14][O03] :205-206 */
++#define AFE_CONN3_I02_TO_O11		BIT(6)		/* mConnectionReg[I02][O11] :287-288, mConnectionbits[I02][O11] :181-182 */
++
++#define AFE_CONN4_I02_TO_O07		BIT(21)		/* mConnectionReg[I02][O07] :287-288, mConnectionbits[I02][O07] :181-182 */
++#define AFE_CONN4_I02_TO_O17		BIT(23)		/* mConnectionReg[I02][O17] :287-288, mConnectionbits[I02][O17] :181-182 */
++#define AFE_CONN4_I02_TO_O18		BIT(24)		/* mConnectionReg[I02][O18] :287-288, mConnectionbits[I02][O18] :181-182 */
++#define AFE_CONN4_I03_TO_O17		BIT(13)		/* mConnectionReg[I03][O17] :289-290, mConnectionbits[I03][O17] :183-184 */
++#define AFE_CONN4_I04_TO_O18		BIT(16)		/* mConnectionReg[I04][O18] :291-292, mConnectionbits[I04][O18] :185-186 */
++#define AFE_CONN4_I14_TO_O04		BIT(0)		/* mConnectionReg[I14][O04] :311-312, mConnectionbits[I14][O04] :205-206 */
++
++/*
++ * mConnectionReg[I02][O08] is -1, so the second channel of the BT ->
++ * external-modem uplink (mt_soc_pcm_voice_md2_bt.c:264-266) has no
++ * register and is silently dropped by SetConnectionState(); see the
++ * md2_bt notes in mt6735-dai-voice.c.
++ */
++
+ /* AFE_CONN_24BIT: bit N selects 24 bit data for output O<N>
+  * (SetoutputConnectionFormat(), mt_soc_afe_control.c:2371-2377).
+  */
+@@ -191,6 +237,115 @@
+ #define AFE_IRQ_MCU_CON_IRQ2_FS_SHIFT	8		/* mt_soc_afe_control.c:2139 */
+ #define AFE_IRQ_MCU_CON_FS_MASK		GENMASK(3, 0)
+ 
++/*
++ * BT SCO (DAI_BT) interface, SetDaiBtEnable() mt_soc_afe_control.c:1220-1258
++ * and the merge interface it is fed from.
++ */
++#define AFE_DAIBT_CON0			0x001c		/* AudDrv_Afe.h:430 */
++#define AFE_MRGIF_CON			0x003c		/* AudDrv_Afe.h:440 */
++
++#define AFE_DAIBT_CON0_EN		GENMASK(1, 0)	/* mt_soc_afe_control.c:1229,1238 */
++#define AFE_DAIBT_CON0_DATA_READY	BIT(3)		/* mt_soc_afe_control.c:1228 */
++#define AFE_DAIBT_CON0_MODE_SHIFT	9		/* mt_soc_afe_control.c:1225 */
++#define AFE_DAIBT_CON0_USE_MERGE	BIT(12)		/* mt_soc_afe_control.c:1227 */
++
++/* AFE_DAIBT_CON0 mode field values (mt_soc_digital_type.h:387-390) */
++#define AFE_DAIBT_MODE_8K		0		/* Soc_Aud_DATBT_MODE_Mode8K */
++#define AFE_DAIBT_MODE_16K		1		/* Soc_Aud_DATBT_MODE_Mode16K */
++
++/* AFE_MRGIF_CON fields, SetDaiBtEnable()/SetMrgI2SEnable() */
++#define AFE_MRGIF_CON_EN		BIT(0)		/* mt_soc_afe_control.c:1234 */
++#define AFE_MRGIF_CON_I2S_EN		BIT(16)		/* mt_soc_afe_control.c:1233 */
++#define AFE_MRGIF_CON_FS_SHIFT		20		/* mt_soc_afe_control.c:1231 */
++#define AFE_MRGIF_CON_FS_MASK		GENMASK(3, 0)
++
++/*
++ * MEM_DAI memory interface: the BT SCO capture buffer used by
++ * mt_soc_pcm_bt_dai.c (SetDAIBuffer(), :228-240; pointer, :175-210).
++ */
++#define AFE_DAI_BASE			0x0090		/* AudDrv_Afe.h:465 */
++#define AFE_DAI_END			0x0098		/* AudDrv_Afe.h:466 */
++#define AFE_DAI_CUR			0x009c		/* AudDrv_Afe.h:467 */
++
++/*
++ * AFE_DAC_CON0 additions.  SetMemoryPathEnable() enables the digital block
++ * with bit (block + 1) (mt_soc_afe_control.c:1995-1997); block numbers come
++ * from the Soc_Aud_Digital_Block enum (mt_soc_digital_type.h:48-82):
++ * MEM_DAI = 3, I2S_OUT_DAC = 12, I2S_IN_ADC = 14.
++ */
++#define AFE_DAC_CON0_DAI_FS_SHIFT	24		/* mt_soc_afe_control.c:1099-1112 */
++#define AFE_DAC_CON0_DAI_FS_MASK	GENMASK(1, 0)
++#define AFE_DAC_CON0_I2S_OUT_DAC_EN	BIT(13)		/* block 12 + 1 */
++#define AFE_DAC_CON0_I2S_IN_ADC_EN	BIT(15)		/* block 14 + 1 */
++
++/* MEM_DAI rate field values, SetSampleRate(MEM_DAI) :1099-1112 */
++#define AFE_DAI_FS_8K			0
++#define AFE_DAI_FS_16K			1
++
++/* MEM_DAI fetch format, SetMemIfFetchFormatPerSample() :2343-2346 */
++#define AFE_MEMIF_PBUF_DAI_FMT_SHIFT	24
++
++/*
++ * Modem PCM interfaces (AudDrv_Afe.h:670-672).  The internal modem uses
++ * PCM2_INTF_CON and the external modem PCM_INTF_CON, see the comments in
++ * SetModemPcmEnable() mt_soc_afe_control.c:1845-1880.
++ */
++#define PCM_INTF_CON			0x0530
++#define PCM_INTF_CON2			0x0538
++#define PCM2_INTF_CON			0x053c
++
++/* PCM_INTF_CON bits used by SetModemPcmEnable() :1868,1870 and the async
++ * FIFO selection read back at :1861
++ */
++#define PCM_INTF_CON_EN			BIT(0)		/* :1868,1870 */
++#define PCM_INTF_CON_BYP_ASRC		BIT(6)		/* :1832 */
++
++/* PCM2_INTF_CON bit, SetModemPcmEnable() :1854 */
++#define PCM2_INTF_CON_EN		BIT(0)
++
++/* PCM_INTF_CON2 bit, SetModemPcmEnable() :1859-1860 */
++#define PCM_INTF_CON2_MD3_SEL		BIT(8)
++
++/* PCM field values (mt_soc_digital_type.h:313-363) */
++#define PCM_TX_LCH_RPT_NO_REPEAT	0	/* Soc_Aud_TX_LCH_RPT_TX_LCH_NO_REPEAT */
++#define PCM_VBT_16K_DISABLE		0	/* Soc_Aud_VBT_16K_MODE_VBT_16K_MODE_DISABLE */
++#define PCM_EXT_MODEM_INTERNAL		0	/* Soc_Aud_EXT_MODEM_MODEM_2_USE_INTERNAL_MODEM */
++#define PCM_SYNC_ONE_BCK_CYCLE		0	/* Soc_Aud_PCM_SYNC_TYPE_BCK_CYCLE_SYNC */
++#define PCM_BT_MODE_DUAL_MIC_ON_TX	0	/* Soc_Aud_BT_MODE_DUAL_MIC_ON_TX */
++#define PCM_AFIFO_ASRC			0	/* Soc_Aud_BYPASS_SRC_SLAVE_USE_ASRC */
++#define PCM_AFIFO_ASYNC_FIFO		1	/* Soc_Aud_BYPASS_SRC_SLAVE_USE_ASYNC_FIFO */
++#define PCM_CLOCK_SLAVE			1	/* Soc_Aud_PCM_CLOCK_SOURCE_SALVE_MODE */
++#define PCM_WLEN_16BIT			0	/* Soc_Aud_PCM_WLEN_LEN_PCM_16BIT */
++#define PCM_MODE_8K			0	/* Soc_Aud_PCM_MODE_PCM_MODE_8K */
++#define PCM_MODE_16K			1	/* Soc_Aud_PCM_MODE_PCM_MODE_16K */
++#define PCM_FMT_MODE_B			3	/* Soc_Aud_PCM_FMT_PCM_MODE_B */
++
++/* ASRC blocks programmed by SetModemPcmConfig()/SetModemPcmEnable(). */
++#define AFE_ASRC_CON0			0x0500		/* AudDrv_Afe.h:657 */
++#define AFE_ASRC_CON1			0x0504		/* AudDrv_Afe.h:658 */
++#define AFE_ASRC_CON2			0x0508		/* AudDrv_Afe.h:659 */
++#define AFE_ASRC_CON3			0x050c		/* AudDrv_Afe.h:660 */
++#define AFE_ASRC_CON4			0x0510		/* AudDrv_Afe.h:661 */
++#define AFE_ASRC_CON6			0x0518		/* AudDrv_Afe.h:663 */
++#define AFE_ASRC_CON7			0x051c		/* AudDrv_Afe.h:664 */
++#define AFE_ASRC4_CON0			0x06c0		/* AudDrv_Afe.h:685 */
++#define AFE_ASRC4_CON1			0x06c4		/* AudDrv_Afe.h:686 */
++#define AFE_ASRC4_CON2			0x06c8		/* AudDrv_Afe.h:687 */
++#define AFE_ASRC4_CON3			0x06cc		/* AudDrv_Afe.h:688 */
++#define AFE_ASRC4_CON4			0x06d0		/* AudDrv_Afe.h:689 */
++#define AFE_ASRC4_CON6			0x06d8		/* AudDrv_Afe.h:691 */
++#define AFE_ASRC4_CON7			0x06dc		/* AudDrv_Afe.h:692 */
++#define AFE_ASRC2_CON1			0x0704		/* AudDrv_Afe.h:702 */
++#define AFE_ASRC2_CON2			0x0708		/* AudDrv_Afe.h:703 */
++#define AFE_ASRC2_CON3			0x070c		/* AudDrv_Afe.h:704 */
++#define AFE_ASRC2_CON4			0x0710		/* AudDrv_Afe.h:705 */
++#define AFE_ASRC2_CON7			0x071c		/* AudDrv_Afe.h:708 */
++#define AFE_ASRC3_CON1			0x0744		/* AudDrv_Afe.h:717 */
++#define AFE_ASRC3_CON2			0x0748		/* AudDrv_Afe.h:718 */
++#define AFE_ASRC3_CON3			0x074c		/* AudDrv_Afe.h:719 */
++#define AFE_ASRC3_CON4			0x0750		/* AudDrv_Afe.h:720 */
++#define AFE_ASRC3_CON7			0x075c		/* AudDrv_Afe.h:723 */
++
+ /* AFE_IRQ_MCU_STATUS / AFE_IRQ_MCU_CLR bits (AudDrv_Kernel.h:246-251) */
+ #define AFE_IRQ_STATUS_IRQ1		BIT(0)
+ #define AFE_IRQ_STATUS_IRQ2		BIT(1)
+diff --git a/sound/soc/mediatek/mt6735/mt6735-dai-voice.c b/sound/soc/mediatek/mt6735/mt6735-dai-voice.c
+new file mode 100644
+index 000000000..df15dd295
+--- /dev/null
++++ b/sound/soc/mediatek/mt6735/mt6735-dai-voice.c
+@@ -0,0 +1,1105 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT6735/MT6737T ALSA SoC AFE voice and BT SCO front-end DAIs.
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * Port from Samsung/MTK downstream
++ * sound/soc/mediatek/mt_soc_audio_v3/:
++ *   mt_soc_pcm_voice_md1.c     - internal modem voice (PCM2_INTF_CON)
++ *   mt_soc_pcm_voice_md2.c     - external modem voice (PCM_INTF_CON)
++ *   mt_soc_pcm_voice_md1_bt.c  - internal modem <-> BT SCO
++ *   mt_soc_pcm_voice_md2_bt.c  - external modem <-> BT SCO
++ *   mt_soc_pcm_bt_dai.c        - BT SCO capture into the DAI memory interface
++ *   mt_soc_afe_control.c       - SetModemPcmConfig/SetModemPcmEnable,
++ *                                SetDaiBt/SetDaiBtEnable, codec path setup
++ *   mt_soc_afe_connection.c    - AFE_CONNx routing used by the voice PCMs
++ *
++ * The downstream voice PCMs have no AP-side DMA: the modem PCM interface
++ * (or the DAI_BT block for BT SCO) moves the samples between the modem / BT
++ * controller and the AFE, and the AP stream only configures the hardware.
++ * mtk_voice_pcm_copy() and mtk_voice1_prepare() in mt_soc_pcm_voice_md1.c
++ * therefore never touch the ALSA buffer, which is why the stream position of
++ * these DAIs does not advance (see mt6735_afe_dai_memif_id() in
++ * mt6735-afe-pcm.c).  The BT SCO DAI is the exception: it is a real memory
++ * interface (MEM_DAI), so its pointer tracks AFE_DAI_CUR.
++ *
++ * Not implemented, with the downstream input that is missing:
++ *   - MRG/HDMI/FM/TDM/AWB/offload PCMs (out of scope).
++ *   - BT SCO playback: the downstream DAI memory interface has no documented
++ *     route towards DAI_BT (mConnectionReg[I10..I13][O02] are all -1); the
++ *     AP -> BT direction exists only as DL1 -> O02 in mt_soc_pcm_dl1_bt.c,
++ *     which is the separate VOIP_CALL_BT PCM, not this DAI.
++ *   - BT -> external-modem second uplink channel: mConnectionReg[I02][O08] is
++ *     -1, the downstream SetConnection() call is a no-op.
++ */
++
++#include <linux/delay.h>
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++
++#include "mt6735-afe-common.h"
++
++/* Voice DAI kind, selected from the DAI id. */
++enum mt6735_voice_kind {
++	MT6735_VOICE_MD1 = 0,	/* internal modem, PCM2_INTF_CON (0x53c) */
++	MT6735_VOICE_MD2,	/* external modem, PCM_INTF_CON (0x530) */
++	MT6735_VOICE_MD1_BT,	/* internal modem <-> DAI_BT */
++	MT6735_VOICE_MD2_BT,	/* external modem <-> DAI_BT */
++	MT6735_VOICE_DAIBT,	/* BT SCO <-> MEM_DAI */
++};
++
++/*
++ * Voice hardware parameters, mt_soc_pcm_voice_md1.c:102-118: MAX_BUFFER_SIZE
++ * and MAX_PERIOD_SIZE are 36 KiB (mt_soc_pcm_common.h:132-134) and the period
++ * count runs 1..4096.  The internal modem PCMs and the two BT variants use
++ * that set; the external modem PCM (mt_soc_pcm_voice_md2.c:123-138) uses
++ * MAX_BUFFER_SIZE_MD2 = 16 KiB instead (mt_soc_pcm_voice_md2.c:74).
++ *
++ * 8 kHz (narrow band) and 16 kHz (wide band) mono S16_LE are the PCM modes
++ * the AFE implements.  Downstream also lists 32000
++ * (soc_voice_supported_sample_rates, mt_soc_pcm_common.h:214-216), but its
++ * prepare path programs any rate other than 8 kHz as 16 kHz PCM mode
++ * (mt_soc_pcm_voice_md1.c:303-304, mt_soc_pcm_voice_md2.c:296-297), so 32 kHz
++ * is rejected here instead of running at half the requested rate.
++ */
++static const struct snd_pcm_hardware mt6735_voice_hardware = {
++	.info = SNDRV_PCM_INFO_MMAP |
++		SNDRV_PCM_INFO_INTERLEAVED |
++		SNDRV_PCM_INFO_RESUME |
++		SNDRV_PCM_INFO_MMAP_VALID,
++	.formats = MT6735_VOICE_FORMATS,
++	.rates = MT6735_VOICE_RATES,
++	.rate_min = MT6735_VOICE_RATE_MIN,
++	.rate_max = MT6735_VOICE_RATE_MAX,
++	.channels_min = 1,
++	.channels_max = 1,
++	.buffer_bytes_max = MT6735_VOICE_BUFFER_MAX,
++	.period_bytes_min = 64,
++	.period_bytes_max = MT6735_VOICE_BUFFER_MAX,
++	.periods_min = 1,
++	.periods_max = 4096,
++	.fifo_size = 0,
++};
++
++/* External modem PCM, mt_soc_pcm_voice_md2.c:123-138. */
++static const struct snd_pcm_hardware mt6735_voice_md2_hardware = {
++	.info = SNDRV_PCM_INFO_MMAP |
++		SNDRV_PCM_INFO_INTERLEAVED |
++		SNDRV_PCM_INFO_RESUME |
++		SNDRV_PCM_INFO_MMAP_VALID,
++	.formats = MT6735_VOICE_FORMATS,
++	.rates = MT6735_VOICE_RATES,
++	.rate_min = MT6735_VOICE_RATE_MIN,
++	.rate_max = MT6735_VOICE_RATE_MAX,
++	.channels_min = 1,
++	.channels_max = 1,
++	.buffer_bytes_max = MT6735_VOICE_MD2_BUFFER_MAX,
++	.period_bytes_min = 64,
++	.period_bytes_max = MT6735_VOICE_MD2_BUFFER_MAX,
++	.periods_min = 1,
++	.periods_max = 4096,
++	.fifo_size = 0,
++};
++
++/*
++ * BT SCO hardware parameters, mt_soc_pcm_bt_dai.c:69-78 with
++ * BT_DAI_MAX_BUFFER_SIZE = 16 KiB (mt_soc_pcm_common.h:119) and 1..4 periods
++ * (SOC_NORMAL_USE_PERIODS_MIN/MAX, mt_soc_pcm_common.h:193-194).
++ *
++ * SNDRV_PCM_INFO_MMAP/MMAP_VALID are added to the downstream flags
++ * (INTERLEAVED only): this DAI has no custom .copy callback, the AFE writes
++ * the managed DMA buffer directly, so the standard mmap path is used.
++ */
++static const struct snd_pcm_hardware mt6735_btcvsd_hardware = {
++	.info = SNDRV_PCM_INFO_MMAP |
++		SNDRV_PCM_INFO_INTERLEAVED |
++		SNDRV_PCM_INFO_MMAP_VALID,
++	.formats = MT6735_VOICE_FORMATS,
++	.rates = MT6735_VOICE_RATES,
++	.rate_min = MT6735_VOICE_RATE_MIN,
++	.rate_max = MT6735_VOICE_RATE_MAX,
++	.channels_min = 1,
++	.channels_max = 1,
++	.buffer_bytes_max = MT6735_BTCVSD_BUFFER_MAX,
++	.period_bytes_min = 64,
++	.period_bytes_max = MT6735_BTCVSD_BUFFER_MAX,
++	.periods_min = 1,
++	.periods_max = MT6735_BTCVSD_PERIODS_MAX,
++	.fifo_size = 0,
++};
++
++static const struct snd_pcm_hardware *
++mt6735_voice_pcm_hardware(enum mt6735_voice_kind kind)
++{
++	switch (kind) {
++	case MT6735_VOICE_MD2:
++		return &mt6735_voice_md2_hardware;
++	case MT6735_VOICE_DAIBT:
++		return &mt6735_btcvsd_hardware;
++	default:
++		return &mt6735_voice_hardware;
++	}
++}
++
++/*
++ * MRG I2S sample rate field used by the merge interface the DAI_BT block is
++ * fed from.  SetDaiBtEnable() (mt_soc_afe_control.c:1231-1234) programs it
++ * from mAudioMrg->Mrg_I2S_SampleRate, which mt_soc_afe_control.c:501
++ * initialises to SampleRateTransform(44100) = 9; the voice-BT and DAI_BT
++ * paths never change that value.
++ */
++#define MT6735_MRGIF_FS_44K	9
++
++static enum mt6735_voice_kind mt6735_voice_kind(int dai_id)
++{
++	switch (dai_id) {
++	case MT6735_AFE_DAI_VOICE_MD1:
++		return MT6735_VOICE_MD1;
++	case MT6735_AFE_DAI_VOICE_MD2:
++		return MT6735_VOICE_MD2;
++	case MT6735_AFE_DAI_VOICE_MD1_BT:
++		return MT6735_VOICE_MD1_BT;
++	case MT6735_AFE_DAI_VOICE_MD2_BT:
++		return MT6735_VOICE_MD2_BT;
++	default:
++		return MT6735_VOICE_DAIBT;
++	}
++}
++
++static struct mt6735_voice_state *mt6735_voice_state(struct mtk_base_afe *afe,
++						    int dai_id)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++
++	return &priv->voice[MT6735_AFE_VOICE_DAI_IDX(dai_id)];
++}
++
++/* SetConnection(), one AFE_CONNx bit (mt_soc_afe_connection.c:415-504). */
++static void mt6735_voice_conn(struct mtk_base_afe *afe, unsigned int reg,
++			      unsigned int bits, bool connect)
++{
++	regmap_update_bits(afe->regmap, reg, bits, connect ? bits : 0);
++}
++
++/*
++ * AFE interconnection for each voice PCM, from the prepare/close sequences of
++ * the downstream PCMs.  Register and bit for every route are in
++ * mt6735-afe-regs.h.
++ *
++ *   MD1    : mt_soc_pcm_voice_md1.c:219-222, 287-290
++ *   MD2    : mt_soc_pcm_voice_md2.c:212-215, 280-283
++ *   MD1_BT : mt_soc_pcm_voice_md1_bt.c:192-194, 278-280
++ *   MD2_BT : mt_soc_pcm_voice_md2_bt.c:176-178, 262-264
++ *   DAIBT  : mt_soc_pcm_bt_dai.c:92,134
++ */
++static void mt6735_voice_connect(struct mtk_base_afe *afe,
++				 enum mt6735_voice_kind kind, bool on)
++{
++	switch (kind) {
++	case MT6735_VOICE_MD1:
++		/* modem PCM1 downlink -> codec DAC */
++		mt6735_voice_conn(afe, AFE_CONN3, AFE_CONN3_I14_TO_O03, on);
++		mt6735_voice_conn(afe, AFE_CONN4, AFE_CONN4_I14_TO_O04, on);
++		/* codec ADC -> modem PCM1 uplink */
++		mt6735_voice_conn(afe, AFE_CONN4, AFE_CONN4_I03_TO_O17, on);
++		mt6735_voice_conn(afe, AFE_CONN4, AFE_CONN4_I04_TO_O18, on);
++		break;
++	case MT6735_VOICE_MD2:
++		/* codec ADC -> external modem uplink */
++		mt6735_voice_conn(afe, AFE_CONN2, AFE_CONN2_I03_TO_O07, on);
++		mt6735_voice_conn(afe, AFE_CONN2, AFE_CONN2_I04_TO_O08, on);
++		/* external modem downlink -> codec DAC */
++		mt6735_voice_conn(afe, AFE_CONN1, AFE_CONN1_I09_TO_O03, on);
++		mt6735_voice_conn(afe, AFE_CONN2, AFE_CONN2_I09_TO_O04, on);
++		break;
++	case MT6735_VOICE_MD1_BT:
++		/* BT SCO -> modem PCM1 uplink */
++		mt6735_voice_conn(afe, AFE_CONN4, AFE_CONN4_I02_TO_O17, on);
++		mt6735_voice_conn(afe, AFE_CONN4, AFE_CONN4_I02_TO_O18, on);
++		/* modem PCM1 downlink -> BT SCO */
++		mt6735_voice_conn(afe, AFE_CONN3, AFE_CONN3_I14_TO_O02, on);
++		break;
++	case MT6735_VOICE_MD2_BT:
++		/* BT SCO -> external modem uplink (ch2 has no register) */
++		mt6735_voice_conn(afe, AFE_CONN4, AFE_CONN4_I02_TO_O07, on);
++		/* external modem downlink -> BT SCO */
++		mt6735_voice_conn(afe, AFE_CONN1, AFE_CONN1_I09_TO_O02, on);
++		break;
++	case MT6735_VOICE_DAIBT:
++		/* BT SCO -> MEM_DAI capture buffer */
++		mt6735_voice_conn(afe, AFE_CONN3, AFE_CONN3_I02_TO_O11, on);
++		break;
++	}
++}
++
++/*
++ * EnableAfe(), mt_soc_afe_control.c:949-1032: the modem PCM and DAI_BT paths
++ * have no memory interface, so they are counted separately and OR-ed into
++ * the AFE_DAC_CON0 power bit by mt6735_afe_update_power().  The PMIC audio
++ * pins follow the AFE state (AudDrv_GPIO_PMIC_Select(),
++ * AudDrv_Gpio.c:215-236), but EnableAfe() only returns them to GPIO when
++ * CheckMemIfEnable() reports no memory interface left
++ * (mt_soc_afe_control.c:903-916, 980-993), hence the memif check below.
++ */
++static bool mt6735_voice_memif_busy(struct mtk_base_afe *afe)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	int i;
++
++	for (i = 0; i < MT6735_AFE_MEMIF_NUM; i++)
++		if (priv->memif_enabled[i])
++			return true;
++
++	return false;
++}
++
++static void mt6735_voice_afe_enable(struct mtk_base_afe *afe, bool enable)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++
++	if (enable) {
++		if (!priv->voice_afe_users)
++			mt6735_afe_select_pmic_pins(afe, true);
++		priv->voice_afe_users++;
++		mt6735_afe_update_power(afe);
++		return;
++	}
++
++	if (!priv->voice_afe_users)
++		return;
++
++	if (!--priv->voice_afe_users) {
++		mt6735_afe_update_power(afe);
++		if (!mt6735_voice_memif_busy(afe))
++			mt6735_afe_select_pmic_pins(afe, false);
++	}
++}
++
++/* SetDLSrc2(), mt_soc_afe_control.c:1592-1635 (dense 8k..48k index). */
++static int mt6735_voice_dlsrc2_index(unsigned int rate)
++{
++	switch (rate) {
++	case 8000:
++		return 0;
++	case 16000:
++		return 3;
++	default:
++		return -EINVAL;
++	}
++}
++
++/*
++ * SetI2SDacOut()/SetI2SDacEnable() for the voice rates,
++ * mt_soc_afe_control.c:1637-1655 and :2010-2026.  The voice PCMs only use
++ * the 16 bit I2S format (Soc_Aud_I2S_WLEN_WLEN_16BITS).
++ */
++static int mt6735_voice_dac_on(struct mtk_base_afe *afe, unsigned int rate)
++{
++	int fs, idx;
++
++	fs = mt6735_afe_rate_to_fs(rate);
++	if (fs < 0)
++		return fs;
++
++	idx = mt6735_voice_dlsrc2_index(rate);
++	if (idx < 0)
++		return idx;
++
++	/* CleanPreDistortion(), mt_soc_afe_control.c:1582-1590 */
++	regmap_write(afe->regmap, AFE_ADDA_PREDIS_CON0, 0);
++	regmap_write(afe->regmap, AFE_ADDA_PREDIS_CON1, 0);
++
++	/* SetDLSrc2(): voice mode and the -0.3 dB speech gain */
++	regmap_write(afe->regmap, AFE_ADDA_DL_SRC2_CON0,
++		     (idx << 28) | (0x3 << 24) | (0x3 << 11) |
++		     (0x1 << 5) | (0x1 << 1));
++	regmap_write(afe->regmap, AFE_ADDA_DL_SRC2_CON1, 0xf74f0000);
++
++	/* SetI2SDacOut(): I2S format, 16 bit, no LRCK inversion, no LR swap */
++	regmap_write(afe->regmap, AFE_I2S_CON1,
++		     (fs << AFE_I2S_CON_FS_SHIFT) |
++		     (AFE_I2S_FORMAT_I2S << AFE_I2S_CON_FMT_SHIFT) |
++		     (AFE_I2S_WLEN_16BIT << AFE_I2S_CON_WLEN_SHIFT));
++
++	/* SetMemoryPathEnable(I2S_OUT_DAC, true) */
++	regmap_update_bits(afe->regmap, AFE_DAC_CON0,
++			   AFE_DAC_CON0_I2S_OUT_DAC_EN,
++			   AFE_DAC_CON0_I2S_OUT_DAC_EN);
++
++	/* SetI2SDacEnable(true) */
++	regmap_update_bits(afe->regmap, AFE_ADDA_UL_DL_CON0,
++			   AFE_ADDA_UL_DL_CON0_EN, AFE_ADDA_UL_DL_CON0_EN);
++	regmap_update_bits(afe->regmap, AFE_ADDA_DL_SRC2_CON0,
++			   AFE_ADDA_DL_SRC2_CON0_EN, AFE_ADDA_DL_SRC2_CON0_EN);
++	regmap_update_bits(afe->regmap, AFE_I2S_CON1, AFE_I2S_CON1_EN,
++			   AFE_I2S_CON1_EN);
++
++	return 0;
++}
++
++/*
++ * SetI2SAdcIn()/SetI2SAdcEnable() with the internal ADC,
++ * mt_soc_afe_control.c:1346-1370 and :1553-1572.  AudioAdcI2SStatus is false
++ * unless an external ADC is selected (mt_soc_afe_control.c:497), so the
++ * internal ADC branch is the one the voice PCMs use.
++ */
++static int mt6735_voice_adc_on(struct mtk_base_afe *afe, unsigned int rate)
++{
++	unsigned int voice_mode;
++
++	switch (rate) {
++	case 8000:
++		voice_mode = 0;
++		break;
++	case 16000:
++		voice_mode = 1;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	regmap_update_bits(afe->regmap, AFE_ADDA_TOP_CON0,
++			   AFE_ADDA_TOP_CON0_EXT_ADC, 0);
++	regmap_update_bits(afe->regmap, AFE_ADDA_UL_SRC_CON0, 0x001e0000,
++			   (voice_mode << 19) | (voice_mode << 17));
++	regmap_write(afe->regmap, AFE_ADDA_NEWIF_CFG0, 0x03f87201);
++	/* dVoiceModeSelect is 0 or 1 for the two voice rates */
++	regmap_update_bits(afe->regmap, AFE_ADDA_NEWIF_CFG1, 0x00000c00,
++			   1 << 10);
++
++	/* SetMemoryPathEnable(I2S_IN_ADC, true) */
++	regmap_update_bits(afe->regmap, AFE_DAC_CON0,
++			   AFE_DAC_CON0_I2S_IN_ADC_EN,
++			   AFE_DAC_CON0_I2S_IN_ADC_EN);
++
++	/* SetI2SAdcEnable(true) */
++	regmap_update_bits(afe->regmap, AFE_ADDA_UL_DL_CON0,
++			   AFE_ADDA_UL_DL_CON0_EN, AFE_ADDA_UL_DL_CON0_EN);
++	regmap_update_bits(afe->regmap, AFE_ADDA_UL_SRC_CON0,
++			   AFE_ADDA_UL_SRC_CON0_EN, AFE_ADDA_UL_SRC_CON0_EN);
++
++	return 0;
++}
++
++/*
++ * SetI2SDacEnable(false)/SetI2SAdcEnable(false),
++ * mt_soc_afe_control.c:2010-2034 and :1553-1572.  The downstream driver
++ * gates these on the I2S_OUT_DAC / I2S_IN_ADC user counts; the multimedia
++ * path keeps its state in priv->dac_path_on / adc_path_on and in the memory
++ * interfaces, so those are honoured here as well.
++ */
++static void mt6735_voice_codec_off(struct mtk_base_afe *afe)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	bool dac_used = priv->dac_path_on ||
++			priv->memif_enabled[MT6735_AFE_MEMIF_DL1] ||
++			priv->memif_enabled[MT6735_AFE_MEMIF_DL2];
++	bool adc_used = priv->adc_path_on ||
++			priv->memif_enabled[MT6735_AFE_MEMIF_VUL];
++
++	if (!dac_used) {
++		regmap_update_bits(afe->regmap, AFE_ADDA_DL_SRC2_CON0,
++				   AFE_ADDA_DL_SRC2_CON0_EN, 0);
++		regmap_update_bits(afe->regmap, AFE_I2S_CON1,
++				   AFE_I2S_CON1_EN, 0);
++		regmap_update_bits(afe->regmap, AFE_DAC_CON0,
++				   AFE_DAC_CON0_I2S_OUT_DAC_EN, 0);
++	}
++
++	if (!adc_used) {
++		regmap_update_bits(afe->regmap, AFE_ADDA_UL_SRC_CON0,
++				   AFE_ADDA_UL_SRC_CON0_EN, 0);
++		regmap_update_bits(afe->regmap, AFE_DAC_CON0,
++				   AFE_DAC_CON0_I2S_IN_ADC_EN, 0);
++	}
++
++	if (!dac_used && !adc_used)
++		regmap_update_bits(afe->regmap, AFE_ADDA_UL_DL_CON0,
++				   AFE_ADDA_UL_DL_CON0_EN, 0);
++}
++
++/*
++ * SetModemPcmConfig() for the internal modem, mt_soc_afe_control.c:1732-1785:
++ * PCM2_INTF_CON plus the ASRC2/ASRC3 ratio registers.  Values are the
++ * Voice1Pcm attributes of mt_soc_pcm_voice_md1.c:81-96 with
++ * mAsyncFifoSel = Soc_Aud_BYPASS_SRC_SLAVE_USE_ASYNC_FIFO and
++ * mPcmModeWidebandSel from the stream rate (mt_soc_pcm_voice_md1.c:303-304).
++ */
++static int mt6735_voice_md1_config(struct mtk_base_afe *afe, unsigned int rate)
++{
++	unsigned int wideband, val;
++
++	if (rate == 8000) {
++		wideband = PCM_MODE_8K;
++		regmap_write(afe->regmap, AFE_ASRC2_CON1, 0x00098580);
++		regmap_write(afe->regmap, AFE_ASRC2_CON2, 0x00400000);
++		regmap_write(afe->regmap, AFE_ASRC2_CON3, 0x00400000);
++		regmap_write(afe->regmap, AFE_ASRC2_CON4, 0x00098580);
++		regmap_write(afe->regmap, AFE_ASRC2_CON7, 0x0004c2c0);
++		regmap_write(afe->regmap, AFE_ASRC3_CON1, 0x00098580);
++		regmap_write(afe->regmap, AFE_ASRC3_CON2, 0x00400000);
++		regmap_write(afe->regmap, AFE_ASRC3_CON3, 0x00400000);
++		regmap_write(afe->regmap, AFE_ASRC3_CON4, 0x00098580);
++		regmap_write(afe->regmap, AFE_ASRC3_CON7, 0x0004c2c0);
++	} else if (rate == 16000) {
++		wideband = PCM_MODE_16K;
++		regmap_write(afe->regmap, AFE_ASRC2_CON1, 0x0004c2c0);
++		regmap_write(afe->regmap, AFE_ASRC2_CON2, 0x00400000);
++		regmap_write(afe->regmap, AFE_ASRC2_CON3, 0x00400000);
++		regmap_write(afe->regmap, AFE_ASRC2_CON4, 0x0004c2c0);
++		regmap_write(afe->regmap, AFE_ASRC2_CON7, 0x00026160);
++		regmap_write(afe->regmap, AFE_ASRC3_CON1, 0x0004c2c0);
++		regmap_write(afe->regmap, AFE_ASRC3_CON2, 0x00400000);
++		regmap_write(afe->regmap, AFE_ASRC3_CON3, 0x00400000);
++		regmap_write(afe->regmap, AFE_ASRC3_CON4, 0x0004c2c0);
++		regmap_write(afe->regmap, AFE_ASRC3_CON7, 0x00026160);
++	} else {
++		return -EINVAL;
++	}
++
++	val = (PCM_TX_LCH_RPT_NO_REPEAT << 13) |
++	      (PCM_VBT_16K_DISABLE << 12) |
++	      (PCM_BT_MODE_DUAL_MIC_ON_TX << 7) |
++	      (PCM_AFIFO_ASYNC_FIFO << 6) |
++	      (PCM_WLEN_16BIT << 5) |
++	      (wideband << 3) |
++	      (PCM_FMT_MODE_B << 1);
++
++	/* Afe_Set_Reg(PCM2_INTF_CON, val, MASK_ALL), :1742 */
++	regmap_write(afe->regmap, PCM2_INTF_CON, val);
++
++	return 0;
++}
++
++/*
++ * SetModemPcmConfig() for the external modem, mt_soc_afe_control.c:1786-1838:
++ * PCM_INTF_CON plus the ASRC/ASRC4 ratio registers.  Values are the
++ * Voice2IntPcm attributes of mt_soc_pcm_voice_md2.c:87-106 (mAsyncFifoSel
++ * stays Soc_Aud_BYPASS_SRC_SLAVE_USE_ASRC, the async FIFO assignment is
++ * commented out at mt_soc_pcm_voice_md2.c:298).
++ */
++static int mt6735_voice_md2_config(struct mtk_base_afe *afe, unsigned int rate)
++{
++	unsigned int wideband, val;
++
++	if (rate == 8000) {
++		wideband = PCM_MODE_8K;
++		regmap_write(afe->regmap, AFE_ASRC_CON1, 0x00065900);
++		regmap_write(afe->regmap, AFE_ASRC_CON2, 0x00400000);
++		regmap_write(afe->regmap, AFE_ASRC_CON3, 0x00400000);
++		regmap_write(afe->regmap, AFE_ASRC_CON4, 0x00065900);
++		regmap_write(afe->regmap, AFE_ASRC_CON6, 0x007f188f);
++		regmap_write(afe->regmap, AFE_ASRC_CON7, 0x00032c80);
++		regmap_write(afe->regmap, AFE_ASRC4_CON1, 0x00065900);
++		regmap_write(afe->regmap, AFE_ASRC4_CON2, 0x00400000);
++		regmap_write(afe->regmap, AFE_ASRC4_CON3, 0x00400000);
++		regmap_write(afe->regmap, AFE_ASRC4_CON4, 0x00065900);
++		regmap_write(afe->regmap, AFE_ASRC4_CON6, 0x007f188f);
++		regmap_write(afe->regmap, AFE_ASRC4_CON7, 0x00032c80);
++	} else if (rate == 16000) {
++		wideband = PCM_MODE_16K;
++		regmap_write(afe->regmap, AFE_ASRC_CON1, 0x00032c80);
++		regmap_write(afe->regmap, AFE_ASRC_CON2, 0x00400000);
++		regmap_write(afe->regmap, AFE_ASRC_CON3, 0x00400000);
++		regmap_write(afe->regmap, AFE_ASRC_CON4, 0x00032c80);
++		regmap_write(afe->regmap, AFE_ASRC_CON6, 0x007f188f);
++		regmap_write(afe->regmap, AFE_ASRC_CON7, 0x00019640);
++		regmap_write(afe->regmap, AFE_ASRC4_CON1, 0x00032c80);
++		regmap_write(afe->regmap, AFE_ASRC4_CON2, 0x00400000);
++		regmap_write(afe->regmap, AFE_ASRC4_CON3, 0x00400000);
++		regmap_write(afe->regmap, AFE_ASRC4_CON4, 0x00032c80);
++		regmap_write(afe->regmap, AFE_ASRC4_CON6, 0x007f188f);
++		regmap_write(afe->regmap, AFE_ASRC4_CON7, 0x00019640);
++	} else {
++		return -EINVAL;
++	}
++
++	val = (0 << 22) |				/* mBclkOutInv = false */
++	      (PCM_TX_LCH_RPT_NO_REPEAT << 19) |
++	      (PCM_VBT_16K_DISABLE << 18) |
++	      (PCM_EXT_MODEM_INTERNAL << 17) |
++	      (0 << 9) |				/* mExtendBckSyncLength = 0 */
++	      (PCM_SYNC_ONE_BCK_CYCLE << 8) |
++	      (PCM_BT_MODE_DUAL_MIC_ON_TX << 7) |
++	      (PCM_AFIFO_ASRC << 6) |
++	      (PCM_CLOCK_SLAVE << 5) |
++	      (wideband << 3) |
++	      (PCM_FMT_MODE_B << 1);
++
++	/* Afe_Set_Reg(PCM_INTF_CON, val, MASK_ALL), :1838 */
++	regmap_write(afe->regmap, PCM_INTF_CON, val);
++
++	return 0;
++}
++
++/*
++ * SetModemPcmEnable(), mt_soc_afe_control.c:1845-1886.  MODEM_1 only flips
++ * PCM2_INTF_CON bit 0; the external modem also enables the ASRC blocks on
++ * start and tears them down on stop.
++ */
++static int mt6735_voice_modem_enable(struct mtk_base_afe *afe,
++				     enum mt6735_voice_kind kind, bool enable)
++{
++	unsigned int pcm1_afifo;
++
++	if (kind == MT6735_VOICE_MD1 || kind == MT6735_VOICE_MD1_BT) {
++		regmap_update_bits(afe->regmap, PCM2_INTF_CON, PCM2_INTF_CON_EN,
++				   enable ? PCM2_INTF_CON_EN : 0);
++		return 0;
++	}
++
++	if (enable) {
++		int ret;
++
++		regmap_update_bits(afe->regmap, PCM_INTF_CON2,
++				   PCM_INTF_CON2_MD3_SEL,
++				   PCM_INTF_CON2_MD3_SEL);
++		/*
++		 * The external modem PCM runs through the ASRC unless the
++		 * interface was configured for the async FIFO; the voice path
++		 * sets mAsyncFifoSel = ASRC, so this is the branch taken.
++		 */
++		ret = regmap_read(afe->regmap, PCM_INTF_CON, &pcm1_afifo);
++		if (ret)
++			return ret;
++		if (!(pcm1_afifo & PCM_INTF_CON_BYP_ASRC)) {
++			regmap_write(afe->regmap, AFE_ASRC_CON0, 0x86083031);
++			regmap_write(afe->regmap, AFE_ASRC4_CON0, 0x06003031);
++		}
++		regmap_update_bits(afe->regmap, PCM_INTF_CON, PCM_INTF_CON_EN,
++				   PCM_INTF_CON_EN);
++		return 0;
++	}
++
++	regmap_update_bits(afe->regmap, PCM_INTF_CON, PCM_INTF_CON_EN, 0);
++	regmap_write(afe->regmap, AFE_ASRC_CON6, 0);
++	regmap_update_bits(afe->regmap, AFE_ASRC_CON0,
++			   BIT(4) | BIT(5) | BIT(0), 0);
++	regmap_update_bits(afe->regmap, AFE_ASRC_CON0, BIT(0), 0);
++	regmap_write(afe->regmap, AFE_ASRC4_CON6, 0);
++	regmap_update_bits(afe->regmap, AFE_ASRC4_CON0, BIT(4) | BIT(5), 0);
++	regmap_update_bits(afe->regmap, AFE_ASRC4_CON0, BIT(0), 0);
++
++	return 0;
++}
++
++/*
++ * SetDaiBt()/SetDaiBtEnable(), mt_soc_afe_control.c:1207-1258.  The merge
++ * interface is brought up once (this port has no other MRGIF user) and the
++ * DAI_BT block is fed from it; the BT mode comes from the stream rate
++ * (mt_soc_pcm_voice_md1_bt.c:265-276, mt_soc_pcm_bt_dai.c:104-115).
++ */
++static int mt6735_voice_daibt_config(struct mtk_base_afe *afe,
++				     unsigned int rate)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	unsigned int mode;
++
++	if (rate == 8000)
++		mode = AFE_DAIBT_MODE_8K;
++	else if (rate == 16000)
++		mode = AFE_DAIBT_MODE_16K;
++	else
++		return -EINVAL;
++
++	if (!priv->daibt_merge_on) {
++		regmap_update_bits(afe->regmap, AFE_MRGIF_CON,
++				   AFE_MRGIF_CON_FS_MASK <<
++				   AFE_MRGIF_CON_FS_SHIFT,
++				   MT6735_MRGIF_FS_44K <<
++				   AFE_MRGIF_CON_FS_SHIFT);
++		regmap_update_bits(afe->regmap, AFE_MRGIF_CON,
++				   AFE_MRGIF_CON_I2S_EN, AFE_MRGIF_CON_I2S_EN);
++		regmap_update_bits(afe->regmap, AFE_MRGIF_CON,
++				   AFE_MRGIF_CON_EN, AFE_MRGIF_CON_EN);
++		udelay(100);
++		priv->daibt_merge_on = true;
++	}
++
++	regmap_update_bits(afe->regmap, AFE_DAIBT_CON0,
++			   BIT(AFE_DAIBT_CON0_MODE_SHIFT) |
++			   AFE_DAIBT_CON0_USE_MERGE |
++			   AFE_DAIBT_CON0_DATA_READY,
++			   (mode << AFE_DAIBT_CON0_MODE_SHIFT) |
++			   AFE_DAIBT_CON0_USE_MERGE |
++			   AFE_DAIBT_CON0_DATA_READY);
++
++	return 0;
++}
++
++/*
++ * The DAI_BT / BT SCO "on" state is AFE_DAIBT_CON0 bits 1:0,
++ * mt_soc_afe_control.c:1229,1238.  Tearing down the merge interface when the
++ * last DAI_BT user stops mirrors mt_soc_afe_control.c:1244-1252.
++ */
++static void mt6735_voice_daibt_enable(struct mtk_base_afe *afe, bool enable)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++
++	if (enable) {
++		regmap_update_bits(afe->regmap, AFE_DAIBT_CON0,
++				   AFE_DAIBT_CON0_EN, AFE_DAIBT_CON0_EN);
++		priv->daibt_users++;
++		return;
++	}
++
++	if (!priv->daibt_users)
++		return;
++
++	if (--priv->daibt_users)
++		return;
++
++	regmap_update_bits(afe->regmap, AFE_DAIBT_CON0, AFE_DAIBT_CON0_EN, 0);
++	udelay(100);
++	regmap_update_bits(afe->regmap, AFE_MRGIF_CON, AFE_MRGIF_CON_I2S_EN, 0);
++	regmap_update_bits(afe->regmap, AFE_MRGIF_CON, AFE_MRGIF_CON_EN, 0);
++	priv->daibt_merge_on = false;
++}
++
++/*
++ * SetMemoryPathEnable(MEM_DAI, ...), mt_soc_afe_control.c:1968-2000.  This is
++ * the same register bit the memory interface descriptors use
++ * (mt6735-afe-pcm.c), the helper exists because mt6735_afe_memif_enable() is
++ * private to mt6735-dai-pcm.c.
++ */
++static void mt6735_voice_memif_dai_enable(struct mtk_base_afe *afe, bool enable)
++{
++	const struct mtk_base_memif_data *data =
++		afe->memif[MT6735_AFE_MEMIF_DAI].data;
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	unsigned int bit = BIT(data->enable_shift);
++
++	regmap_update_bits(afe->regmap, data->enable_reg, bit,
++			   enable ? bit : 0);
++	priv->memif_enabled[MT6735_AFE_MEMIF_DAI] = enable;
++	mt6735_afe_update_power(afe);
++}
++
++static int mt6735_voice_startup(struct snd_pcm_substream *substream,
++				struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_voice_state *st = mt6735_voice_state(afe, dai->id);
++	enum mt6735_voice_kind kind = mt6735_voice_kind(dai->id);
++	const struct snd_pcm_hardware *hw;
++	int ret;
++
++	hw = mt6735_voice_pcm_hardware(kind);
++
++	ret = pm_runtime_get_sync(afe->dev);
++	if (ret < 0) {
++		pm_runtime_put_noidle(afe->dev);
++		return ret;
++	}
++
++	if (!st->users) {
++		st->rate = 0;
++		st->prepared = false;
++		st->running = false;
++	}
++	st->users++;
++
++	snd_soc_set_runtime_hwparams(substream, hw);
++
++	ret = snd_pcm_hw_constraint_integer(substream->runtime,
++					    SNDRV_PCM_HW_PARAM_PERIODS);
++	if (ret < 0)
++		goto err_put;
++
++	if (kind == MT6735_VOICE_DAIBT) {
++		/*
++		 * The memory interface consumes whole 64 byte blocks
++		 * (Align64ByteSize(), mt_soc_afe_control.c:3702-3710).
++		 */
++		ret = snd_pcm_hw_constraint_step(substream->runtime, 0,
++						 SNDRV_PCM_HW_PARAM_BUFFER_BYTES,
++						 64);
++		if (ret < 0)
++			goto err_put;
++
++		afe->memif[MT6735_AFE_MEMIF_DAI].substream = substream;
++	}
++
++	return 0;
++
++err_put:
++	st->users--;
++	pm_runtime_put_noidle(afe->dev);
++	return ret;
++}
++
++static void mt6735_voice_shutdown(struct snd_pcm_substream *substream,
++				  struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_voice_state *st = mt6735_voice_state(afe, dai->id);
++	enum mt6735_voice_kind kind = mt6735_voice_kind(dai->id);
++
++	if (!st->users)
++		return;
++
++	if (!--st->users) {
++		if (kind == MT6735_VOICE_DAIBT ||
++		    kind == MT6735_VOICE_MD1_BT ||
++		    kind == MT6735_VOICE_MD2_BT) {
++			mt6735_voice_daibt_enable(afe, false);
++		}
++		if (kind != MT6735_VOICE_DAIBT)
++			mt6735_voice_modem_enable(afe, kind, false);
++
++		/* mtk_voice_close()/mtk_voice_md2_close() :219-236 / :212-229 */
++		mt6735_voice_connect(afe, kind, false);
++
++		if (kind == MT6735_VOICE_MD1 || kind == MT6735_VOICE_MD2)
++			mt6735_voice_codec_off(afe);
++
++		if (kind == MT6735_VOICE_DAIBT) {
++			mt6735_voice_memif_dai_enable(afe, false);
++			afe->memif[MT6735_AFE_MEMIF_DAI].substream = NULL;
++			mt6735_afe_irq_update(afe, MT6735_AFE_IRQ2);
++		}
++
++		mt6735_voice_afe_enable(afe, false);
++
++		st->rate = 0;
++		st->prepared = false;
++		st->running = false;
++	}
++
++	pm_runtime_put(afe->dev);
++}
++
++/* Reject everything the voice / BT SCO interfaces cannot represent. */
++static int mt6735_voice_check_params(struct snd_pcm_hw_params *params)
++{
++	unsigned int rate = params_rate(params);
++
++	if (rate != 8000 && rate != 16000)
++		return -EINVAL;
++
++	if (params_channels(params) != 1)
++		return -EINVAL;
++
++	if (params_format(params) != SNDRV_PCM_FORMAT_S16_LE)
++		return -EINVAL;
++
++	return 0;
++}
++
++static int mt6735_voice_hw_params(struct snd_pcm_substream *substream,
++				  struct snd_pcm_hw_params *params,
++				  struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_voice_state *st = mt6735_voice_state(afe, dai->id);
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	int ret;
++
++	ret = mt6735_voice_check_params(params);
++	if (ret)
++		return ret;
++
++	st->rate = params_rate(params);
++
++	if (mt6735_voice_kind(dai->id) != MT6735_VOICE_DAIBT)
++		return 0;
++
++	if (!runtime->dma_bytes || !runtime->dma_addr)
++		return -EINVAL;
++
++	/* The memory interfaces only decode 32 bit addresses, AudDrv_Afe.h:470 */
++	if (upper_32_bits(runtime->dma_addr))
++		return -EINVAL;
++
++	/* SetDAIBuffer(), mt_soc_pcm_bt_dai.c:228-240 */
++	regmap_write(afe->regmap, AFE_DAI_BASE,
++		     lower_32_bits(runtime->dma_addr));
++	regmap_write(afe->regmap, AFE_DAI_END,
++		     lower_32_bits(runtime->dma_addr) + runtime->dma_bytes - 1);
++
++	/* SetSampleRate(MEM_DAI), mt_soc_afe_control.c:1099-1112 */
++	regmap_update_bits(afe->regmap, AFE_DAC_CON0,
++			   AFE_DAC_CON0_DAI_FS_MASK << AFE_DAC_CON0_DAI_FS_SHIFT,
++			   ((st->rate == 8000 ? AFE_DAI_FS_8K : AFE_DAI_FS_16K)
++			    << AFE_DAC_CON0_DAI_FS_SHIFT));
++
++	/* SetMemIfFetchFormatPerSample(MEM_DAI, 16 bit), :2343-2346 */
++	regmap_update_bits(afe->regmap, AFE_MEMIF_PBUF_SIZE,
++			   AFE_MEMIF_PBUF_FMT_MASK << AFE_MEMIF_PBUF_DAI_FMT_SHIFT,
++			   AFE_WLEN_16_BIT << AFE_MEMIF_PBUF_DAI_FMT_SHIFT);
++
++	return 0;
++}
++
++static int mt6735_voice_prepare(struct snd_pcm_substream *substream,
++				struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_voice_state *st = mt6735_voice_state(afe, dai->id);
++	enum mt6735_voice_kind kind = mt6735_voice_kind(dai->id);
++	bool codec_path = (kind == MT6735_VOICE_MD1 || kind == MT6735_VOICE_MD2);
++	bool afe_on = false;
++	int ret;
++
++	if (st->prepared && st->prepared_rate == st->rate)
++		return 0;
++
++	if (!st->rate)
++		return -EINVAL;
++
++	if (st->prepared) {
++		/* The rate changed while the DAI stayed open: reprogram. */
++		mt6735_voice_connect(afe, kind, false);
++		if (codec_path)
++			mt6735_voice_codec_off(afe);
++		mt6735_voice_afe_enable(afe, false);
++		st->prepared = false;
++	}
++
++	mt6735_voice_connect(afe, kind, true);
++
++	/*
++	 * Order of mtk_voice1_prepare()/mtk_voice_md2_prepare(),
++	 * mt_soc_pcm_voice_md1.c:284-300 / mt_soc_pcm_voice_md2.c:268-300:
++	 * codec downlink/uplink, EnableAfe(), then the modem PCM attributes.
++	 * The BT variants (mt_soc_pcm_voice_md1_bt.c:257-284) configure the
++	 * DAI_BT block instead of the codec, and the DAI_BT PCM
++	 * (mt_soc_pcm_bt_dai.c:119-147) has no AFE power call of its own.
++	 */
++	if (codec_path) {
++		ret = mt6735_voice_dac_on(afe, st->rate);
++		if (ret)
++			goto err_disconnect;
++		ret = mt6735_voice_adc_on(afe, st->rate);
++		if (ret)
++			goto err_disconnect;
++	} else
++		ret = mt6735_voice_daibt_config(afe, st->rate);
++
++	if (ret)
++		goto err_disconnect;
++
++	if (kind != MT6735_VOICE_DAIBT) {
++		mt6735_voice_afe_enable(afe, true);
++		afe_on = true;
++	}
++
++	if (kind != MT6735_VOICE_DAIBT) {
++		if (kind == MT6735_VOICE_MD2)
++			ret = mt6735_voice_md2_config(afe, st->rate);
++		else
++			ret = mt6735_voice_md1_config(afe, st->rate);
++		if (ret)
++			goto err_afe;
++	}
++
++	st->prepared_rate = st->rate;
++	st->prepared = true;
++
++	return 0;
++
++err_afe:
++	if (afe_on)
++		mt6735_voice_afe_enable(afe, false);
++err_disconnect:
++	mt6735_voice_connect(afe, kind, false);
++	return ret;
++}
++
++static int mt6735_voice_trigger(struct snd_pcm_substream *substream, int cmd,
++				struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_voice_state *st = mt6735_voice_state(afe, dai->id);
++	enum mt6735_voice_kind kind = mt6735_voice_kind(dai->id);
++
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_START:
++	case SNDRV_PCM_TRIGGER_RESUME:
++	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++		if (!st->prepared)
++			return -EINVAL;
++		if (st->running)
++			return 0;
++
++		if (kind == MT6735_VOICE_DAIBT) {
++			mt6735_voice_memif_dai_enable(afe, true);
++			mt6735_voice_daibt_enable(afe, true);
++			mt6735_afe_irq_update(afe, MT6735_AFE_IRQ2);
++		} else if (kind == MT6735_VOICE_MD1_BT ||
++			   kind == MT6735_VOICE_MD2_BT) {
++			mt6735_voice_daibt_enable(afe, true);
++			mt6735_voice_modem_enable(afe, kind, true);
++		} else {
++			mt6735_voice_modem_enable(afe, kind, true);
++		}
++
++		st->running = true;
++		return 0;
++	case SNDRV_PCM_TRIGGER_STOP:
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++		if (!st->running)
++			return 0;
++
++		if (kind == MT6735_VOICE_DAIBT) {
++			mt6735_voice_daibt_enable(afe, false);
++			mt6735_voice_memif_dai_enable(afe, false);
++			mt6735_afe_irq_update(afe, MT6735_AFE_IRQ2);
++		} else if (kind == MT6735_VOICE_MD1_BT ||
++			   kind == MT6735_VOICE_MD2_BT) {
++			mt6735_voice_modem_enable(afe, kind, false);
++			mt6735_voice_daibt_enable(afe, false);
++		} else {
++			mt6735_voice_modem_enable(afe, kind, false);
++		}
++
++		st->running = false;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static const struct snd_soc_dai_ops mt6735_voice_ops = {
++	.startup = mt6735_voice_startup,
++	.shutdown = mt6735_voice_shutdown,
++	.hw_params = mt6735_voice_hw_params,
++	.prepare = mt6735_voice_prepare,
++	.trigger = mt6735_voice_trigger,
++};
++
++/*
++ * Voice / BT SCO DAI drivers.  The array order and the .id values must match
++ * the id block in mt6735-afe-common.h, mt6735-afe-pcm.c copies it right after
++ * MT6735_AFE_DAI_I2S0.
++ *
++ * The modem PCM interface is shared by both directions, so the rate, channel
++ * count and sample width are symmetric.  8 kHz is narrow band and 16 kHz is
++ * wide band; both are mono S16_LE.
++ */
++const struct snd_soc_dai_driver mt6735_afe_voice_dais[MT6735_AFE_VOICE_DAI_NUM] = {
++	{
++		.name = "mt-soc-btcvsd-dai",
++		.id = MT6735_AFE_DAI_BTCVSD,
++		.ops = &mt6735_voice_ops,
++		/* mt_soc_pcm_bt_dai.c:304-307 rejects playback */
++		.capture = {
++			.stream_name = "BT SCO Capture",
++			.channels_min = 1,
++			.channels_max = 1,
++			.rates = MT6735_VOICE_RATES,
++			.rate_min = MT6735_VOICE_RATE_MIN,
++			.rate_max = MT6735_VOICE_RATE_MAX,
++			.formats = MT6735_VOICE_FORMATS,
++		},
++	},
++	{
++		.name = "mt-soc-voice-md1-dai",
++		.id = MT6735_AFE_DAI_VOICE_MD1,
++		.ops = &mt6735_voice_ops,
++		.playback = {
++			.stream_name = "Voice MD1 Playback",
++			.channels_min = 1,
++			.channels_max = 1,
++			.rates = MT6735_VOICE_RATES,
++			.rate_min = MT6735_VOICE_RATE_MIN,
++			.rate_max = MT6735_VOICE_RATE_MAX,
++			.formats = MT6735_VOICE_FORMATS,
++		},
++		.capture = {
++			.stream_name = "Voice MD1 Capture",
++			.channels_min = 1,
++			.channels_max = 1,
++			.rates = MT6735_VOICE_RATES,
++			.rate_min = MT6735_VOICE_RATE_MIN,
++			.rate_max = MT6735_VOICE_RATE_MAX,
++			.formats = MT6735_VOICE_FORMATS,
++		},
++		.symmetric_rate = 1,
++		.symmetric_channels = 1,
++		.symmetric_sample_bits = 1,
++	},
++	{
++		.name = "mt-soc-voice-md2-dai",
++		.id = MT6735_AFE_DAI_VOICE_MD2,
++		.ops = &mt6735_voice_ops,
++		.playback = {
++			.stream_name = "Voice MD2 Playback",
++			.channels_min = 1,
++			.channels_max = 1,
++			.rates = MT6735_VOICE_RATES,
++			.rate_min = MT6735_VOICE_RATE_MIN,
++			.rate_max = MT6735_VOICE_RATE_MAX,
++			.formats = MT6735_VOICE_FORMATS,
++		},
++		.capture = {
++			.stream_name = "Voice MD2 Capture",
++			.channels_min = 1,
++			.channels_max = 1,
++			.rates = MT6735_VOICE_RATES,
++			.rate_min = MT6735_VOICE_RATE_MIN,
++			.rate_max = MT6735_VOICE_RATE_MAX,
++			.formats = MT6735_VOICE_FORMATS,
++		},
++		.symmetric_rate = 1,
++		.symmetric_channels = 1,
++		.symmetric_sample_bits = 1,
++	},
++	{
++		.name = "mt-soc-voice-md1-bt-dai",
++		.id = MT6735_AFE_DAI_VOICE_MD1_BT,
++		.ops = &mt6735_voice_ops,
++		.playback = {
++			.stream_name = "Voice MD1 BT Playback",
++			.channels_min = 1,
++			.channels_max = 1,
++			.rates = MT6735_VOICE_RATES,
++			.rate_min = MT6735_VOICE_RATE_MIN,
++			.rate_max = MT6735_VOICE_RATE_MAX,
++			.formats = MT6735_VOICE_FORMATS,
++		},
++		.capture = {
++			.stream_name = "Voice MD1 BT Capture",
++			.channels_min = 1,
++			.channels_max = 1,
++			.rates = MT6735_VOICE_RATES,
++			.rate_min = MT6735_VOICE_RATE_MIN,
++			.rate_max = MT6735_VOICE_RATE_MAX,
++			.formats = MT6735_VOICE_FORMATS,
++		},
++		.symmetric_rate = 1,
++		.symmetric_channels = 1,
++		.symmetric_sample_bits = 1,
++	},
++	{
++		.name = "mt-soc-voice-md2-bt-dai",
++		.id = MT6735_AFE_DAI_VOICE_MD2_BT,
++		.ops = &mt6735_voice_ops,
++		.playback = {
++			.stream_name = "Voice MD2 BT Playback",
++			.channels_min = 1,
++			.channels_max = 1,
++			.rates = MT6735_VOICE_RATES,
++			.rate_min = MT6735_VOICE_RATE_MIN,
++			.rate_max = MT6735_VOICE_RATE_MAX,
++			.formats = MT6735_VOICE_FORMATS,
++		},
++		.capture = {
++			.stream_name = "Voice MD2 BT Capture",
++			.channels_min = 1,
++			.channels_max = 1,
++			.rates = MT6735_VOICE_RATES,
++			.rate_min = MT6735_VOICE_RATE_MIN,
++			.rate_max = MT6735_VOICE_RATE_MAX,
++			.formats = MT6735_VOICE_FORMATS,
++		},
++		.symmetric_rate = 1,
++		.symmetric_channels = 1,
++		.symmetric_sample_bits = 1,
++	},
++};
+diff --git a/sound/soc/mediatek/mt6735/mt6735-mt6331.c b/sound/soc/mediatek/mt6735/mt6735-mt6331.c
+index 7475c2b58..213202a1f 100644
+--- a/sound/soc/mediatek/mt6735/mt6735-mt6331.c
++++ b/sound/soc/mediatek/mt6735/mt6735-mt6331.c
+@@ -47,6 +47,11 @@
+ #define MT6735_MM2_STREAM	"MultiMedia1_Capture"
+ #define MT6735_DL2_STREAM	"MultiMedia2_PLayback"
+ #define MT6735_I2S0_STREAM	"I2S0_PLayback"
++#define MT6735_VOICE_MD1_STREAM	"Voice_MD1_PLayback"
++#define MT6735_VOICE_MD2_STREAM	"Voice_MD2_PLayback"
++#define MT6735_VOICE_MD1_BT_STREAM "Voice_MD1_BT_Playback"
++#define MT6735_VOICE_MD2_BT_STREAM "Voice_MD2_BT_Playback"
++#define MT6735_DAI_STREAM	"MultiMedia_dai_Capture"
+ 
+ #define MT6735_JACK_BTN_MASK	(SND_JACK_BTN_0 | SND_JACK_BTN_1 | \
+ 				 SND_JACK_BTN_2 | SND_JACK_BTN_3)
+@@ -98,6 +103,60 @@ SND_SOC_DAILINK_DEFS(i2s0,
+ 	DAILINK_COMP_ARRAY(COMP_CODEC("snd-soc-dummy", "snd-soc-dummy-dai")),
+ 	DAILINK_COMP_ARRAY(COMP_EMPTY()));
+ 
++/*
++ * Voice links, mt_soc_machine.c:863-869 ("Voice_MD1"), :985-992
++ * ("Voice_MD1_BT"), :1047-1056 ("Voice_MD2") and :1087-1094
++ * ("Voice_MD2_BT").
++ *
++ * Downstream paired the two modem voice links with dedicated PMIC voice
++ * codec DAIs (MT_SOC_CODEC_VOICE_MD1DAI_NAME/VOICE_MD2DAI_NAME,
++ * AudDrv_Def.h:280-281) that mt_soc_codec_63xx.c implements with the AIF1
++ * ops, i.e. they power and configure the PMIC DAC/ADC exactly like the
++ * multimedia DAIs.  The mt6331 codec driver exports those two DAIs, so the
++ * voice links use them; the AFE voice DAI programs the SoC side of the same
++ * interface (AFE_ADDA_xxx / AFE_I2S_CON1, see mt6735-dai-voice.c), matching
++ * mtk_voice1_prepare() in mt_soc_pcm_voice_md1.c:284-300.
++ *
++ * The BT variants used MT_SOC_CODEC_DUMMY_NAME downstream as well
++ * (mt_soc_machine.c:990, :1092): their audio path is DAI_BT <-> modem PCM
++ * and never reaches the PMIC codec.
++ */
++SND_SOC_DAILINK_DEFS(voice_md1,
++	DAILINK_COMP_ARRAY(COMP_CPU("mt-soc-voice-md1-dai")),
++	DAILINK_COMP_ARRAY(COMP_CODEC("mt-soc-codec",
++				      "mt-soc-codec-voicemd1-dai")),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++SND_SOC_DAILINK_DEFS(voice_md2,
++	DAILINK_COMP_ARRAY(COMP_CPU("mt-soc-voice-md2-dai")),
++	DAILINK_COMP_ARRAY(COMP_CODEC("mt-soc-codec",
++				      "mt-soc-codec-voicemd2-dai")),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++SND_SOC_DAILINK_DEFS(voice_md1_bt,
++	DAILINK_COMP_ARRAY(COMP_CPU("mt-soc-voice-md1-bt-dai")),
++	DAILINK_COMP_ARRAY(COMP_CODEC("snd-soc-dummy", "snd-soc-dummy-dai")),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++SND_SOC_DAILINK_DEFS(voice_md2_bt,
++	DAILINK_COMP_ARRAY(COMP_CPU("mt-soc-voice-md2-bt-dai")),
++	DAILINK_COMP_ARRAY(COMP_CODEC("snd-soc-dummy", "snd-soc-dummy-dai")),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++/*
++ * BT SCO capture, mt_soc_pcm_bt_dai.c.  The PCM is capture-only there
++ * (:304-307 rejects playback) and captures from the DAI_BT block into the
++ * MEM_DAI memory interface.  mtk-btcvsd.c exposes only component PCM ops and
++ * no DAI (it registers num_dai = 0 at mtk-btcvsd.c:1374-1378), so the codec
++ * side is the dummy DAI here too; the in-tree btcvsd component additionally
++ * expects the "mediatek,mtk-btcvsd-snd" DT node, while the ROM node is
++ * "mediatek,audio_bt_cvsd" (rom_dtb_0.dts:3836-3845).
++ */
++SND_SOC_DAILINK_DEFS(btcvsd,
++	DAILINK_COMP_ARRAY(COMP_CPU("mt-soc-btcvsd-dai")),
++	DAILINK_COMP_ARRAY(COMP_CODEC("snd-soc-dummy", "snd-soc-dummy-dai")),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
+ static struct snd_soc_jack_pin mt6735_mt6331_jack_pins[] = {
+ 	{
+ 		.pin = "Headphone",
+@@ -151,6 +210,32 @@ static struct snd_soc_dai_link mt6735_mt6331_dai_links[] = {
+ 			   SND_SOC_DAIFMT_CBC_CFC,
+ 		SND_SOC_DAILINK_REG(i2s0),
+ 	},
++	{
++		.name = "Voice_MD1",
++		.stream_name = MT6735_VOICE_MD1_STREAM,
++		SND_SOC_DAILINK_REG(voice_md1),
++	},
++	{
++		.name = "Voice_MD2",
++		.stream_name = MT6735_VOICE_MD2_STREAM,
++		SND_SOC_DAILINK_REG(voice_md2),
++	},
++	{
++		.name = "Voice_MD1_BT",
++		.stream_name = MT6735_VOICE_MD1_BT_STREAM,
++		SND_SOC_DAILINK_REG(voice_md1_bt),
++	},
++	{
++		.name = "Voice_MD2_BT",
++		.stream_name = MT6735_VOICE_MD2_BT_STREAM,
++		SND_SOC_DAILINK_REG(voice_md2_bt),
++	},
++	{
++		.name = "BTCVSD",
++		.stream_name = MT6735_DAI_STREAM,
++		.capture_only = 1,
++		SND_SOC_DAILINK_REG(btcvsd),
++	},
+ };
+ 
+ /*

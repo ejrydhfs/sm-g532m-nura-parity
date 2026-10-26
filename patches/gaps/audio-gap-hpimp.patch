@@ -1,0 +1,1456 @@
+diff --git a/sound/soc/codecs/mt6331.c b/sound/soc/codecs/mt6331.c
+index 825b2fb60..6f628e21b 100644
+--- a/sound/soc/codecs/mt6331.c
++++ b/sound/soc/codecs/mt6331.c
+@@ -48,6 +48,9 @@
+ #define MT6331_TXDAI_NAME		"mt-soc-codec-tx-dai"
+ #define MT6331_TXDAI2_NAME		"mt-soc-codec-tx-dai2"
+ #define MT6331_RXDAI_NAME		"mt-soc-codec-rx-dai"
++/* AudDrv_Def.h:287,336 */
++#define MT6331_HP_IMP_DAI_NAME		"mt-soc-codec-hp-impedance-dai"
++#define MT6331_HP_IMP_STREAM_NAME	"HP_IMPEDANCE_Playback"
+ #define MT6331_DL1_STREAM_NAME		"MultiMedia1_PLayback"
+ #define MT6331_DL2_STREAM_NAME		"MultiMedia2_PLayback"
+ #define MT6331_UL1_STREAM_NAME		"MultiMedia1_Capture"
+@@ -104,6 +107,26 @@ struct mt6331_priv {
+ 	bool headset_mic;		/* jack reports a headset microphone */
+ 	unsigned int mic_gain;		/* vendor mAudio_Ana_Volume[MICAMPx] */
+ 
++	/* vendor RG_AUDHP*TRIM_VAUDP15[_SPKHP], vendor:545-561 */
++	struct {
++		unsigned int hpl;
++		unsigned int hpr;
++		unsigned int hpl_fine;
++		unsigned int hpr_fine;
++		unsigned int hpl_spkhp;
++		unsigned int hpr_spkhp;
++		unsigned int hpl_fine_spkhp;
++		unsigned int hpr_fine_spkhp;
++		bool valid;
++	} hp_trim;
++
++	/* HP impedance measurement, vendor mhp_impedance/mAuxAdc_Offset */
++	unsigned int auxadc_channel;	/* vendor dAuxAdcChannel, default 9 */
++	unsigned int auxadc_offset;	/* vendor mAuxAdc_Offset */
++	bool auxadc_offset_valid;
++	unsigned long hp_impedance_dc;	/* value written by userspace */
++	bool hp_impedance_on;
++
+ 	struct snd_soc_jack *jack;
+ 	struct notifier_block jack_nb;
+ };
+@@ -255,6 +278,126 @@ static unsigned int mt6331_ul_rate_sel(unsigned int rate)
+ 	}
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* PMIC efuse HP offset trim (vendor:484-566)                         */
++/* ------------------------------------------------------------------ */
++/*
++ * Read the three PMIC efuse rows that hold the headphone DC offset trim
++ * and decode them exactly like Auddrv_Read_Efuse_HPOffset() (vendor:484-566),
++ * which InitAfeControl() calls once on the first audio open
++ * (mt_soc_afe_control.c:457-470).
++ *
++ * EFUSE_HP_TRIM is not defined in the downstream build
++ * (mt_soc_pcm_common.h:106 keeps it commented out, no Makefile defines it),
++ * so SetDcCompenSation() takes the software ramp branch (vendor:1202-1204)
++ * and these fields are only ever logged.  This driver keeps that parity:
++ * the values are decoded and stored, never written to AUDDEC_ANA_CON2.
++ */
++static int mt6331_efuse_hp_offset_read(struct mt6331_priv *priv)
++{
++	unsigned int efuse[MT6331_OTP_HP_ROWS] = { };
++	unsigned int val;
++	int i, ret;
++
++	if (priv->hp_trim.valid)
++		return 0;
++
++	/* 1. enable the efuse controller clock (vendor:496-497) */
++	ret = regmap_write(priv->regmap, MT6328_TOP_CKHWEN_CON0_CLR,
++			   MT6331_OTP_CK_HWEN);
++	if (!ret)
++		ret = regmap_write(priv->regmap, MT6328_TOP_CKPDN_CON3_CLR,
++				   MT6331_OTP_CK_PDN);
++	/* 2. enable the OTP engine (vendor:500) */
++	if (!ret)
++		ret = regmap_update_bits(priv->regmap, MT6328_OTP_CON11,
++					 MT6331_OTP_ENGINE_EN,
++					 MT6331_OTP_ENGINE_EN);
++	if (ret)
++		goto out_gate;
++
++	for (i = 0; i < MT6331_OTP_HP_ROWS; i++) {
++		/* 3. select the row (vendor:514-515) */
++		ret = regmap_update_bits(priv->regmap, MT6328_OTP_CON0,
++					 MT6331_OTP_ROW_MASK,
++					 (MT6331_OTP_HP_ROW_START + i) <<
++					 MT6331_OTP_ROW_SHIFT);
++		if (ret)
++			break;
++
++		/* 4. toggle the read trigger (vendor:517-525) */
++		ret = regmap_read(priv->regmap, MT6328_OTP_CON8, &val);
++		if (ret)
++			break;
++		val = (val & MT6331_OTP_READ_TRIGGER) ? 0 :
++						       MT6331_OTP_READ_TRIGGER;
++		ret = regmap_update_bits(priv->regmap, MT6328_OTP_CON8,
++					 MT6331_OTP_READ_TRIGGER, val);
++		if (ret)
++			break;
++
++		/* 5. wait for the engine (vendor:526-531).  The downstream
++		 * loop is unbounded; bound it so a wedged PMIC cannot hang
++		 * the caller.
++		 */
++		ret = regmap_read_poll_timeout(priv->regmap, MT6328_OTP_CON13,
++					       val, !(val & MT6331_OTP_READY),
++					       MT6331_OTP_POLL_US,
++					       MT6331_OTP_TIMEOUT_US);
++		if (ret)
++			break;
++
++		/* The word is only valid at least 1 ms after the ready bit
++		 * drops (vendor:533).
++		 */
++		usleep_range(1000, 1100);
++
++		/* 6. read the word (vendor:535) */
++		ret = regmap_read(priv->regmap, MT6328_OTP_CON12, &efuse[i]);
++		if (ret)
++			break;
++	}
++
++out_gate:
++	/* 7. disable the controller clock (vendor:541-543) */
++	regmap_write(priv->regmap, MT6328_TOP_CKPDN_CON3_SET,
++		     MT6331_OTP_CK_PDN);
++	regmap_write(priv->regmap, MT6328_TOP_CKHWEN_CON0_SET,
++		     MT6331_OTP_CK_HWEN);
++
++	if (ret) {
++		dev_err(priv->dev, "PMIC efuse HP offset read failed: %d\n",
++			ret);
++		return ret;
++	}
++
++	/* Decode, vendor:545-552.  efuse[1] bit 0 is the fourth HPR trim
++	 * bit; the two fields do not overlap, so "|" equals the vendor "+".
++	 */
++	priv->hp_trim.hpl = (efuse[0] >> 9) & 0xf;
++	priv->hp_trim.hpr = ((efuse[0] >> 13) & 0x7) |
++			    ((efuse[1] & 0x1) << 3);
++	priv->hp_trim.hpl_fine = (efuse[1] >> 2) & 0x3;
++	priv->hp_trim.hpr_fine = (efuse[1] >> 4) & 0x3;
++	priv->hp_trim.hpl_spkhp = (efuse[1] >> 6) & 0xf;
++	priv->hp_trim.hpr_spkhp = (efuse[1] >> 10) & 0xf;
++	priv->hp_trim.hpl_fine_spkhp = (efuse[1] >> 14) & 0x3;
++	priv->hp_trim.hpr_fine_spkhp = efuse[2] & 0x3;
++	priv->hp_trim.valid = true;
++
++	/* vendor:553-565 logs every field */
++	dev_info(priv->dev,
++		 "HP offset trim: HPL=%u HPR=%u HPL fine=%u HPR fine=%u\n",
++		 priv->hp_trim.hpl, priv->hp_trim.hpr,
++		 priv->hp_trim.hpl_fine, priv->hp_trim.hpr_fine);
++	dev_info(priv->dev,
++		 "SPKHP offset trim: HPL=%u HPR=%u HPL fine=%u HPR fine=%u\n",
++		 priv->hp_trim.hpl_spkhp, priv->hp_trim.hpr_spkhp,
++		 priv->hp_trim.hpl_fine_spkhp, priv->hp_trim.hpr_fine_spkhp);
++
++	return 0;
++}
++
+ /* ------------------------------------------------------------------ */
+ /* Downlink digital path (vendor:1618 TurnOnDacPower)                 */
+ /* ------------------------------------------------------------------ */
+@@ -273,6 +416,14 @@ static int mt6331_dl_power_up(struct mt6331_priv *priv)
+ 	if (ret)
+ 		return ret;
+ 
++	/* Equivalent of InitAfeControl() calling Auddrv_Read_Efuse_HPOffset()
++	 * on the first audio open (mt_soc_afe_control.c:457-470).  The read
++	 * already happened at probe; this only retries a failed probe read.
++	 */
++	ret = mt6331_efuse_hp_offset_read(priv);
++	if (ret)
++		dev_warn(priv->dev, "HP offset trim unavailable: %d\n", ret);
++
+ 	/* vendor:1628-1631 */
+ 	mt6331_ana_write(priv, MT6328_AFE_AUDIO_TOP_CON0,
+ 			 (priv->state & MT6331_ST_ADC) ? 0x0000 : 0x003a,
+@@ -675,6 +826,459 @@ static int mt6331_speaker_power_down(struct mt6331_priv *priv)
+ 	return 0;
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* HP impedance measurement (vendor:610-700, 748-820, 880-989, 1059-1066)      */
++/* ------------------------------------------------------------------ */
++/*
++ * Port from Samsung/MTK downstream mt_soc_codec_63xx.c:748-878
++ * OpenAnalogTrimHardware(): power the DAC/analog block up, bring up the NCP,
++ * the cap-less LDOs and the HP/HS bias, then enable both audio DACs with the
++ * HP gain at 0 dB.
++ */
++static int mt6331_open_analog_trim_hw(struct mt6331_priv *priv, bool enable)
++{
++	int ret;
++
++	if (enable) {
++		/* vendor:752 TurnOnDacPower() */
++		ret = mt6331_dl_power_up(priv);
++		if (ret)
++			return ret;
++
++		/* vendor:755-763: 604 kHz NCP clock and soft start */
++		mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON1, 0x0001,
++				 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON2, 0x002b,
++				 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON0, 0x0001,
++				 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON4, 0x0000,
++				 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON3, 0x0000,
++				 0xffff);
++		/* vendor:765-776: LDOs + NV regulator, then disable the HP /
++		 * voice protection and the ZCD block.
++		 */
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x0a41,
++				 RG_AUDDEC_ANA_CON6_SPK_MASK);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac1,
++				 RG_AUDDEC_ANA_CON6_SPK_MASK);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON7, 0x8000,
++				 RG_NVREG_EN_VAUDP15);
++		mt6331_ana_write(priv, MT6328_ZCD_CON0, 0x0400, 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe080,
++				 0xffff);
++		/* vendor:776 IBIST */
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac0,
++				 RG_AUDDEC_ANA_CON6_SPK_MASK);
++		/* vendor:780-781: HP & HS drivers bias circuit + trim buffer */
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON4, 0x1f01,
++				 0xffff);
++		/* vendor:783 */
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON5, 0x5490,
++				 0xffff);
++		udelay(50);
++		/* vendor:786-796: 0 dB HP gain, voice muted, drivers on */
++		mt6331_ana_write(priv, MT6328_ZCD_CON2, 0x0408, 0xffff);
++		mt6331_ana_write(priv, MT6328_ZCD_CON3, 0x001f, 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON1, 0x0480,
++				 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON1, 0x1480,
++				 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe090,
++				 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON1, 0x14a0,
++				 0xffff);
++		udelay(50);
++		/* vendor:798-803: AUD_CLK and both audio DACs */
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac2,
++				 RG_AUDDEC_ANA_CON6_SPK_MASK);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0x0009,
++				 0x0009);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0x0006,
++				 0x0006);
++	} else {
++		/* vendor:807-818 */
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON4, 0x0000,
++				 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0x0000,
++				 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac0,
++				 RG_AUDDEC_ANA_CON6_SPK_MASK);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON7, 0x0000,
++				 RG_NVREG_EN_VAUDP15);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x0001,
++				 RG_AUDDEC_ANA_CON6_SPK_MASK);
++		mt6331_dl_power_down(priv);
++	}
++
++	return 0;
++}
++
++/* vendor:610-614 setOffsetTrimMux() */
++static void mt6331_set_offset_trim_mux(struct mt6331_priv *priv,
++				       unsigned int mux)
++{
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON3,
++			 mux << RG_AUDDEC_ANA_CON3_TRIM_MUX_SHIFT,
++			 RG_AUDDEC_ANA_CON3_TRIM_MUX_MASK);
++}
++
++/* vendor:616-619 setOffsetTrimBufferGain() */
++static void mt6331_set_offset_trim_buffer_gain(struct mt6331_priv *priv,
++					       unsigned int gain)
++{
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON3,
++			 gain << RG_AUDDEC_ANA_CON3_TRIM_GAIN_SHIFT,
++			 RG_AUDDEC_ANA_CON3_TRIM_GAIN_MASK);
++}
++
++/* vendor:666-679 EnableTrimbuffer() */
++static void mt6331_enable_trimbuffer(struct mt6331_priv *priv, bool enable)
++{
++	if (enable) {
++		/* vendor:668: HP & HS drivers bias circuit */
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON4,
++				 RG_AUDDEC_ANA_CON4_TRIM_BUF_EN,
++				 RG_AUDDEC_ANA_CON4_TRIM_BUF_EN);
++		/* vendor:671: audio offset trimming buffer */
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON3,
++				 RG_AUDDEC_ANA_CON3_TRIM_BUF_EN,
++				 RG_AUDDEC_ANA_CON3_TRIM_BUF_EN);
++	} else {
++		/* vendor:673-677 */
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON4, 0,
++				 RG_AUDDEC_ANA_CON4_TRIM_BUF_EN);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON3, 0,
++				 RG_AUDDEC_ANA_CON3_TRIM_BUF_EN);
++	}
++}
++
++/* vendor:1059-1064 setHpGain() -> HeadsetVoloumeRestore() (vendor:1673) */
++static void mt6331_set_hp_gain(struct mt6331_priv *priv, unsigned int index)
++{
++	mt6331_hp_volume_ramp(priv, index, index);
++}
++
++/* vendor:1065-1068 SetSdmLevel() */
++static void mt6331_set_sdm_level(struct mt6331_priv *priv, unsigned int level)
++{
++	mt6331_ana_write(priv, MT6328_AFE_DL_SDM_CON1, level, 0xffffffff);
++}
++
++/*
++ * Port from Samsung/MTK downstream mt_soc_codec_63xx.c:880-989
++ * OpenHeadPhoneImpedanceSetting().  The whole body sits inside "#if 0" in
++ * the vendor source and the function therefore only returns true; the
++ * sequence below is the intended (dead) implementation, which is what the
++ * header comment "AUXADC large scale" and the callers in
++ * mt_soc_pcm_hp_impedance.c:338-420, 579-606 assume.
++ *
++ * The vendor early-returns when a downlink stream is active
++ * (vendor:884-886 GetDLStatus()).  This driver has no cross-component
++ * stream query, so userspace must only use the control while playback is
++ * stopped (documented in the report).
++ */
++static int mt6331_open_hp_impedance_setting(struct mt6331_priv *priv,
++					    bool enable)
++{
++	int ret;
++
++	if (enable) {
++		ret = mt6331_dl_power_up(priv);
++		if (ret)
++			return ret;
++
++		/* vendor:889-891: AUXADC large scale, mic bias 1 on */
++		mt6331_ana_write(priv, MT6328_AUXADC_CON2,
++				 MT6328_AUXADC_AVG_LARGE,
++				 MT6328_AUXADC_AVG_LARGE);
++		mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON9, 0x0010,
++				 0x0010);
++
++		/* vendor:910-921: NCP soft start + 604 kHz NCP clock */
++		mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON4, 0x0003,
++				 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON1, 0x0001,
++				 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON2, 0x002b,
++				 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON0, 0x0001,
++				 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON3, 0x0000,
++				 0xffff);
++
++		/* vendor:926-935: cap-less HC/LC LDO (1.5V) */
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x0841,
++				 RG_AUDDEC_ANA_CON6_SPK_MASK);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x28c1,
++				 RG_AUDDEC_ANA_CON6_SPK_MASK);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac1,
++				 RG_AUDDEC_ANA_CON6_SPK_MASK);
++		/* vendor:938: NV regulator (-1.5V) */
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON7, 0x8000,
++				 RG_NVREG_EN_VAUDP15);
++		/* vendor:940: AUD_ZCD off */
++		mt6331_ana_write(priv, MT6328_ZCD_CON0, 0x0000, 0xffff);
++
++		/* vendor:944-958: HP/voice protection off, HP output not
++		 * shorted to VCM, headphone speaker detection on, IbiasDistrib
++		 * on, AUD_CLK on, left DAC on, HPDET mux on.
++		 */
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe080,
++				 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON1, 0x0000,
++				 0x0400);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON1, 0x0000,
++				 0x0080);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON3, 0x0080,
++				 0x0080);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x0000,
++				 0x0001);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x0002,
++				 0x0002);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe089,
++				 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON3, 0x0900,
++				 0x0f00);
++	} else {
++		/* vendor:961-984 */
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON3, 0x0000,
++				 0x0f00);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe080,
++				 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x0000,
++				 0x0002);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x0001,
++				 0x0001);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON3, 0x0000,
++				 0x0080);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON7, 0x0000,
++				 RG_NVREG_EN_VAUDP15);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x0001,
++				 RG_AUDDEC_ANA_CON6_SPK_MASK);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON1, 0x0080,
++				 0x0080);
++		mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe000,
++				 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON9, 0x0000,
++				 0x0010);
++		mt6331_dl_power_down(priv);
++	}
++
++	return 0;
++}
++
++/*
++ * Port from Samsung/MTK downstream pmic_auxadc.c:173-455
++ * PMIC_IMM_GetOneChannelValue(): one-shot conversion of one channel.
++ *
++ * The downstream function turns on the AUXADC clock, the input buffer and
++ * the AP-mode 26 MHz clock, requests the channel through RQST0_SET and polls
++ * the ready bit of that channel's output register.  For channel 9 it returns
++ * the raw 12 bit code (pmic_auxadc.c:434-436); every other channel is scaled
++ * to millivolts there.  This helper always returns the raw code, which is
++ * what the HP impedance path consumes.
++ *
++ * The baseline accdet driver (drivers/misc/mediatek/accdet/accdet.c:137-166)
++ * uses the same PMIC AUXADC block for channel 5 through the same RQST0_SET /
++ * ready-bit scheme; only the channel and the auto-sample setup differ.
++ */
++static int mt6331_auxadc_read(struct mt6331_priv *priv, unsigned int channel,
++			      unsigned int *code)
++{
++	unsigned int val;
++	int ret;
++
++	/* pmic_auxadc.c:207: the PMIC has 16 channels */
++	if (channel > 15)
++		return -EINVAL;
++
++	/* pmic_auxadc.c:212-214 */
++	ret = regmap_update_bits(priv->regmap, MT6328_AUXADC_CON0,
++				 MT6328_AUXADC_CK_AON,
++				 MT6328_AUXADC_CK_AON);
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(priv->regmap, MT6328_AUXADC_CON12,
++				 MT6328_AUXADC_VBUF_EN,
++				 MT6328_AUXADC_VBUF_EN);
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(priv->regmap, MT6328_TOP_CLKSQ,
++				 RG_CLKSQ_EN_AUX_AP_MODE,
++				 RG_CLKSQ_EN_AUX_AP_MODE);
++	if (ret)
++		return ret;
++
++	/* pmic_auxadc.c:222: request one conversion */
++	ret = regmap_write(priv->regmap, MT6328_AUXADC_RQST0_SET,
++			   BIT(channel));
++	if (ret)
++		return ret;
++
++	/* pmic_auxadc.c:337-347: bit 15 of the channel output is the ready
++	 * flag, bits 11:0 the code.  The downstream loop is bounded by a retry
++	 * counter; a poll timeout is equivalent.
++	 */
++	ret = regmap_read_poll_timeout(priv->regmap,
++				       MT6328_AUXADC_ADC_BASE + 2 * channel,
++				       val, val & MT6328_AUXADC_RDY,
++				       MT6331_AUXADC_POLL_US,
++				       MT6331_AUXADC_TIMEOUT_US);
++	if (ret)
++		return ret;
++
++	*code = val & MT6328_AUXADC_DATA_MASK;
++	return 0;
++}
++
++/*
++ * vendor:351-370: the first call measures the analog/AUXADC offset with the
++ * trim buffer connected to ground.  The vendor also fills the AFE internal
++ * SRAM and waits 5 s in this branch; the SRAM fill is userspace's job here
++ * (AFE control "HP Impedance DC Value"), so only the offset is measured.
++ */
++static int mt6331_hp_impedance_calibrate(struct mt6331_priv *priv)
++{
++	unsigned int code = 0;
++	int ret;
++
++	ret = mt6331_open_analog_trim_hw(priv, true);
++	if (ret)
++		return ret;
++
++	mt6331_set_offset_trim_mux(priv, MT6331_TRIM_MUX_GROUND);
++	mt6331_set_offset_trim_buffer_gain(priv, 3);
++	mt6331_enable_trimbuffer(priv, true);
++	usleep_range(5000, 20000);	/* vendor:357 */
++
++	ret = mt6331_auxadc_read(priv, MT6331_AUXADC_HP_CHANNEL, &code);
++
++	mt6331_enable_trimbuffer(priv, false);
++	mt6331_open_analog_trim_hw(priv, false);
++	if (ret)
++		return ret;
++
++	priv->auxadc_offset = code;
++	priv->auxadc_offset_valid = true;
++	dev_info(priv->dev, "HP impedance AUXADC offset = %u\n", code);
++
++	return 0;
++}
++
++/* mt_soc_pcm_hp_impedance.c:338-420 Audio_HP_ImpeDance_Set() */
++static int mt6331_hp_impedance_set(struct snd_kcontrol *kcontrol,
++				   struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *cmpnt = snd_kcontrol_chip(kcontrol);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	unsigned long value = ucontrol->value.integer.value[0];
++	int ret = 0;
++
++	/* The AFE SRAM DC word is 16 bit wide. */
++	if (value > U16_MAX)
++		return -EINVAL;
++
++	mutex_lock(&priv->ana_lock);
++
++	priv->hp_impedance_dc = value;
++
++	if (!priv->auxadc_offset_valid) {
++		ret = mt6331_hp_impedance_calibrate(priv);
++		if (ret)
++			goto out;
++	}
++
++	if (value == 1) {
++		/* vendor:371-379: start the measurement.  The AFE SRAM is
++		 * filled through the AFE component control "HP Impedance DC
++		 * Value" instead of the vendor's memset() (vendor:377-378).
++		 */
++		ret = mt6331_open_hp_impedance_setting(priv, true);
++		if (ret)
++			goto out;
++		mt6331_set_offset_trim_mux(priv, MT6331_TRIM_MUX_HPR);
++		mt6331_set_offset_trim_buffer_gain(priv, 3);
++		mt6331_enable_trimbuffer(priv, true);
++		mt6331_set_hp_gain(priv, 8);	/* 8: 0 dB */
++		priv->hp_impedance_on = true;
++	} else if (value == 0) {
++		/* vendor:380-386: stop and restore the idle analog state */
++		ret = mt6331_open_hp_impedance_setting(priv, false);
++		if (ret)
++			goto out;
++		mt6331_set_offset_trim_mux(priv, MT6331_TRIM_MUX_GROUND);
++		mt6331_enable_trimbuffer(priv, false);
++		mt6331_set_sdm_level(priv, MT6331_SDM_LEVEL_NORMAL);
++		priv->hp_impedance_on = false;
++	} else {
++		/* vendor:387-418 sweeps this value in 200-count steps with a
++		 * 20 ms settle and a 3 s pause.  That sweep is userspace
++		 * driven here: write the DC value, start, wait, read
++		 * "Audio AUXADC Data".
++		 */
++		dev_dbg(priv->dev, "HP impedance DC value %lu\n", value);
++	}
++
++out:
++	mutex_unlock(&priv->ana_lock);
++	return ret;
++}
++
++/*
++ * The downstream get handler (mt_soc_pcm_hp_impedance.c:579-606) runs the
++ * whole DC sweep and returns the computed resistance.  That sweep needs the
++ * AFE SRAM buffer and is userspace's job in this design, so report the last
++ * value written to the control instead.
++ */
++static int mt6331_hp_impedance_get(struct snd_kcontrol *kcontrol,
++				   struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *cmpnt = snd_kcontrol_chip(kcontrol);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++
++	ucontrol->value.integer.value[0] = priv->hp_impedance_dc;
++
++	return 0;
++}
++
++/* vendor:2814-2825 Audio_AuxAdcData_Get() */
++static int mt6331_auxadc_data_get(struct snd_kcontrol *kcontrol,
++				  struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *cmpnt = snd_kcontrol_chip(kcontrol);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	unsigned int code;
++	int ret;
++
++	mutex_lock(&priv->ana_lock);
++	ret = mt6331_auxadc_read(priv, priv->auxadc_channel, &code);
++	mutex_unlock(&priv->ana_lock);
++	if (ret)
++		return ret;
++
++	ucontrol->value.integer.value[0] = code;
++
++	return 0;
++}
++
++/* vendor:2828-2833 Audio_AuxAdcData_Set() */
++static int mt6331_auxadc_data_set(struct snd_kcontrol *kcontrol,
++				  struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *cmpnt = snd_kcontrol_chip(kcontrol);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	unsigned long channel = ucontrol->value.integer.value[0];
++
++	if (channel > 15)
++		return -EINVAL;
++
++	priv->auxadc_channel = channel;
++
++	return 0;
++}
++
+ /* ------------------------------------------------------------------ */
+ /* Uplink (capture) paths                                             */
+ /* ------------------------------------------------------------------ */
+@@ -1203,6 +1807,18 @@ static const struct snd_kcontrol_new mt6331_snd_controls[] = {
+ 		   RG_AUDMICBIASVREF_SHIFT, 7, 0),
+ 	SOC_ENUM("MICBIAS1 Mode", mt6331_micbias1_mode_enum),
+ 	SOC_ENUM("MICBIAS2 Mode", mt6331_micbias2_mode_enum),
++	/* HP impedance measurement (mt_soc_pcm_hp_impedance.c:607-610).
++	 * The vendor UI name is "Audio HP ImpeDance Setting" (ROM string at
++	 * zip/vmlinux.strings:59622); "Audio_HP_ImpeDance" is registered as an
++	 * alias over the same state for the HAL wrapper.
++	 */
++	SOC_SINGLE_EXT("Audio HP ImpeDance Setting", SND_SOC_NOPM, 0, 65536, 0,
++		       mt6331_hp_impedance_get, mt6331_hp_impedance_set),
++	SOC_SINGLE_EXT("Audio_HP_ImpeDance", SND_SOC_NOPM, 0, 65536, 0,
++		       mt6331_hp_impedance_get, mt6331_hp_impedance_set),
++	/* One-shot AUXADC read, vendor:2814-2839. */
++	SOC_SINGLE_EXT("Audio AUXADC Data", SND_SOC_NOPM, 0, 0x80000, 0,
++		       mt6331_auxadc_data_get, mt6331_auxadc_data_set),
+ };
+ 
+ /* ------------------------------------------------------------------ */
+@@ -1467,6 +2083,29 @@ static struct snd_soc_dai_driver mt6331_dai_driver[] = {
+ 				   SNDRV_PCM_FMTBIT_S24_LE,
+ 		},
+ 		.ops = &mt6331_dai_ops,
++	}, {
++		/*
++		 * HP impedance downlink, vendor mt_soc_codec_63xx.c:1538-1548
++		 * (MT_SOC_CODEC_HP_IMPEDANCE_NAME, playback-only, same ops as
++		 * every other codec DAI).  The vendor ops only record the rate
++		 * (mt63xx_codec_startup/prepare, :1308-1347) for
++		 * TurnOnDacPower()'s PMIC downlink interface programming
++		 * (:1641-1646); mt6331_dai_hw_params() is the equivalent here
++		 * and also writes MT6328_AFE_PMIC_NEWIF_CFG0/_DL_SRC2_CON0_H,
++		 * which the HP impedance analog sequence relies on.  It is a
++		 * real DAI, not a dummy: the link must set priv->dl_rate before
++		 * "Audio_HP_ImpeDance Setting" powers the downlink.
++		 */
++		.name = MT6331_HP_IMP_DAI_NAME,
++		.playback = {
++			.stream_name = MT6331_HP_IMP_STREAM_NAME,
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = SNDRV_PCM_RATE_8000_48000,
++			.formats = SNDRV_PCM_FMTBIT_S16_LE |
++				   SNDRV_PCM_FMTBIT_S24_LE,
++		},
++		.ops = &mt6331_dai_ops,
+ 	},
+ };
+ 
+@@ -1551,6 +2190,16 @@ static int mt6331_codec_probe(struct snd_soc_component *cmpnt)
+ 		return ret;
+ 	}
+ 
++	/* Read and log the efuse HP offset trim once, as InitAfeControl()
++	 * does on the first audio open (mt_soc_afe_control.c:457-470).  The
++	 * values are informational only: EFUSE_HP_TRIM is not defined in the
++	 * downstream build, so the software DC compensation ramp is used.
++	 */
++	ret = mt6331_efuse_hp_offset_read(priv);
++	if (ret)
++		dev_warn(priv->dev, "PMIC efuse HP offset read failed: %d\n",
++			 ret);
++
+ 	dev_info(priv->dev, "MT6328 audio codec ready\n");
+ 
+ 	return 0;
+@@ -1665,6 +2314,7 @@ static int mt6331_platform_probe(struct platform_device *pdev)
+ 	priv->regmap = pmic->regmap;
+ 	priv->dl_rate = 48000;	/* vendor:118 mBlockSampleRate[] */
+ 	priv->ul_rate = 48000;
++	priv->auxadc_channel = MT6331_AUXADC_HP_CHANNEL;
+ 
+ 	mutex_init(&priv->ana_lock);
+ 	mutex_init(&priv->clk_lock);
+diff --git a/sound/soc/codecs/mt6331.h b/sound/soc/codecs/mt6331.h
+index e786f9770..dfc4f449c 100644
+--- a/sound/soc/codecs/mt6331.h
++++ b/sound/soc/codecs/mt6331.h
+@@ -98,6 +98,8 @@
+ /* ------------------------------------------------------------------ */
+ #define MT6328_AUDDEC_ANA_CON0		0x0cdc
+ #define MT6328_AUDDEC_ANA_CON1		0x0cde
++#define MT6328_AUDDEC_ANA_CON2		0x0ce0	/* upmu_hw.h:596 */
++#define MT6328_AUDDEC_ANA_CON3		0x0ce2	/* upmu_hw.h:597 */
+ #define MT6328_AUDDEC_ANA_CON4		0x0ce4
+ #define MT6328_AUDDEC_ANA_CON5		0x0ce6
+ #define MT6328_AUDDEC_ANA_CON6		0x0ce8
+@@ -176,4 +178,93 @@
+ /* Uplink rate / mode field, bits 0-4 (mt_soc_codec_63xx.c:3386) */
+ #define RG_UL_RATE_MASK			0x1f
+ 
++/* ------------------------------------------------------------------ */
++/* Audio offset trim buffer / SDM (vendor:610-700, 1065)              */
++/* ------------------------------------------------------------------ */
++/* AUDDEC_ANA_CON3[4:1] selects the offset trim buffer input, [6:5] its
++ * gain and bit 0 enables the buffer (mt_soc_codec_63xx.c:611-617, 688).
++ */
++#define RG_AUDDEC_ANA_CON3_TRIM_MUX_MASK	(0xf << 1)
++#define RG_AUDDEC_ANA_CON3_TRIM_MUX_SHIFT	1
++#define RG_AUDDEC_ANA_CON3_TRIM_GAIN_MASK	(0x3 << 5)
++#define RG_AUDDEC_ANA_CON3_TRIM_GAIN_SHIFT	5
++#define RG_AUDDEC_ANA_CON3_TRIM_BUF_EN		BIT(0)
++/* AUDDEC_ANA_CON4 bit 0: HP/HS driver bias circuit (vendor:686, 693) */
++#define RG_AUDDEC_ANA_CON4_TRIM_BUF_EN		BIT(0)
++
++/* Offset trim mux inputs (mt_soc_analog_type.h:221-231). */
++#define MT6331_TRIM_MUX_OPEN		0
++#define MT6331_TRIM_MUX_HPL		1
++#define MT6331_TRIM_MUX_HPR		2
++#define MT6331_TRIM_MUX_HSP		3
++#define MT6331_TRIM_MUX_HSN		4
++#define MT6331_TRIM_MUX_LOLP		5
++#define MT6331_TRIM_MUX_LOLN		6
++#define MT6331_TRIM_MUX_LORP		7
++#define MT6331_TRIM_MUX_LORN		8
++#define MT6331_TRIM_MUX_GROUND		9
++
++/* SDM level values written to AFE_DL_SDM_CON1 (mt_soc_analog_type.h:216-218). */
++#define MT6331_SDM_LEVEL_MUTE		0x00
++#define MT6331_SDM_LEVEL_NORMAL		0x1e
++
++/* ------------------------------------------------------------------ */
++/* PMIC OTP/efuse controller (upmu_hw.h:484-497, 114-115, 93-94)      */
++/* ------------------------------------------------------------------ */
++#define MT6328_TOP_CKHWEN_CON0_CLR	0x027c	/* upmu_hw.h:115 */
++#define MT6328_TOP_CKHWEN_CON0_SET	0x027a	/* upmu_hw.h:114 */
++#define MT6328_TOP_CKPDN_CON3_SET	0x0250	/* upmu_hw.h:93 */
++#define MT6328_TOP_CKPDN_CON3_CLR	0x0252	/* upmu_hw.h:94 */
++#define MT6328_OTP_CON0			0x0c00	/* upmu_hw.h:484 */
++#define MT6328_OTP_CON8			0x0c10	/* upmu_hw.h:492 */
++#define MT6328_OTP_CON11		0x0c16	/* upmu_hw.h:495 */
++#define MT6328_OTP_CON12		0x0c18	/* upmu_hw.h:496 */
++#define MT6328_OTP_CON13		0x0c1a	/* upmu_hw.h:497 */
++
++/* OTP engine control bits, pmic.c:5158-5192. */
++#define MT6331_OTP_CK_HWEN		0x0040	/* bit 6 clock enable */
++#define MT6331_OTP_CK_PDN		0x0004	/* bit 2 clock gate */
++#define MT6331_OTP_ENGINE_EN		BIT(0)	/* OTP_CON11, pmic.c:5166 */
++#define MT6331_OTP_READ_TRIGGER		BIT(0)	/* OTP_CON8,  pmic.c:5176 */
++#define MT6331_OTP_READY		BIT(0)	/* OTP_CON13, pmic.c:5182 */
++#define MT6331_OTP_ROW_MASK		GENMASK(5, 1)	/* pmic.c:5172 */
++#define MT6331_OTP_ROW_SHIFT		1
++#define MT6331_OTP_HP_ROW_START		0xa	/* vendor:510 */
++#define MT6331_OTP_HP_ROWS		3
++/* Downstream polls OTP_CON13 without a bound (vendor:522-526); this
++ * timeout only stops a wedged PMIC from hanging the caller. [INFERENCE]
++ */
++#define MT6331_OTP_POLL_US		1000
++#define MT6331_OTP_TIMEOUT_US		20000
++
++/* ------------------------------------------------------------------ */
++/* PMIC AUXADC (upmu_hw.h:628, 688, 693, 697, 707)                    */
++/* ------------------------------------------------------------------ */
++#define MT6328_AUXADC_ADC_BASE		0x0e00	/* upmu_hw.h:619 */
++#define MT6328_AUXADC_ADC9		0x0e12	/* upmu_hw.h:628 */
++#define MT6328_AUXADC_RQST0_SET		0x0e8a	/* upmu_hw.h:688 */
++#define MT6328_AUXADC_CON0		0x0e94	/* upmu_hw.h:693 */
++#define MT6328_AUXADC_CON2		0x0e9c	/* upmu_hw.h:697 */
++#define MT6328_AUXADC_CON12		0x0eb0	/* upmu_hw.h:707 */
++
++#define MT6328_AUXADC_CK_AON		BIT(15)	/* CON0 bit 15, upmu_hw.h:7694 */
++#define MT6328_AUXADC_VBUF_EN		BIT(7)	/* CON12 bit 7, upmu_hw.h:7838 */
++#define MT6328_AUXADC_DATA_MASK		GENMASK(11, 0)	/* upmu_hw.h:7200 */
++#define MT6328_AUXADC_RDY		BIT(15)	/* upmu_hw.h:7203 */
++/* CON2 bit 9 widens the AUXADC full scale (vendor:767). */
++#define MT6328_AUXADC_AVG_LARGE		BIT(9)
++
++/* TOP_CLKSQ bit 8: AUXADC 26MHz clock in AP mode, upmu_hw.h:2285-2287. */
++#define RG_CLKSQ_EN_AUX_AP_MODE		BIT(8)
++
++/* PMIC AUXADC channel used for the HP impedance DC measurement
++ * (mt_soc_pcm_hp_impedance.c:364, 389).
++ */
++#define MT6331_AUXADC_HP_CHANNEL	9
++/* Downstream polls the ready bit once per millisecond with a fixed retry
++ * count; keep that cadence but never poll forever (pmic_auxadc.c:337-345).
++ */
++#define MT6331_AUXADC_POLL_US		1000
++#define MT6331_AUXADC_TIMEOUT_US	20000
++
+ #endif /* __SND_SOC_MT6331_H */
+diff --git a/sound/soc/mediatek/mt6735/Makefile b/sound/soc/mediatek/mt6735/Makefile
+index bcf2f0cf2..d9f8e6806 100644
+--- a/sound/soc/mediatek/mt6735/Makefile
++++ b/sound/soc/mediatek/mt6735/Makefile
+@@ -3,6 +3,7 @@ snd-soc-mt6735-afe-objs := \
+ 	mt6735-afe-pcm.o \
+ 	mt6735-afe-clk.o \
+ 	mt6735-dai-pcm.o \
++	mt6735-dai-hpimp.o \
+ 	mt6735-dai-i2s.o
+ 
+ obj-$(CONFIG_SND_SOC_MT6735) += snd-soc-mt6735-afe.o
+diff --git a/sound/soc/mediatek/mt6735/mt6735-afe-common.h b/sound/soc/mediatek/mt6735/mt6735-afe-common.h
+index 0e968fbec..cc818e8ed 100644
+--- a/sound/soc/mediatek/mt6735/mt6735-afe-common.h
++++ b/sound/soc/mediatek/mt6735/mt6735-afe-common.h
+@@ -14,6 +14,7 @@
+ #define _MT6735_AFE_COMMON_H_
+ 
+ #include <linux/clk.h>
++#include <linux/mutex.h>
+ #include <linux/pinctrl/consumer.h>
+ #include <sound/soc.h>
+ 
+@@ -45,6 +46,7 @@ enum {
+ 	MT6735_AFE_DAI_DL2,
+ 	MT6735_AFE_DAI_VUL,
+ 	MT6735_AFE_DAI_I2S0,
++	MT6735_AFE_DAI_HPIMP,
+ 	MT6735_AFE_DAI_NUM,
+ };
+ 
+@@ -126,6 +128,16 @@ struct mt6735_afe_priv {
+ 	unsigned int i2s_sysclk;
+ 
+ 	unsigned int spurious_irqs;
++
++	/*
++	 * HP impedance FE: while hp_imp_open is set the stream holds the DL1
++	 * memory interface (rebased onto the AFE internal SRAM) and the AFE
++	 * "HP Impedance DC Value" control is allowed to fill the SRAM.
++	 * hp_imp_lock serialises that flag against the kcontrol and the DL1
++	 * startup path.
++	 */
++	struct mutex hp_imp_lock;
++	bool hp_imp_open;
+ };
+ 
+ static inline struct mt6735_afe_priv *mt6735_afe_priv(struct mtk_base_afe *afe)
+@@ -138,8 +150,21 @@ int mt6735_afe_rate_to_fs(unsigned int rate);
+ void mt6735_afe_update_power(struct mtk_base_afe *afe);
+ int mt6735_afe_irq_update(struct mtk_base_afe *afe, int irq);
+ 
++/*
++ * Front-end register helpers, implemented in mt6735-dai-pcm.c and shared
++ * with the HP impedance FE DAI in mt6735-dai-hpimp.c.
++ */
++bool mt6735_afe_playback_enabled(struct mtk_base_afe *afe);
++int mt6735_afe_memif_enable(struct mtk_base_afe *afe, int id, bool enable);
++int mt6735_afe_connect(struct mtk_base_afe *afe, int id, bool connect);
++void mt6735_afe_set_conn_width(struct mtk_base_afe *afe, int id, bool wlen24);
++int mt6735_afe_dac_prepare(struct mtk_base_afe *afe, unsigned int rate,
++			   bool wlen32);
++void mt6735_afe_dac_disable(struct mtk_base_afe *afe);
++
+ /* DAI drivers */
+ extern const struct snd_soc_dai_driver mt6735_afe_pcm_dais[MT6735_AFE_PCM_DAI_NUM];
+ extern const struct snd_soc_dai_driver mt6735_afe_i2s_dai;
++extern const struct snd_soc_dai_driver mt6735_afe_hp_imp_dai;
+ 
+ #endif /* _MT6735_AFE_COMMON_H_ */
+diff --git a/sound/soc/mediatek/mt6735/mt6735-afe-pcm.c b/sound/soc/mediatek/mt6735/mt6735-afe-pcm.c
+index 728140374..e9e270128 100644
+--- a/sound/soc/mediatek/mt6735/mt6735-afe-pcm.c
++++ b/sound/soc/mediatek/mt6735/mt6735-afe-pcm.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include <linux/dma-mapping.h>
++#include <linux/io.h>
+ #include <linux/math64.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+@@ -417,11 +418,86 @@ static int mt6735_afe_component_probe(struct snd_soc_component *component)
+ 	return 0;
+ }
+ 
++/*
++ * AFE internal SRAM DC excitation for the HP impedance measurement.
++ *
++ * The vendor writes AFE_INTERNAL_SRAM_SIZE (0x8000) bytes at
++ * Get_Afe_SramBase_Pointer() with the 16 bit DC value supplied by userspace
++ * (mt_soc_pcm_hp_impedance.c:361-362, 377-378) while its HP impedance PCM
++ * owns the DL1 memory interface.  The fill is only accepted while the HP
++ * impedance FE stream is open (mt6735-dai-hpimp.c), so a control write can
++ * never move the memory interface underneath an active stream; DL1 and the
++ * HP impedance DAI are mutually exclusive there.
++ */
++static int mt6735_afe_hp_dc_put(struct snd_kcontrol *kcontrol,
++				struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component =
++		snd_kcontrol_chip(kcontrol);
++	struct mtk_base_afe *afe = snd_soc_component_get_drvdata(component);
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	unsigned long value = ucontrol->value.integer.value[0];
++	void __iomem *sram;
++	int i, ret;
++
++	/* The AFE sample width is 16 bit. */
++	if (value > U16_MAX)
++		return -EINVAL;
++
++	mutex_lock(&priv->hp_imp_lock);
++	if (!priv->hp_imp_open) {
++		mutex_unlock(&priv->hp_imp_lock);
++		return -EBUSY;
++	}
++
++	ret = pm_runtime_resume_and_get(afe->dev);
++	if (ret) {
++		mutex_unlock(&priv->hp_imp_lock);
++		return ret;
++	}
++
++	sram = afe->base_addr + MT6735_AFE_INTERNAL_SRAM_OFFSET;
++	for (i = 0; i < MT6735_AFE_INTERNAL_SRAM_SIZE / 2; i++)
++		writew(value, sram + i * 2);
++
++	pm_runtime_put(afe->dev);
++	mutex_unlock(&priv->hp_imp_lock);
++
++	return 0;
++}
++
++static int mt6735_afe_hp_dc_get(struct snd_kcontrol *kcontrol,
++				struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component =
++		snd_kcontrol_chip(kcontrol);
++	struct mtk_base_afe *afe = snd_soc_component_get_drvdata(component);
++	int ret;
++
++	ret = pm_runtime_resume_and_get(afe->dev);
++	if (ret)
++		return ret;
++
++	ucontrol->value.integer.value[0] =
++		readw(afe->base_addr + MT6735_AFE_INTERNAL_SRAM_OFFSET);
++
++	pm_runtime_put(afe->dev);
++
++	return 0;
++}
++
++static const struct snd_kcontrol_new mt6735_afe_controls[] = {
++	SOC_SINGLE_EXT("HP Impedance DC Value", SND_SOC_NOPM, 0, 0xffff, 0,
++		       mt6735_afe_hp_dc_get, mt6735_afe_hp_dc_put),
++};
++
+ static const struct snd_soc_component_driver mt6735_afe_component = {
+ 	.name = "mtk-afe-pcm",
+ 	.probe = mt6735_afe_component_probe,
+ 	.pcm_construct = mt6735_afe_pcm_new,
+ 	.pointer = mt6735_afe_pcm_pointer,
++	.controls = mt6735_afe_controls,
++	.num_controls = ARRAY_SIZE(mt6735_afe_controls),
+ };
+ 
+ static int mt6735_afe_runtime_suspend(struct device *dev)
+@@ -471,6 +547,7 @@ static int mt6735_afe_pcm_dev_probe(struct platform_device *pdev)
+ 	if (!priv)
+ 		return -ENOMEM;
+ 	afe->platform_priv = priv;
++	mutex_init(&priv->hp_imp_lock);
+ 
+ 	afe->base_addr = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(afe->base_addr))
+@@ -545,6 +622,7 @@ static int mt6735_afe_pcm_dev_probe(struct platform_device *pdev)
+ 
+ 	memcpy(dais, mt6735_afe_pcm_dais, sizeof(mt6735_afe_pcm_dais));
+ 	dais[MT6735_AFE_DAI_I2S0] = mt6735_afe_i2s_dai;
++	dais[MT6735_AFE_DAI_HPIMP] = mt6735_afe_hp_imp_dai;
+ 
+ 	ret = devm_snd_soc_register_component(dev, &mt6735_afe_component,
+ 					      dais, MT6735_AFE_DAI_NUM);
+diff --git a/sound/soc/mediatek/mt6735/mt6735-afe-regs.h b/sound/soc/mediatek/mt6735/mt6735-afe-regs.h
+index 3f92e7876..eda58c5ab 100644
+--- a/sound/soc/mediatek/mt6735/mt6735-afe-regs.h
++++ b/sound/soc/mediatek/mt6735/mt6735-afe-regs.h
+@@ -20,6 +20,15 @@
+ #define MT6735_AFE_PHYS_BASE		0x11220000	/* AudDrv_Afe.h:361 */
+ #define MT6735_AFE_SIZE			0x10000		/* rom_dtb_0.dts audio@11220000 */
+ 
++/*
++ * AFE internal SRAM: physical 0x11221000, 0x8000 bytes
++ * (AudDrv_Afe.h:375-377; Get_Afe_SramBase_Pointer(), AudDrv_Afe.c:126).
++ * It lies inside the AFE ioremap window, 0x1000 bytes above the register
++ * base.
++ */
++#define MT6735_AFE_INTERNAL_SRAM_OFFSET	0x1000
++#define MT6735_AFE_INTERNAL_SRAM_SIZE	0x8000
++
+ /* Top level clock/power control */
+ #define AUDIO_TOP_CON0			0x0000		/* AudDrv_Afe.h:416 */
+ #define AUDIO_TOP_CON1			0x0004		/* AudDrv_Afe.h:423 */
+diff --git a/sound/soc/mediatek/mt6735/mt6735-dai-hpimp.c b/sound/soc/mediatek/mt6735/mt6735-dai-hpimp.c
+new file mode 100644
+index 000000000..25b300411
+--- /dev/null
++++ b/sound/soc/mediatek/mt6735/mt6735-dai-hpimp.c
+@@ -0,0 +1,269 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT6735/MT6737T ALSA SoC HP impedance front-end DAI.
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * Port from Samsung/MTK downstream
++ * sound/soc/mediatek/mt_soc_audio_v3/mt_soc_pcm_hp_impedance.c and the DL1
++ * pieces it calls in mt_soc_afe_control.c.
++ *
++ * The HP impedance measurement plays a constant DC level out of the AFE and
++ * reads the resulting voltage on PMIC AUXADC channel 9.  The DC level comes
++ * from the AFE component control "HP Impedance DC Value"
++ * (mt6735-afe-pcm.c), which fills the AFE internal SRAM; this DAI points the
++ * DL1 memory interface at that SRAM and enables the normal AFE downlink
++ * (DL1 -> I05/I06 -> O03/O04 -> I2S DAC -> PMIC codec) so the value is
++ * actually clocked out.
++ *
++ * Why the internal SRAM and not the ALSA ring buffer: the downstream build
++ * defines AUDIO_MEMORY_SRAM (AudDrv_Def.h:45), so AudDrv_Allocate_DL1_Buffer()
++ * hands the DL1 memory interface AFE_INTERNAL_SRAM_PHY_BASE (0x11221000,
++ * AFE_INTERNAL_SRAM_SIZE 0x8000) and the ioremapped SRAM pointer
++ * (mt_soc_afe_control.c:2563-2584, AudDrv_Afe.h:375-377,
++ * AudDrv_Afe.c:118-129).  The same buffer address is what
++ * mtk_pcm_dl1_params() installs into runtime->dma_addr in the SRAM state
++ * (mt_soc_pcm_dl1.c:265-273).  The vendor HP impedance PCM instead rebinds
++ * its ALSA buffer, but the DC value it is given is written to the SRAM by
++ * Audio_HP_ImpeDance_Set() (mt_soc_pcm_hp_impedance.c:361-362, 377-378), so
++ * the SRAM is the buffer this port must play.
++ */
++
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++
++#include "mt6735-afe-common.h"
++
++/* AFE_INTERNAL_SRAM_PHY_BASE (AudDrv_Afe.h:375) inside the AFE mapping. */
++#define MT6735_AFE_HPIMP_SRAM_PHYS	(MT6735_AFE_PHYS_BASE + \
++					 MT6735_AFE_INTERNAL_SRAM_OFFSET)
++
++static int mt6735_afe_hpimp_startup(struct snd_pcm_substream *substream,
++				    struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	int ret;
++
++	/*
++	 * DL1 is shared with the normal MultiMedia1 playback.  Refuse to take
++	 * it over while another stream owns it.  afe->memif[].substream is set
++	 * by the generic DL1 DAI at startup, so a merely opened DL1 stream is
++	 * rejected as well as a running one.
++	 */
++	mutex_lock(&priv->hp_imp_lock);
++	if (priv->hp_imp_open || afe->memif[MT6735_AFE_MEMIF_DL1].substream) {
++		mutex_unlock(&priv->hp_imp_lock);
++		return -EBUSY;
++	}
++	priv->hp_imp_open = true;
++	mutex_unlock(&priv->hp_imp_lock);
++
++	ret = pm_runtime_get_sync(afe->dev);
++	if (ret < 0) {
++		pm_runtime_put_noidle(afe->dev);
++		mutex_lock(&priv->hp_imp_lock);
++		priv->hp_imp_open = false;
++		mutex_unlock(&priv->hp_imp_lock);
++		return ret;
++	}
++
++	/* mtk_pcm_hp_impedance_hardware, mt_soc_pcm_hp_impedance.c:100-116 */
++	snd_soc_set_runtime_hwparams(substream, afe->mtk_afe_hardware);
++
++	return 0;
++}
++
++static void mt6735_afe_hpimp_shutdown(struct snd_pcm_substream *substream,
++				      struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++
++	mutex_lock(&priv->hp_imp_lock);
++	priv->hp_imp_open = false;
++	mutex_unlock(&priv->hp_imp_lock);
++
++	/*
++	 * EnableAfe(false) returns the PMIC audio pins to GPIO mode once no
++	 * memory interface is running (AudDrv_Gpio.c:215-236).
++	 */
++	if (!mt6735_afe_playback_enabled(afe) &&
++	    !priv->memif_enabled[MT6735_AFE_MEMIF_VUL])
++		mt6735_afe_select_pmic_pins(afe, false);
++
++	pm_runtime_put(afe->dev);
++}
++
++static int mt6735_afe_hpimp_hw_params(struct snd_pcm_substream *substream,
++				      struct snd_pcm_hw_params *params,
++				      struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mtk_base_afe_memif *memif = &afe->memif[MT6735_AFE_MEMIF_DL1];
++	unsigned int rate = params_rate(params);
++	unsigned int channels = params_channels(params);
++	int fs;
++
++	if (substream->stream != SNDRV_PCM_STREAM_PLAYBACK)
++		return -EINVAL;
++
++	fs = mt6735_afe_rate_to_fs(rate);
++	if (fs < 0)
++		return -EINVAL;
++	if (channels < MT6735_AFE_CHANNELS_MIN ||
++	    channels > MT6735_AFE_CHANNELS_MAX)
++		return -EINVAL;
++
++	switch (params_format(params)) {
++	case SNDRV_PCM_FORMAT_S16_LE:
++	case SNDRV_PCM_FORMAT_S24_LE:
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	/*
++	 * SetDL1Buffer(), mt_soc_pcm_hp_impedance.c:137-160, with the buffer
++	 * address forced to the AFE internal SRAM instead of the ALSA ring
++	 * buffer (see the file header).  The vendor writes
++	 * base .. base + size - 1 to AFE_DL1_BASE/END.
++	 */
++	regmap_write(afe->regmap, AFE_DL1_BASE, MT6735_AFE_HPIMP_SRAM_PHYS);
++	regmap_write(afe->regmap, AFE_DL1_END,
++		     MT6735_AFE_HPIMP_SRAM_PHYS +
++		     MT6735_AFE_INTERNAL_SRAM_SIZE - 1);
++
++	memif->phys_buf_addr = MT6735_AFE_HPIMP_SRAM_PHYS;
++	memif->buffer_size = MT6735_AFE_INTERNAL_SRAM_SIZE;
++
++	return 0;
++}
++
++static int mt6735_afe_hpimp_prepare(struct snd_pcm_substream *substream,
++				    struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	const struct mtk_base_memif_data *data =
++		afe->memif[MT6735_AFE_MEMIF_DL1].data;
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	bool wlen24 = (runtime->format == SNDRV_PCM_FORMAT_S24_LE);
++	unsigned int wlen, mono;
++	int fs, ret;
++
++	if (substream->stream != SNDRV_PCM_STREAM_PLAYBACK)
++		return -EINVAL;
++
++	fs = mt6735_afe_rate_to_fs(runtime->rate);
++	if (fs < 0)
++		return fs;
++
++	/*
++	 * EnableAfe(true) also switches the PMIC audio bus pins to their audio
++	 * function (AudDrv_Gpio.c:215-236, AudDrv_GPIO_PMIC_Select()).
++	 */
++	mt6735_afe_select_pmic_pins(afe, true);
++
++	/*
++	 * SetMemIfFetchFormatPerSample(DL1, ...), mt_soc_pcm_hp_impedance.c:
++	 * 239-250: AFE_WLEN_32_BIT_ALIGN_8BIT_0_24BIT_DATA for a 32/24 bit
++	 * stream (the port supports S24_LE) and AFE_WLEN_16_BIT otherwise.
++	 */
++	wlen = wlen24 ? AFE_WLEN_24_BIT : AFE_WLEN_16_BIT;
++	regmap_update_bits(afe->regmap, data->hd_reg,
++			   AFE_MEMIF_PBUF_FMT_MASK << data->hd_shift,
++			   wlen << data->hd_shift);
++
++	/* SetoutputConnectionFormat() for O03/O04, :243-253 */
++	mt6735_afe_set_conn_width(afe, MT6735_AFE_MEMIF_DL1, wlen24);
++
++	/* SetI2SDacOut()/SetI2SDacEnable(), :257-263 and 2010-2026 */
++	if (!priv->dac_path_on) {
++		ret = mt6735_afe_dac_prepare(afe, runtime->rate, wlen24);
++		if (ret)
++			return ret;
++	}
++
++	/* SetSampleRate(DL1)/SetChannels(DL1), :270-271 */
++	regmap_update_bits(afe->regmap, data->fs_reg,
++			   data->fs_maskbit << data->fs_shift,
++			   fs << data->fs_shift);
++	mono = (runtime->channels == 1) ? 1 : 0;
++	regmap_update_bits(afe->regmap, data->mono_reg,
++			   BIT(data->mono_shift), mono << data->mono_shift);
++
++	/*
++	 * SetConnection(I05 -> O03) and SetConnection(I06 -> O04),
++	 * mt_soc_pcm_hp_impedance.c:265-268.
++	 */
++	return mt6735_afe_connect(afe, MT6735_AFE_MEMIF_DL1, true);
++}
++
++static int mt6735_afe_hpimp_trigger(struct snd_pcm_substream *substream,
++				    int cmd, struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	int ret;
++
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_START:
++	case SNDRV_PCM_TRIGGER_RESUME:
++	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++		/*
++		 * SetMemoryPathEnable(MEM_DL1, true) plus EnableAfe(true),
++		 * mt_soc_pcm_hp_impedance.c:272-274.  The vendor enables both
++		 * in prepare; the port keeps ALSA's prepare/trigger split.
++		 */
++		return mt6735_afe_memif_enable(afe, MT6735_AFE_MEMIF_DL1, true);
++	case SNDRV_PCM_TRIGGER_STOP:
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++		/* mtk_soc_pcm_hp_impedance_close(), :281-290 */
++		ret = mt6735_afe_memif_enable(afe, MT6735_AFE_MEMIF_DL1,
++					      false);
++		if (ret)
++			return ret;
++		mt6735_afe_connect(afe, MT6735_AFE_MEMIF_DL1, false);
++
++		if (!mt6735_afe_playback_enabled(afe) &&
++		    !priv->memif_enabled[MT6735_AFE_MEMIF_VUL])
++			mt6735_afe_dac_disable(afe);
++
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static const struct snd_soc_dai_ops mt6735_afe_hpimp_ops = {
++	.startup = mt6735_afe_hpimp_startup,
++	.shutdown = mt6735_afe_hpimp_shutdown,
++	.hw_params = mt6735_afe_hpimp_hw_params,
++	.prepare = mt6735_afe_hpimp_prepare,
++	.trigger = mt6735_afe_hpimp_trigger,
++};
++
++/*
++ * MT_SOC_HP_IMPEDANCE_NAME (AudDrv_Def.h:229) and
++ * MT_SOC_HP_IMPEDANCE_STREAM_NAME (AudDrv_Def.h:336).
++ */
++const struct snd_soc_dai_driver mt6735_afe_hp_imp_dai = {
++	.name = "mt-soc-hpimpedancedai-driver",
++	.id = MT6735_AFE_DAI_HPIMP,
++	.ops = &mt6735_afe_hpimp_ops,
++	.playback = {
++		.stream_name = "HP_IMPEDANCE_Playback",
++		.channels_min = MT6735_AFE_CHANNELS_MIN,
++		.channels_max = MT6735_AFE_CHANNELS_MAX,
++		.rates = MT6735_AFE_RATES,
++		.rate_min = MT6735_AFE_RATE_MIN,
++		.rate_max = MT6735_AFE_RATE_MAX,
++		.formats = MT6735_AFE_FORMATS,
++	},
++};
+diff --git a/sound/soc/mediatek/mt6735/mt6735-dai-pcm.c b/sound/soc/mediatek/mt6735/mt6735-dai-pcm.c
+index 72af375dd..2202f2e3b 100644
+--- a/sound/soc/mediatek/mt6735/mt6735-dai-pcm.c
++++ b/sound/soc/mediatek/mt6735/mt6735-dai-pcm.c
+@@ -29,7 +29,7 @@ static const unsigned int mt6735_afe_dlsrc2_rates[] = {
+ 	8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000,
+ };
+ 
+-static bool mt6735_afe_playback_enabled(struct mtk_base_afe *afe)
++bool mt6735_afe_playback_enabled(struct mtk_base_afe *afe)
+ {
+ 	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
+ 
+@@ -48,8 +48,8 @@ static bool mt6735_afe_capture_enabled(struct mtk_base_afe *afe)
+  * SetMemoryPathEnable(), mt_soc_afe_control.c:1968-2000: the memory
+  * interface enable bit is AFE_DAC_CON0 bit (interface + 1).
+  */
+-static int mt6735_afe_memif_enable(struct mtk_base_afe *afe, int id,
+-				   bool enable)
++int mt6735_afe_memif_enable(struct mtk_base_afe *afe, int id,
++			    bool enable)
+ {
+ 	const struct mtk_base_memif_data *data = afe->memif[id].data;
+ 	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
+@@ -68,7 +68,7 @@ static int mt6735_afe_memif_enable(struct mtk_base_afe *afe, int id,
+  * used by this driver are implemented; see the table entries cited in
+  * mt6735-afe-regs.h.
+  */
+-static int mt6735_afe_connect(struct mtk_base_afe *afe, int id, bool connect)
++int mt6735_afe_connect(struct mtk_base_afe *afe, int id, bool connect)
+ {
+ 	unsigned int reg, bits;
+ 
+@@ -101,8 +101,7 @@ static int mt6735_afe_connect(struct mtk_base_afe *afe, int id, bool connect)
+ }
+ 
+ /* SetoutputConnectionFormat(), mt_soc_afe_control.c:2371-2377 */
+-static void mt6735_afe_set_conn_width(struct mtk_base_afe *afe, int id,
+-				      bool wlen24)
++void mt6735_afe_set_conn_width(struct mtk_base_afe *afe, int id, bool wlen24)
+ {
+ 	unsigned int bits;
+ 
+@@ -127,8 +126,8 @@ static void mt6735_afe_set_conn_width(struct mtk_base_afe *afe, int id,
+  * SetI2SDacEnable() from mt_soc_afe_control.c:1592-1655 and 2010-2034.
+  * AFE_I2S_CON1 is the I2S-style bus between the AFE and the PMIC codec.
+  */
+-static int mt6735_afe_dac_prepare(struct mtk_base_afe *afe, unsigned int rate,
+-				  bool wlen32)
++int mt6735_afe_dac_prepare(struct mtk_base_afe *afe, unsigned int rate,
++			   bool wlen32)
+ {
+ 	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
+ 	unsigned int val;
+@@ -187,7 +186,7 @@ static int mt6735_afe_dac_prepare(struct mtk_base_afe *afe, unsigned int rate,
+ }
+ 
+ /* SetI2SDacEnable(false), mt_soc_afe_control.c:2010-2034 */
+-static void mt6735_afe_dac_disable(struct mtk_base_afe *afe)
++void mt6735_afe_dac_disable(struct mtk_base_afe *afe)
+ {
+ 	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
+ 
+@@ -276,6 +275,7 @@ static int mt6735_afe_fe_startup(struct snd_pcm_substream *substream,
+ 				 struct snd_soc_dai *dai)
+ {
+ 	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
+ 	struct snd_pcm_runtime *runtime = substream->runtime;
+ 	int id = dai->id;
+ 	int ret;
+@@ -286,7 +286,22 @@ static int mt6735_afe_fe_startup(struct snd_pcm_substream *substream,
+ 		return ret;
+ 	}
+ 
++	/*
++	 * The HP impedance FE stream rebases the DL1 memory interface onto the
++	 * AFE internal SRAM.  Refuse a second DL1 user while it is held; the
++	 * HP impedance DAI likewise refuses to start while DL1 is playing.
++	 * Both reservations happen under hp_imp_lock, so the two DAIs cannot
++	 * slip past each other's check.
++	 */
++	mutex_lock(&priv->hp_imp_lock);
++	if (id == MT6735_AFE_DAI_DL1 && priv->hp_imp_open) {
++		mutex_unlock(&priv->hp_imp_lock);
++		pm_runtime_put(afe->dev);
++		return -EBUSY;
++	}
+ 	afe->memif[id].substream = substream;
++	mutex_unlock(&priv->hp_imp_lock);
++
+ 	snd_soc_set_runtime_hwparams(substream, afe->mtk_afe_hardware);
+ 
+ 	/*
+@@ -319,7 +334,9 @@ static int mt6735_afe_fe_startup(struct snd_pcm_substream *substream,
+ 	return 0;
+ 
+ err_put:
++	mutex_lock(&priv->hp_imp_lock);
+ 	afe->memif[id].substream = NULL;
++	mutex_unlock(&priv->hp_imp_lock);
+ 	pm_runtime_put_noidle(afe->dev);
+ 	return ret;
+ }
+@@ -328,8 +345,11 @@ static void mt6735_afe_fe_shutdown(struct snd_pcm_substream *substream,
+ 				   struct snd_soc_dai *dai)
+ {
+ 	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
+ 
++	mutex_lock(&priv->hp_imp_lock);
+ 	afe->memif[dai->id].substream = NULL;
++	mutex_unlock(&priv->hp_imp_lock);
+ 
+ 	/*
+ 	 * EnableAfe(false) returns the PMIC audio pins to GPIO mode once no
+diff --git a/sound/soc/mediatek/mt6735/mt6735-mt6331.c b/sound/soc/mediatek/mt6735/mt6735-mt6331.c
+index 7475c2b58..510f88909 100644
+--- a/sound/soc/mediatek/mt6735/mt6735-mt6331.c
++++ b/sound/soc/mediatek/mt6735/mt6735-mt6331.c
+@@ -98,6 +98,17 @@ SND_SOC_DAILINK_DEFS(i2s0,
+ 	DAILINK_COMP_ARRAY(COMP_CODEC("snd-soc-dummy", "snd-soc-dummy-dai")),
+ 	DAILINK_COMP_ARRAY(COMP_EMPTY()));
+ 
++/*
++ * HP impedance link, mt_soc_machine.c:1057-1066: CPU DAI
++ * MT_SOC_HP_IMPEDANCE_NAME, stream MT_SOC_HP_IMPEDANCE_STREAM_NAME, codec
++ * DAI MT_SOC_CODEC_HP_IMPEDANCE_NAME (AudDrv_Def.h:229, 287, 336).
++ */
++SND_SOC_DAILINK_DEFS(hp_impedance,
++	DAILINK_COMP_ARRAY(COMP_CPU("mt-soc-hpimpedancedai-driver")),
++	DAILINK_COMP_ARRAY(COMP_CODEC("mt-soc-codec",
++				      "mt-soc-codec-hp-impedance-dai")),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
+ static struct snd_soc_jack_pin mt6735_mt6331_jack_pins[] = {
+ 	{
+ 		.pin = "Headphone",
+@@ -151,6 +162,12 @@ static struct snd_soc_dai_link mt6735_mt6331_dai_links[] = {
+ 			   SND_SOC_DAIFMT_CBC_CFC,
+ 		SND_SOC_DAILINK_REG(i2s0),
+ 	},
++	{
++		.name = "HP_IMPEDANCE",
++		.stream_name = "HP_IMPEDANCE_Playback",
++		.playback_only = 1,
++		SND_SOC_DAILINK_REG(hp_impedance),
++	},
+ };
+ 
+ /*

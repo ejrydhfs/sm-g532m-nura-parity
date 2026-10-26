@@ -1,0 +1,2367 @@
+diff --git a/drivers/media/platform/mediatek/seninf/mtk-seninf-regs.h b/drivers/media/platform/mediatek/seninf/mtk-seninf-regs.h
+index 6b2661da4..f57acad58 100644
+--- a/drivers/media/platform/mediatek/seninf/mtk-seninf-regs.h
++++ b/drivers/media/platform/mediatek/seninf/mtk-seninf-regs.h
+@@ -16,6 +16,16 @@
+  * 0x15008000 (SENINF_BASE_ADDR, same lines, and the kd_camera_hw1 node in
+  * arch/arm/boot/dts/mt6735.dtsi:1307-1320).  The offsets in this file are
+  * expressed relative to the SENINF base, i.e. downstream offset - 0x4000.
++ *
++ * The CSI-2 receiver and MIPI D-PHY programming is not present in the
++ * downstream GPL source at all: it lives in the proprietary userspace
++ * "seninf_drv" (camera_isp_D1.c:125-133).  The layout of that part of this
++ * file therefore comes from the Thumb-2 implementation in the vendor
++ * library libcam.halsensor.so (class SeninfDrvImp), and every definition
++ * cites the instruction address (file offset of the ELF image) that
++ * programs it.  Instruction addresses are relative to the start of the
++ * library; the disassembly is generated with
++ *   llvm-objdump -d --triple=thumbv7-none-eabi libcam.halsensor.so
+  */
+ 
+ #ifndef __MTK_SENINF_REGS_H__
+@@ -35,6 +45,10 @@
+  * 0x400 apart: SENINFn_IRQ_INTSTA is ISP_ADDR + 0x4128/0x4528/0x4928/0x4D28
+  * (camera_isp_D1.c:257-260) and the MCLK control registers are
+  * ISP_ADDR + 0x4200/0x4600/0x4A00 (camera_isp_D1.c:12060/12093/12123).
++ * The vendor library confirms the same stride for the CSI-2 registers:
++ * setSeninf1NCSI2 touches 0x100/0x120/0x338..0x3d8 (@0x16240..0x166dc),
++ * setSeninf2NCSI2 the same set + 0x400 (@0x16712..0x169fc) and
++ * setSeninf3NCSI2 + 0x800 (@0x16c..0x16ee0).
+  */
+ #define MTK_SENINF_CAM_STRIDE		0x400
+ 
+@@ -70,4 +84,228 @@
+ /* Bit 29 (0x20000000) of the ISP_MCLKn_EN registers, camera_isp_D1.c:12063-12069 */
+ #define MTK_SENINF_MCLK_EN		BIT(29)
+ 
++/*
++ * SENINFn_CTRL (n = 0..3), programmed by SeninfDrvImp::setSeninf1Ctrl
++ * @0x1508a and its siblings @0x150b8/0x150e6/0x15114:
++ *
++ *   0x15090  ldr.w r0, [r3, #0x100]     read
++ *   0x15094  orr   r0, r0, #0x1         bit 0
++ *   0x150a0  bfi   r0, r1, #28, #3      bits 30:28 = PAD2CAM_DATA_ENUM
++ *   0x150ae  bfi   r1, r2, #12, #4      bits 15:12 = SENINF_SOURCE_ENUM
++ *
++ * Bit 0 is also raised unconditionally for SENINF1..3 by init()
++ * (@0x182e8..0x1833e), i.e. before any source is selected.
++ */
++#define MTK_SENINF_CAM_CTRL(n)		(0x100 + (n) * MTK_SENINF_CAM_STRIDE)
++#define MTK_SENINF_CTRL_EN		BIT(0)
++#define MTK_SENINF_CTRL_SRC		GENMASK(15, 12)	/* SENINF_SOURCE_ENUM */
++#define MTK_SENINF_CTRL_PAD2CAM		GENMASK(30, 28)	/* PAD2CAM_DATA_ENUM */
++#define MTK_SENINF_CTRL_CSI2_MODE	BIT(15)	/* set for MIPI_OPHY_NCSI2 */
++
++/*
++ * SENINFn_MUX_CTRL (n = 0..3), programmed by SeninfDrvImp::setSeninf1MuxCtrl
++ * @0x14d5e and its siblings @0x14e2a/0x14ef6/0x14fc2:
++ *
++ *   0x14d64  ldr.w r5, [r0, #0x120]
++ *   0x14d68  orr   r6, r5, #0x80000000   bit 31 = mux enable
++ *   0x14d74  bfi   r5, r3, #12, #4       bits 15:12 = SENINF_SOURCE_ENUM
++ *   0x14d7e  bit 8 = (arg6 == 1)         (line/lane related)
++ *   0x14d9e  bfi   r5, 1, #28, #2        bits 29:28 = (TG_FORMAT_ENUM == 7 ? 0 : 1)
++ *   0x14de6  bfi   r3, 0x1b, #22, #6     bits 27:22 = source dependent
++ *   0x14e06  bfi   r5, 0x1f, #16, #6     bits 21:16 = source dependent
++ *   0x14e12  bfi   r5, r1, #10, #1       bit 10 = arg1
++ *   0x14e1e  bfi   r1, r2, #9, #1        bit 9  = arg2
++ *
++ * The source dependent values (0x18/0x1e, 0x1b/0x1f, 0x3b/0x3f) and the
++ * SENINF_SOURCE_ENUM/PAD2CAM_DATA_ENUM numbers themselves are supplied by
++ * the vendor camera HAL from its per-sensor configuration; they are not
++ * recoverable from the binaries (see the report).  Only bit 31 is applied
++ * by this driver, from init() below.
++ */
++#define MTK_SENINF_CAM_MUX_CTRL(n)	(0x120 + (n) * MTK_SENINF_CAM_STRIDE)
++#define MTK_SENINF_MUX_EN		BIT(31)
++
++/*
++ * SENINF_TOP_MUX_CTRL (relative to the SENINF base), programmed by
++ * SeninfDrvImp::setSeninfTopMuxCtrl @0x14d12: one 4-bit source field per
++ * "top mux" input, in nibble order {1, 0, 2, 3} for input 0..3
++ * (@0x14d2e/0x14d24/0x14d3c/0x14d4c, write at @0x14d56).
++ */
++#define MTK_SENINF_TOP_MUX_CTRL		0x8
++
++/*
++ * CSI-2 receiver, SENINF1 instances.  All offsets + n * MTK_SENINF_CAM_STRIDE
++ * for SENINF2 (pad 1) and SENINF3 (pad 2).
++ *
++ * The whole block below is programmed by SeninfDrvImp::setSeninf1NCSI2
++ * @0x16240 (SENINF2 @0x166f8, SENINF3 @0x16b34).  The vendor function takes
++ * ten arguments; the format string of its own trace message (@0x2863c)
++ * names them:
++ *   "[%s]TermDelay:%d SettleDelay:%d ClkTermDelay:%d Vsync:%d lane_num:%d
++ *    NCSI2_en:%d HeaderOrder:%d SettleDelay(cnt):%d ISP_clk:%d dpcm:%d"
++ * plus a second message (@0x285eb) for the calibration phase:
++ *   "[%s]CSI-0 calibration start,MIPIType=%d,HSRXDE=%d"
++ * The values come from the sensor static information block, whose layout is
++ * ACDK_SENSOR_INFO_STRUCT in
++ * drivers/misc/mediatek/imgsensor/inc/kd_imgsensor_define.h:427-460.
++ */
++
++/*
++ * CSI-2 protocol control (NCSI2 path, MIPI_OPHY_NCSI2 = 0):
++ *   0x165a8  ldr   r2, [r4, #0x3a0]
++ *   0x165ae  bic   r1, r2, #0x80          clear bit 7
++ *   0x165b4  str   r1, [r4, #0x3a0]
++ *   0x165c4  orr   r6, r0, #0x4000000     bit 26
++ *   0x165ca  orr   r1, r6, #0x10          bit 4
++ *   0x165d0  orr.w r5, r1, r2, lsl #16    bits 31:16 = HeaderOrder
++ *   0x165d6  orrs  r7, r5                  bits lane_num+1:0 = lane mask
++ *   0x165d8  str.w r7, [r4, #0x3a0]
++ */
++#define MTK_SENINF_CSI2_CTRL(n)		(0x3a0 + (n) * MTK_SENINF_CAM_STRIDE)
++#define MTK_SENINF_CSI2_CTRL_CLR	BIT(7)
++#define MTK_SENINF_CSI2_CTRL_EN		BIT(26)
++#define MTK_SENINF_CSI2_CTRL_HS		BIT(4)
++#define MTK_SENINF_CSI2_CTRL_ECC_ORDER	GENMASK(31, 16)	/* HeaderOrder << 16 */
++#define MTK_SENINF_CSI2_CTRL_LANES	GENMASK(3, 0)	/* (1 << (lane_num + 1)) - 1 */
++
++/* Settle time, in SENINF clock cycles << 8: @0x165b8 / @0x169c2 / @0x16df2 */
++#define MTK_SENINF_CSI2_SETTLE(n)	(0x3a8 + (n) * MTK_SENINF_CAM_STRIDE)
++
++/* Constant written by the vendor: @0x165dc / @0x169e8 / @0x16e18 */
++#define MTK_SENINF_CSI2_CTRL2(n)	(0x3b0 + (n) * MTK_SENINF_CAM_STRIDE)
++#define MTK_SENINF_CSI2_CTRL2_MAGIC	0x80007fff
++
++/*
++ * DPCM dependent value: 0x16506..0x1651e indexes an 8 entry u16 table for
++ * dpcm values 42..49 and writes the result (0 otherwise) to 0x3ac.  Both
++ * sensors of this board leave DPCM_INFO at its zero-initialised value
++ * (imx219mipiraw_Sensor.c / s5k5e3yxmipiraw_Sensor.c never assign
++ * sensor_info->DPCM_INFO), so the value written is 0.
++ */
++#define MTK_SENINF_CSI2_DPCM(n)		(0x3ac + (n) * MTK_SENINF_CAM_STRIDE)
++
++/*
++ * "CSI-0 calibration" handshake (the vendor's own name, @0x285eb/0x2861c):
++ * SENINF1 (@0x163ca..0x164bc) and SENINF3 (@0x16c60..0x16d52):
++ *   bits 4,0,1,2,3 of 0x3d8 set          (lane/deskew control)
++ *   0x338 |= 0x1                         (start, @0x1640a / @0x16ca0)
++ *   0x33c = 0x1541                       (sequence, @0x16412 / @0x16caa)
++ *   0x338 |= 0x4                         (mode, @0x16422 / @0x16cb8)
++ *   usleep(500)                          (@0x1643e / @0x16cd2)
++ *   completion: 0x344 & 0x10001, 0x348 & 0x101  (@0x16442..0x1645a)
++ *   0x338 &= ~0x1, 0x3d8 &= ~0x1f        (@0x1646a..0x164bc)
++ * SENINF2 (@0x16854..0x16920) only sets 0x738 |= 0x4 (@0x16894): the vendor
++ * driver runs no start/sequence/status handshake on that instance.
++ * The completion test is not fatal in the vendor driver: it only logs
++ * "CSI-0 calibration failed!, NCSI2Config Reg 0x44=..., 0x48=..." (@0x286c1,
++ * emitted from @0x16f14).
++ */
++#define MTK_SENINF_CSI2_CAL_CTRL(n)	(0x338 + (n) * MTK_SENINF_CAM_STRIDE)
++#define MTK_SENINF_CSI2_CAL_START	BIT(0)
++#define MTK_SENINF_CSI2_CAL_MODE	BIT(2)
++#define MTK_SENINF_CSI2_CAL_SEQ(n)	(0x33c + (n) * MTK_SENINF_CAM_STRIDE)
++#define MTK_SENINF_CSI2_CAL_SEQ_VAL	0x1541
++#define MTK_SENINF_CSI2_CAL_STA0(n)	(0x344 + (n) * MTK_SENINF_CAM_STRIDE)
++#define MTK_SENINF_CSI2_CAL_STA0_MASK	0x10001
++#define MTK_SENINF_CSI2_CAL_STA1(n)	(0x348 + (n) * MTK_SENINF_CAM_STRIDE)
++#define MTK_SENINF_CSI2_CAL_STA1_MASK	0x101
++#define MTK_SENINF_CSI2_LANE_CTRL(n)	(0x3d8 + (n) * MTK_SENINF_CAM_STRIDE)
++#define MTK_SENINF_CSI2_LANE_MASK	GENMASK(4, 0)
++
++/*
++ * Alternate CSI-2 group used when MIPIType == MIPI_OPHY_CSI2 (1)
++ * (@0x16534..0x1655a): 0x360 = (0x360 | 0x30) | lane mask,
++ * 0x364 = settle_count << 16, 0x368 |= 0xf.  Neither sensor of this board
++ * selects it (both set MIPIsensorType = MIPI_OPHY_NCSI2) and no DT/kernel
++ * input selects the PHY type, so the driver does not program it.
++ */
++#define MTK_SENINF_CSI2_CSI2_CFG(n)	(0x360 + (n) * MTK_SENINF_CAM_STRIDE)
++#define MTK_SENINF_CSI2_CSI2_SETTLE(n)	(0x364 + (n) * MTK_SENINF_CAM_STRIDE)
++#define MTK_SENINF_CSI2_CSI2_LANES(n)	(0x368 + (n) * MTK_SENINF_CAM_STRIDE)
++
++/*
++ * MIPI D-PHY / MIPI RX digital block.
++ *
++ * The vendor library maps 0x10215000 for 0x3000 bytes (mmap call @0x1824a,
++ * literal pool @0x18408) and uses that window + 0x800 for SENINF1, + 0xc00
++ * for SENINF2 and + 0x1000 for SENINF3 (init @0x1827c..0x18356 stores the
++ * three pointers to this[0x2c], this[0x30], this[0x34]).  The same window
++ * and range are what camera_isp_D1.c:131 declares as MIPIRX_ANALOG_ADDR, and
++ * the ROM device tree lists it as the fourth register of the ispsys node
++ * (zip/rom_dtb_0.dts:3703).
++ *
++ * Per lane registers, lane 0 = clock lane, lanes 1..4 = data lanes: the
++ * deskew code writes the clock lane at +0x0 (bit 20, @0x1728c) and the four
++ * data lanes at +0x4..+0x10 (bit 24, @0x17298..0x172c2).
++ */
++#define MTK_SENINF_MIPI_RX_OFF(n)	(0x800 + (n) * MTK_SENINF_CAM_STRIDE)
++#define MTK_SENINF_MIPI_LANES		5
++#define MTK_SENINF_MIPI_LANE_REG(i)	((i) * 4)
++
++/*
++ * Lane enable sequence, SeninfDrvImp::setSeninf1NCSI2 @0x16288..0x1633a
++ * (same sequence in setSeninf2NCSI2 @0x16712..0x167c2 and setSeninf3NCSI2):
++ *   +0x4c/+0x50 &= 0xfefbefbe  (@0x16294/0x1629e, clears bits 24,18,12,7,0)
++ *   lane regs |= 0x8           (@0x162aa..0x162da)
++ *   +0x24 |= 0x1, usleep(30)   (@0x162e8/0x162ea)
++ *   +0x20 |= 0x3, usleep(1)    (@0x162f8/0x162fc)
++ *   lane regs |= 0x1           (@0x1630a..0x1633a)
++ * Disable (@0x165f6..0x166b4):
++ *   +0x24 &= ~0x1, +0x20 &= ~0x1, lane regs &= ~0x1,
++ *   +0x4c/+0x50 |= 0x01041041  (@0x1666e/0x16678, sets bits 24,22,12,6,0),
++ *   lane regs &= ~0x8
++ */
++#define MTK_SENINF_MIPI_LANE_PWR	BIT(3)
++#define MTK_SENINF_MIPI_LANE_EN		BIT(0)
++#define MTK_SENINF_MIPI_CFG_CLR		0xfefbefbe	/* bits 24,18,12,7,0 */
++#define MTK_SENINF_MIPI_CFG_SET		0x01041041	/* bits 24,22,12,6,0 */
++#define MTK_SENINF_MIPI_SHARED0		0x4c
++#define MTK_SENINF_MIPI_SHARED1		0x50
++#define MTK_SENINF_MIPI_CTL0		0x20
++#define MTK_SENINF_MIPI_CTL1		0x24
++#define MTK_SENINF_MIPI_CTL0_BITS	GENMASK(1, 0)
++
++/*
++ * Per-lane HS deskew, recovered from
++ * SeninfDrvImp::autoDeskewCalibrationSeninf1 @0x16f34:
++ *   bit 24 of a data lane register enables the deskew measurement and bits
++ *   28:25 hold its delay (@0x16fe0..0x16ff2 for lane 1, @0x17052.. for lane
++ *   2, @0x170c4.. lane 3, @0x17136.. lane 4), the clock lane uses bit 20 and
++ *   bits 24:21 (@0x1728c..0x172ea);
++ *   SENINF + 0x3b0 = 0x80007fff control (@0x16f92),
++ *   SENINF + 0x3b4 = status/result, polled with 0xfb8 (@0x16f96/0x16fe6),
++ *   SENINF + 0x3b8 = 0x12 (@0x16f8e), SENINF + 0x3bc = free running counter
++ *   used as the measurement handshake (@0x16ffe).
++ * The routine is not called from anywhere in the shipped camera stack (no
++ * call site of vtable slot 52 exists in libcam.halsensor.so and no other
++ * library imports it), so this driver does not run it; the definitions are
++ * kept for documentation and debugfs.
++ */
++#define MTK_SENINF_CSI2_DESKEW_CTL(n)	(0x3b0 + (n) * MTK_SENINF_CAM_STRIDE)
++#define MTK_SENINF_CSI2_DESKEW_STA(n)	(0x3b4 + (n) * MTK_SENINF_CAM_STRIDE)
++#define MTK_SENINF_CSI2_DESKEW_STA_MASK	0xfb8
++#define MTK_SENINF_CSI2_DESKEW_CFG(n)	(0x3b8 + (n) * MTK_SENINF_CAM_STRIDE)
++#define MTK_SENINF_CSI2_DESKEW_CFG_VAL	0x12
++#define MTK_SENINF_CSI2_DESKEW_CNT(n)	(0x3bc + (n) * MTK_SENINF_CAM_STRIDE)
++#define MTK_SENINF_MIPI_LANE_DESKEW_DATA	BIT(24)
++#define MTK_SENINF_MIPI_LANE_DESKEW_DLY		GENMASK(28, 25)
++#define MTK_SENINF_MIPI_LANE_DESKEW_CLK		BIT(20)
++#define MTK_SENINF_MIPI_LANE_DESKEW_CLK_DLY	GENMASK(24, 21)
++
++/*
++ * Settle time conversion, SeninfDrvImp::setSeninf1NCSI2:
++ *   0x164c8  cmp   r7, #0
++ *   0x164cc  moveq r7, #0x55        default 85 ns when the caller passes 0
++ *   0x1647e  mov.w r5, #0x12c       SENINF clock, 300 MHz
++ *   0x164ce  mov.w r1, #0x3e8       divisor
++ *   0x164d2  mul   r2, r5, r7
++ *   0x164da  udiv  r5, r2, r1       settle_count = settle_ns * 300 / 1000
++ * The value handed to setSeninf1NCSI2 for both sensors of this board is
++ * 85 ns: .mipi_data_lp2hs_settle_dc = 85 in
++ * imx219_mipi_raw/imx219mipiraw_Sensor.c:78 and
++ * s5k5e3yx_mipi_raw/s5k5e3yxmipiraw_Sensor.c:69.
++ */
++#define MTK_SENINF_SETTLE_CLK_MHZ	300
++#define MTK_SENINF_SETTLE_DEFAULT_NS	85
++
+ #endif /* __MTK_SENINF_REGS_H__ */
+diff --git a/drivers/media/platform/mediatek/seninf/mtk-seninf.c b/drivers/media/platform/mediatek/seninf/mtk-seninf.c
+index 1ea4d819b..44fdef21b 100644
+--- a/drivers/media/platform/mediatek/seninf/mtk-seninf.c
++++ b/drivers/media/platform/mediatek/seninf/mtk-seninf.c
+@@ -12,18 +12,21 @@
+  * Copyright (C) 2016 Samsung Electronics Co., Ltd.
+  *
+  * The SENINF block is the CSI-2 receiver of the MT6735 camera subsystem.  It
+- * owns the per-camera MCLK output gates and the per-camera error status
+- * registers, and it is the MIPI CSI-2 receiver the sensor subdevices connect
+- * to.  The table that programs the MIPI D-PHY and the SENINF lane/timing
+- * registers lives only in the proprietary userspace "seninf_drv" library
+- * (referenced at camera_isp_D1.c:125-133) and has no equivalent in the
+- * downstream GPL source; that programming is therefore deferred, see
+- * Documentation in the report.
++ * owns the per-camera MCLK output gates, the per-camera error status
++ * registers and the CSI-2 receiver including its MIPI D-PHY lane and settle
++ * time programming.  The downstream GPL source only describes the MCLK and
++ * error status registers; the CSI-2/D-PHY programming exists solely in the
++ * proprietary userspace "seninf_drv" (referenced at camera_isp_D1.c:125-133),
++ * which is shipped as libcam.halsensor.so on this device.  That library was
++ * disassembled and the recovered programming is implemented here; every
++ * register value cites the instruction address it was taken from, see
++ * mtk-seninf-regs.h and the report.
+  */
+ 
+ #include <linux/clk.h>
+ #include <linux/clk-provider.h>
+ #include <linux/debugfs.h>
++#include <linux/delay.h>
+ #include <linux/minmax.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+@@ -109,6 +112,7 @@ struct mtk_seninf_asc {
+  * @notifier: async notifier for the sensor subdevices
+  * @lock: serialises s_stream
+  * @streaming: streaming state
++ * @streaming_pads: sink pads currently enabled in the CSI-2 receiver
+  * @debugfs: debugfs directory
+  */
+ struct mtk_seninf {
+@@ -130,6 +134,7 @@ struct mtk_seninf {
+ 
+ 	struct mutex lock;
+ 	bool streaming;
++	u32 streaming_pads;
+ 
+ 	struct dentry *debugfs;
+ };
+@@ -317,15 +322,41 @@ static void mtk_seninf_mclk_restore(struct mtk_seninf *priv)
+ 	}
+ }
+ 
++/*
++ * Register defaults applied by SeninfDrvImp::init() @0x182e8..0x1833e, i.e.
++ * before any source is selected:
++ *   SENINF1..4 MUX_CTRL |= bit 31   (@0x182f2/0x182fe/0x1830a/0x18316)
++ *   SENINF1..3 CTRL |= bit 0        (@0x18322/0x1832e/0x1833e)
++ * This is the only part of the SENINF mux configuration that does not depend
++ * on the vendor HAL's per-sensor source selection, which is not available to
++ * the kernel (see the report).
++ */
++static void mtk_seninf_hw_init(struct mtk_seninf *priv)
++{
++	unsigned int i;
++
++	for (i = 0; i < MTK_SENINF_NUM_CAMS - 1; i++)
++		writel(readl(priv->base + MTK_SENINF_CAM_CTRL(i)) |
++		       MTK_SENINF_CTRL_EN,
++		       priv->base + MTK_SENINF_CAM_CTRL(i));
++
++	for (i = 0; i < MTK_SENINF_NUM_CAMS; i++)
++		writel(readl(priv->base + MTK_SENINF_CAM_MUX_CTRL(i)) |
++		       MTK_SENINF_MUX_EN,
++		       priv->base + MTK_SENINF_CAM_MUX_CTRL(i));
++}
++
+ static int mtk_seninf_runtime_resume(struct device *dev)
+ {
+ 	struct mtk_seninf *priv = dev_get_drvdata(dev);
+ 
+ 	/*
+ 	 * The ISP power domain has just been switched on again, so the SENINF
+-	 * registers lost their contents: re-apply the MCLK gates of every output
+-	 * a consumer still holds and poll the error status.
++	 * registers lost their contents: re-apply the init defaults, the MCLK
++	 * gates of every output a consumer still holds and poll the error
++	 * status.
+ 	 */
++	mtk_seninf_hw_init(priv);
+ 	mtk_seninf_mclk_restore(priv);
+ 	mtk_seninf_check_errors(priv, "runtime resume");
+ 
+@@ -347,23 +378,31 @@ static const struct dev_pm_ops mtk_seninf_pm_ops = {
+ };
+ 
+ /*
+- * Link validation
++ * Link configuration
+  *
+  * The remote sensor describes the CSI-2 link through its mbus configuration
+- * (link frequency and number of data lanes).  Those are the parameters the
+- * deferred D-PHY/SENINF programming would consume, so they are queried and
+- * logged here and a configuration the receiver cannot support is rejected.
++ * (link frequency and number of data lanes).  The lane count is the value the
++ * CSI-2 receiver needs; the link frequency is validated and logged.
+  */
+-static int mtk_seninf_check_link(struct mtk_seninf *priv, unsigned int pad)
++struct mtk_seninf_link {
++	unsigned int lanes;
++	s64 link_freq;
++};
++
++static int mtk_seninf_get_link(struct mtk_seninf *priv, unsigned int pad,
++			       struct mtk_seninf_link *link)
+ {
+ 	struct media_pad *remote;
+ 	struct v4l2_subdev *remote_sd;
+ 	s64 link_freq;
+ 	int lanes;
+ 
++	link->lanes = 0;
++	link->link_freq = 0;
++
+ 	remote = media_pad_remote_pad_first(&priv->pads[pad]);
+ 	if (!remote)
+-		return 0;
++		return -ENODEV;
+ 
+ 	remote_sd = media_entity_to_v4l2_subdev(remote->entity);
+ 
+@@ -377,6 +416,7 @@ static int mtk_seninf_check_link(struct mtk_seninf *priv, unsigned int pad)
+ 		dev_warn(priv->dev, "pad%u: %s does not report a link frequency\n",
+ 			 pad, remote_sd->name);
+ 	} else {
++		link->link_freq = link_freq;
+ 		dev_info(priv->dev, "pad%u: %s link frequency %lld Hz\n",
+ 			 pad, remote_sd->name, link_freq);
+ 	}
+@@ -391,9 +431,247 @@ static int mtk_seninf_check_link(struct mtk_seninf *priv, unsigned int pad)
+ 	dev_info(priv->dev, "pad%u: %s %d data lane(s)\n",
+ 		 pad, remote_sd->name, lanes);
+ 
++	link->lanes = lanes;
++
+ 	return 0;
+ }
+ 
++/*
++ * CSI-2 receiver and MIPI D-PHY programming
++ *
++ * Recovered from the proprietary userspace SENINF driver that the vendor
++ * camera HAL uses on this SoC: libcam.halsensor.so, class SeninfDrvImp,
++ * methods init() @0x18078, setSeninf1NCSI2 @0x16240, setSeninf2NCSI2
++ * @0x166f8, setSeninf3NCSI2 @0x16b34.  The code is Thumb-2
++ * (readelf -A: Tag_THUMB_ISA_use: Thumb-2).
++ *
++ * The vendor function takes the D-PHY parameters from the sensor static
++ * information block (ACDK_SENSOR_INFO_STRUCT, kd_imgsensor_define.h:427-460).
++ * Both sensors of this board report MIPI_OPHY_NCSI2, 85 ns data lane settle
++ * time, ECC order 1 and no DPCM, so the NCSI2 register group below is the one
++ * that applies; see mtk-seninf-regs.h for the full per-register evidence.
++ */
++
++/*
++ * Static sensor information that has no V4L2/DT representation on this
++ * platform.  Both sensors wired to this receiver report the same values:
++ *   .mipi_sensor_type = MIPI_OPHY_NCSI2  (imx219mipiraw_Sensor.c:156,
++ *                                         s5k5e3yxmipiraw_Sensor.c:146)
++ *   sensor_info->SensorPacketECCOrder = 1 (imx219mipiraw_Sensor.c:1476,
++ *                                          s5k5e3yxmipiraw_Sensor.c:1433)
++ *   sensor_info->MIPIDataLowPwr2HighSpeedTermDelayCount = 0
++ *                                        (imx219mipiraw_Sensor.c:1472)
++ *   .mipi_data_lp2hs_settle_dc = 85 ns   (imx219mipiraw_Sensor.c:78,
++ *                                         s5k5e3yxmipiraw_Sensor.c:69)
++ */
++#define MTK_SENINF_ECC_ORDER		1
++
++static u32 mtk_seninf_settle_count(unsigned int settle_ns)
++{
++	/* 0x164d2/0x164da: settle_count = settle_ns * 300 / 1000 */
++	return settle_ns * MTK_SENINF_SETTLE_CLK_MHZ / 1000;
++}
++
++/*
++ * MIPI D-PHY / MIPI RX digital bring-up, SeninfDrvImp::setSeninf1NCSI2
++ * @0x16288..0x1633a.  The register window is the MIPI RX analog block plus
++ * 0x800 per SENINF instance (init @0x1827c..0x18356).
++ */
++static void mtk_seninf_mipi_rx_enable(struct mtk_seninf *priv, unsigned int pad)
++{
++	void __iomem *rx = priv->mipi_ana + MTK_SENINF_MIPI_RX_OFF(pad);
++	unsigned int i;
++
++	/* @0x16294/0x1629e: clear the configuration bit fields */
++	writel(readl(rx + MTK_SENINF_MIPI_SHARED0) & MTK_SENINF_MIPI_CFG_CLR,
++	       rx + MTK_SENINF_MIPI_SHARED0);
++	writel(readl(rx + MTK_SENINF_MIPI_SHARED1) & MTK_SENINF_MIPI_CFG_CLR,
++	       rx + MTK_SENINF_MIPI_SHARED1);
++
++	/* @0x162aa..0x162da: pre-charge all five lane registers */
++	for (i = 0; i < MTK_SENINF_MIPI_LANES; i++)
++		writel(readl(rx + MTK_SENINF_MIPI_LANE_REG(i)) |
++		       MTK_SENINF_MIPI_LANE_PWR,
++		       rx + MTK_SENINF_MIPI_LANE_REG(i));
++
++	/* @0x162e8, then usleep(30) @0x162ea */
++	writel(readl(rx + MTK_SENINF_MIPI_CTL1) | BIT(0),
++	       rx + MTK_SENINF_MIPI_CTL1);
++	usleep_range(30, 50);
++
++	/* @0x162f8, then usleep(en) @0x162fc */
++	writel(readl(rx + MTK_SENINF_MIPI_CTL0) | MTK_SENINF_MIPI_CTL0_BITS,
++	       rx + MTK_SENINF_MIPI_CTL0);
++	usleep_range(1, 10);
++
++	/* @0x1630a..0x1633a: enable all five lane registers */
++	for (i = 0; i < MTK_SENINF_MIPI_LANES; i++)
++		writel(readl(rx + MTK_SENINF_MIPI_LANE_REG(i)) |
++		       MTK_SENINF_MIPI_LANE_EN,
++		       rx + MTK_SENINF_MIPI_LANE_REG(i));
++}
++
++/*
++ * SeninfDrvImp::setSeninf1NCSI2 @0x165f6..0x166b4, the "NCSI2_en != 1" branch.
++ * The vendor function never programs the lane map (this[0x58]) on this board:
++ * the value comes from an ioctl into the HAL and the block is skipped when it
++ * is zero (@0x16340), so it is not reproduced here.
++ */
++static void mtk_seninf_mipi_rx_disable(struct mtk_seninf *priv, unsigned int pad)
++{
++	void __iomem *rx = priv->mipi_ana + MTK_SENINF_MIPI_RX_OFF(pad);
++	unsigned int i;
++
++	writel(readl(rx + MTK_SENINF_MIPI_CTL1) & ~BIT(0),
++	       rx + MTK_SENINF_MIPI_CTL1);
++	writel(readl(rx + MTK_SENINF_MIPI_CTL0) & ~BIT(0),
++	       rx + MTK_SENINF_MIPI_CTL0);
++
++	for (i = 0; i < MTK_SENINF_MIPI_LANES; i++)
++		writel(readl(rx + MTK_SENINF_MIPI_LANE_REG(i)) &
++		       ~MTK_SENINF_MIPI_LANE_EN,
++		       rx + MTK_SENINF_MIPI_LANE_REG(i));
++
++	/* @0x1666e/0x16678 */
++	writel(readl(rx + MTK_SENINF_MIPI_SHARED0) | MTK_SENINF_MIPI_CFG_SET,
++	       rx + MTK_SENINF_MIPI_SHARED0);
++	writel(readl(rx + MTK_SENINF_MIPI_SHARED1) | MTK_SENINF_MIPI_CFG_SET,
++	       rx + MTK_SENINF_MIPI_SHARED1);
++
++	for (i = 0; i < MTK_SENINF_MIPI_LANES; i++)
++		writel(readl(rx + MTK_SENINF_MIPI_LANE_REG(i)) &
++		       ~MTK_SENINF_MIPI_LANE_PWR,
++		       rx + MTK_SENINF_MIPI_LANE_REG(i));
++}
++
++/*
++ * "CSI-0 calibration" handshake, SeninfDrvImp::setSeninf1NCSI2
++ * (@0x163ca..0x164bc; SENINF3 @0x16c60..0x16d52, SENINF2 @0x16854..0x16920).
++ *
++ * SENINF1 and SENINF3 start the sequence, write its parameter and poll two
++ * status registers; SENINF2 only sets the mode bit and runs no start/sequence
++ * write at all (@0x16894 is its single write to the control register).  A
++ * failed handshake is only reported by the vendor driver, it does not abort
++ * the stream-on; the same is done here.
++ */
++static void mtk_seninf_csi2_calibrate(struct mtk_seninf *priv, unsigned int pad)
++{
++	void __iomem *cal = priv->base + MTK_SENINF_CSI2_CAL_CTRL(pad);
++	u32 sta0;
++	u32 sta1;
++
++	/* @0x163ca..0x163fe: lane/deskew control bits, set one by one */
++	writel(readl(priv->base + MTK_SENINF_CSI2_LANE_CTRL(pad)) |
++	       MTK_SENINF_CSI2_LANE_MASK,
++	       priv->base + MTK_SENINF_CSI2_LANE_CTRL(pad));
++
++	if (pad != 1) {
++		/* @0x1640a / @0x16ca0 */
++		writel(readl(cal) | MTK_SENINF_CSI2_CAL_START, cal);
++		/* @0x16412 / @0x16caa */
++		writel(MTK_SENINF_CSI2_CAL_SEQ_VAL,
++		       priv->base + MTK_SENINF_CSI2_CAL_SEQ(pad));
++	}
++
++	/* @0x16422 / @0x16894 / @0x16cb8 */
++	writel(readl(cal) | MTK_SENINF_CSI2_CAL_MODE, cal);
++
++	usleep_range(500, 600);
++
++	sta0 = readl(priv->base + MTK_SENINF_CSI2_CAL_STA0(pad));
++	sta1 = readl(priv->base + MTK_SENINF_CSI2_CAL_STA1(pad));
++	if (!(sta0 & MTK_SENINF_CSI2_CAL_STA0_MASK) ||
++	    !(sta1 & MTK_SENINF_CSI2_CAL_STA1_MASK))
++		dev_warn(priv->dev,
++			 "pad%u: CSI-2 calibration status 0x%08x/0x%08x\n",
++			 pad, sta0, sta1);
++
++	if (pad != 1) {
++		/* @0x1646a / @0x16d00 */
++		writel(readl(cal) & ~MTK_SENINF_CSI2_CAL_START, cal);
++	}
++
++	/* @0x1647a..0x164bc: clear the lane/deskew control bits */
++	writel(readl(priv->base + MTK_SENINF_CSI2_LANE_CTRL(pad)) &
++	       ~MTK_SENINF_CSI2_LANE_MASK,
++	       priv->base + MTK_SENINF_CSI2_LANE_CTRL(pad));
++}
++
++/*
++ * Stream-on programming for one input, SeninfDrvImp::setSeninf1NCSI2
++ * @0x16282..0x166dc with NCSI2_en == 1 and MIPI_OPHY_NCSI2.
++ */
++static void mtk_seninf_csi2_enable(struct mtk_seninf *priv, unsigned int pad,
++				   const struct mtk_seninf_link *link)
++{
++	u32 lane_mask = (1U << link->lanes) - 1;
++	u32 settle = mtk_seninf_settle_count(MTK_SENINF_SETTLE_DEFAULT_NS);
++	u32 ctrl;
++
++	/* MIPI D-PHY / MIPI RX first, in the vendor's order */
++	mtk_seninf_mipi_rx_enable(priv, pad);
++
++	mtk_seninf_csi2_calibrate(priv, pad);
++
++	/* @0x1651e: DPCM dependent value, 0 for DPCM_INFO outside 42..49 */
++	writel(0, priv->base + MTK_SENINF_CSI2_DPCM(pad));
++
++	/* @0x16526..0x165a4: CSI-2 mode, bits 15:12 of SENINFn_CTRL */
++	ctrl = readl(priv->base + MTK_SENINF_CAM_CTRL(pad));
++	ctrl &= ~MTK_SENINF_CTRL_SRC;
++	writel(ctrl | MTK_SENINF_CTRL_CSI2_MODE,
++	       priv->base + MTK_SENINF_CAM_CTRL(pad));
++
++	/* @0x165a8..0x165b4 */
++	writel(readl(priv->base + MTK_SENINF_CSI2_CTRL(pad)) &
++	       ~MTK_SENINF_CSI2_CTRL_CLR,
++	       priv->base + MTK_SENINF_CSI2_CTRL(pad));
++
++	/* @0x165b8: settle time in SENINF clock cycles, bits 15:8 */
++	writel((settle << 8) & 0xffff,
++	       priv->base + MTK_SENINF_CSI2_SETTLE(pad));
++
++	/* @0x165be..0x165d8: enable, high speed mode, ECC order, lane count */
++	writel(readl(priv->base + MTK_SENINF_CSI2_CTRL(pad)) |
++	       MTK_SENINF_CSI2_CTRL_EN | MTK_SENINF_CSI2_CTRL_HS |
++	       (MTK_SENINF_ECC_ORDER << 16) |
++	       (lane_mask & MTK_SENINF_CSI2_CTRL_LANES),
++	       priv->base + MTK_SENINF_CSI2_CTRL(pad));
++
++	/* @0x165dc */
++	writel(MTK_SENINF_CSI2_CTRL2_MAGIC,
++	       priv->base + MTK_SENINF_CSI2_CTRL2(pad));
++
++	/*
++	 * @0x165e0..0x165f0: set and immediately clear bits 1:0 of
++	 * SENINFn_MUX_CTRL.  The vendor reads the register once and writes
++	 * both values back to back, so the two writes are reproduced here.
++	 */
++	ctrl = readl(priv->base + MTK_SENINF_CAM_MUX_CTRL(pad));
++	writel(ctrl | GENMASK(1, 0), priv->base + MTK_SENINF_CAM_MUX_CTRL(pad));
++	writel(ctrl & ~GENMASK(1, 0), priv->base + MTK_SENINF_CAM_MUX_CTRL(pad));
++
++	dev_dbg(priv->dev,
++		"pad%u: CSI-2 on, %u lane(s), settle %u ns (%u cycles), freq %lld Hz\n",
++		pad, link->lanes, MTK_SENINF_SETTLE_DEFAULT_NS, settle,
++		link->link_freq);
++}
++
++/* Stream-off for one input, SeninfDrvImp::setSeninf1NCSI2 @0x165f6..0x166b4 */
++static void mtk_seninf_csi2_disable(struct mtk_seninf *priv, unsigned int pad)
++{
++	writel(readl(priv->base + MTK_SENINF_CSI2_CTRL(pad)) &
++	       ~MTK_SENINF_CSI2_CTRL_LANES,
++	       priv->base + MTK_SENINF_CSI2_CTRL(pad));
++	writel(readl(priv->base + MTK_SENINF_CSI2_CSI2_CFG(pad)) &
++	       ~MTK_SENINF_CSI2_CTRL_LANES,
++	       priv->base + MTK_SENINF_CSI2_CSI2_CFG(pad));
++
++	mtk_seninf_mipi_rx_disable(priv, pad);
++
++	dev_dbg(priv->dev, "pad%u: CSI-2 off\n", pad);
++}
++
+ static int mtk_seninf_s_stream(struct v4l2_subdev *sd, int enable)
+ {
+ 	struct mtk_seninf *priv = to_mtk_seninf(sd);
+@@ -414,15 +692,39 @@ static int mtk_seninf_s_stream(struct v4l2_subdev *sd, int enable)
+ 			goto out_unlock;
+ 		}
+ 
++		/*
++		 * s_stream() carries no pad argument, so every sink pad that has
++		 * a sensor bound to it is brought up; each SENINF instance has
++		 * its own register set and its own sensor's link parameters, so
++		 * this is exactly the set of active inputs of this bridge.
++		 */
+ 		for (i = 0; i < priv->num_sink_pads; i++) {
+-			ret = mtk_seninf_check_link(priv, i);
++			struct mtk_seninf_link link;
++
++			ret = mtk_seninf_get_link(priv, i, &link);
++			if (ret == -ENODEV)
++				continue;
+ 			if (ret)
+-				goto err_put;
++				goto err_disable;
++			if (!link.lanes) {
++				ret = -EINVAL;
++				goto err_disable;
++			}
++
++			mtk_seninf_csi2_enable(priv, i, &link);
++			priv->streaming_pads |= BIT(i);
+ 		}
+ 
+ 		mtk_seninf_check_errors(priv, "stream on");
+ 		priv->streaming = true;
+ 	} else {
++		for (i = 0; i < priv->num_sink_pads; i++) {
++			if (!(priv->streaming_pads & BIT(i)))
++				continue;
++			mtk_seninf_csi2_disable(priv, i);
++		}
++		priv->streaming_pads = 0;
++
+ 		mtk_seninf_check_errors(priv, "stream off");
+ 		priv->streaming = false;
+ 		pm_runtime_put(priv->dev);
+@@ -431,7 +733,13 @@ static int mtk_seninf_s_stream(struct v4l2_subdev *sd, int enable)
+ 	mutex_unlock(&priv->lock);
+ 	return 0;
+ 
+-err_put:
++err_disable:
++	for (i = 0; i < priv->num_sink_pads; i++) {
++		if (!(priv->streaming_pads & BIT(i)))
++			continue;
++		mtk_seninf_csi2_disable(priv, i);
++	}
++	priv->streaming_pads = 0;
+ 	pm_runtime_put(priv->dev);
+ out_unlock:
+ 	mutex_unlock(&priv->lock);
+@@ -785,8 +1093,14 @@ static int mtk_seninf_probe(struct platform_device *pdev)
+ static void mtk_seninf_remove(struct platform_device *pdev)
+ {
+ 	struct mtk_seninf *priv = platform_get_drvdata(pdev);
++	unsigned int i;
+ 
+ 	if (priv->streaming) {
++		for (i = 0; i < priv->num_sink_pads; i++) {
++			if (priv->streaming_pads & BIT(i))
++				mtk_seninf_csi2_disable(priv, i);
++		}
++		priv->streaming_pads = 0;
+ 		priv->streaming = false;
+ 		pm_runtime_put(priv->dev);
+ 	}
+diff --git a/tools/mediatek/camera/seninf-dphy/.gitignore b/tools/mediatek/camera/seninf-dphy/.gitignore
+new file mode 100644
+index 000000000..567609b12
+--- /dev/null
++++ b/tools/mediatek/camera/seninf-dphy/.gitignore
+@@ -0,0 +1 @@
++build/
+diff --git a/tools/mediatek/camera/seninf-dphy/Makefile b/tools/mediatek/camera/seninf-dphy/Makefile
+new file mode 100644
+index 000000000..437171749
+--- /dev/null
++++ b/tools/mediatek/camera/seninf-dphy/Makefile
+@@ -0,0 +1,59 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# seninf-dphy-extract: offline evidence extractor for the MT6735 SENINF
++# CSI-2 / MIPI D-PHY register programming of the vendor camera HAL
++# (libcam.halsensor.so).  Host tool, never part of kernel or device runtime.
++#
++#   make            build build/seninf-dphy-extract
++#   make check      run it against $(SENINF_LIB) and verify the proof addresses
++#   make clean
++#
++# The extractor needs a disassembly of the library.  $(OBJDUMP) is used to
++# produce it; any objdump that understands ARM/Thumb-2 works, for example
++#   OBJDUMP="$(M)/llvmpkg/usr/bin/llvm-objdump --triple=thumbv7-none-eabi -d"
++# The default path is the vendor library of this device.  When either the
++# library or the disassembler is unavailable, `make check` skips instead of
++# pretending to pass.
++
++CC ?= gcc
++CFLAGS ?= -O2
++CFLAGS += -Wall -Wextra -std=gnu11
++BUILD := build
++
++SENINF_LIB ?= /run/media/asdf/30620d0d-1e41-4d55-af08-b4de2fb9c517/g532m_work/zip/vendor-libs/libcam.halsensor.so
++OBJDUMP ?= llvm-objdump
++
++BIN := $(BUILD)/seninf-dphy-extract
++DIS := $(BUILD)/libcam.halsensor.dis
++LOG := $(BUILD)/extract.log
++
++all: $(BIN)
++
++$(BUILD):
++	mkdir -p $(BUILD)
++
++$(BIN): seninf-dphy-extract.c | $(BUILD)
++	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
++
++check: $(BIN)
++	@if [ ! -f "$(SENINF_LIB)" ]; then \
++		echo "SKIP: $(SENINF_LIB) not present"; exit 0; \
++	fi
++	@if ! command -v $(firstword $(OBJDUMP)) >/dev/null 2>&1; then \
++		echo "SKIP: $(firstword $(OBJDUMP)) not available"; exit 0; \
++	fi
++	$(OBJDUMP) -d $(SENINF_LIB) > $(DIS)
++	./$(BIN) $(SENINF_LIB) $(DIS) > $(LOG)
++	@echo "--- window proofs ---"
++	@grep -E '^(  \[this|  (ISP|SENINF|PLL|MIPI_ANA|GPIO) )' $(LOG) || true
++	@echo "--- CSI-2 stores ---"
++	@grep -E '^  0x0001[0-9a-f]{4} (SENINF|MIPI_ANA)' $(LOG) || true
++	@if grep -q 'PROOF MISMATCH' $(LOG); then \
++		echo "FAIL: a documented proof address moved"; exit 1; \
++	fi
++	@echo "OK: all proof addresses verified ($(LOG))"
++
++clean:
++	rm -rf $(BUILD)
++
++.PHONY: all check clean
+diff --git a/tools/mediatek/camera/seninf-dphy/seninf-dphy-extract.c b/tools/mediatek/camera/seninf-dphy/seninf-dphy-extract.c
+new file mode 100644
+index 000000000..7a62c5c19
+--- /dev/null
++++ b/tools/mediatek/camera/seninf-dphy/seninf-dphy-extract.c
+@@ -0,0 +1,1569 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * seninf-dphy-extract - offline evidence extractor for the MT6735 SENINF
++ * CSI-2 / MIPI D-PHY register programming of the vendor camera HAL.
++ *
++ * The MT6735 SENINF CSI-2 receiver and MIPI D-PHY are programmed by the
++ * proprietary userspace component "seninf_drv", which ships as
++ * libcam.halsensor.so (class SeninfDrvImp).  The downstream GPL kernel source
++ * contains no equivalent, so the register programming of the driver in
++ * drivers/media/platform/mediatek/seninf/ had to be recovered from that
++ * binary.  This tool reproduces that recovery: it reads the library and a
++ * disassembly of it, and prints, for every store instruction of the relevant
++ * functions, the destination window, the window relative and absolute MMIO
++ * address, the value expression and the instruction address that proves it.
++ *
++ * Values the tool cannot derive are printed as "<unprovable>"; nothing is
++ * guessed and nothing is filled in.  The tool is an offline analysis aid: it
++ * is never used at kernel runtime and it does not touch hardware.
++ *
++ * Usage:
++ *   seninf-dphy-extract <libcam.halsensor.so> <disassembly.txt>
++ *
++ * The disassembly must be produced with
++ *   llvm-objdump -d --triple=thumbv7-none-eabi libcam.halsensor.so
++ * (any objdump that prints " <addr>: <hex bytes> <mnemonic> <operands>" lines
++ * works).  The tool fails loudly if a documented proof address does not hold
++ * the instruction it is supposed to hold.
++ *
++ * Copyright (C) 2026
++ */
++
++#define _GNU_SOURCE
++#include <ctype.h>
++#include <errno.h>
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
++#define EXPR_LEN 128
++#define MAX_WIN 8
++#define MAX_INSN 8192
++#define MAX_STACK 1024
++
++/* ------------------------------------------------------------------ */
++/* ELF image                                                          */
++/* ------------------------------------------------------------------ */
++
++/*
++ * All expression formatting goes through a va_list formatter: the buffers are
++ * deliberately fixed size and truncated, which is fine for a diagnostic string
++ * but would trip -Wformat-truncation at every literal call site.
++ */
++static void set_fmt(char *dst, size_t sz, const char *fmt, ...)
++{
++	va_list ap;
++
++	va_start(ap, fmt);
++	vsnprintf(dst, sz, fmt, ap);
++	va_end(ap);
++}
++
++
++
++struct section {
++	char name[32];
++	uint32_t addr;
++	uint32_t off;
++	uint32_t size;
++	bool alloc;
++};
++
++struct symbol {
++	char name[128];
++	uint32_t addr;
++	uint32_t size;
++};
++
++struct elf {
++	const uint8_t *data;
++	size_t len;
++	struct section sec[40];
++	unsigned int nsec;
++	struct symbol sym[256];
++	unsigned int nsym;
++};
++
++static uint32_t rd32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static uint16_t rd16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | (p[1] << 8));
++}
++
++static bool elf_load(struct elf *e, const char *path)
++{
++	FILE *f = fopen(path, "rb");
++	long size;
++	uint32_t shoff, shnum, shstrndx, symtab = 0, strtab = 0;
++	unsigned int i;
++
++	memset(e, 0, sizeof(*e));
++	if (!f) {
++		fprintf(stderr, "cannot open %s: %s\n", path, strerror(errno));
++		return false;
++	}
++	if (fseek(f, 0, SEEK_END) || (size = ftell(f)) < 0 ||
++	    fseek(f, 0, SEEK_SET)) {
++		fprintf(stderr, "cannot size %s\n", path);
++		fclose(f);
++		return false;
++	}
++	e->data = malloc((size_t)size);
++	if (!e->data || fread((void *)e->data, 1, (size_t)size, f) != (size_t)size) {
++		fprintf(stderr, "cannot read %s\n", path);
++		fclose(f);
++		return false;
++	}
++	fclose(f);
++	e->len = (size_t)size;
++
++	if (e->len < 52 || memcmp(e->data, "\177ELF", 4) != 0 ||
++	    e->data[4] != 1 /* ELFCLASS32 */) {
++		fprintf(stderr, "%s: not an ELF32 file\n", path);
++		return false;
++	}
++	if (rd16(e->data + 18) != 40 /* EM_ARM */) {
++		fprintf(stderr, "%s: not an ARM file\n", path);
++		return false;
++	}
++
++	shoff = rd32(e->data + 32);
++	shnum = rd16(e->data + 48);
++	shstrndx = rd16(e->data + 50);
++	if (shoff + shnum * 40 > e->len || shnum > ARRAY_SIZE(e->sec)) {
++		fprintf(stderr, "%s: implausible section table\n", path);
++		return false;
++	}
++	e->nsec = shnum;
++	for (i = 0; i < shnum; i++) {
++		const uint8_t *sh = e->data + shoff + i * 40;
++
++		e->sec[i].addr = rd32(sh + 12);
++		e->sec[i].off = rd32(sh + 16);
++		e->sec[i].size = rd32(sh + 20);
++		e->sec[i].alloc = (rd32(sh + 8) & 0x2) != 0;
++		e->sec[i].name[0] = '\0';
++	}
++
++	/* Section names can only be resolved once every section header is read. */
++	if (shstrndx < shnum) {
++		uint32_t so = e->sec[shstrndx].off;
++
++		for (i = 0; i < shnum; i++) {
++			uint32_t nameoff = rd32(e->data + shoff + i * 40);
++			size_t n = 0;
++
++			while (so + nameoff + n < e->len &&
++			       e->data[so + nameoff + n] &&
++			       n < sizeof(e->sec[i].name) - 1) {
++				e->sec[i].name[n] =
++					(char)e->data[so + nameoff + n];
++				n++;
++			}
++			e->sec[i].name[n] = '\0';
++			if (!strcmp(e->sec[i].name, ".dynsym"))
++				symtab = i;
++		}
++	}
++
++	if (symtab) {
++		uint32_t strndx = rd32(e->data + shoff + symtab * 40 + 24);
++		uint32_t count = e->sec[symtab].size / 16;
++		unsigned int j;
++		const struct section *st = &e->sec[symtab];
++
++		if (strndx < shnum) {
++			strtab = e->sec[strndx].off;
++			for (j = 0; j < count && e->nsym < ARRAY_SIZE(e->sym); j++) {
++				const uint8_t *s = e->data + st->off + j * 16;
++				uint32_t nameoff = rd32(s);
++				uint32_t addr = rd32(s + 4);
++				uint32_t sz = rd32(s + 8);
++				size_t n = 0;
++
++				if (!addr || st->off + j * 16 + 16 > e->len)
++					continue;
++				while (strtab + nameoff + n < e->len &&
++				       e->data[strtab + nameoff + n] && n < sizeof(e->sym[e->nsym].name) - 1) {
++					e->sym[e->nsym].name[n] =
++						(char)e->data[strtab + nameoff + n];
++					n++;
++				}
++				e->sym[e->nsym].name[n] = '\0';
++				e->sym[e->nsym].addr = addr & ~1U;	/* drop Thumb bit */
++				e->sym[e->nsym].size = sz;
++				e->nsym++;
++			}
++		}
++	}
++
++	if (!e->nsym) {
++		fprintf(stderr, "%s: no .dynsym\n", path);
++		return false;
++	}
++	return true;
++}
++
++/* Map a virtual address to a file offset. */
++static const uint8_t *vaddr_to_ptr(const struct elf *e, uint32_t addr, size_t need)
++{
++	unsigned int i;
++
++	for (i = 0; i < e->nsec; i++) {
++		const struct section *s = &e->sec[i];
++
++		if (!s->alloc || addr < s->addr)
++			continue;
++		if (addr - s->addr + need > s->size)
++			continue;
++		if (s->off + (addr - s->addr) + need > e->len)
++			continue;
++		return e->data + s->off + (addr - s->addr);
++	}
++	return NULL;
++}
++
++static const struct symbol *find_sym(const struct elf *e, const char *name)
++{
++	unsigned int i;
++
++	for (i = 0; i < e->nsym; i++)
++		if (!strcmp(e->sym[i].name, name))
++			return &e->sym[i];
++	return NULL;
++}
++
++/* Print a C string stored in .rodata, or NULL when the address is not text. */
++static const char *rodata_str(const struct elf *e, uint32_t addr)
++{
++	const uint8_t *p = vaddr_to_ptr(e, addr, 1);
++	static char buf[160];
++	size_t n = 0;
++
++	if (!p || !isprint(*p))
++		return NULL;
++	while (n < sizeof(buf) - 1 && p[n] && isprint(p[n])) {
++		buf[n] = (char)p[n];
++		n++;
++	}
++	buf[n] = '\0';
++	return n > 1 ? buf : NULL;
++}
++
++/* ------------------------------------------------------------------ */
++/* Disassembly                                                        */
++/* ------------------------------------------------------------------ */
++
++struct insn {
++	uint32_t addr;
++	char mnem[16];
++	char ops[128];
++};
++
++struct disasm {
++	struct insn *v;
++	unsigned int n;
++};
++
++static int insn_cmp(const void *a, const void *b)
++{
++	const struct insn *x = a, *y = b;
++
++	return x->addr < y->addr ? -1 : (x->addr > y->addr ? 1 : 0);
++}
++
++static bool disasm_load(struct disasm *d, const char *path)
++{
++	FILE *f = fopen(path, "r");
++	char line[512];
++	unsigned int cap = 4096;
++
++	if (!f) {
++		fprintf(stderr, "cannot open %s: %s\n", path, strerror(errno));
++		return false;
++	}
++	d->v = calloc(cap, sizeof(*d->v));
++	if (!d->v) {
++		fclose(f);
++		return false;
++	}
++
++	while (fgets(line, sizeof(line), f)) {
++		char *p = strchr(line, ':');
++		char *q;
++		unsigned long addr;
++		size_t n;
++
++		if (!p || (!isxdigit((unsigned char)line[0]) &&
++			   !isspace((unsigned char)line[0])))
++			continue;
++		errno = 0;
++		addr = strtoul(line, NULL, 16);
++		if (errno || addr > 0xffffffffUL)
++			continue;
++
++		/* Skip the hex byte column that objdump prints after the colon. */
++		for (q = p + 1; *q && (isxdigit((unsigned char)*q) || *q == ' '); q++)
++			;
++		while (*q == ' ' || *q == '\t')
++			q++;
++		if (!*q)
++			continue;
++
++		if (d->n == cap) {
++			struct insn *nv;
++
++			cap *= 2;
++			nv = realloc(d->v, cap * sizeof(*d->v));
++			if (!nv) {
++				fclose(f);
++				return false;
++			}
++			d->v = nv;
++		}
++
++		n = 0;
++		while (*q && !isspace((unsigned char)*q) && n < sizeof(d->v[d->n].mnem) - 1)
++			d->v[d->n].mnem[n++] = *q++;
++		d->v[d->n].mnem[n] = '\0';
++		while (*q == ' ' || *q == '\t')
++			q++;
++
++		/* Drop a trailing comment ("@ 0x1234 <sym>"). */
++		{
++			char *at = strstr(q, " @");
++			if (at)
++				*at = '\0';
++		}
++		n = strlen(q);
++		while (n && (q[n - 1] == '\n' || q[n - 1] == ' ' || q[n - 1] == '\t'))
++			q[--n] = '\0';
++		set_fmt(d->v[d->n].ops, sizeof(d->v[d->n].ops), "%s", q);
++		d->v[d->n].addr = (uint32_t)addr;
++		d->n++;
++	}
++	fclose(f);
++
++	qsort(d->v, d->n, sizeof(*d->v), insn_cmp);
++	return d->n > 0;
++}
++
++static const struct insn *insn_at(const struct disasm *d, uint32_t addr)
++{
++	unsigned int lo = 0, hi = d->n;
++
++	while (lo < hi) {
++		unsigned int mid = (lo + hi) / 2;
++
++		if (d->v[mid].addr == addr)
++			return &d->v[mid];
++		if (d->v[mid].addr < addr)
++			lo = mid + 1;
++		else
++			hi = mid;
++	}
++	return NULL;
++}
++
++/* ------------------------------------------------------------------ */
++/* MMIO windows                                                       */
++/* ------------------------------------------------------------------ */
++
++struct window {
++	const char *name;
++	uint32_t base;
++	uint32_t len;
++	/* proof of the length: instruction holding the immediate */
++	uint32_t proof;
++	const char *proof_expect;
++	/* proof of the base: literal pool slot holding it (0 when immediate) */
++	uint32_t lit_addr;
++};
++
++/*
++ * The five mmap() calls of SeninfDrvImp::init() and the derived per-instance
++ * pointers.  Every entry carries the address of the instruction that sets the
++ * immediate it is built from; verify_windows() checks each one.
++ */
++static const struct window windows[] = {
++	{ "ISP",      0x15000000, 0xa000, 0x18176, "mov.w\tr1, #0xa000", 0 },
++	{ "ISP",      0x15000000, 0xa000, 0x1816a, "mov.w\tr2, #0x15000000", 0 },
++	{ "SENINF",   0x15008000, 0x4000, 0x181b0, "mov.w\tr1, #0x4000", 0x18404 },
++	{ "PLL",      0x10000000, 0x100,  0x18200, "mov.w\tr1, #0x100", 0 },
++	{ "PLL",      0x10000000, 0x100,  0x181f4, "mov.w\tr2, #0x10000000", 0 },
++	{ "MIPI_ANA", 0x10215000, 0x3000, 0x1823e, "mov.w\tr1, #0x3000", 0x18408 },
++	{ "GPIO",     0x10211000, 0x1000, 0x18288, "mov.w\tr1, #0x1000", 0x1840c },
++};
++
++/* this-offsets holding a mapped window pointer (init() @0x18180..0x18356) */
++struct member {
++	const char *name;
++	uint32_t member;
++	const struct window *win;
++	uint32_t proof;
++	const char *proof_expect;
++};
++
++static const struct member members[] = {
++	{ "ISP",      0x14, &windows[0], 0x18180, "str\tr0, [r4, #0x14]" },
++	{ "SENINF",   0x18, &windows[2], 0x181c4, "str\tr0, [r4, #0x18]" },
++	{ "GPIO",     0x38, &windows[6], 0x1829a, "str\tr0, [r4, #0x38]" },
++	{ "MIPI_ANA", 0x28, &windows[5], 0x18250, "str\tr0, [r4, #0x28]" },
++	{ "PLL",      0x3c, &windows[3], 0x1820a, "str\tr0, [r4, #0x3c]" },
++};
++
++/* Derived pointers: [this+0x24] = [this+0x28] + 0x800, etc. */
++struct derived {
++	const char *name;
++	uint32_t member;
++	uint32_t from;
++	uint32_t add;
++	uint32_t proof;
++	const char *proof_expect;
++};
++
++static const struct derived derived_members[] = {
++	{ "MIPI_ANA+0x800", 0x24, 0x28, 0x800, 0x1827e, "add.w\tr1, r0, #0x800" },
++	{ "MIPI_ANA+0x800", 0x2c, 0x24, 0x000, 0x18348, "str\tr6, [r4, #0x2c]" },
++	{ "MIPI_ANA+0xc00", 0x30, 0x24, 0x400, 0x1834a, "add.w\tr0, r6, #0x400" },
++	{ "MIPI_ANA+0x1000", 0x34, 0x24, 0x800, 0x18350, "add.w\tr5, r6, #0x800" },
++	{ "GPIO+0x970",     0x1c, 0x38, 0x970, 0x182c8, "add.w\tr2, r0, #0x970" },
++	{ "PLL+0x60",       0x40, 0x3c, 0x060, 0x182d0, "adds\tr1, #0x60" },
++};
++
++static bool verify_windows(const struct elf *e, const struct disasm *d)
++{
++	unsigned int i;
++	bool ok = true;
++
++	printf("== mapped windows (SeninfDrvImp::init) ==\n");
++	for (i = 0; i < ARRAY_SIZE(windows); i++) {
++		const struct window *w = &windows[i];
++		const struct insn *in = insn_at(d, w->proof);
++		const uint8_t *lit = w->lit_addr ?
++			vaddr_to_ptr(e, w->lit_addr, 4) : NULL;
++		char want[64];
++		bool base_ok = true;
++
++		if (w->lit_addr)
++			base_ok = lit && rd32(lit) == w->base;
++		set_fmt(want, sizeof(want), "%s\t%s", in ? in->mnem : "?", in ? in->ops : "");
++		if (!in || !strstr(want, strchr(w->proof_expect, '\t') ?
++				   strchr(w->proof_expect, '\t') + 1 : w->proof_expect) ||
++		    !base_ok) {
++			printf("  %-9s base 0x%08x len 0x%05x  PROOF MISMATCH at 0x%x (%s)%s\n",
++			       w->name, w->base, w->len, w->proof, in ? want : "missing",
++			       base_ok ? "" : " base literal mismatch");
++			ok = false;
++			continue;
++		}
++		printf("  %-9s base 0x%08x len 0x%05x  proof 0x%x: %s%s\n",
++		       w->name, w->base, w->len, w->proof, want,
++		       w->lit_addr ? " (base from literal pool)" : "");
++	}
++
++	printf("== windows bound to SeninfDrvImp members ==\n");
++	for (i = 0; i < ARRAY_SIZE(members); i++) {
++		const struct member *m = &members[i];
++		const struct insn *in = insn_at(d, m->proof);
++		char want[64];
++
++		set_fmt(want, sizeof(want), "%s\t%s", in ? in->mnem : "?", in ? in->ops : "");
++		if (!in || !strstr(want, m->proof_expect)) {
++			printf("  [this+0x%02x] = %-12s PROOF MISMATCH at 0x%x\n",
++			       m->member, m->name, m->proof);
++			ok = false;
++			continue;
++		}
++		printf("  [this+0x%02x] = %-12s (0x%08x + 0x%x)  proof %s\n",
++		       m->member, m->name, m->win->base, m->win->len, want);
++	}
++
++	printf("== derived per-instance pointers ==\n");
++	for (i = 0; i < ARRAY_SIZE(derived_members); i++) {
++		const struct derived *x = &derived_members[i];
++		const struct insn *in = insn_at(d, x->proof);
++		char want[64];
++
++		set_fmt(want, sizeof(want), "%s\t%s", in ? in->mnem : "?", in ? in->ops : "");
++		if (!in || !strstr(want, x->proof_expect)) {
++			printf("  [this+0x%02x] = %-14s PROOF MISMATCH at 0x%x\n",
++			       x->member, x->name, x->proof);
++			ok = false;
++			continue;
++		}
++		printf("  [this+0x%02x] = %-14s ([this+0x%02x] + 0x%x)  proof 0x%x: %s\n",
++		       x->member, x->name, x->from, x->add, x->proof, want);
++	}
++	printf("\n");
++
++	return ok;
++}
++
++/*
++ * Combined map of the pointers held by a SeninfDrvImp instance: the five
++ * mmap() results and the per-instance pointers derived from them.
++ */
++struct ptrent {
++	const char *name;
++	uint32_t member;
++	uint32_t base;
++	uint32_t span;
++};
++
++static struct ptrent ptr_map[16];
++static unsigned int ptr_n;
++
++static void build_ptr_map(void)
++{
++	unsigned int i;
++
++	ptr_n = 0;
++	for (i = 0; i < ARRAY_SIZE(members); i++) {
++		ptr_map[ptr_n].name = members[i].name;
++		ptr_map[ptr_n].member = members[i].member;
++		ptr_map[ptr_n].base = members[i].win->base;
++		ptr_map[ptr_n].span = members[i].win->len;
++		ptr_n++;
++	}
++	for (i = 0; i < ARRAY_SIZE(derived_members); i++) {
++		const struct derived *x = &derived_members[i];
++		unsigned int j;
++		uint32_t base = 0, span = 0;
++
++		for (j = 0; j < ptr_n; j++) {
++			if (ptr_map[j].member == x->from) {
++				base = ptr_map[j].base + x->add;
++				span = ptr_map[j].span - x->add;
++				break;
++			}
++		}
++		ptr_map[ptr_n].name = x->name;
++		ptr_map[ptr_n].member = x->member;
++		ptr_map[ptr_n].base = base;
++		ptr_map[ptr_n].span = span;
++		ptr_n++;
++	}
++}
++
++static int member_index(uint32_t off)
++{
++	unsigned int i;
++
++	for (i = 0; i < ptr_n; i++)
++		if (ptr_map[i].member == off)
++			return (int)i;
++	return -1;
++}
++
++static const char *win_name(int win)
++{
++	return (win >= 0 && win < (int)ptr_n) ? ptr_map[win].name : "?";
++}
++
++static uint32_t win_base(int win)
++{
++	return (win >= 0 && win < (int)ptr_n) ? ptr_map[win].base : 0;
++}
++/* ------------------------------------------------------------------ */
++/* Symbolic interpreter                                               */
++/* ------------------------------------------------------------------ */
++
++enum kind {
++	K_UNK,		/* not derivable */
++	K_CONST,	/* integer constant */
++	K_WIN,		/* pointer into a mapped window */
++	K_ARG,		/* function argument */
++	K_SYM,		/* pointer to a .rodata string */
++};
++
++struct val {
++	enum kind kind;
++	long long c;
++	int win;
++	char e[EXPR_LEN];
++};
++
++static struct val v_unk(const char *fmt, ...)
++{
++	struct val v;
++	va_list ap;
++
++	memset(&v, 0, sizeof(v));
++	v.kind = K_UNK;
++	va_start(ap, fmt);
++	vsnprintf(v.e, sizeof(v.e), fmt, ap);
++	va_end(ap);
++	return v;
++}
++
++static struct val v_const(long long c)
++{
++	struct val v;
++
++	memset(&v, 0, sizeof(v));
++	v.kind = K_CONST;
++	v.c = c;
++	set_fmt(v.e, sizeof(v.e), "0x%llx", (unsigned long long)c);
++	return v;
++}
++
++static struct val v_win(int win, long long off)
++{
++	struct val v;
++
++	memset(&v, 0, sizeof(v));
++	v.kind = K_WIN;
++	v.win = win;
++	v.c = off;
++	set_fmt(v.e, sizeof(v.e), "[this+0x%02x]%+lld",
++		 (win >= 0 && win < (int)ptr_n) ? ptr_map[win].member : 0, off);
++	return v;
++}
++
++static struct val v_arg(int n)
++{
++	struct val v;
++
++	memset(&v, 0, sizeof(v));
++	v.kind = K_ARG;
++	v.c = n;
++	set_fmt(v.e, sizeof(v.e), "arg%d", n);
++	return v;
++}
++
++static struct val v_sym(uint32_t addr, const char *str)
++{
++	struct val v;
++
++	memset(&v, 0, sizeof(v));
++	v.kind = K_SYM;
++	v.c = addr;
++	set_fmt(v.e, sizeof(v.e), "\"%.120s\"", str);
++	return v;
++}
++
++
++/* Number of operands, ignoring separators inside [] or {}. */
++static int count_ops(const char *ops)
++{
++	int n = 1, depth = 0;
++
++	for (; *ops; ops++) {
++		if (*ops == '[' || *ops == '{')
++			depth++;
++		else if ((*ops == ']' || *ops == '}') && depth)
++			depth--;
++		else if (*ops == ',' && !depth)
++			n++;
++	}
++	return *ops == '\0' && n > 0 ? n : n;
++}
++
++/* Value of an immediate operand such as "#0x1e" or "#-0x4". */
++static bool imm_value(const char *s, long long *out)
++{
++	char *end;
++	long long v;
++
++	while (*s == ' ')
++		s++;
++	if (*s != '#')
++		return false;
++	s++;
++	errno = 0;
++	v = strtoll(s, &end, 0);
++	if (end == s || errno)
++		return false;
++	*out = v;
++	return true;
++}
++
++/* Register name to index, -1 if not a plain register. */
++static int reg_index(const char *s, size_t len)
++{
++	char b[8];
++	int n;
++
++	if (len == 0 || len >= sizeof(b))
++		return -1;
++	memcpy(b, s, len);
++	b[len] = '\0';
++	if (!strcmp(b, "sp"))
++		return 13;
++	if (!strcmp(b, "lr"))
++		return 14;
++	if (!strcmp(b, "pc"))
++		return 15;
++	if (b[0] != 'r')
++		return -1;
++	n = atoi(b + 1);
++	return (n >= 0 && n <= 12) ? n : -1;
++}
++
++
++struct frame {
++	const struct elf *elf;
++	const struct disasm *dis;
++	const char *fname;
++	struct val r[16];
++	struct val stack[MAX_STACK];
++	long long sp_key_base;	/* -frame */
++	bool stack_valid[MAX_STACK];
++	/* condition tracking */
++	char last_cmp[96];
++	char it_cond[24];
++	int it_left;
++	int it_idx;
++	int this_reg;		/* register that still holds "this" */
++	bool this_moved;
++	unsigned int dead_writes;
++	/* conditional branch targets reached later in the linear sweep */
++	struct {
++		uint32_t addr;
++		struct val r[16];
++	} target[32];
++	int ntarget;
++	unsigned int stores;
++};
++
++static int slot_of(long long key)
++{
++	long long idx = (key + 2048) / 4;
++
++	if (idx < 0 || idx >= MAX_STACK || (key & 3))
++		return -1;
++	return (int)idx;
++}
++
++static struct val get_reg(struct frame *f, int r)
++{
++	if (r < 0 || r > 15)
++		return v_unk("<bad reg>");
++	return f->r[r];
++}
++
++static void set_reg(struct frame *f, int r, struct val v)
++{
++	if (r < 0 || r > 15)
++		return;
++	/*
++	 * The object pointer ("this") is loaded once and then kept in one
++	 * register for the whole function.  The inline error handling of these
++	 * functions reloads that register from unrelated pointers; those writes
++	 * belong to branches that are not taken on a successful call, so they
++	 * are dropped (and counted) instead of corrupting the window base.
++	 */
++	if (r == f->this_reg && !(v.kind == K_ARG && v.c == 0)) {
++		f->dead_writes++;
++		return;
++	}
++	f->r[r] = v;
++}
++
++static void clobber(struct frame *f)
++{
++	int i;
++
++	for (i = 0; i <= 3; i++)
++		f->r[i] = v_unk("<call>");
++	f->r[12] = v_unk("<call>");
++	f->r[14] = v_unk("<call>");
++}
++
++static void emit_store(struct frame *f, struct val base, long long off,
++		       struct val val, uint32_t addr, const char *insn_text)
++{
++	f->stores++;
++	if (base.kind == K_WIN) {
++		uint32_t abs = win_base(base.win) + (uint32_t)(base.c + off);
++
++		printf("  0x%08x %-12s + 0x%03llx = 0x%08x  <=  %s\n",
++		       addr, win_name(base.win), (unsigned long long)(base.c + off),
++		       abs, val.e);
++	} else {
++		printf("  0x%08x %-12s + 0x%s  = <unprovable>  <=  %s\n",
++		       addr, "?", "?", val.e);
++	}
++	(void)insn_text;
++}
++
++/* Resolve a pc relative literal load: ldr rX, [pc, #imm]. */
++static struct val literal(struct frame *f, uint32_t addr, long long off)
++{
++	uint32_t lit = (uint32_t)((addr + 4) & ~3U) + (uint32_t)off;
++	const uint8_t *p = vaddr_to_ptr(f->elf, lit, 4);
++
++	if (!p)
++		return v_unk("<no literal at 0x%x>", lit);
++	return v_const((long long)rd32(p));
++}
++
++static bool is_cond_branch(const char *m)
++{
++	static const char *cm[] = {
++		"beq", "bne", "bhs", "blo", "bmi", "bpl", "bvs", "bvc",
++		"bhi", "bls", "bge", "blt", "bgt", "ble", "bcs", "bcc",
++		"beq.w", "bne.w", "bhs.w", "blo.w", "bhi.w", "bls.w",
++		"bge.w", "blt.w", "bgt.w", "ble.w", "bcs.w", "bcc.w",
++	};
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(cm); i++)
++		if (!strcmp(m, cm[i]))
++			return true;
++	return false;
++}
++
++static void note_cond(struct frame *f, const char *what, uint32_t addr)
++{
++	if (f->it_left > 0)
++		printf("  (%s conditional, %s @0x%x)\n", what, f->it_cond, addr);
++}
++
++/*
++ * Interpret one instruction.  Returns false to stop the sweep.
++ */
++static bool step(struct frame *f, const struct insn *in)
++{
++	char op1[32] = "", op2[32] = "", op3[32] = "", op4[32] = "";
++	const char *m = in->mnem;
++	const char *ops = in->ops;
++	size_t base_len;
++	int r1 = -1, r2 = -1, r3 = -1;
++	long long imm = 0, imm2 = 0;
++	bool have = false, have2 = false;
++	int nops;
++	struct val a, b, res;
++	uint32_t target;
++
++	/* Strip a condition suffix of an IT block: beq -> b + eq. */
++	if (f->it_left > 0) {
++		const char *sfx = NULL;
++
++		if (strlen(m) > 2) {
++			static const char *sfxs[] = { "eq", "ne", "hs", "lo", "mi",
++						      "pl", "vs", "vc", "hi", "ls",
++						      "ge", "lt", "gt", "le", "cs", "cc" };
++			unsigned int i;
++
++			sfx = m + strlen(m) - 2;
++			for (i = 0; i < ARRAY_SIZE(sfxs); i++)
++				if (!strcmp(sfx, sfxs[i]))
++					note_cond(f, m, in->addr);
++		}
++	}
++
++	/* Parse "#imm" operands; op2 may itself be the immediate. */
++	have = imm_value(ops, &imm);
++	sscanf(ops, "%31[^,], %31[^,], %31[^,], %31[^ ]", op1, op2, op3, op4);
++	have2 = imm_value(op2, &imm2);
++	nops = count_ops(ops);
++	base_len = strcspn(op1, " ,");
++	r1 = reg_index(op1, base_len);
++
++	if (!strcmp(m, "push") || !strcmp(m, "push.w")) {
++		unsigned int n = 0;
++		const char *p;
++
++		for (p = ops; *p; p++)
++			if (*p == ',')
++				n++;
++		if (*ops)
++			n++;			/* registers = commas + 1 */
++		f->sp_key_base -= (long long)n * 4;
++		return true;
++	}
++	if (!strcmp(m, "pop") || !strcmp(m, "pop.w")) {
++		if (strstr(ops, "pc"))
++			return false;
++		return true;
++	}
++	if (!strcmp(m, "bx") || !strcmp(m, "bx.w")) {
++		if (strstr(ops, "lr") || strstr(ops, "pc"))
++			return false;
++		return true;
++	}
++	if (!strcmp(m, "sub") || !strcmp(m, "subs") || !strcmp(m, "sub.w")) {
++		if (strstr(op1, "sp") && (have || have2)) {
++			f->sp_key_base -= have2 ? imm2 : imm;
++			return true;
++		}
++	}
++	if (!strcmp(m, "add") || !strcmp(m, "adds") || !strcmp(m, "add.w")) {
++		/* add rX, pc  : pc relative address of a string/table */
++		if (r1 >= 0 && !strcmp(op2, "pc")) {
++			struct val old = get_reg(f, r1);
++			long long pcval = (long long)((in->addr + 4) & ~3U);
++			long long v = (old.kind == K_CONST ? old.c : 0) + pcval;
++			const char *s;
++
++			if (old.kind != K_CONST)
++				return true;
++			s = rodata_str(f->elf, (uint32_t)v);
++			if (s)
++				set_reg(f, r1, v_sym((uint32_t)v, s));
++			else
++				set_reg(f, r1, v_const(v));
++			return true;
++		}
++		if (r1 >= 0 && (have || have2)) {
++			long long av = have2 ? imm2 : imm;
++			unsigned int l2 = strcspn(op2, " ,");
++
++			if (have2) {	/* add rX, #imm */
++				a = get_reg(f, r1);
++				if (a.kind == K_CONST) {
++					set_reg(f, r1, v_const(a.c + av));
++				} else if (a.kind == K_WIN) {
++					set_reg(f, r1, v_win(a.win, a.c + av));
++				} else if (a.kind == K_ARG && a.c == 0) {
++					set_reg(f, r1, v_unk("this + %lld", av));
++				} else {
++					set_reg(f, r1, v_unk("%s + %lld", a.e, av));
++				}
++				return true;
++			}
++			r2 = reg_index(op2, l2);
++			if (r2 >= 0) {
++				a = get_reg(f, r2);
++				if (a.kind == K_CONST) {
++					set_reg(f, r1, v_const(a.c + imm));
++				} else if (a.kind == K_WIN) {
++					set_reg(f, r1, v_win(a.win, a.c + imm));
++				} else {
++					set_reg(f, r1, v_unk("%s + %lld", a.e, imm));
++				}
++				return true;
++			}
++		}
++	}
++	if (!strcmp(m, "ldr") || !strcmp(m, "ldr.w") ||
++	    !strcmp(m, "ldrh") || !strcmp(m, "ldrh.w")) {
++		/* ldr rX, [pc, #imm] */
++		if (r1 >= 0 && !strncmp(op2, "[pc", 3)) {
++			imm_value(strchr(ops, '#') ? strchr(ops, '#') : "#0", &imm);
++			set_reg(f, r1, literal(f, in->addr, imm));
++			return true;
++		}
++		if (r1 >= 0 && !strncmp(op2, "[sp", 3)) {
++			long long key;
++			int slot;
++
++			imm_value(strchr(ops, '#') ? strchr(ops, '#') : "#0", &imm);
++			key = f->sp_key_base + imm;
++			slot = slot_of(key);
++			set_reg(f, r1, (slot >= 0 && f->stack_valid[slot]) ?
++				f->stack[slot] : v_unk("<stack+%lld>", imm));
++			return true;
++		}
++		if (r1 >= 0 && op2[0] == '[') {
++			unsigned int l2 = strcspn(op2 + 1, " ,]");
++			struct val bv;
++
++			r2 = reg_index(op2 + 1, l2);
++			imm_value(strchr(ops, '#') ? strchr(ops, '#') : "#0", &imm);
++			bv = get_reg(f, r2);
++			if (bv.kind == K_ARG && bv.c == 0) {
++				int mi = member_index((uint32_t)imm);
++
++				if (mi >= 0) {
++					set_reg(f, r1, v_win(mi, 0));
++					return true;
++				}
++				set_reg(f, r1, v_unk("this[0x%llx]",
++						     (unsigned long long)imm));
++				return true;
++			}
++			if (bv.kind == K_WIN) {
++				set_reg(f, r1, v_unk("*(%s+0x%llx)", win_name(bv.win),
++						     (unsigned long long)(bv.c + imm)));
++			} else {
++				set_reg(f, r1, v_unk("*(%s)", bv.e));
++			}
++			return true;
++		}
++		set_reg(f, r1, v_unk("<ldr>"));
++		return true;
++	}
++	if (!strcmp(m, "str") || !strcmp(m, "str.w") || !strcmp(m, "strh") ||
++	    !strcmp(m, "strh.w") || !strcmp(m, "strex")) {
++		struct val src;
++		unsigned int l2;
++
++		if (!strncmp(op2, "[sp", 3)) {
++			long long key;
++			int slot;
++
++			imm_value(strchr(ops, '#') ? strchr(ops, '#') : "#0", &imm);
++			key = f->sp_key_base + imm;
++			slot = slot_of(key);
++			if (slot >= 0) {
++				f->stack[slot] = get_reg(f, r1);
++				f->stack_valid[slot] = true;
++			}
++			return true;
++		}
++		if (op2[0] != '[')
++			return true;
++		l2 = strcspn(op2 + 1, " ,]");
++		r2 = reg_index(op2 + 1, l2);
++		imm_value(strchr(ops, '#') ? strchr(ops, '#') : "#0", &imm);
++		src = get_reg(f, r1);
++		b = get_reg(f, r2);
++		if (b.kind == K_ARG && b.c == 0 && member_index((uint32_t)imm) >= 0) {
++			printf("  [this+0x%02llx] := %s  @0x%x (window pointer)\n",
++			       (unsigned long long)imm, src.e, in->addr);
++			return true;
++		}
++		emit_store(f, b, imm, src, in->addr, m);
++		return true;
++	}
++	if (!strcmp(m, "stm.w") || !strcmp(m, "stm") || !strcmp(m, "stmdb")) {
++		/* stm.w sp, {r3, r7, r11} : consecutive vararg slots */
++		char list[64];
++		const char *p = strchr(ops, '{');
++		unsigned int k = 0;
++		char *tok;
++
++		if (!p || !strstr(op1, "sp"))
++			return true;
++		set_fmt(list, sizeof(list), "%s", p);
++		for (tok = strtok(list, "{}, "); tok; tok = strtok(NULL, "{}, ")) {
++			int r = reg_index(tok, strlen(tok));
++			long long key = f->sp_key_base + (long long)k * 4;
++			int slot = slot_of(key);
++
++			if (r >= 0 && slot >= 0) {
++				f->stack[slot] = get_reg(f, r);
++				f->stack_valid[slot] = true;
++			}
++			k++;
++		}
++		return true;
++	}
++	if (!strcmp(m, "mov") || !strcmp(m, "movs") || !strcmp(m, "mov.w") ||
++	    !strcmp(m, "movw")) {
++		unsigned int l2 = strcspn(op2, " ,");
++
++		if (have2 || have) {
++			set_reg(f, r1, v_const(have2 ? imm2 : imm));
++			return true;
++		}
++		r2 = reg_index(op2, l2);
++		if (r2 == f->this_reg && f->this_reg >= 0 && !f->this_moved &&
++		    get_reg(f, r2).kind == K_ARG && get_reg(f, r2).c == 0) {
++			/* prologue copies the object pointer, e.g. mov r4, r0 */
++			f->this_reg = r1;
++			f->this_moved = true;
++			set_reg(f, r1, v_arg(0));
++			return true;
++		}
++		set_reg(f, r1, get_reg(f, r2));
++		return true;
++	}
++	if (!strcmp(m, "movt")) {
++		long long hi = 0;
++
++		imm_value(strchr(op2, '#') ? strchr(op2, '#') : "#0", &hi);
++		a = get_reg(f, r1);
++		if (a.kind == K_CONST)
++			set_reg(f, r1, v_const(((a.c & 0xffff) | (hi << 16))));
++		else
++			set_reg(f, r1, v_unk("<movt>"));
++		return true;
++	}
++	if (!strcmp(m, "and") || !strcmp(m, "ands") || !strcmp(m, "bic") ||
++	    !strcmp(m, "orr") || !strcmp(m, "orrs") || !strcmp(m, "orr.w") ||
++	    !strcmp(m, "eor") || !strcmp(m, "add") || !strcmp(m, "adds") ||
++	    !strcmp(m, "add.w") || !strcmp(m, "adds.w") ||
++	    !strcmp(m, "sub") || !strcmp(m, "subs") || !strcmp(m, "sub.w")) {
++		long long iv = 0;
++		int s1, s2 = -1;
++		bool ivok;
++
++		/*
++		 * Two operand forms are Rd = Rd op Rm, three operand forms are
++		 * Rd = Rn op <Rm|#imm>.
++		 */
++		if (nops >= 3) {
++			s1 = reg_index(op2, strcspn(op2, " ,"));
++			ivok = imm_value(op3, &iv);
++			if (!ivok)
++				s2 = reg_index(op3, strcspn(op3, " ,"));
++		} else {
++			s1 = r1;
++			ivok = imm_value(op2, &iv);
++			if (!ivok)
++				s2 = reg_index(op2, strcspn(op2, " ,"));
++		}
++
++		a = get_reg(f, s1);
++		if (ivok) {
++			if (a.kind == K_CONST) {
++				long long nv;
++
++				if (!strncmp(m, "and", 3))
++					nv = a.c & iv;
++				else if (!strncmp(m, "bic", 3))
++					nv = a.c & ~iv;
++				else if (!strncmp(m, "orr", 3))
++					nv = a.c | iv;
++				else if (!strncmp(m, "eor", 3))
++					nv = a.c ^ iv;
++				else if (!strncmp(m, "sub", 3))
++					nv = a.c - iv;
++				else
++					nv = a.c + iv;
++				set_reg(f, r1, v_const(nv));
++				return true;
++			}
++			if (!strncmp(m, "and", 3))
++				res = v_unk("(%s & 0x%llx)", a.e, (unsigned long long)iv);
++			else if (!strncmp(m, "bic", 3))
++				res = v_unk("(%s & ~0x%llx)", a.e, (unsigned long long)iv);
++			else if (!strncmp(m, "orr", 3))
++				res = v_unk("(%s | 0x%llx)", a.e, (unsigned long long)iv);
++			else if (!strncmp(m, "eor", 3))
++				res = v_unk("(%s ^ 0x%llx)", a.e, (unsigned long long)iv);
++			else if (!strncmp(m, "sub", 3))
++				res = v_unk("(%s - 0x%llx)", a.e, (unsigned long long)iv);
++			else
++				res = v_unk("(%s + 0x%llx)", a.e, (unsigned long long)iv);
++			set_reg(f, r1, res);
++			return true;
++		}
++		b = get_reg(f, s2);
++		if (a.kind == K_CONST && b.kind == K_CONST) {
++			long long nv;
++
++			if (!strncmp(m, "and", 3))
++				nv = a.c & b.c;
++			else if (!strncmp(m, "bic", 3))
++				nv = a.c & ~b.c;
++			else if (!strncmp(m, "orr", 3))
++				nv = a.c | b.c;
++			else if (!strncmp(m, "eor", 3))
++				nv = a.c ^ b.c;
++			else if (!strncmp(m, "sub", 3))
++				nv = a.c - b.c;
++			else
++				nv = a.c + b.c;
++			set_reg(f, r1, v_const(nv));
++			return true;
++		}
++		if (a.kind == K_WIN && b.kind == K_CONST)
++			set_reg(f, r1, v_win(a.win, a.c + b.c));
++		else if (!strncmp(m, "and", 3))
++			set_reg(f, r1, v_unk("(%s & %s)", a.e, b.e));
++		else if (!strncmp(m, "bic", 3))
++			set_reg(f, r1, v_unk("(%s & ~%s)", a.e, b.e));
++		else if (!strncmp(m, "orr", 3))
++			set_reg(f, r1, v_unk("(%s | %s)", a.e, b.e));
++		else if (!strncmp(m, "eor", 3))
++			set_reg(f, r1, v_unk("(%s ^ %s)", a.e, b.e));
++		else if (!strncmp(m, "sub", 3))
++			set_reg(f, r1, v_unk("(%s - %s)", a.e, b.e));
++		else
++			set_reg(f, r1, v_unk("(%s + %s)", a.e, b.e));
++		return true;
++	}
++	if (!strcmp(m, "bfi") || !strcmp(m, "bfc")) {
++		long long lsb = 0, width = 0;
++		const char *p;
++
++		p = strchr(op2, '#');
++		if (p)
++			imm_value(p, &lsb);
++		if (!strcmp(m, "bfi")) {
++			p = strchr(op3, '#');
++			if (p)
++				imm_value(p, &width);
++			a = get_reg(f, r1);
++			b = get_reg(f, r2);
++			if (a.kind == K_CONST && b.kind == K_CONST) {
++				long long mask = ((1LL << width) - 1) << lsb;
++
++				set_reg(f, r1, v_const((a.c & ~mask) |
++						       ((b.c << lsb) & mask)));
++			} else {
++				set_reg(f, r1, v_unk("((%s & ~0x%llx) | ((%s & 0x%llx) << %lld))",
++						     a.e, ((1LL << width) - 1) << lsb,
++						     b.e, (1LL << width) - 1, lsb));
++			}
++			return true;
++		}
++		p = strchr(op3, '#');
++		if (p)
++			imm_value(p, &width);
++		a = get_reg(f, r1);
++		if (a.kind == K_CONST)
++			set_reg(f, r1, v_const(a.c & ~(((1LL << width) - 1) << lsb)));
++		else
++			set_reg(f, r1, v_unk("(%s & ~0x%llx)", a.e,
++					     ((1LL << width) - 1) << lsb));
++		return true;
++	}
++	if (!strcmp(m, "lsls") || !strcmp(m, "lsrs") || !strcmp(m, "asrs") ||
++	    !strcmp(m, "uxth") || !strcmp(m, "uxtb") || !strcmp(m, "sxtb") ||
++	    !strcmp(m, "sxth") || !strcmp(m, "ubfx") || !strcmp(m, "clz")) {
++		unsigned int l2 = strcspn(op2, " ,");
++		long long sh = 0;
++		int src;
++
++		/*
++		 * Shifts are Rd = Rd shift Rm, the extends and clz are
++		 * Rd = op(Rm), ubfx is Rd = (Rm >> lsb) & mask.
++		 */
++		if (!strcmp(m, "lsls") || !strcmp(m, "lsrs") ||
++		    !strcmp(m, "asrs"))
++			src = (nops >= 3) ? reg_index(op2, l2) : r1;
++		else
++			src = reg_index(op2, l2);
++		a = get_reg(f, src);
++
++		if (!strcmp(m, "clz")) {
++			set_reg(f, r1, a.kind == K_CONST ? v_const(a.c ? 0 : 32) :
++				v_unk("clz(%s)", a.e));
++			return true;
++		}
++		if (!strcmp(m, "ubfx")) {
++			long long lsb = 0, w = 0;
++
++			if (strchr(op2, '#'))
++				imm_value(strchr(op2, '#'), &lsb);
++			if (strchr(op3, '#'))
++				imm_value(strchr(op3, '#'), &w);
++			if (a.kind == K_CONST)
++				set_reg(f, r1, v_const((a.c >> lsb) & ((1LL << w) - 1)));
++			else
++				set_reg(f, r1, v_unk("((%s >> %lld) & 0x%llx)", a.e, lsb,
++						     (1LL << w) - 1));
++			return true;
++		}
++		if (nops >= 3 && strchr(op3, '#'))
++			imm_value(strchr(op3, '#'), &sh);
++		else if (strchr(op2, '#'))
++			imm_value(strchr(op2, '#'), &sh);
++		else if (!strcmp(m, "lsls") || !strcmp(m, "lsrs") ||
++			 !strcmp(m, "asrs")) {
++			/* shift amount in a register: keep it symbolic */
++			int rs = reg_index(nops >= 3 ? op3 : op2, strcspn(nops >= 3 ? op3 : op2, " ,"));
++			const char *op = "lsls";
++
++			if (!strcmp(m, "lsrs"))
++				op = "lsrs";
++			else if (!strcmp(m, "asrs"))
++				op = "asrs";
++			b = get_reg(f, rs);
++			set_reg(f, r1, v_unk("(%s %s %s)", a.e, op, b.e));
++			return true;
++		}
++		if (a.kind == K_CONST) {
++			long long nv = a.c;
++
++			if (!strcmp(m, "lsls"))
++				nv = a.c << sh;
++			else if (!strcmp(m, "lsrs"))
++				nv = (long long)((unsigned long long)a.c >> sh);
++			else if (!strcmp(m, "asrs"))
++				nv = a.c >> sh;
++			else if (!strcmp(m, "uxth"))
++				nv = a.c & 0xffff;
++			else if (!strcmp(m, "uxtb"))
++				nv = a.c & 0xff;
++			set_reg(f, r1, v_const(nv));
++			return true;
++		}
++		set_reg(f, r1, v_unk("%s(%s, %lld)", m, a.e, sh));
++		return true;
++	}
++	if (!strcmp(m, "mul")) {
++		int s1 = (nops >= 3) ? reg_index(op2, strcspn(op2, " ,")) : r1;
++		int s2 = (nops >= 3) ? reg_index(op3, strcspn(op3, " ,")) :
++			reg_index(op2, strcspn(op2, " ,"));
++
++		a = get_reg(f, s1);
++		b = get_reg(f, s2);
++		set_reg(f, r1, (a.kind == K_CONST && b.kind == K_CONST) ?
++			v_const(a.c * b.c) : v_unk("(%s * %s)", a.e, b.e));
++		return true;
++	}
++	if (!strcmp(m, "udiv") || !strcmp(m, "sdiv")) {
++		int s1 = (nops >= 3) ? reg_index(op2, strcspn(op2, " ,")) : r1;
++		int s2 = (nops >= 3) ? reg_index(op3, strcspn(op3, " ,")) :
++			reg_index(op2, strcspn(op2, " ,"));
++
++		a = get_reg(f, s1);
++		b = get_reg(f, s2);
++		if (a.kind == K_CONST && b.kind == K_CONST && b.c)
++			set_reg(f, r1, v_const(a.c / b.c));
++		else
++			set_reg(f, r1, v_unk("(%s / %s)", a.e, b.e));
++		return true;
++	}
++	if (!strcmp(m, "rsb")) {
++		a = get_reg(f, r1);
++		sscanf(op2, "%31[^,], %31[^,]", op3, op4);
++		r2 = reg_index(op3, strcspn(op3, " ,"));
++		r3 = reg_index(op4, strcspn(op4, " ,"));
++		if (r3 >= 0 && imm_value(op4, &imm)) {
++			b = get_reg(f, r2);
++			set_reg(f, r1, b.kind == K_CONST ? v_const(imm - b.c) :
++				v_unk("(%lld - %s)", imm, b.e));
++			return true;
++		}
++		b = get_reg(f, r2);
++		a = get_reg(f, r3);
++		set_reg(f, r1, (a.kind == K_CONST && b.kind == K_CONST) ?
++			v_const(a.c - b.c) : v_unk("(%s - %s)", a.e, b.e));
++		return true;
++	}
++	if (!strcmp(m, "cmp") || !strcmp(m, "cmp.w") || !strcmp(m, "tst") ||
++	    !strcmp(m, "tst.w")) {
++		unsigned int l2 = strcspn(op2, " ,");
++		long long iv;
++
++		if (imm_value(op2, &iv)) {
++			a = get_reg(f, r1);
++			set_fmt(f->last_cmp, sizeof(f->last_cmp),
++				 "%s %s 0x%llx", a.e,
++				 !strcmp(m, "cmp") || !strcmp(m, "cmp.w") ? "==" : "&",
++				 (unsigned long long)iv);
++		} else {
++			r2 = reg_index(op2, l2);
++			set_fmt(f->last_cmp, sizeof(f->last_cmp), "%s %s %s",
++				 get_reg(f, r1).e,
++				 !strcmp(m, "cmp") || !strcmp(m, "cmp.w") ? "==" : "&",
++				 get_reg(f, r2).e);
++		}
++		return true;
++	}
++	if (!strncmp(m, "it", 2)) {
++		const char *sfx = m + 2;
++		unsigned int i;
++
++		f->it_idx = 0;
++		f->it_left = (int)strlen(sfx);
++		for (i = 0; i < strlen(sfx); i++) {
++			static const char *cond[] = { "eq", "ne", "hs", "lo",
++						      "mi", "pl", "ge", "lt", "gt", "le" };
++			/* suffix letters: t = then, e = else */
++			if (sfx[i] == 't' || sfx[i] == 'e')
++				continue;
++			(void)cond;
++		}
++		set_fmt(f->it_cond, sizeof(f->it_cond), "%s", f->last_cmp);
++		return true;
++	}
++	if (!strcmp(m, "b") || !strcmp(m, "b.w")) {
++		/* forward unconditional branch: fall through is not taken */
++		return true;
++	}
++	if (is_cond_branch(m)) {
++		/* conditional branch: remember the state of the taken path */
++		char *end = NULL;
++
++		target = (uint32_t)strtoul(ops[0] == '#' ? ops + 1 : ops, &end, 16);
++		if (end && end != (ops[0] == '#' ? ops + 1 : ops)) {
++			printf("  branch 0x%x (%s): taken when %s; the target is\n"
++			       "    interpreted with the register state of this point\n",
++			       target, m, f->last_cmp[0] ? f->last_cmp : "?");
++			if (f->ntarget < (int)ARRAY_SIZE(f->target)) {
++				f->target[f->ntarget].addr = target;
++				memcpy(f->target[f->ntarget].r, f->r, sizeof(f->r));
++				f->ntarget++;
++			}
++		}
++		return true;
++	}
++	if (!strcmp(m, "bl") || !strcmp(m, "blx")) {
++		const char *lt = strchr(ops, '<');
++		char name[96] = "";
++		struct val fmt, v1;
++
++		if (lt)
++			set_fmt(name, sizeof(name), "%s", lt + 1);
++		if (strchr(name, '>'))
++			*(char *)strchr(name, '>') = '\0';
++
++		if (strstr(name, "__android_log_print")) {
++			fmt = get_reg(f, 2);
++			v1 = get_reg(f, 3);
++			printf("  log: fmt=%s v1=%s", fmt.e, v1.e);
++			if (f->stack_valid[slot_of(f->sp_key_base)]) {
++				int i;
++
++				printf(" stack={");
++				for (i = 0; i < 8; i++) {
++					int sl = slot_of(f->sp_key_base + i * 4);
++
++					if (sl < 0 || !f->stack_valid[sl])
++						continue;
++					printf("%s%s", i ? ", " : "", f->stack[sl].e);
++				}
++				printf("}");
++			}
++			printf("  @0x%x\n", in->addr);
++		} else if (strstr(name, "usleep")) {
++			printf("  usleep(%s) @0x%x\n", get_reg(f, 0).e, in->addr);
++		} else if (strstr(name, "mmap")) {
++			int sl = slot_of(f->sp_key_base + 4);
++
++			printf("  mmap(len=%s, off=%s) @0x%x\n", get_reg(f, 1).e,
++			       (sl >= 0 && f->stack_valid[sl]) ? f->stack[sl].e : "?",
++			       in->addr);
++		} else if (strstr(name, "ioctl")) {
++			printf("  ioctl(fd=%s, cmd=0x%llx) @0x%x\n",
++			       get_reg(f, 0).e,
++			       get_reg(f, 1).kind == K_CONST ? get_reg(f, 1).c : 0,
++			       in->addr);
++		} else if (name[0]) {
++			printf("  call %s @0x%x\n", name, in->addr);
++		}
++		clobber(f);
++		return true;
++	}
++	if (!strcmp(m, "cbz") || !strcmp(m, "cbnz")) {
++		printf("  %s %s @0x%x\n", m, get_reg(f, r1).e, in->addr);
++		return true;
++	}
++	if (!strcmp(m, "dmb") || !strcmp(m, "nop") || !strcmp(m, "ldrex") ||
++	    !strcmp(m, "strex") || !strcmp(m, "sxtb16") || !strcmp(m, "uxtb16"))
++		return true;
++
++	return true;
++}
++
++static void run_function(const struct elf *e, const struct disasm *d,
++			 const struct symbol *sym, bool scan)
++{
++	struct frame f;
++	unsigned int i;
++	bool started = false;
++
++	memset(&f, 0, sizeof(f));
++	f.elf = e;
++	f.dis = d;
++	f.fname = sym->name;
++	for (i = 0; i < ARRAY_SIZE(f.r); i++)
++		f.r[i] = v_unk("<entry>");
++	f.this_reg = 0;
++	f.r[0] = v_arg(0);
++	set_fmt(f.r[0].e, sizeof(f.r[0].e), "this");
++	f.r[1] = v_arg(1);
++	f.r[2] = v_arg(2);
++	f.r[3] = v_arg(3);
++	{
++		int a;
++
++		for (a = 4; a <= 10; a++) {
++			int slot = slot_of((long long)(a - 4) * 4);
++
++			if (slot < 0)
++				continue;
++			f.stack[slot] = v_arg(a);
++			f.stack_valid[slot] = true;
++		}
++	}
++
++	if (!scan)
++		printf("== %s @0x%x (%u bytes) ==\n", sym->name, sym->addr, sym->size);
++
++	for (i = 0; i < d->n; i++) {
++		const struct insn *in = &d->v[i];
++
++		if (in->addr < sym->addr)
++			continue;
++		if (in->addr >= sym->addr + sym->size)
++			break;
++		started = true;
++
++		if (f.it_left > 0)
++			f.it_left--;
++		{
++			int t;
++
++			for (t = 0; t < f.ntarget; t++) {
++				if (f.target[t].addr != in->addr)
++					continue;
++				memcpy(f.r, f.target[t].r, sizeof(f.r));
++				printf("    [entered branch target 0x%x]\n", in->addr);
++				f.target[t].addr = 0;
++			}
++		}
++		if (!step(&f, in))
++			break;
++	}
++
++	if (scan)
++		return;
++	if (!started)
++		printf("  (no instructions found; is the disassembly complete?)\n");
++	printf("  %u store(s); %u of them in conditionally entered blocks;\n"
++	       "  %u write(s) to the \"this\" register in dead error-handling\n"
++	       "  branches were ignored\n\n",
++	       f.stores, 0, f.dead_writes);
++}
++
++int main(int argc, char **argv)
++{
++	struct elf e;
++	struct disasm d;
++	static const char *funcs[] = {
++		"_ZN12SeninfDrvImp4initEv",
++		"_ZN12SeninfDrvImp15setSeninf1NCSI2Emmmmmmmmmm",
++		"_ZN12SeninfDrvImp15setSeninf2NCSI2Emmmmmmmmmm",
++		"_ZN12SeninfDrvImp15setSeninf3NCSI2Emmmmmmmmmm",
++	};
++	unsigned int i;
++	int ret = 0;
++
++	if (argc != 3) {
++		fprintf(stderr, "usage: %s <libcam.halsensor.so> <disassembly.txt>\n",
++			argv[0]);
++		return 2;
++	}
++
++	build_ptr_map();
++	if (!elf_load(&e, argv[1]))
++		return 1;
++	if (!disasm_load(&d, argv[2]))
++		return 1;
++
++	printf("seninf-dphy-extract: %s (%u instructions parsed)\n\n", argv[1], d.n);
++
++	if (!verify_windows(&e, &d)) {
++		fprintf(stderr, "window proof mismatch: refusing to print values\n");
++		return 1;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(funcs); i++) {
++		const struct symbol *s = find_sym(&e, funcs[i]);
++
++		if (!s) {
++			fprintf(stderr, "symbol %s not found\n", funcs[i]);
++			ret = 1;
++			continue;
++		}
++		run_function(&e, &d, s, false);
++	}
++
++
++	printf("Legend: the left column is the instruction address that issues the\n"
++	       "store (Thumb-2), the middle column the destination, the right column\n"
++	       "the value expression.  \"<unprovable>\" means the tool could not\n"
++	       "derive the operand from the instruction stream; such a value must\n"
++	       "not be used.\n");
++
++	return ret;
++}

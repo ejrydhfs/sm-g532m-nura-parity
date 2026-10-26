@@ -1,0 +1,407 @@
+diff --git a/drivers/media/platform/mediatek/Kconfig b/drivers/media/platform/mediatek/Kconfig
+index 84104e2cd..5b3d1ad71 100644
+--- a/drivers/media/platform/mediatek/Kconfig
++++ b/drivers/media/platform/mediatek/Kconfig
+@@ -7,3 +7,4 @@ source "drivers/media/platform/mediatek/mdp/Kconfig"
+ source "drivers/media/platform/mediatek/vcodec/Kconfig"
+ source "drivers/media/platform/mediatek/vpu/Kconfig"
+ source "drivers/media/platform/mediatek/mdp3/Kconfig"
++source "drivers/media/platform/mediatek/imgsys/Kconfig"
+diff --git a/drivers/media/platform/mediatek/Makefile b/drivers/media/platform/mediatek/Makefile
+index 38e6ba917..2c215d529 100644
+--- a/drivers/media/platform/mediatek/Makefile
++++ b/drivers/media/platform/mediatek/Makefile
+@@ -4,3 +4,4 @@ obj-y += mdp/
+ obj-y += vcodec/
+ obj-y += vpu/
+ obj-y += mdp3/
++obj-y += imgsys/
+diff --git a/drivers/media/platform/mediatek/imgsys/Kconfig b/drivers/media/platform/mediatek/imgsys/Kconfig
+new file mode 100644
+index 000000000..2e600c8cd
+--- /dev/null
++++ b/drivers/media/platform/mediatek/imgsys/Kconfig
+@@ -0,0 +1,25 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config VIDEO_MTK_IMGSYS
++	tristate "MediaTek MT6735 IMGSYS/ISP platform driver"
++	depends on MEDIA_SUPPORT
++	depends on VIDEO_DEV
++	depends on COMMON_CLK
++	depends on OF
++	depends on PM
++	help
++	  Platform, clock, power and reset driver for the MediaTek MT6735 /
++	  MT6737T image signal processor (IMGSYS) block.
++
++	  The driver owns the ISP core register windows, the six IMGSYS clock
++	  gates and the ISP power domain, performs the documented Pass 1 soft
++	  reset on probe and resume, and exposes the mapped register windows
++	  through debugfs for diagnostics.
++
++	  The ISP capture pipeline itself is not implemented: running the
++	  Pass 1 / Pass 2 / CAM_SV / DSP pipelines requires the proprietary
++	  MTK camera userspace ABI (libcamdrv) plus the ISP firmware images,
++	  neither of which is available.  This driver therefore provides no
++	  V4L2 entity and no video node.
++
++	  To compile this driver as a module, choose M here: the module will
++	  be called mtk-imgsys.
+diff --git a/drivers/media/platform/mediatek/imgsys/Makefile b/drivers/media/platform/mediatek/imgsys/Makefile
+new file mode 100644
+index 000000000..729a3af8d
+--- /dev/null
++++ b/drivers/media/platform/mediatek/imgsys/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_VIDEO_MTK_IMGSYS) += mtk-imgsys.o
+diff --git a/drivers/media/platform/mediatek/imgsys/mtk-imgsys-regs.h b/drivers/media/platform/mediatek/imgsys/mtk-imgsys-regs.h
+new file mode 100644
+index 000000000..c41e3919a
+--- /dev/null
++++ b/drivers/media/platform/mediatek/imgsys/mtk-imgsys-regs.h
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * MediaTek MT6735/MT6737T IMGSYS/ISP register definitions
++ *
++ * Port from Samsung/MTK downstream
++ * drivers/misc/mediatek/cameraisp/src/mt6735/camera_isp_D1.c
++ *
++ * Copyright 2008-2009 MediaTek Co., Ltd.
++ *
++ * Only the registers needed to power up, reset and inspect the ISP block are
++ * described here.  The downstream ISP register map is much larger, but every
++ * other register belongs to the Pass 1/Pass 2/CAM_SV programming sequences
++ * which are driven by the proprietary MTK camera userspace ABI (libcamdrv)
++ * and are intentionally not ported.
++ */
++
++#ifndef __MTK_IMGSYS_REGS_H
++#define __MTK_IMGSYS_REGS_H
++
++/* ISP core window, DT reg entry 0 (camera_isp_D1.c:110-200, :1278). */
++#define MTK_IMGSYS_ISP_WINDOW_SIZE		0x4000
++
++/* Inner ISP window, DT reg entry 1 (camera_isp_D1.c:311-313). */
++#define MTK_IMGSYS_INNER_ISP_WINDOW_SIZE	0x1000
++
++/*
++ * CAM_CTL_SW_CTL, ISP base + 0x8C
++ * (camera_isp_D1.c:244 "ISP_REG_ADDR_CAM_SW_CTL (ISP_ADDR + 0x8C)").
++ */
++#define MTK_IMGSYS_CAM_SW_CTL			0x008c
++
++/* P1 soft reset field, camera_isp_D1.c:370-374. */
++#define MTK_IMGSYS_SW_CTL_SW_RST_P1_MASK	GENMASK(2, 0)
++#define MTK_IMGSYS_SW_CTL_SW_RST_TRIG		BIT(0)
++#define MTK_IMGSYS_SW_CTL_SW_RST_STATUS		BIT(1)
++#define MTK_IMGSYS_SW_CTL_HW_RST		BIT(2)
++
++#endif /* __MTK_IMGSYS_REGS_H */
+diff --git a/drivers/media/platform/mediatek/imgsys/mtk-imgsys.c b/drivers/media/platform/mediatek/imgsys/mtk-imgsys.c
+new file mode 100644
+index 000000000..c89459f38
+--- /dev/null
++++ b/drivers/media/platform/mediatek/imgsys/mtk-imgsys.c
+@@ -0,0 +1,300 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek MT6735/MT6737T IMGSYS/ISP platform driver
++ *
++ * Port from Samsung/MTK downstream
++ * drivers/misc/mediatek/cameraisp/src/mt6735/camera_isp_D1.c
++ *
++ * Copyright 2008-2009 MediaTek Co., Ltd.
++ *
++ * This driver implements the parts of the MT6735 ISP block that are fully
++ * documented by the downstream GPL source drop: register window mapping, the
++ * six IMGSYS clock gates, the ISP power domain, the Pass 1 soft reset and a
++ * register dump for diagnostics.
++ *
++ * The ISP capture pipeline (Pass 1 / Pass 2 / CAM_SV / DSP programming, CQ
++ * command queues, interrupt driven frame completion) is not implemented: it
++ * is driven by the proprietary MTK camera userspace ABI (libcamdrv) and
++ * requires ISP firmware images.  Consequently this driver registers no V4L2
++ * entity, no video node and no interrupt handler; see the driver report for
++ * the detailed rationale and the deferred work list.
++ */
++
++#include <linux/clk.h>
++#include <linux/debugfs.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/seq_file.h>
++
++#include "mtk-imgsys-regs.h"
++
++/*
++ * Clock gates, in the order mandated by the downstream ISP driver
++ * (camera_isp_D1.c:3062-3100, "must keep this clk open order"):
++ * CG_IMAGE_CAM_SMI, CG_IMAGE_CAM_CAM, CG_IMAGE_SEN_TG, CG_IMAGE_SEN_CAM,
++ * CG_IMAGE_CAM_SV, CG_IMAGE_LARB2_SMI.
++ *
++ * All six are gates of the IMGSYS clock controller, addressed through the
++ * <&imgsys CLK_IMG_*> clock specifiers (include/dt-bindings/clock/
++ * mediatek,mt6735-imgsys.h).
++ */
++static const char *const mtk_imgsys_clk_names[] = {
++	"CG_IMAGE_CAM_SMI",
++	"CG_IMAGE_CAM_CAM",
++	"CG_IMAGE_SEN_TG",
++	"CG_IMAGE_SEN_CAM",
++	"CG_IMAGE_CAM_SV",
++	"CG_IMAGE_LARB2_SMI",
++};
++
++#define MTK_IMGSYS_CLK_NUM	ARRAY_SIZE(mtk_imgsys_clk_names)
++
++/* Software policy: reset completion poll interval and timeout. */
++#define MTK_IMGSYS_RESET_POLL_US	10
++#define MTK_IMGSYS_RESET_TIMEOUT_US	10000
++
++struct mtk_imgsys {
++	struct device *dev;
++	void __iomem *isp_base;
++	void __iomem *inner_base;
++	phys_addr_t isp_phys;
++	phys_addr_t inner_phys;
++	struct clk *clks[MTK_IMGSYS_CLK_NUM];
++	struct dentry *debugfs_dir;
++};
++
++static int mtk_imgsys_clks_enable(struct mtk_imgsys *priv)
++{
++	int i, ret;
++
++	for (i = 0; i < MTK_IMGSYS_CLK_NUM; i++) {
++		ret = clk_prepare_enable(priv->clks[i]);
++		if (ret) {
++			dev_err(priv->dev, "failed to enable clock %s: %d\n",
++				mtk_imgsys_clk_names[i], ret);
++			while (--i >= 0)
++				clk_disable_unprepare(priv->clks[i]);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++static void mtk_imgsys_clks_disable(struct mtk_imgsys *priv)
++{
++	int i;
++
++	for (i = MTK_IMGSYS_CLK_NUM - 1; i >= 0; i--)
++		clk_disable_unprepare(priv->clks[i]);
++}
++
++/*
++ * Pass 1 soft reset, following ISP_Reset(ISP_REG_SW_CTL_RST_CAM_P1) at
++ * camera_isp_D1.c:3263-3300 (the enabled "#if 1" variant):
++ *
++ *	reg = readl(CAM_SW_CTL);
++ *	writel((reg & ~RST_P1_MASK) | SW_RST_TRIG, CAM_SW_CTL);
++ *	poll SW_RST_STATUS;
++ *	writel(HW_RST, CAM_SW_CTL);
++ *	writel(reg & ~RST_P1_MASK, CAM_SW_CTL);
++ *
++ * The downstream completion loop is
++ * "do { Reg = read; } while ((!Reg) & SW_RST_STATUS);", which always
++ * terminates after a single read because of the use of bitwise "&" instead
++ * of "&&" and the inverted test.  The loop below waits for the documented
++ * status bit (bit 1, camera_isp_D1.c:372) with a bounded timeout instead.
++ */
++static int mtk_imgsys_soft_reset(struct mtk_imgsys *priv)
++{
++	void __iomem *sw_ctl = priv->isp_base + MTK_IMGSYS_CAM_SW_CTL;
++	u32 val;
++	int ret;
++
++	val = readl(sw_ctl);
++	writel((val & ~MTK_IMGSYS_SW_CTL_SW_RST_P1_MASK) |
++	       MTK_IMGSYS_SW_CTL_SW_RST_TRIG, sw_ctl);
++
++	ret = readl_poll_timeout(sw_ctl, val,
++				 val & MTK_IMGSYS_SW_CTL_SW_RST_STATUS,
++				 MTK_IMGSYS_RESET_POLL_US,
++				 MTK_IMGSYS_RESET_TIMEOUT_US);
++	if (ret) {
++		dev_err(priv->dev, "ISP P1 soft reset timed out, CAM_SW_CTL=0x%08x\n",
++			val);
++		return ret;
++	}
++
++	writel(MTK_IMGSYS_SW_CTL_HW_RST, sw_ctl);
++	writel(val & ~MTK_IMGSYS_SW_CTL_SW_RST_P1_MASK, sw_ctl);
++
++	return 0;
++}
++
++static int mtk_imgsys_runtime_resume(struct device *dev)
++{
++	struct mtk_imgsys *priv = dev_get_drvdata(dev);
++	int ret;
++
++	ret = mtk_imgsys_clks_enable(priv);
++	if (ret)
++		return ret;	/* mtk_imgsys_clks_enable() rolled back */
++
++	ret = mtk_imgsys_soft_reset(priv);
++	if (ret) {
++		mtk_imgsys_clks_disable(priv);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int mtk_imgsys_runtime_suspend(struct device *dev)
++{
++	struct mtk_imgsys *priv = dev_get_drvdata(dev);
++
++	mtk_imgsys_clks_disable(priv);
++
++	return 0;
++}
++
++static const struct dev_pm_ops mtk_imgsys_pm_ops = {
++	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
++	RUNTIME_PM_OPS(mtk_imgsys_runtime_suspend, mtk_imgsys_runtime_resume,
++		       NULL)
++};
++
++static int mtk_imgsys_regs_show(struct seq_file *s, void *unused)
++{
++	struct mtk_imgsys *priv = s->private;
++	unsigned int i, off;
++	int ret;
++
++	/*
++	 * The register windows are only accessible while the ISP power domain
++	 * and the clock gates are on, so resume the device for the duration of
++	 * the dump.
++	 */
++	ret = pm_runtime_resume_and_get(priv->dev);
++	if (ret)
++		return ret;
++
++	seq_printf(s, "ISP core @ %pa (0x%x bytes)\n", &priv->isp_phys,
++		   MTK_IMGSYS_ISP_WINDOW_SIZE);
++	for (i = 0, off = 0; i < MTK_IMGSYS_ISP_WINDOW_SIZE / sizeof(u32);
++	     i++, off += sizeof(u32))
++		seq_printf(s, "%04x: %08x\n", off,
++			   readl(priv->isp_base + off));
++
++	seq_printf(s, "inner ISP @ %pa (0x%x bytes)\n", &priv->inner_phys,
++		   MTK_IMGSYS_INNER_ISP_WINDOW_SIZE);
++	for (i = 0, off = 0; i < MTK_IMGSYS_INNER_ISP_WINDOW_SIZE / sizeof(u32);
++	     i++, off += sizeof(u32))
++		seq_printf(s, "%04x: %08x\n", off,
++			   readl(priv->inner_base + off));
++
++	pm_runtime_put(priv->dev);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mtk_imgsys_regs);
++
++static int mtk_imgsys_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct mtk_imgsys *priv;
++	struct resource *res;
++	int i, ret;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->dev = dev;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res)
++		return -ENODEV;
++	priv->isp_phys = res->start;
++	priv->isp_base = devm_ioremap_resource(dev, res);
++	if (IS_ERR(priv->isp_base))
++		return PTR_ERR(priv->isp_base);
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++	if (!res)
++		return -ENODEV;
++	priv->inner_phys = res->start;
++	priv->inner_base = devm_ioremap_resource(dev, res);
++	if (IS_ERR(priv->inner_base))
++		return PTR_ERR(priv->inner_base);
++
++	for (i = 0; i < MTK_IMGSYS_CLK_NUM; i++) {
++		priv->clks[i] = devm_clk_get(dev, mtk_imgsys_clk_names[i]);
++		if (IS_ERR(priv->clks[i])) {
++			dev_err(dev, "failed to get clock %s: %ld\n",
++				mtk_imgsys_clk_names[i],
++				PTR_ERR(priv->clks[i]));
++			return PTR_ERR(priv->clks[i]);
++		}
++	}
++
++	platform_set_drvdata(pdev, priv);
++
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
++
++	/*
++	 * Power the block on (ISP power domain through genpd, then the clock
++	 * gates) and run the Pass 1 soft reset.  The device is suspended again
++	 * right after probe; every later user (debugfs dump) resumes it.
++	 */
++	ret = pm_runtime_resume_and_get(dev);
++	if (ret) {
++		dev_err(dev, "failed to power on ISP block: %d\n", ret);
++		return ret;
++	}
++
++	priv->debugfs_dir = debugfs_create_dir("mtk-imgsys", NULL);
++	if (!IS_ERR_OR_NULL(priv->debugfs_dir))
++		debugfs_create_file("regs", 0444, priv->debugfs_dir, priv,
++				    &mtk_imgsys_regs_fops);
++
++	pm_runtime_put(dev);
++
++	dev_info(dev, "MT6735 IMGSYS/ISP block registered (ISP pipeline deferred)\n");
++
++	return 0;
++}
++
++static void mtk_imgsys_remove(struct platform_device *pdev)
++{
++	struct mtk_imgsys *priv = platform_get_drvdata(pdev);
++
++	debugfs_remove(priv->debugfs_dir);
++}
++
++static const struct of_device_id mtk_imgsys_of_match[] = {
++	{ .compatible = "mediatek,mt6735-ispsys" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, mtk_imgsys_of_match);
++
++static struct platform_driver mtk_imgsys_driver = {
++	.probe = mtk_imgsys_probe,
++	.remove = mtk_imgsys_remove,
++	.driver = {
++		.name = "mtk-imgsys",
++		.of_match_table = mtk_imgsys_of_match,
++		.pm = pm_ptr(&mtk_imgsys_pm_ops),
++	},
++};
++module_platform_driver(mtk_imgsys_driver);
++
++MODULE_AUTHOR("MediaTek Co., Ltd.");
++MODULE_DESCRIPTION("MediaTek MT6735 IMGSYS/ISP platform driver");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,39 @@
+diff --git a/drivers/misc/mediatek/ccci/ccci_boot.c b/drivers/misc/mediatek/ccci/ccci_boot.c
+index a73a4b0a1..eb1c5ca15 100644
+--- a/drivers/misc/mediatek/ccci/ccci_boot.c
++++ b/drivers/misc/mediatek/ccci/ccci_boot.c
+@@ -24,6 +24,7 @@
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/of_platform.h>
++#include <linux/of_reserved_mem.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/minmax.h>
+ #include <linux/random.h>
+@@ -228,6 +229,26 @@ static int ccci_boot_region_get(struct device *dev, const char *prop,
+ 	struct resource res;
+ 	int ret;
+ 
++	/*
++	 * A reserved-memory child may describe the carve-out with
++	 * size/alignment/alloc-ranges instead of reg (downstream
++	 * arch/arm64/boot/dts/mt6735.dtsi:197-203 reserve-memory-ccci_md1).
++	 * Its base is picked by the early reserved-memory allocator and only
++	 * recorded in the reserved_mem[] table (drivers/of/of_reserved_mem.c:
++	 * 391-491, fdt_reserved_mem_save_node()), so of_address_to_resource()
++	 * cannot resolve it. of_reserved_mem_region_to_resource() handles both
++	 * the reg-based and the size-based form.
++	 */
++	if (!strcmp(prop, "memory-region")) {
++		ret = of_reserved_mem_region_to_resource(np, index, &res);
++		if (!ret) {
++			*phys = res.start;
++			*size = resource_size(&res);
++			return 0;
++		}
++	}
++
++	/* Fallback: a plain reg node referenced by the phandle property. */
+ 	rn = of_parse_phandle(np, prop, index);
+ 	if (!rn)
+ 		return -ENOENT;

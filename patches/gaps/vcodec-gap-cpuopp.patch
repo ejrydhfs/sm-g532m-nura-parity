@@ -1,0 +1,329 @@
+diff --git a/drivers/misc/mediatek/vcodec/vcodec-core.c b/drivers/misc/mediatek/vcodec/vcodec-core.c
+index a21a49c15..a719cf378 100644
+--- a/drivers/misc/mediatek/vcodec/vcodec-core.c
++++ b/drivers/misc/mediatek/vcodec/vcodec-core.c
+@@ -19,6 +19,7 @@
+ #define pr_fmt(fmt)	"vcodec: " fmt
+ 
+ #include <linux/compat.h>
++#include <linux/cpufreq.h>
+ #include <linux/fs.h>
+ #include <linux/init.h>
+ #include <linux/ioctl.h>
+@@ -31,6 +32,7 @@
+ #include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/pm_qos.h>
+ #include <linux/sched.h>
+ #include <linux/sched/clock.h>
+ #include <linux/sched/mm.h>
+@@ -642,6 +644,237 @@ static long vcodec_ioc_thread_id(const struct vcodec_thread_id *tid)
+ 	return 0;
+ }
+ 
++/*
++ * VCODEC_SET_CPU_OPP_LIMIT.
++ *
++ * Port from Samsung/MTK downstream
++ * drivers/misc/mediatek/videocodec/mt6735/videocodec_kernel_driver_D1.c:
++ * 1533-1555, which copies VAL_VCODEC_CPU_OPP_LIMIT_T and then calls
++ * cpu_opp_limit(EVENT_VIDEO, limited_freq, limited_cpu, enable).  That helper
++ * exists neither in the downstream tree nor in the ROM, so the call is
++ * commented out there.  The semantics below follow the argument names and
++ * the downstream call site:
++ *
++ *   limited_freq  frequency ceiling in kHz
++ *   limited_cpu   bitmask of CPUs; 0 means every CPU
++ *   enable        1 applies the ceiling, 0 removes it
++ *
++ * They are [INFERENCE]: no available source defines cpu_opp_limit().  The
++ * ceiling is expressed with the frequency QoS API on each policy's maximum
++ * frequency constraint, which is what cpufreq-dt (CONFIG_CPUFREQ_DT, the
++ * provider Nura uses) honours for every CPU sharing the policy.
++ *
++ * Unlike downstream's fire-and-forget call, every active request is dropped
++ * when the last user closes /dev/Vcodec and at module exit, so a crashed
++ * caller cannot leave the CPU capped.  Enabling again replaces the previous
++ * ceiling set: policies the new mask does not select are released.  Those
++ * are deliberate deviations.
++ */
++#if IS_ENABLED(CONFIG_CPU_FREQ)
++struct vcodec_cpu_opp {
++	struct cpufreq_policy *policy;
++	struct freq_qos_request max_freq_req;
++	bool visited;
++};
++
++/*
++ * One entry per policy.  There can never be more policies than CPUs, so
++ * NR_CPUS bounds the array; nr_cpu_ids bounds the CPUs we look at below.
++ */
++static DEFINE_MUTEX(vcodec_cpu_opp_lock);
++static struct vcodec_cpu_opp vcodec_cpu_opps[NR_CPUS];
++
++static struct vcodec_cpu_opp *vcodec_cpu_opp_find(struct cpufreq_policy *policy)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(vcodec_cpu_opps); i++)
++		if (vcodec_cpu_opps[i].policy == policy)
++			return &vcodec_cpu_opps[i];
++
++	return NULL;
++}
++
++static struct vcodec_cpu_opp *vcodec_cpu_opp_free(void)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(vcodec_cpu_opps); i++)
++		if (!vcodec_cpu_opps[i].policy)
++			return &vcodec_cpu_opps[i];
++
++	return NULL;
++}
++
++/* Drop one ceiling.  Caller holds vcodec_cpu_opp_lock. */
++static void __vcodec_cpu_opp_release(struct vcodec_cpu_opp *opp)
++{
++	freq_qos_update_request(&opp->max_freq_req, FREQ_QOS_MAX_DEFAULT_VALUE);
++	freq_qos_remove_request(&opp->max_freq_req);
++	cpufreq_cpu_put(opp->policy);
++	opp->policy = NULL;
++	opp->visited = false;
++}
++
++/* Drop every active ceiling.  Caller holds vcodec_cpu_opp_lock. */
++static void __vcodec_cpu_opp_release_all(void)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(vcodec_cpu_opps); i++)
++		if (vcodec_cpu_opps[i].policy)
++			__vcodec_cpu_opp_release(&vcodec_cpu_opps[i]);
++}
++
++static void vcodec_cpu_opp_release_all(void)
++{
++	mutex_lock(&vcodec_cpu_opp_lock);
++	__vcodec_cpu_opp_release_all();
++	mutex_unlock(&vcodec_cpu_opp_lock);
++}
++
++static long vcodec_cpu_opp_enable(const struct vcodec_cpu_opp_limit *limit)
++{
++	u32 mask = (u32)limit->limited_cpu;
++	int matched = 0;
++	int applied = 0;
++	int err = 0;
++	int cpu, i;
++
++	mutex_lock(&vcodec_cpu_opp_lock);
++
++	for (i = 0; i < ARRAY_SIZE(vcodec_cpu_opps); i++)
++		vcodec_cpu_opps[i].visited = false;
++
++	for_each_possible_cpu(cpu) {
++		struct vcodec_cpu_opp *opp;
++		struct cpufreq_policy *policy;
++		int ret;
++
++		/*
++		 * limited_cpu == 0 applies to every CPU.  It is the 32-bit ABI
++		 * field, so CPUs at or above bit 31 can never be selected.
++		 */
++		if (mask && (cpu >= 32 || !((mask >> cpu) & 1)))
++			continue;
++
++		policy = cpufreq_cpu_get(cpu);
++		if (!policy)
++			continue;
++
++		matched++;
++
++		/*
++		 * Several CPUs share one policy and its constraint set, so
++		 * only one request per policy is added; later selections of
++		 * the same policy reuse (and update) that request.
++		 */
++		opp = vcodec_cpu_opp_find(policy);
++		if (opp) {
++			opp->visited = true;
++			ret = freq_qos_update_request(&opp->max_freq_req,
++						      limit->limited_freq);
++			cpufreq_cpu_put(policy);
++			if (ret < 0) {
++				pr_warn("cannot update cpu opp limit for cpu %d: %d\n",
++					cpu, ret);
++				if (!err)
++					err = ret;
++				continue;
++			}
++			applied++;
++			continue;
++		}
++
++		opp = vcodec_cpu_opp_free();
++		if (!opp) {
++			/* Cannot happen: at most NR_CPUS policies. */
++			pr_warn("cpu opp limit table is full\n");
++			cpufreq_cpu_put(policy);
++			if (!err)
++				err = -ENOSPC;
++			continue;
++		}
++
++		ret = freq_qos_add_request(&policy->constraints,
++					   &opp->max_freq_req, FREQ_QOS_MAX,
++					   limit->limited_freq);
++		if (ret < 0) {
++			pr_warn("cannot add cpu opp limit for cpu %d: %d\n",
++				cpu, ret);
++			cpufreq_cpu_put(policy);
++			if (!err)
++				err = ret;
++			continue;
++		}
++
++		opp->policy = policy;
++		opp->visited = true;
++		applied++;
++
++		pr_debug("cpu %d limited to %d kHz\n", cpu,
++			 limit->limited_freq);
++	}
++
++	/*
++	 * A re-issue replaces the previous ceiling set: policies that this
++	 * call did not select must not stay capped.
++	 */
++	for (i = 0; i < ARRAY_SIZE(vcodec_cpu_opps); i++) {
++		struct vcodec_cpu_opp *opp = &vcodec_cpu_opps[i];
++
++		if (opp->policy && !opp->visited)
++			__vcodec_cpu_opp_release(opp);
++	}
++
++	mutex_unlock(&vcodec_cpu_opp_lock);
++
++	if (!matched)
++		return -ENODEV;
++
++	if (!applied)
++		return err;
++
++	return 0;
++}
++
++static long vcodec_cpu_opp_disable(void)
++{
++	mutex_lock(&vcodec_cpu_opp_lock);
++	__vcodec_cpu_opp_release_all();
++	mutex_unlock(&vcodec_cpu_opp_lock);
++
++	return 0;
++}
++
++static long vcodec_ioc_cpu_opp_limit(const struct vcodec_cpu_opp_limit *limit)
++{
++	if (limit->enable != 0 && limit->enable != 1)
++		return -EINVAL;
++
++	if (limit->limited_cpu < 0)
++		return -EINVAL;
++
++	if (limit->enable && limit->limited_freq <= 0)
++		return -EINVAL;
++
++	if (limit->enable)
++		return vcodec_cpu_opp_enable(limit);
++
++	/*
++	 * Removing the ceiling drops every request this driver owns, whatever
++	 * the mask says: a stale cap is worse than an over-broad release, and
++	 * it is the same operation the last-close path performs.
++	 */
++	return vcodec_cpu_opp_disable();
++}
++#else /* !CONFIG_CPU_FREQ */
++static long vcodec_ioc_cpu_opp_limit(const struct vcodec_cpu_opp_limit *limit)
++{
++	return -EOPNOTSUPP;
++}
++#endif /* CONFIG_CPU_FREQ */
++
+ static int vcodec_open(struct inode *inode, struct file *file)
+ {
+ 	mutex_lock(&vcodec_open_lock);
+@@ -719,6 +952,13 @@ static int vcodec_release(struct inode *inode, struct file *file)
+ 	if (last) {
+ 		pr_debug("last user gone, forcing engines idle\n");
+ 		vcodec_cleanup_engines();
++#if IS_ENABLED(CONFIG_CPU_FREQ)
++		/*
++		 * The caller that set a CPU ceiling may be gone without
++		 * clearing it; drop it with the rest of the session state.
++		 */
++		vcodec_cpu_opp_release_all();
++#endif
+ 	}
+ 
+ 	return 0;
+@@ -806,7 +1046,6 @@ static const unsigned int vcodec_unsupported_cmds[] = {
+ 	VCODEC_GET_SYSRAM_INFO,
+ 	VCODEC_ALLOC_NON_CACHE_BUFFER,
+ 	VCODEC_FREE_NON_CACHE_BUFFER,
+-	VCODEC_SET_CPU_OPP_LIMIT,
+ };
+ 
+ static bool vcodec_cmd_is_unsupported(unsigned int cmd)
+@@ -828,6 +1067,7 @@ static long vcodec_unlocked_ioctl(struct file *file, unsigned int cmd,
+ 	struct vcodec_power power;
+ 	struct vcodec_isr isr;
+ 	struct vcodec_thread_id thread_id;
++	struct vcodec_cpu_opp_limit cpu_opp;
+ 	struct vcodec_core_loading loading;
+ 	struct vcodec_cpu_loading_info info;
+ 	u32 status = 0;
+@@ -894,6 +1134,10 @@ static long vcodec_unlocked_ioctl(struct file *file, unsigned int cmd,
+ 		if (copy_from_user(&thread_id, uarg, sizeof(thread_id)))
+ 			return -EFAULT;
+ 		return vcodec_ioc_thread_id(&thread_id);
++	case VCODEC_SET_CPU_OPP_LIMIT:
++		if (copy_from_user(&cpu_opp, uarg, sizeof(cpu_opp)))
++			return -EFAULT;
++		return vcodec_ioc_cpu_opp_limit(&cpu_opp);
+ 	case VCODEC_INITHWLOCK:
+ 	case VCODEC_DEINITHWLOCK:
+ 		/* Downstream only logs these, the lock is owned by this file. */
+@@ -1017,6 +1261,7 @@ static long vcodec_compat_ioctl(struct file *file, unsigned int cmd,
+ 				unsigned long arg)
+ {
+ 	void __user *uarg = compat_ptr(arg);
++	struct vcodec_cpu_opp_limit cpu_opp;
+ 	struct vcodec_core_loading loading;
+ 	struct vcodec_cpu_loading_info info;
+ 	struct vcodec_thread_id thread_id;
+@@ -1080,6 +1325,11 @@ static long vcodec_compat_ioctl(struct file *file, unsigned int cmd,
+ 		if (copy_from_user(&thread_id, uarg, sizeof(thread_id)))
+ 			return -EFAULT;
+ 		return vcodec_ioc_thread_id(&thread_id);
++	case VCODEC_SET_CPU_OPP_LIMIT:
++		/* Three s32 fields, identical on both word sizes. */
++		if (copy_from_user(&cpu_opp, uarg, sizeof(cpu_opp)))
++			return -EFAULT;
++		return vcodec_ioc_cpu_opp_limit(&cpu_opp);
+ 	case VCODEC_MB:
+ 		/* Downstream: full barrier, no other effect. */
+ 		mb();
+@@ -1146,6 +1396,9 @@ static int __init vcodec_core_init(void)
+ 
+ static void __exit vcodec_core_exit(void)
+ {
++#if IS_ENABLED(CONFIG_CPU_FREQ)
++	vcodec_cpu_opp_release_all();
++#endif
+ 	vcodec_venc_unregister();
+ 	vcodec_vdec_unregister();
+ 	misc_deregister(&vcodec_miscdev);

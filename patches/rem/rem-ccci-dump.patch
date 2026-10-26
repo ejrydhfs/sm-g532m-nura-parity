@@ -1,0 +1,2560 @@
+diff --git a/drivers/misc/mediatek/ccci/Kconfig b/drivers/misc/mediatek/ccci/Kconfig
+index 5a1d55eaa..0086306a7 100644
+--- a/drivers/misc/mediatek/ccci/Kconfig
++++ b/drivers/misc/mediatek/ccci/Kconfig
+@@ -23,3 +23,25 @@ config MTK_CCCI
+ 	  must be present in the firmware search path.
+ 
+ 	  Say N unless you are building for such a modem platform.
++
++config MTK_MD_SBP_CUSTOM_VALUE
++	string "Configure modem 1 default bind operator ID"
++	depends on MTK_CCCI
++	default ""
++	help
++	  Default MD SBP (Single Binary Platform) operator/bind value
++	  reported to userspace by CCCI_IOC_GET_MD_SBP_CFG and used for the
++	  handshake-2 runtime data when userspace has not called
++	  CCCI_IOC_SET_MD_SBP_CFG.
++
++	  Ported from Samsung/MTK 3.18 ccci_util/Kconfig:99-105.  The value is
++	  parsed as an unsigned integer (kstrtouint base 0); an empty string,
++	  which is the ROM default, disables the SBP feature.
++
++config MTK_MD2_SBP_CUSTOM_VALUE
++	string "Configure modem 2 default bind operator ID"
++	depends on MTK_CCCI
++	default ""
++	help
++	  Same as MTK_MD_SBP_CUSTOM_VALUE for modem 2
++	  (Samsung/MTK 3.18 ccci_util/Kconfig:107-113).
+diff --git a/drivers/misc/mediatek/ccci/Makefile b/drivers/misc/mediatek/ccci/Makefile
+index d3491b227..4098929f3 100644
+--- a/drivers/misc/mediatek/ccci/Makefile
++++ b/drivers/misc/mediatek/ccci/Makefile
+@@ -12,4 +12,5 @@ ccci-y := ccci_core.o \
+ 	  ccci_port_net.o \
+ 	  ccci_port_kernel.o \
+ 	  ccci_ringbuf.o \
+-	  ccci_sysfs.o
++	  ccci_sysfs.o \
++	  ccci_exception.o
+diff --git a/drivers/misc/mediatek/ccci/ccci_boot.c b/drivers/misc/mediatek/ccci/ccci_boot.c
+index a73a4b0a1..d0143c4da 100644
+--- a/drivers/misc/mediatek/ccci/ccci_boot.c
++++ b/drivers/misc/mediatek/ccci/ccci_boot.c
+@@ -184,19 +184,19 @@ static void ccci_boot_timeout(struct timer_list *t)
+ 	ccci_md_err(md, "handshake%d timeout, boot failed\n",
+ 		    md->boot_stage + 1);
+ 	ccci_md_notify_ports(md, CCCI_EV_BOOT_FAIL);
+-	/* downstream md_bootup_timeout_func() additionally hands a dump to
+-	 * AEE (ccci_aed); there is no AEE client in this tree, so only the
+-	 * kernel log dump of the image head is produced.
++	/*
++	 * downstream md_bootup_timeout_func() (port_kernel.c:3421-3456):
++	 * handshake 1 failure hands the CCIF registers and the MD image head
++	 * to AEE, handshake 2 failure the exception shared memory and the CCIF
++	 * registers; the image head and the memory layout are always dumped
++	 * into the util ring.
+ 	 */
+-	if (md->img_vir) {
+-		u32 vals[8], i;
+-
+-		for (i = 0; i < ARRAY_SIZE(vals); i++)
+-			vals[i] = readl(md->img_vir + i * 4);
+-		ccci_md_err(md, "md image %08x %08x %08x %08x %08x %08x %08x %08x\n",
+-			    vals[0], vals[1], vals[2], vals[3], vals[4], vals[5],
+-			    vals[6], vals[7]);
+-	}
++	ccci_exception_trigger(md, CCCI_EX_DUMP_NO_RESPONSE,
++			       md->boot_stage == CCCI_BOOT_STAGE_0 ?
++			       (CCCI_AED_DUMP_CCIF_REG |
++				CCCI_AED_DUMP_MD_IMG_MEM) :
++			       (CCCI_AED_DUMP_CCIF_REG |
++				CCCI_AED_DUMP_EX_MEM));
+ }
+ 
+ void ccci_boot_arm_timer(struct ccci_md *md)
+@@ -809,16 +809,26 @@ static int ccci_boot_send_runtime_sram(struct ccci_md *md)
+ 	rt.misc_prefix = 0x4353494D;	/* "MISC" */
+ 	rt.misc_postfix = 0x4353494D;
+ 
+-	mask |= CCCI_FEATURE_NOT_SUPPORT << (CCCI_RT_MISC_INFO_RTC_32K_LESS * 2);
+-	mask |= CCCI_FEATURE_SUPPORT << (CCCI_RT_MISC_INFO_RANDOM_SEED_NUM * 2);
+-	mask |= CCCI_FEATURE_SUPPORT << (CCCI_RT_MISC_INFO_SBP_ID * 2);
+-	mask |= CCCI_FEATURE_SUPPORT << (CCCI_RT_MISC_INFO_CCCI * 2);
++	/*
++	 * Legacy block slot numbers, downstream MISC_FEATURE_ID: RAND_SEED is
++	 * feature_2_val[], MD_SBP_SETTING is feature_4_val[] and
++	 * MD_SEQ_CHECK is feature_5_val[] (modem_ccif.c:930-958).  The SBP
++	 * feature is only advertised when a code was configured, exactly like
++	 * md_cd_send_runtime_data() does for the CLDMA block
++	 * (modem_cldma.c:3353-3360).
++	 */
++	mask |= CCCI_FEATURE_NOT_SUPPORT << (CCCI_MISC_32K_LESS * 2);
++	mask |= CCCI_FEATURE_SUPPORT << (CCCI_MISC_RAND_SEED * 2);
++	if (md->sbp_code > 0)
++		mask |= CCCI_FEATURE_SUPPORT << (CCCI_MISC_MD_SBP_SETTING * 2);
++	mask |= CCCI_FEATURE_SUPPORT << (CCCI_MISC_MD_SEQ_CHECK * 2);
+ 	rt.support_mask = mask;
+ 
+ 	get_random_bytes(&seed, sizeof(seed));
+-	rt.feature_val[CCCI_RT_MISC_INFO_RANDOM_SEED_NUM][0] = seed;
+-	rt.feature_val[CCCI_RT_MISC_INFO_SBP_ID][0] = md->sbp_code;
+-	rt.feature_val[CCCI_RT_MISC_INFO_CCCI][0] = BIT(0);
++	rt.feature_val[CCCI_MISC_RAND_SEED][0] = seed;
++	if (md->sbp_code > 0)
++		rt.feature_val[CCCI_MISC_MD_SBP_SETTING][0] = md->sbp_code;
++	rt.feature_val[CCCI_MISC_MD_SEQ_CHECK][0] = BIT(0);
+ 
+ 	memcpy_toio(ccif->sram->runtime, &rt, sizeof(rt));
+ 	wmb();
+diff --git a/drivers/misc/mediatek/ccci/ccci_ccif.c b/drivers/misc/mediatek/ccci/ccci_ccif.c
+index 66fcf8d2a..e197d1cc0 100644
+--- a/drivers/misc/mediatek/ccci/ccci_ccif.c
++++ b/drivers/misc/mediatek/ccci/ccci_ccif.c
+@@ -366,18 +366,55 @@ void ccci_ccif_exception(struct ccci_md *md, unsigned int stage)
+ 
+ 	switch (stage) {
+ 	case HIF_EX_INIT:
++		/*
++		 * Downstream md_cd_exception()/md_ccif_exception() notify
++		 * EX_INIT here (modem_cldma.c:2003, modem_ccif.c:400), which
++		 * also broadcasts the EXCEPTION state and stops the watchdog
++		 * timers.
++		 */
++		md->ex_stage = CCCI_EX_INIT;
+ 		ccci_md_set_state(md, CCCI_MD_EXCEPTION);
+ 		if (md->cldma)
+ 			ccci_cldma_stop(md->cldma);
++		/*
++		 * The engine has no "stop the TX queues but keep the RX ring
++		 * that carries DHL alive" primitive (downstream
++		 * cldma_stop_for_ee(), modem_cldma.c:1449-1520); the gap is
++		 * reported by the CLDMA leaf as a SCAFFOLD CHANGE REQUIRED.
++		 * Until then the whole engine stops here, which is safe (no
++		 * packet is handed to a modem that is resetting) but makes
++		 * the DHL window below empty.
++		 */
++		ccci_exception_trigger(md, CCCI_EX_DUMP_MD_EX,
++				       ccci_exception_dump_flags(md));
+ 		/* dispatch must not depend on queue indices, so Rx can still
+ 		 * reach the ports during the exception flow
+ 		 */
+ 		ccci_ccif_send(md, H2D_EXCEPTION_ACK);
+ 		break;
+ 	case HIF_EX_INIT_DONE:
++		/* modem_cldma.c:2012 / modem_ccif.c:405 */
++		md->ex_stage = CCCI_EX_DHL_DL_RDY;
+ 		ccci_md_set_state(md, CCCI_MD_EXCEPTION);
++		ccci_exception_trigger(md, CCCI_EX_DUMP_MD_EX_REC_OK,
++				       ccci_exception_dump_flags(md));
+ 		break;
+ 	case HIF_EX_CLEARQ_DONE:
++		/*
++		 * Downstream gives DHL two seconds to flush its data before the
++		 * AP acknowledges the queue clear (modem_cldma.c:2015) and only
++		 * then stops CLDMA and flushes its TX/RX workers
++		 * (md_cd_ccif_delayed_work(), modem_cldma.c:1966-1983).  The
++		 * engine's cldma_hw_stop() already flushes the per-queue
++		 * delayed TX work and the RX/refill work, so the stop is the
++		 * purge; it is a no-op when HIF_EX_INIT already stopped the
++		 * engine.  The CCIF-ring modems do not have this stage delay
++		 * (modem_ccif.c:401-406).
++		 */
++		if (md->cldma) {
++			msleep(2000);
++			ccci_cldma_stop(md->cldma);
++		}
+ 		if (ccif) {
+ 			for (i = 0; i < CCCI_MAX_QUEUES; i++) {
+ 				if (ccif->q[i].rx_ring) {
+@@ -388,9 +425,21 @@ void ccci_ccif_exception(struct ccci_md *md, unsigned int stage)
+ 				}
+ 			}
+ 		}
++		/*
++		 * Snapshot after the flush so the DHL data collected during the
++		 * window is part of the dump, and before the ACK so it is
++		 * ordered before the modem restarts CLDMA (ROM: "Modem
++		 * exception dump start, please wait up to 5 minutes.",
++		 * vmlinux.elf 0xc0c9b534, printed by
++		 * md_cd_ccif_delayed_work()).
++		 */
++		ccci_exception_trigger_sync(md, CCCI_EX_DUMP_MD_EX,
++					    ccci_exception_dump_flags(md));
+ 		ccci_ccif_send(md, H2D_EXCEPTION_CLEARQ_ACK);
+ 		break;
+ 	case HIF_EX_ALLQ_RESET:
++		/* modem_cldma.c:2023 / modem_ccif.c:413 */
++		md->ex_stage = CCCI_EX_INIT_DONE;
+ 		if (md->cldma)
+ 			ccci_cldma_start(md->cldma);
+ 		md->boot_stage = CCCI_BOOT_STAGE_2;
+@@ -560,6 +609,16 @@ static void ccci_ccif_wdt_work(struct work_struct *work)
+ 	ccci_md_err(md, "MD watchdog IRQ, recovering\n");
+ 	ccif_disable_irq(md);
+ 	ccci_ccif_dump_regs(md, NULL);
++	/*
++	 * downstream md_cd_wdt_work() dumps the RGU registers and the
++	 * shared-memory windows before it resets the modem
++	 * (modem_cldma.c:1838-1897, md_cd_dump_debug_register()).  The reset
++	 * is destructive, so take the snapshot synchronously first.
++	 */
++	md->ex_stage = CCCI_EX_WDT;
++	ccci_exception_trigger_sync(md, CCCI_EX_DUMP_WDT,
++				    CCCI_AED_DUMP_EX_MEM |
++				    CCCI_AED_DUMP_CCIF_REG);
+ 	ccci_md_reset(md);
+ 	ccci_send_virtual_md_msg(md, CCCI_MONITOR_CH, CCCI_MD_MSG_RESET, 0);
+ }
+diff --git a/drivers/misc/mediatek/ccci/ccci_core.c b/drivers/misc/mediatek/ccci/ccci_core.c
+index c2c4194a5..f3478063c 100644
+--- a/drivers/misc/mediatek/ccci/ccci_core.c
++++ b/drivers/misc/mediatek/ccci/ccci_core.c
+@@ -15,6 +15,7 @@
+  */
+ #include <linux/ccci.h>
+ #include <linux/init.h>
++#include <linux/kstrtox.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+@@ -120,6 +121,23 @@ int ccci_md_set_state(struct ccci_md *md, enum ccci_md_state state)
+ 
+ 	ccci_md_info(md, "state %d -> %d\n", old, state);
+ 	ccci_md_notify_ports(md, state);
++
++	/*
++	 * First entry into CCCI_MD_EXCEPTION (MD_EX, MD_EX_REC_OK, MD_EX_PASS,
++	 * the CCIF exception handshake).  Downstream reaches ccci_aed() from
++	 * the exception timers, and ccci_ee_info_dump() (port_kernel.c:
++	 * 3079-3088) picks EX_PKT before the boot handshake and the EX_MEM
++	 * shared-memory window afterwards.  Messages that arrive while the
++	 * modem is already in CCCI_MD_EXCEPTION do not change the state; they
++	 * are dumped by ccci_rx_exception_packet().
++	 */
++	if (state == CCCI_MD_EXCEPTION) {
++		ccci_exception_trigger(md,
++				       md->ex_stage == CCCI_EX_DHL_DL_RDY ?
++				       CCCI_EX_DUMP_MD_EX_REC_OK :
++				       CCCI_EX_DUMP_MD_EX,
++				       ccci_exception_dump_flags(md));
++	}
+ 	return 0;
+ }
+ 
+@@ -219,6 +237,62 @@ int ccci_port_recv_skb(struct ccci_port *port, struct sk_buff *skb)
+ 	return 0;
+ }
+ 
++/*
++ * ccci_rx_exception_packet - record/dump exception control messages
++ *
++ * MD_EX_REC_OK carries the EX_LOG_T record; downstream validates it and
++ * copies sizeof(EX_LOG_T) bytes out of the packet (port_kernel.c:551-582).
++ * The other exception messages are dumped as they arrive so that a repeat or
++ * a message that does not change md->state still produces a snapshot
++ * (downstream re-arms the exception timers on each of them).
++ */
++static void ccci_rx_exception_packet(struct ccci_md *md, struct sk_buff *skb)
++{
++	struct ccci_header *ccci_h = (struct ccci_header *)skb->data;
++	unsigned int flags;
++	bool in_exception;
++
++	if (ccci_h->channel != CCCI_CONTROL_RX)
++		return;
++
++	in_exception = READ_ONCE(md->state) == CCCI_MD_EXCEPTION;
++	flags = ccci_exception_dump_flags(md);
++
++	switch (ccci_h->data[1]) {
++	case MD_EX_REC_OK:
++		if (ccci_h->reserved != MD_EX_REC_OK_CHK_ID)
++			return;
++		if (skb->len < CCCI_HEADER_SIZE + sizeof(struct ccci_ex_log)) {
++			/* downstream rejects the short record as invalid */
++			ccci_md_err(md,
++				    "invalid MD_EX_REC_OK: len %u, expected %zu\n",
++				    skb->len, CCCI_HEADER_SIZE +
++				    sizeof(struct ccci_ex_log));
++			return;
++		}
++		ccci_exception_capture_packet(md, skb->data,
++					      CCCI_HEADER_SIZE +
++					      sizeof(struct ccci_ex_log));
++		if (in_exception)
++			ccci_exception_trigger(md, CCCI_EX_DUMP_MD_EX_REC_OK,
++					       flags);
++		break;
++	case MD_EX:
++		if (!in_exception || ccci_h->reserved != MD_EX_CHK_ID)
++			return;
++		ccci_exception_trigger(md, CCCI_EX_DUMP_MD_EX, flags);
++		break;
++	case MD_EX_PASS:
++	case MD_EX_RESUME:
++		if (!in_exception)
++			return;
++		ccci_exception_trigger(md, CCCI_EX_DUMP_MD_EX, flags);
++		break;
++	default:
++		break;
++	}
++}
++
+ /*
+  * ccci_rx_dispatch_qno - hand a received packet from hardware queue @qno to
+  * its port
+@@ -254,6 +328,8 @@ int ccci_rx_dispatch_qno(struct ccci_md *md, struct sk_buff *skb,
+ 		return -CCCI_ERR_HIF_NOT_POWER_ON;
+ 	}
+ 
++	ccci_rx_exception_packet(md, skb);
++
+ 	ccci_chk_rx_seq(md, ccci_h, qno);
+ 	ccci_md_dbg(md, "rx ch%u len%u\n", ccci_h->channel, skb->len);
+ 
+@@ -664,6 +740,12 @@ int ccci_md_reset(struct ccci_md *md)
+ 	mutex_lock(&md->op_lock);
+ 	ccci_md_info(md, "reset\n");
+ 
++	/*
++	 * No exception dump here: this is also the normal userspace reset path
++	 * (CCCI_IOC_MD_RESET, flight mode, stop request, port_kernel.c:130).
++	 * Downstream only dumps when the MD watchdog fires while the mdlogger
++	 * is attached; that hook is in ccci_ccif_wdt_work().
++	 */
+ 	ccci_boot_disarm_timer(md);
+ 	if (md->ccif)
+ 		ccif_disable_irq(md);
+@@ -817,7 +899,12 @@ int ccci_md_register(const struct ccci_md_cfg *cfg, struct device *parent)
+ 
+ 	ret = ccci_sysfs_md_init(md);
+ 	if (ret)
+-		goto err_char;
++		goto err_sysfs;
++
++	/* exception dump engine (kernel log, ccci_dump ring, debugfs) */
++	ret = ccci_exception_init(md);
++	if (ret)
++		goto err_exception;
+ 
+ 	if (ccci_util_log_init(md->id, md->dev))
+ 		ccci_md_warn(md, "util log init failed\n");
+@@ -827,7 +914,11 @@ int ccci_md_register(const struct ccci_md_cfg *cfg, struct device *parent)
+ 		     md->ring_mode ? "CCIF-ring" : "CLDMA");
+ 	return 0;
+ 
+-err_char:
++	/* each label unwinds exactly the step taken by the goto above it */
++err_exception:
++	ccci_exception_exit(md);
++err_sysfs:
++	ccci_sysfs_md_exit(md);
+ 	ccci_port_kernel_exit(md);
+ 	ccci_port_net_exit(md);
+ 	ccci_port_char_exit(md);
+@@ -880,6 +971,7 @@ void ccci_unregister_modem(unsigned int md_id)
+ 	md->registered = false;
+ 
+ 	ccci_util_log_exit(md->id);
++	ccci_exception_exit(md);
+ 	ccci_sysfs_md_exit(md);
+ 	ccci_port_kernel_exit(md);
+ 	ccci_port_net_exit(md);
+@@ -934,6 +1026,47 @@ int ccci_md_set_irat(unsigned int md_id, unsigned int irat_md_id)
+ }
+ EXPORT_SYMBOL_GPL(ccci_md_set_irat);
+ 
++/*
++ * aee_dump_ccci_debug_info - ROM ABI for an AEE exception consumer
++ *
++ * Downstream eccci/ccci_core.c:580-599.  AEE strings use 1-based modem ids.
++ * Returns the CCCI debug record at the start of the modem shared memory
++ * (CCCI_SMEM_OFFSET_CCCI_DEBUG, CCCI_SMEM_CCCI_DEBUG_SIZE bytes).
++ *
++ * The AEE client itself (aed_md_exception_api, ROM 0xc0628298) does not
++ * exist in this kernel tree; this export is the ABI such a client would use.
++ */
++int aee_dump_ccci_debug_info(int md_id, void **addr, int *size)
++{
++	struct ccci_md *md;
++	void __iomem *vir;
++	size_t len;
++	int ret;
++
++	if (!addr || !size)
++		return -CCCI_ERR_INVALID_PARAM;
++
++	md_id--;	/* EE strings use 1 and 2, not 0 and 1 */
++
++	md = ccci_md_get(md_id);
++	if (!md)
++		return -CCCI_ERR_MD_INDEX_NOT_FOUND;
++
++	/*
++	 * The region is ccci_exp_smem_base_vir + CCCI_SMEM_OFFSET_CCCI_DEBUG,
++	 * CCCI_SMEM_CCCI_DEBUG_SIZE bytes (downstream ccci_core.c:271-273,
++	 * returned at ccci_core.c:596-597).
++	 */
++	ret = ccci_exception_ccci_debug_window(md, &vir, &len);
++	if (ret)
++		return ret;
++
++	*addr = (void __force *)vir;
++	*size = (int)len;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(aee_dump_ccci_debug_info);
++
+ int ccci_register_md_hw_ops(unsigned int md_id, const struct ccci_md_hw_ops *ops)
+ {
+ 	struct ccci_md *md = ccci_md_get(md_id);
+@@ -958,6 +1091,40 @@ EXPORT_SYMBOL_GPL(ccci_unregister_md_hw_ops);
+ /* ------------------------------------------------------------------ */
+ /* modem object allocation                                             */
+ /* ------------------------------------------------------------------ */
++/*
++ * Default SBP (Single Binary Platform) bind value, downstream
++ * ccci_util/Kconfig:99-113 and eccci/port_char.c:914-947.  Downstream parses
++ * the Kconfig string lazily from CCCI_IOC_GET_MD_SBP_CFG; here it is resolved
++ * once when the modem object is created.  An empty string is the ROM default
++ * and disables SBP (value 0).
++ */
++static u32 ccci_md_sbp_default(unsigned int md_id)
++{
++	const char *cfg = NULL;
++	u32 val = 0;
++
++#if defined(CONFIG_MTK_MD_SBP_CUSTOM_VALUE)
++	if (md_id == CCCI_MD_SYS1)
++		cfg = CONFIG_MTK_MD_SBP_CUSTOM_VALUE;
++#endif
++#if defined(CONFIG_MTK_MD2_SBP_CUSTOM_VALUE)
++	if (md_id == CCCI_MD_SYS2)
++		cfg = CONFIG_MTK_MD2_SBP_CUSTOM_VALUE;
++#endif
++	if (!cfg || !cfg[0])
++		return 0;
++
++	if (kstrtouint(cfg, 0, &val)) {
++		pr_warn("ccci: md%u invalid SBP config \"%s\", using 0\n",
++			md_id + 1, cfg);
++		return 0;
++	}
++
++	pr_info("ccci: md%u default SBP code 0x%x from Kconfig\n", md_id + 1,
++		val);
++	return val;
++}
++
+ static struct ccci_md *ccci_md_alloc(unsigned int md_id)
+ {
+ 	struct ccci_md *md;
+@@ -975,6 +1142,8 @@ static struct ccci_md *ccci_md_alloc(unsigned int md_id)
+ 	md->runtime_version = AP_MD_HS_V2;
+ 	md->md_boot_mode = 0;	/* MD_BOOT_MODE_INVALID */
+ 	md->sim_type = 0xEEEEEEEE;
++	md->sbp_code = 0;
++	md->sbp_code_default = ccci_md_sbp_default(md_id);
+ 	spin_lock_init(&md->lock);
+ 	mutex_init(&md->op_lock);
+ 	INIT_LIST_HEAD(&md->list);
+diff --git a/drivers/misc/mediatek/ccci/ccci_exception.c b/drivers/misc/mediatek/ccci/ccci_exception.c
+new file mode 100644
+index 000000000..fa2fbff6c
+--- /dev/null
++++ b/drivers/misc/mediatek/ccci/ccci_exception.c
+@@ -0,0 +1,939 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * CCCI exception dump engine: collect the modem exception record and the
++ * shared-memory debug windows, decode them and expose the result in the
++ * kernel log, in the util dump ring, in debugfs files per modem and in a
++ * kernel-retrievable buffer.
++ *
++ * Ported from the Samsung/MTK 3.18 downstream kernel
++ * drivers/misc/mediatek/eccci/port_kernel.c (ccci_aed, ccci_md_exception,
++ * ccci_ee_info_dump, md_ex_monitor_func, md_ex_monitor2_func,
++ * md_bootup_timeout_func) and ccci_bm.c (ccci_mem_dump).
++ * Original copyright: Copyright (C) 2015 MediaTek Inc. GPL-2.0.
++ *
++ * The ROM hands the collected buffers to the AEE client
++ * (aed_md_exception_api, ROM 0xc0628298).  That client does not exist in this
++ * kernel tree, so the dump is delivered to the destinations above instead of
++ * pretending to call AEE.  The ROM ABI used by such a client,
++ * aee_dump_ccci_debug_info(), is implemented in ccci_core.c and exported.
++ *
++ * Layout of the AP<->MD shared-memory exception window, which is the base of
++ * the modem smem region (downstream ccci_core.c:262-293, ccci_core.h:580-619,
++ * mt6735/ccci_config.h:70-83):
++ *
++ *   smem+0x0000  2048  CCCI debug record       (aee_dump_ccci_debug_info())
++ *   smem+0x0800  2048  MDSS debug window       (CCCI_AED_DUMP_EX_MEM)
++ *   smem+0x0BF0    16  CCIF SRAM header copy   (CCCI_AED_DUMP_CCIF_REG)
++ *
++ * The MDSS debug window and the exception record (CCCI_SMEM_OFFSET_EXREC) are
++ * the same 2 KiB because on this platform both constants are 2048:
++ * ccci_config.h:75 and :82.  The modem fills either the legacy EX_LOG_T that
++ * arrives in the MD_EX_REC_OK packet or, after the boot handshake, a record
++ * at CCCI_SMEM_OFFSET_EXREC (port_kernel.c:3125-3135); the build has no
++ * MD_UMOLY_EE_SUPPORT, so the EX_LOG_T layout applies.
++ */
++#include <linux/ccci.h>
++#include <linux/byteorder/generic.h>
++#include <linux/delay.h>
++#include <linux/fs.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/printk.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++
++#include "ccci_priv.h"
++
++/*
++ * Text snapshot builder.  The buffer is allocated with kvmalloc() in
++ * ccci_ex_build() and swapped into md->ex.dump under dump_lock, so a debugfs
++ * reader always sees a complete snapshot.
++ */
++struct ccci_ex_text {
++	char *buf;
++	size_t size;
++	size_t len;
++};
++
++static void ccci_ex_printf(struct ccci_ex_text *t, const char *fmt, ...)
++	__printf(2, 3);
++static void ccci_ex_printf(struct ccci_ex_text *t, const char *fmt, ...)
++{
++	va_list args;
++	int n;
++
++	if (t->len >= t->size)
++		return;
++
++	va_start(args, fmt);
++	n = vscnprintf(t->buf + t->len, t->size - t->len, fmt, args);
++	va_end(args);
++	t->len += n;
++}
++
++static void ccci_ex_hex(struct ccci_ex_text *t, const void *data, size_t len)
++{
++	const u8 *p = data;
++	size_t off;
++	int i;
++
++	for (off = 0; off < len; off += 16) {
++		size_t n = min_t(size_t, 16, len - off);
++
++		ccci_ex_printf(t, "  %08zx:", off);
++		for (i = 0; i < n; i++)
++			ccci_ex_printf(t, " %02x", p[off + i]);
++		ccci_ex_printf(t, "\n");
++	}
++}
++
++static const char *ccci_ex_reason_name(unsigned int reason)
++{
++	switch (reason) {
++	case CCCI_EX_DUMP_MD_EX:
++		return "MD_EX";
++	case CCCI_EX_DUMP_MD_EX_REC_OK:
++		return "MD_EX_REC_OK";
++	case CCCI_EX_DUMP_WDT:
++		return "watchdog/reset";
++	case CCCI_EX_DUMP_NO_RESPONSE:
++		return "no-response/boot-timeout";
++	default:
++		return "unknown";
++	}
++}
++
++const char *ccci_exception_stage_name(unsigned int stage)
++{
++	switch (stage) {
++	case CCCI_EX_NONE:
++		return "none";
++	case CCCI_EX_INIT:
++		return "EX_INIT";
++	case CCCI_EX_DHL_DL_RDY:
++		return "EX_DHL_DL_RDY";
++	case CCCI_EX_INIT_DONE:
++		return "EX_INIT_DONE";
++	case CCCI_EX_NO_RESPONSE:
++		return "MD_NO_RESPONSE";
++	case CCCI_EX_WDT:
++		return "MD_WDT";
++	default:
++		return "unknown";
++	}
++}
++
++static void ccci_ex_aed_flags(struct ccci_ex_text *t, unsigned int flags)
++{
++	ccci_ex_printf(t, "  AED selection: 0x%x%s%s%s%s\n", flags,
++		       flags & CCCI_AED_DUMP_EX_MEM ? " EX_MEM" : "",
++		       flags & CCCI_AED_DUMP_MD_IMG_MEM ? " MD_IMG_MEM" : "",
++		       flags & CCCI_AED_DUMP_CCIF_REG ? " CCIF_REG" : "",
++		       flags & CCCI_AED_DUMP_EX_PKT ? " EX_PKT" : "");
++}
++
++/*
++ * EX_HEADER_T.ex_type names, verbatim from the non-MD_UMOLY decoder of
++ * downstream port_kernel.c:3128-3250 (the names the ROM prints), plus the
++ * MD_EX_CC_* values of ccci_core.h:230-246.
++ */
++static const char *ccci_ex_type_name(unsigned int type)
++{
++	switch (type) {
++	case CCCI_EX_TYPE_INVALID:
++		return "INVALID";
++	case CCCI_EX_TYPE_UNDEF:
++		return "Fatal error (undefine)";
++	case CCCI_EX_TYPE_SWI:
++		return "Fatal error (swi)";
++	case CCCI_EX_TYPE_PREF_ABT:
++		return "Fatal error (prefetch abort)";
++	case CCCI_EX_TYPE_DATA_ABT:
++		return "Fatal error (data abort)";
++	case CCCI_EX_TYPE_ASSERT:
++		return "ASSERT";
++	case CCCI_EX_TYPE_FATALERR_TASK:
++		return "Fatal error (task)";
++	case CCCI_EX_TYPE_FATALERR_BUF:
++		return "Fatal error (buff)";
++	case CCCI_EX_TYPE_LOCKUP:
++		return "Lockup";
++	case CCCI_EX_TYPE_ASSERT_DUMP:
++		return "ASSERT DUMP";
++	case CCCI_EX_TYPE_ASSERT_FAIL:
++		return "ASSERT FAIL";
++	case CCCI_EX_TYPE_DSP_ASSERT:
++		return "MD DMD ASSERT";
++	case CCCI_EX_TYPE_DSP_EXCEPTION:
++		return "MD DMD Exception";
++	case CCCI_EX_TYPE_DSP_FATAL_ERROR:
++		return "MD DMD FATAL ERROR";
++	case CCCI_EX_TYPE_CROSS_CORE:
++		return "Fatal error (LTE_EXP)";
++	case CCCI_EX_TYPE_EMI_MPU_VIOLATION:
++		return "Fatal error (rmpu violation)";
++	case CCCI_EX_TYPE_C2K_ERROR:
++		return "Fatal error (C2K_EXP)";
++	case CCCI_EX_TYPE_EMI_CHECK:
++		return "EMI_CHK";
++	default:
++		return "UNKNOWN Exception";
++	}
++}
++
++/*
++ * Copy a bounded, printable C string out of the modem record.  The modem
++ * writes raw bytes; anything outside printable ASCII is shown as '.'.
++ */
++static void ccci_ex_sanitize(char *dst, size_t dst_len, const u8 *src,
++			     size_t src_len)
++{
++	size_t i, n;
++
++	n = strnlen((const char *)src, src_len);
++	if (n >= dst_len)
++		n = dst_len - 1;
++	for (i = 0; i < n; i++)
++		dst[i] = (src[i] >= 0x20 && src[i] <= 0x7e) ? src[i] : '.';
++	dst[i] = '\0';
++}
++
++static bool ccci_ex_type_is_assert(u8 type)
++{
++	/*
++	 * port_kernel.c:3153-3175, 3200-3215: ASSERT, ASSERT DUMP and the
++	 * DSP/MD32 ASSERT all carry EX_ASSERTFAIL_T in the content union.
++	 */
++	switch (type) {
++	case CCCI_EX_TYPE_ASSERT:
++	case CCCI_EX_TYPE_ASSERT_DUMP:
++	case CCCI_EX_TYPE_ASSERT_FAIL:
++	case CCCI_EX_TYPE_DSP_ASSERT:
++		return true;
++	default:
++		return false;
++	}
++}
++
++/*
++ * Types whose content union is EX_FATALERR_T and therefore carries
++ * error_code.code1/code2 (port_kernel.c:3130-3205).  INVALID, LOCKUP and the
++ * EMI check have no error code in the ROM decoder.
++ */
++static bool ccci_ex_type_has_codes(u8 type)
++{
++	switch (type) {
++	case CCCI_EX_TYPE_UNDEF:
++	case CCCI_EX_TYPE_SWI:
++	case CCCI_EX_TYPE_PREF_ABT:
++	case CCCI_EX_TYPE_DATA_ABT:
++	case CCCI_EX_TYPE_FATALERR_TASK:
++	case CCCI_EX_TYPE_FATALERR_BUF:
++	case CCCI_EX_TYPE_DSP_EXCEPTION:
++	case CCCI_EX_TYPE_DSP_FATAL_ERROR:
++	case CCCI_EX_TYPE_CROSS_CORE:
++	case CCCI_EX_TYPE_EMI_MPU_VIOLATION:
++	case CCCI_EX_TYPE_C2K_ERROR:
++		return true;
++	default:
++		return false;
++	}
++}
++
++/*
++ * Decode one EX_LOG_T (downstream eccci/ccci_core.h:130-135).  The content
++ * union is an assert record or a fatal-error record depending on ex_type;
++ * the offender string sits at offset 288 of the record (port_kernel.h:29,
++ * port_kernel.c:3160-3168).
++ */
++static void ccci_ex_decode_record(struct ccci_md *md, struct ccci_ex_text *t,
++				  const char *source, const u8 *rec,
++				  size_t len)
++{
++	const struct ccci_ex_log *log = (const struct ccci_ex_log *)rec;
++	u32 code1, code2;
++	bool is_assert, has_codes;
++	char text[33];
++	char file[33];
++
++	ccci_ex_printf(t, "--- EX_LOG_T from %s (%zu of %zu bytes)\n", source,
++		       len, sizeof(*log));
++	if (len < sizeof(*log)) {
++		ccci_ex_printf(t, "  record truncated\n");
++		ccci_md_err(md, "exception record from %s truncated: %zu bytes\n",
++			    source, len);
++		return;
++	}
++
++	ccci_ex_printf(t,
++		       "  header: ex_type %u (%s), nvram %u, serial %u\n",
++		       log->header.ex_type,
++		       ccci_ex_type_name(log->header.ex_type),
++		       log->header.ex_nvram,
++		       le16_to_cpu(log->header.ex_serial_num));
++	ccci_ex_sanitize(text, sizeof(text), log->envinfo.execution_unit,
++			 sizeof(log->envinfo.execution_unit));
++	ccci_ex_printf(t,
++		       "  envinfo: boot_mode %u, unit \"%s\", status 0x%02x, ELM_status 0x%02x\n",
++		       log->envinfo.boot_mode, text, log->envinfo.status,
++		       log->envinfo.elm_status);
++
++	is_assert = ccci_ex_type_is_assert(log->header.ex_type);
++	has_codes = ccci_ex_type_has_codes(log->header.ex_type);
++	code1 = le32_to_cpu(log->content.fatalerr.error_code.code1);
++	code2 = le32_to_cpu(log->content.fatalerr.error_code.code2);
++
++	if (is_assert) {
++		ccci_ex_sanitize(file, sizeof(file), log->content.assert.filename,
++				 sizeof(log->content.assert.filename));
++		ccci_ex_printf(t,
++			       "  assert: file \"%s\", line %u, p1 0x%08x, p2 0x%08x, p3 0x%08x\n",
++			       file,
++			       le32_to_cpu(log->content.assert.linenumber),
++			       le32_to_cpu(log->content.assert.parameters[0]),
++			       le32_to_cpu(log->content.assert.parameters[1]),
++			       le32_to_cpu(log->content.assert.parameters[2]));
++	} else if (has_codes) {
++		ccci_ex_printf(t,
++			       "  fatal error: code1 0x%08x, code2 0x%08x\n",
++			       code1, code2);
++		/*
++		 * EMI MPU / RMPU fault: port_kernel.c:2752-2765 names this case
++		 * "Fatal error (rmpu violation)" and marks it as a fatal-error
++		 * record.  EX_LOG_T only carries two error codes (EX_PL_LOG_T
++		 * has a third); no other field is set by the modem for it.
++		 */
++		if (log->header.ex_type == CCCI_EX_TYPE_EMI_MPU_VIOLATION)
++			ccci_ex_printf(t,
++				       "  RMPU: the modem core violated an EMI MPU/RMPU region permission (ECT_SRC_RMPU, ccci_core.h:352)\n");
++		if (log->header.ex_type == CCCI_EX_TYPE_C2K_ERROR &&
++		    code1 == CCCI_EX_C2K_FATAL_ERR_CODE1)
++			ccci_ex_printf(t,
++				       "  C2K fatal error: no AEE DB trigger for this class (port_kernel.c:3100-3104)\n");
++	} else {
++		ccci_ex_printf(t, "  no error code for this exception type\n");
++	}
++
++	if (rec[CCCI_EXREC_OFFSET_OFFENDER] == CCCI_EX_OFFENDER_NONE) {
++		ccci_ex_printf(t, "  offender: none (0x%02x marker)\n",
++			       CCCI_EX_OFFENDER_NONE);
++		text[0] = '\0';
++	} else {
++		ccci_ex_sanitize(text, sizeof(text),
++				 rec + CCCI_EXREC_OFFSET_OFFENDER,
++				 sizeof(*log) - CCCI_EXREC_OFFSET_OFFENDER);
++		ccci_ex_printf(t, "  offender: \"%s\"\n", text);
++	}
++
++	if (is_assert)
++		ccci_md_err(md,
++			    "EX record from %s: type %u (%s), serial %u, boot_mode %u, status 0x%02x, assert file \"%s\" line %u, offender \"%s\"\n",
++			    source, log->header.ex_type,
++			    ccci_ex_type_name(log->header.ex_type),
++			    le16_to_cpu(log->header.ex_serial_num),
++			    log->envinfo.boot_mode, log->envinfo.status,
++			    file, le32_to_cpu(log->content.assert.linenumber),
++			    text);
++	else if (has_codes)
++		ccci_md_err(md,
++			    "EX record from %s: type %u (%s), nvram %u, serial %u, boot_mode %u, status 0x%02x, ELM 0x%02x, code1 0x%08x, code2 0x%08x, offender \"%s\"\n",
++			    source, log->header.ex_type,
++			    ccci_ex_type_name(log->header.ex_type),
++			    log->header.ex_nvram,
++			    le16_to_cpu(log->header.ex_serial_num),
++			    log->envinfo.boot_mode, log->envinfo.status,
++			    log->envinfo.elm_status, code1, code2, text);
++	else
++		ccci_md_err(md,
++			    "EX record from %s: type %u (%s), nvram %u, serial %u, boot_mode %u, status 0x%02x, ELM 0x%02x, offender \"%s\"\n",
++			    source, log->header.ex_type,
++			    ccci_ex_type_name(log->header.ex_type),
++			    log->header.ex_nvram,
++			    le16_to_cpu(log->header.ex_serial_num),
++			    log->envinfo.boot_mode, log->envinfo.status,
++			    log->envinfo.elm_status, text);
++}
++
++static bool ccci_ex_smem_range(struct ccci_md *md, size_t off, size_t len)
++{
++	return md->smem_vir && off <= md->smem_size &&
++	       len <= md->smem_size - off;
++}
++
++/*
++ * Dump one AP-visible shared-memory window.  The full window goes to the
++ * snapshot and to the util dump ring; the kernel log is bounded to @klog_len
++ * because it is the slowest destination.
++ */
++static void ccci_ex_dump_region(struct ccci_md *md, struct ccci_ex_text *t,
++				const char *name, size_t off, size_t len,
++				size_t klog_len)
++{
++	char prefix[64];
++	u8 *buf;
++
++	if (!ccci_ex_smem_range(md, off, len)) {
++		ccci_ex_printf(t,
++			       "--- %s: smem+0x%zx, 0x%zx bytes: unavailable (smem %s, size 0x%zx)\n",
++			       name, off, len,
++			       md->smem_vir ? "mapped" : "not mapped",
++			       md->smem_size);
++		ccci_md_warn(md, "dump %s unavailable (smem+0x%zx)\n", name,
++			     off);
++		return;
++	}
++
++	buf = kvmalloc(len, GFP_KERNEL);
++	if (!buf) {
++		ccci_ex_printf(t, "--- %s: kvmalloc(0x%zx) failed\n", name,
++			       len);
++		return;
++	}
++	memcpy_fromio(buf, md->smem_vir + off, len);
++
++	ccci_ex_printf(t, "--- %s: smem+0x%zx, 0x%zx bytes%s\n", name, off,
++		       len, len > klog_len ? " (kernel log truncated)" : "");
++	ccci_ex_hex(t, buf, len);
++
++	snprintf(prefix, sizeof(prefix), "ccci: md%u %s: ", md->id + 1, name);
++	print_hex_dump(KERN_ERR, prefix, DUMP_PREFIX_OFFSET, 16, 1, buf,
++		       min_t(size_t, len, klog_len), false);
++
++	/* persistent per-MD dump ring, downstream ccci_mem_dump() */
++	ccci_util_dump_mem(md->id, buf, len);
++	kvfree(buf);
++}
++
++/* MD image head, downstream MD_IMG_DUMP_SIZE == 256 (ccci_core.h:640) */
++static void ccci_ex_dump_image(struct ccci_md *md, struct ccci_ex_text *t)
++{
++	u8 buf[CCCI_MD_IMG_DUMP_SIZE];
++
++	if (!md->img_vir || md->img_size < sizeof(buf)) {
++		ccci_ex_printf(t,
++			       "--- MD image head: unavailable (image %s, size 0x%zx)\n",
++			       md->img_vir ? "mapped" : "not mapped",
++			       md->img_size);
++		return;
++	}
++
++	memcpy_fromio(buf, md->img_vir, sizeof(buf));
++	ccci_ex_printf(t, "--- MD image head: MD_IMG_DUMP_SIZE 0x%zx bytes\n",
++		       sizeof(buf));
++	ccci_ex_hex(t, buf, sizeof(buf));
++	print_hex_dump(KERN_ERR, "ccci: md image head: ", DUMP_PREFIX_OFFSET,
++		       16, 1, buf, sizeof(buf), false);
++	ccci_util_dump_mem(md->id, buf, sizeof(buf));
++}
++
++static bool ccci_ex_dhl_ctrl_open(struct ccci_md *md)
++{
++	struct ccci_port *port;
++
++	list_for_each_entry(port, &md->ports_list, node) {
++		if (port->rx_ch == CCCI_UART1_RX)
++			return atomic_read(&port->open_count) > 0;
++	}
++	return false;
++}
++
++static void ccci_ex_build(struct ccci_md *md, unsigned int reason,
++			  unsigned int flags)
++{
++	struct ccci_ex_text t;
++	struct ccci_exception *ex = &md->ex;
++	unsigned long lflags;
++	u8 packet[CCCI_EX_PACKET_MAX];
++	u8 smem_record[sizeof(struct ccci_ex_log)];
++	const u8 *record = NULL;
++	const char *record_src = NULL;
++	size_t record_len = 0;
++	size_t packet_len = 0;
++	bool packet_valid = false;
++	bool dhl_open;
++	char *buf;
++	char *old;
++	u32 count;
++
++	buf = kvmalloc(CCCI_EX_DUMP_MAX, GFP_KERNEL);
++	if (!buf) {
++		ccci_md_err(md, "exception dump: cannot allocate snapshot\n");
++		return;
++	}
++
++	t.buf = buf;
++	t.size = CCCI_EX_DUMP_MAX;
++	t.len = 0;
++	t.buf[0] = '\0';
++
++	spin_lock_irqsave(&ex->lock, lflags);
++	if (ex->packet_valid && ex->packet_len <= sizeof(packet)) {
++		packet_len = ex->packet_len;
++		memcpy(packet, ex->packet, packet_len);
++		packet_valid = true;
++	}
++	count = ex->dump_count + 1;
++	spin_unlock_irqrestore(&ex->lock, lflags);
++
++	dhl_open = ccci_ex_dhl_ctrl_open(md);
++
++	ccci_ex_printf(&t, "CCCI exception dump md%u #%u\n", md->id + 1,
++		       count);
++	ccci_ex_printf(&t, " reason: %s\n",
++		       ccci_ex_reason_name(reason));
++	ccci_ex_aed_flags(&t, flags);
++	ccci_ex_printf(&t,
++		       " state %d, boot stage %u, exception stage %s (%u), exception type %u (%s)\n",
++		       READ_ONCE(md->state), md->boot_stage,
++		       ccci_exception_stage_name(md->ex_stage), md->ex_stage,
++		       md->ex_type, ccci_ex_type_name(md->ex_type));
++	ccci_ex_printf(&t,
++		       " smem %pa+0x%zx, image %pa+0x%zx, transport %s\n",
++		       &md->smem_phy, md->smem_size, &md->img_phy,
++		       md->img_size,
++		       md->cldma ? "CLDMA" : "CCIF-ring");
++
++	/*
++	 * The modem stamps 0xBAEBAE10 at smem+0xC64 when it took the software
++	 * watchdog path; the ROM watchdog worker tests this word before it
++	 * decides to reset (modem_cldma.c:1862-1872).
++	 */
++	if (ccci_ex_smem_range(md, CCCI_SMEM_OFFSET_EPON, sizeof(u32))) {
++		u32 epon;
++
++		memcpy_fromio(&epon, md->smem_vir + CCCI_SMEM_OFFSET_EPON,
++			      sizeof(epon));
++		ccci_ex_printf(&t,
++			       " SW watchdog marker (smem+0x%x): 0x%08x%s\n",
++			       CCCI_SMEM_OFFSET_EPON, epon,
++			       epon == CCCI_SMEM_EPON_SW_WDT ?
++			       " (MD reported SW WDT)" : "");
++	}
++
++	/*
++	 * DHL: the ROM build leaves FEATURE_DHL_LOG_EN undefined (there is no
++	 * definition in the downstream tree), so port_kernel.c:215-219
++	 * publishes DHL_SHARE_MEMORY as CCCI_FEATURE_NOT_SUPPORT and no
++	 * shared-memory carve-out exists.  What does exist is the protocol-type
++	 * ioctl (port_char.c:571-582) and the META-mode close gate
++	 * (port_char.c:79-90).
++	 */
++	ccci_ex_printf(&t,
++		       " DHL: protocol \"DHL\", control port %s, md_boot_mode %u (%s), close gate %s\n",
++		       dhl_open ? "open" : "closed", md->md_boot_mode,
++		       md->md_boot_mode == CCCI_MD_BOOT_MODE_META ? "META" :
++		       "normal",
++		       (dhl_open && md->md_boot_mode == CCCI_MD_BOOT_MODE_META) ?
++		       "blocks modem reset" : "allows modem reset");
++	ccci_ex_printf(&t,
++		       " DHL shared memory: NOT_SUPPORT (FEATURE_DHL_LOG_EN undefined in the ROM build)\n");
++
++	/*
++	 * Record source, downstream ccci_md_exception() (port_kernel.c:
++	 * 3125-3135): the packet copy is used for MD3 and before the boot
++	 * handshake, the shared-memory record afterwards.
++	 */
++	if ((md->id == CCCI_MD_SYS3 || md->boot_stage == CCCI_BOOT_STAGE_0) &&
++	    packet_valid && packet_len > CCCI_HEADER_SIZE) {
++		record = packet + CCCI_HEADER_SIZE;
++		record_len = packet_len - CCCI_HEADER_SIZE;
++		record_src = "MD_EX_REC_OK packet";
++	} else if (ccci_ex_smem_range(md, CCCI_SMEM_OFFSET_EXREC,
++				      sizeof(smem_record))) {
++		memcpy_fromio(smem_record,
++			      md->smem_vir + CCCI_SMEM_OFFSET_EXREC,
++			      sizeof(smem_record));
++		record = smem_record;
++		record_len = sizeof(smem_record);
++		record_src = "shared memory EXREC (smem+0x800)";
++	} else if (packet_valid && packet_len > CCCI_HEADER_SIZE) {
++		record = packet + CCCI_HEADER_SIZE;
++		record_len = packet_len - CCCI_HEADER_SIZE;
++		record_src = "MD_EX_REC_OK packet (no smem window)";
++	}
++
++	if (packet_valid) {
++		ccci_ex_printf(&t,
++			       "--- MD_EX_REC_OK packet (ccci_header + EX_LOG_T), %zu bytes\n",
++			       packet_len);
++		ccci_ex_hex(&t, packet, packet_len);
++		print_hex_dump(KERN_ERR, "ccci: ex packet: ",
++			       DUMP_PREFIX_OFFSET, 16, 1, packet,
++			       min_t(size_t, packet_len, CCCI_EX_KLOG_BYTES),
++			       false);
++		ccci_util_dump_mem(md->id, packet, packet_len);
++	} else {
++		ccci_ex_printf(&t,
++			       "--- MD_EX_REC_OK packet: not received\n");
++	}
++
++	/*
++	 * Fixed-offset windows of the exception region, ccci_config.h:70-83.
++	 * The CCCI debug record and the MDSS debug window together are the
++	 * 4 KiB CCCI_SMEM_DUMP_SIZE window that md_ex_monitor_func() dumps
++	 * (port_kernel.c:3411-3413); they are printed separately because they
++	 * have different consumers.
++	 */
++	ccci_ex_dump_region(md, &t, "CCCI debug record (CCCI_SMEM_OFFSET_CCCI_DEBUG)",
++			    CCCI_SMEM_OFFSET_CCCI_DEBUG,
++			    CCCI_SMEM_CCCI_DEBUG_SIZE, CCCI_EX_KLOG_BYTES);
++	ccci_ex_dump_region(md, &t, "MDSS debug / exception record (CCCI_SMEM_OFFSET_EXREC)",
++			    CCCI_SMEM_OFFSET_MDSS_DEBUG,
++			    CCCI_SMEM_MDSS_DEBUG_SIZE, CCCI_EX_KLOG_BYTES);
++
++	/* CCIF SRAM header copy, only refreshed for the CCIF_REG selection */
++	if (flags & CCCI_AED_DUMP_CCIF_REG)
++		ccci_ex_dump_region(md, &t, "CCIF SRAM snapshot",
++				    CCCI_SMEM_OFFSET_CCIF_SRAM,
++				    CCCI_SMEM_CCIF_SRAM_SIZE,
++				    CCCI_SMEM_CCIF_SRAM_SIZE);
++
++	ccci_ex_dump_image(md, &t);
++
++	if (record)
++		ccci_ex_decode_record(md, &t, record_src, record, record_len);
++	else
++		ccci_ex_printf(&t,
++			       "--- EX_LOG_T: unavailable (no packet, no smem window)\n");
++
++	/* CCIF registers, existing core helper (prints to the kernel log) */
++	ccci_ex_printf(&t,
++		       "--- CCIF registers: dumped to the kernel log by md%u\n",
++		       md->id + 1);
++	ccci_ccif_dump_regs(md, NULL);
++
++	if (t.len >= t.size)
++		ccci_md_warn(md, "exception snapshot truncated at %zu bytes\n",
++			     t.size);
++
++	mutex_lock(&ex->dump_lock);
++	old = ex->dump;
++	ex->dump = buf;
++	ex->dump_len = t.len;
++	ex->dump_count = count;
++	ex->dump_reason = reason;
++	ex->dump_flags = flags;
++	ex->dump_ex_stage = md->ex_stage;
++	ex->dump_ex_type = md->ex_type;
++	mutex_unlock(&ex->dump_lock);
++	kvfree(old);
++
++	ccci_md_err(md,
++		    "exception dump #%u ready (%zu bytes, reason %s), full hex in ccci_dump/debugfs\n",
++		    count, t.len, ccci_ex_reason_name(reason));
++}
++
++static void ccci_ex_work(struct work_struct *work)
++{
++	struct ccci_md *md = container_of(work, struct ccci_md, ex.work);
++	struct ccci_exception *ex = &md->ex;
++	unsigned long lflags;
++	unsigned int reason, flags;
++
++	for (;;) {
++		spin_lock_irqsave(&ex->lock, lflags);
++		if (!ex->ready || !ex->pending) {
++			ex->worker_active = false;
++			spin_unlock_irqrestore(&ex->lock, lflags);
++			break;
++		}
++		reason = ex->pending_reason;
++		flags = ex->pending_flags;
++		ex->pending = false;
++		spin_unlock_irqrestore(&ex->lock, lflags);
++
++		ccci_ex_build(md, reason, flags);
++	}
++}
++
++void ccci_exception_capture_packet(struct ccci_md *md, const void *data,
++				   size_t len)
++{
++	struct ccci_exception *ex;
++	unsigned long lflags;
++
++	if (!md || !data || !len)
++		return;
++
++	ex = &md->ex;
++	spin_lock_irqsave(&ex->lock, lflags);
++	if (ex->ready) {
++		ex->packet_len = min_t(size_t, len, sizeof(ex->packet));
++		memcpy(ex->packet, data, ex->packet_len);
++		ex->packet_valid = true;
++	}
++	spin_unlock_irqrestore(&ex->lock, lflags);
++}
++
++unsigned int ccci_exception_dump_flags(struct ccci_md *md)
++{
++	/*
++	 * Downstream ccci_ee_info_dump() prefers the MD_EX_REC_OK packet while
++	 * the modem is still in boot stage 0 and the shared-memory record
++	 * afterwards (port_kernel.c:3125-3135, ccci_aed() selection at
++	 * port_kernel.c:3079-3088).
++	 */
++	if (!md)
++		return 0;
++	return md->boot_stage == CCCI_BOOT_STAGE_0 ? CCCI_AED_DUMP_EX_PKT :
++						     CCCI_AED_DUMP_EX_MEM;
++}
++
++void ccci_exception_trigger(struct ccci_md *md, unsigned int reason,
++			    unsigned int flags)
++{
++	struct ccci_exception *ex;
++	unsigned long lflags;
++
++	if (!md)
++		return;
++
++	ex = &md->ex;
++	spin_lock_irqsave(&ex->lock, lflags);
++	if (ex->ready) {
++		ex->pending = true;
++		ex->pending_reason = reason;
++		ex->pending_flags = flags;
++		if (!ex->worker_active) {
++			ex->worker_active = true;
++			/* queued under the lock so exit's cancel_work_sync()
++			 * is ordered after any in-flight trigger
++			 */
++			schedule_work(&ex->work);
++		}
++	}
++	spin_unlock_irqrestore(&ex->lock, lflags);
++}
++
++void ccci_exception_trigger_sync(struct ccci_md *md, unsigned int reason,
++				 unsigned int flags)
++{
++	if (!md)
++		return;
++
++	ccci_exception_trigger(md, reason, flags);
++	/*
++	 * The worker loops over all pending requests, so one flush covers the
++	 * dump queued above.  No-op when the engine was never initialised.
++	 */
++	if (READ_ONCE(md->ex.ready))
++		flush_work(&md->ex.work);
++}
++
++static size_t ccci_exception_packet_copy(struct ccci_md *md, void *dst,
++					 size_t len)
++{
++	unsigned long lflags;
++	size_t n;
++
++	if (!md || !dst || !len)
++		return 0;
++
++	spin_lock_irqsave(&md->ex.lock, lflags);
++	if (!md->ex.packet_valid) {
++		n = 0;
++	} else {
++		n = min(len, md->ex.packet_len);
++		memcpy(dst, md->ex.packet, n);
++	}
++	spin_unlock_irqrestore(&md->ex.lock, lflags);
++	return n;
++}
++
++int ccci_exception_ccci_debug_window(struct ccci_md *md, void __iomem **vir,
++				     size_t *size)
++{
++	/*
++	 * downstream ccci_core.c:271-273 sets
++	 * ccci_exp_smem_ccci_debug_vir = exp_smem_base_vir +
++	 * CCCI_SMEM_OFFSET_CCCI_DEBUG (0) and
++	 * ccci_exp_smem_ccci_debug_size = CCCI_SMEM_CCCI_DEBUG_SIZE (2048);
++	 * aee_dump_ccci_debug_info() returns exactly those two values.
++	 */
++	if (!md || !vir || !size)
++		return -EINVAL;
++	if (!ccci_ex_smem_range(md, CCCI_SMEM_OFFSET_CCCI_DEBUG,
++				CCCI_SMEM_CCCI_DEBUG_SIZE))
++		return -ENODEV;
++
++	*vir = md->smem_vir + CCCI_SMEM_OFFSET_CCCI_DEBUG;
++	*size = CCCI_SMEM_CCCI_DEBUG_SIZE;
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* debugfs per modem                                                   */
++/* ------------------------------------------------------------------ */
++static ssize_t ccci_ex_dbg_dump_read(struct file *file, char __user *buf,
++				     size_t count, loff_t *ppos)
++{
++	struct ccci_md *md = file->private_data;
++	ssize_t ret;
++
++	mutex_lock(&md->ex.dump_lock);
++	if (!md->ex.dump)
++		ret = 0;
++	else
++		ret = simple_read_from_buffer(buf, count, ppos, md->ex.dump,
++					      md->ex.dump_len);
++	mutex_unlock(&md->ex.dump_lock);
++	return ret;
++}
++
++static ssize_t ccci_ex_dbg_packet_read(struct file *file, char __user *buf,
++				       size_t count, loff_t *ppos)
++{
++	struct ccci_md *md = file->private_data;
++	u8 packet[CCCI_EX_PACKET_MAX];
++	size_t len;
++
++	len = ccci_exception_packet_copy(md, packet, sizeof(packet));
++	return simple_read_from_buffer(buf, count, ppos, packet, len);
++}
++
++static ssize_t ccci_ex_dbg_stage_read(struct file *file, char __user *buf,
++				      size_t count, loff_t *ppos)
++{
++	struct ccci_md *md = file->private_data;
++	char text[640];
++	bool dhl_open = ccci_ex_dhl_ctrl_open(md);
++	bool meta = md->md_boot_mode == CCCI_MD_BOOT_MODE_META;
++	int len;
++
++	len = scnprintf(text, sizeof(text),
++			"state %d, boot stage %u\n"
++			"exception stage %u (%s), exception type %u (%s)\n"
++			"md_boot_mode %u (%s), DHL control port %s\n"
++			"DHL META close gate: %s\n"
++			"dumps %u, last reason %s, AED flags 0x%x\n"
++			"last stage %s (%u), last type %u, packet %s\n",
++			READ_ONCE(md->state), md->boot_stage,
++			md->ex_stage, ccci_exception_stage_name(md->ex_stage),
++			md->ex_type, ccci_ex_type_name(md->ex_type),
++			md->md_boot_mode, meta ? "META" : "normal",
++			dhl_open ? "open" : "closed",
++			(dhl_open && meta) ?
++			"refuses modem reset" : "idle",
++			md->ex.dump_count,
++			ccci_ex_reason_name(md->ex.dump_reason),
++			md->ex.dump_flags,
++			ccci_exception_stage_name(md->ex.dump_ex_stage),
++			md->ex.dump_ex_stage, md->ex.dump_ex_type,
++			READ_ONCE(md->ex.packet_valid) ? "captured" : "absent");
++
++	return simple_read_from_buffer(buf, count, ppos, text, len);
++}
++
++static const struct file_operations ccci_ex_dbg_dump_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = ccci_ex_dbg_dump_read,
++	.llseek = default_llseek,
++};
++
++static const struct file_operations ccci_ex_dbg_packet_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = ccci_ex_dbg_packet_read,
++	.llseek = default_llseek,
++};
++
++static const struct file_operations ccci_ex_dbg_stage_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = ccci_ex_dbg_stage_read,
++	.llseek = default_llseek,
++};
++
++static struct dentry *ccci_ex_dbg_create(struct ccci_md *md, const char *name,
++					 const struct file_operations *fops)
++{
++	struct dentry *d;
++
++	d = debugfs_create_file(name, 0444, md->dbg_dir, md, fops);
++	if (IS_ERR_OR_NULL(d)) {
++		ccci_md_dbg(md, "cannot create debugfs %s (%ld)\n", name,
++			    IS_ERR(d) ? PTR_ERR(d) : 0);
++		return NULL;
++	}
++	return d;
++}
++
++int ccci_exception_init(struct ccci_md *md)
++{
++	struct ccci_exception *ex = &md->ex;
++
++	/*
++	 * The wire format must stay byte-identical to the modem's EX_LOG_T;
++	 * every offset above depends on it (ccci_core.h:130-135).
++	 */
++	BUILD_BUG_ON(sizeof(struct ccci_ex_log) != 512);
++	BUILD_BUG_ON(sizeof(struct ccci_ex_header) != 4);
++	BUILD_BUG_ON(sizeof(struct ccci_ex_env_info) != 164);
++	BUILD_BUG_ON(sizeof(union ccci_ex_content) != 296);
++	BUILD_BUG_ON(CCCI_EXREC_OFFSET_OFFENDER >= sizeof(struct ccci_ex_log));
++	/* downstream CCCI_SMEM_DUMP_SIZE (0x1000) covers both dump windows,
++	 * mt6735/ccci_config.h:70-83
++	 */
++	BUILD_BUG_ON(CCCI_SMEM_OFFSET_MDSS_DEBUG + CCCI_SMEM_MDSS_DEBUG_SIZE >
++		     CCCI_SMEM_DUMP_SIZE);
++
++	spin_lock_init(&ex->lock);
++	mutex_init(&ex->dump_lock);
++	INIT_WORK(&ex->work, ccci_ex_work);
++
++	ex->dump = kvmalloc(CCCI_EX_DUMP_MAX, GFP_KERNEL);
++	if (!ex->dump) {
++		mutex_destroy(&ex->dump_lock);
++		return -ENOMEM;
++	}
++	ex->dump[0] = '\0';
++	ex->dump_len = 0;
++
++	if (md->dbg_dir) {
++		ex->dbg_dump = ccci_ex_dbg_create(md, "exception_dump",
++						  &ccci_ex_dbg_dump_fops);
++		ex->dbg_packet = ccci_ex_dbg_create(md, "exception_packet",
++						    &ccci_ex_dbg_packet_fops);
++		ex->dbg_stage = ccci_ex_dbg_create(md, "exception_stage",
++						   &ccci_ex_dbg_stage_fops);
++	} else {
++		ccci_md_dbg(md, "debugfs unavailable, exception snapshot only in ccci_dump\n");
++	}
++
++	spin_lock_irq(&ex->lock);
++	ex->ready = true;
++	spin_unlock_irq(&ex->lock);
++	return 0;
++}
++
++void ccci_exception_exit(struct ccci_md *md)
++{
++	struct ccci_exception *ex = &md->ex;
++	unsigned long lflags;
++
++	if (!ex->ready && !ex->dump)
++		return;
++
++	spin_lock_irqsave(&ex->lock, lflags);
++	ex->ready = false;
++	ex->pending = false;
++	spin_unlock_irqrestore(&ex->lock, lflags);
++
++	cancel_work_sync(&ex->work);
++
++	debugfs_remove(ex->dbg_dump);
++	debugfs_remove(ex->dbg_packet);
++	debugfs_remove(ex->dbg_stage);
++	ex->dbg_dump = NULL;
++	ex->dbg_packet = NULL;
++	ex->dbg_stage = NULL;
++
++	mutex_lock(&ex->dump_lock);
++	kvfree(ex->dump);
++	ex->dump = NULL;
++	ex->dump_len = 0;
++	mutex_unlock(&ex->dump_lock);
++	mutex_destroy(&ex->dump_lock);
++}
+diff --git a/drivers/misc/mediatek/ccci/ccci_exception.h b/drivers/misc/mediatek/ccci/ccci_exception.h
+new file mode 100644
+index 000000000..2774f6d12
+--- /dev/null
++++ b/drivers/misc/mediatek/ccci/ccci_exception.h
+@@ -0,0 +1,242 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * CCCI exception / AEE dump engine: private state and the modem exception
++ * record wire format.
++ *
++ * Ported from the Samsung/MTK 3.18 downstream kernel:
++ *   drivers/misc/mediatek/eccci/ccci_core.h        (EX_HEADER_T, EX_ENVINFO_T,
++ *                                                   EX_LOG_T, MD_EX_TYPE_*)
++ *   drivers/misc/mediatek/eccci/port_kernel.h      (CCCI_AED_DUMP_*,
++ *                                                   AED_STR_LEN,
++ *                                                   CCCI_EXREC_OFFSET_OFFENDER)
++ *   drivers/misc/mediatek/eccci/port_kernel.c      (ccci_aed, EE dump flow)
++ *
++ * Original copyright: Copyright (C) 2015 MediaTek Inc. GPL-2.0.
++ */
++#ifndef __CCCI_EXCEPTION_H__
++#define __CCCI_EXCEPTION_H__
++
++#include <linux/bits.h>
++#include <linux/debugfs.h>
++#include <linux/mutex.h>
++#include <linux/spinlock.h>
++#include <linux/types.h>
++#include <linux/workqueue.h>
++
++struct ccci_md;
++
++/* ------------------------------------------------------------------ */
++/* Modem exception log, downstream eccci/ccci_core.h:60-135            */
++/* ------------------------------------------------------------------ */
++
++/* MODEM MAUI Exception header (4 bytes) */
++struct ccci_ex_header {
++	u8 ex_type;
++	u8 ex_nvram;
++	__le16 ex_serial_num;
++} __packed;
++
++/* MODEM MAUI Environment information (164 bytes) */
++struct ccci_ex_env_info {
++	u8 boot_mode;		/* offset: +0x10 */
++	u8 reserved1[8];
++	u8 execution_unit[8];
++	u8 status;		/* offset: +0x21 */
++	u8 elm_status;		/* offset: +0x22 */
++	u8 reserved2[145];
++} __packed;
++
++/* MODEM MAUI fatal error code (8 bytes) */
++struct ccci_ex_fatalerr_code {
++	__le32 code1;
++	__le32 code2;
++} __packed;
++
++/* MODEM MAUI fatal error (296 bytes) */
++struct ccci_ex_fatalerr {
++	struct ccci_ex_fatalerr_code error_code;
++	u8 reserved1[288];
++} __packed;
++
++/* MODEM MAUI assert fail (296 bytes) */
++struct ccci_ex_assert_fail {
++	u8 filename[24];
++	__le32 linenumber;
++	__le32 parameters[3];
++	u8 reserved1[256];
++} __packed;
++
++/* MODEM MAUI globally exported data structure (296 bytes) */
++union ccci_ex_content {
++	struct ccci_ex_fatalerr fatalerr;
++	struct ccci_ex_assert_fail assert;
++} __packed;
++
++/* MODEM MAUI standard exception log (512 bytes) */
++struct ccci_ex_log {
++	struct ccci_ex_header header;
++	u8 reserved1[12];
++	struct ccci_ex_env_info envinfo;
++	u8 reserved2[36];
++	union ccci_ex_content content;
++} __packed;
++
++/* downstream port_kernel.h:29: fatal-error "offender" string in the record */
++#define CCCI_EXREC_OFFSET_OFFENDER	288
++/* downstream port_kernel.c:3160-3168: a 0xCC lead byte means "no offender" */
++#define CCCI_EX_OFFENDER_NONE		0xCC
++
++/*
++ * EX_LOG_T.ex_type values.
++ *
++ * port_kernel.h:31-54 (the port_kernel.c:3152-3250 decoder uses exactly these)
++ * plus EMI_MPU_VIOLATION from ccci_core.h:246 (0x30).  The latter lives in the
++ * platform exception list because it is raised by the RMPU/EMI MPU, not by the
++ * modem software; the non-MD_UMOLY decoder (port_kernel.c:2899-3010) has no
++ * dedicated case for it and reports it as an unknown type, the
++ * MD_UMOLY_EE_SUPPORT decoder (port_kernel.c:2752-2765) names it
++ * "Fatal error (rmpu violation)".  This kernel has no MD_UMOLY build, so the
++ * record layout is EX_LOG_T and the type is decoded here.
++ */
++#define CCCI_EX_TYPE_INVALID		0
++#define CCCI_EX_TYPE_UNDEF		1
++#define CCCI_EX_TYPE_SWI		2
++#define CCCI_EX_TYPE_PREF_ABT		3
++#define CCCI_EX_TYPE_DATA_ABT		4
++#define CCCI_EX_TYPE_ASSERT		5
++#define CCCI_EX_TYPE_FATALERR_TASK	6
++#define CCCI_EX_TYPE_FATALERR_BUF	7
++#define CCCI_EX_TYPE_LOCKUP		8
++#define CCCI_EX_TYPE_ASSERT_DUMP	9
++#define CCCI_EX_TYPE_ASSERT_FAIL	10
++#define CCCI_EX_TYPE_DSP_ASSERT		11
++#define CCCI_EX_TYPE_DSP_EXCEPTION	12
++#define CCCI_EX_TYPE_DSP_FATAL_ERROR	13
++#define CCCI_EX_TYPE_CROSS_CORE		15
++#define CCCI_EX_TYPE_C2K_ERROR		0x25
++#define CCCI_EX_TYPE_EMI_MPU_VIOLATION	0x30	/* ccci_core.h:246 */
++#define CCCI_EX_TYPE_EMI_CHECK		99
++/*
++ * Not an ex_type: downstream port_kernel.h:58 MD_EX_C2K_FATAL_ERROR is the
++ * err_code1 value that marks a C2K fatal error inside a C2K_ERROR record
++ * (port_kernel.c:3100).
++ */
++#define CCCI_EX_C2K_FATAL_ERR_CODE1	0x3000
++
++/* ------------------------------------------------------------------ */
++/* AED dump selectors, downstream eccci/port_kernel.h:19-22            */
++/* ------------------------------------------------------------------ */
++#define CCCI_AED_DUMP_EX_MEM		BIT(0)
++#define CCCI_AED_DUMP_MD_IMG_MEM	BIT(1)
++#define CCCI_AED_DUMP_CCIF_REG		BIT(2)
++#define CCCI_AED_DUMP_EX_PKT		BIT(3)
++
++/* ------------------------------------------------------------------ */
++/* Dump engine limits and state                                        */
++/* ------------------------------------------------------------------ */
++/* ccci_header + the full exception log, as received on MD_EX_REC_OK */
++#define CCCI_EX_PACKET_MAX	(16 + sizeof(struct ccci_ex_log))
++/* text snapshot: header, hex of every region and the decoded record */
++#define CCCI_EX_DUMP_MAX	32768
++/* every region is also printed to the kernel log, bounded per region */
++#define CCCI_EX_KLOG_BYTES	512
++
++/* One entry of the dump, used by the engine internally */
++enum ccci_ex_dump_reason {
++	CCCI_EX_DUMP_MD_EX = 0,
++	CCCI_EX_DUMP_MD_EX_REC_OK,
++	CCCI_EX_DUMP_WDT,
++	CCCI_EX_DUMP_NO_RESPONSE,
++};
++
++/*
++ * Exception shared-memory window (downstream ccci_core.c:262-293):
++ *
++ *   exp_vir/exp_size               CCCI_SMEM_SIZE_EXCEPTION bytes at the base
++ *                                  of the reserved AP<->MD shared memory
++ *   ccci_debug_vir/ccci_debug_size record handed to AEE at
++ *                                  exp_vir + CCCI_SMEM_OFFSET_CCCI_DEBUG
++ *
++ * Downstream derives these from the smem region returned by the CCCI
++ * "smem_layout" tag (ccci_util_lib_fo.c:468-511) plus the MT6735 layout
++ * constants (mt6735/ccci_config.h:71-83).  The modem image CHECK_HEADER does
++ * not carry the exception window: v3/v4/v5 have no smem field at all and v6
++ * only adds the total AP<->MD smem size (ccci_util_lib_main.h:198-201), which
++ * downstream never uses for the exception window.
++ */
++struct ccci_exception {
++	/* packet capture and dump scheduling, taken from Rx/IRQ contexts */
++	spinlock_t lock;
++	bool ready;
++	bool pending;
++	bool worker_active;
++	unsigned int pending_reason;
++	unsigned int pending_flags;
++
++	void __iomem *exp_vir;
++	size_t exp_size;
++	void __iomem *ccci_debug_vir;
++	size_t ccci_debug_size;
++	bool window_resolved;
++
++	u8 packet[CCCI_EX_PACKET_MAX];
++	size_t packet_len;
++	bool packet_valid;
++
++	struct work_struct work;
++
++	/* text snapshot handed to debugfs and in-kernel consumers */
++	struct mutex dump_lock;
++	char *dump;
++	size_t dump_len;
++	u32 dump_count;
++	unsigned int dump_reason;
++	unsigned int dump_flags;
++	unsigned int dump_ex_stage;
++	unsigned int dump_ex_type;
++
++	struct dentry *dbg_dump;
++	struct dentry *dbg_packet;
++	struct dentry *dbg_stage;
++};
++
++/* ------------------------------------------------------------------ */
++/* API (implemented in ccci_exception.c, called from ccci_core.c)      */
++/* ------------------------------------------------------------------ */
++int ccci_exception_init(struct ccci_md *md);
++void ccci_exception_exit(struct ccci_md *md);
++
++/* store the MD_EX_REC_OK packet (ccci_header + EX_LOG_T) for the dump */
++void ccci_exception_capture_packet(struct ccci_md *md, const void *data,
++				   size_t len);
++
++/*
++ * AED selection the ROM uses for an exception dump: the MD_EX_REC_OK packet
++ * before the first boot handshake completes, the shared-memory window after
++ * it (downstream ccci_ee_info_dump(), port_kernel.c:3125-3135).
++ */
++unsigned int ccci_exception_dump_flags(struct ccci_md *md);
++
++/* queue one dump; @reason is enum ccci_ex_dump_reason, @flags CCCI_AED_DUMP_* */
++void ccci_exception_trigger(struct ccci_md *md, unsigned int reason,
++			    unsigned int flags);
++
++/*
++ * Same, but wait until the snapshot is built.  Only for process context and
++ * only where the dump must precede a modem reset (the MD watchdog path,
++ * downstream modem_cldma.c:1838-1897 dumps the RGU/smem before resetting).
++ */
++void ccci_exception_trigger_sync(struct ccci_md *md, unsigned int reason,
++				 unsigned int flags);
++
++/*
++ * CCCI debug record inside the exception window, for the ROM AEE ABI
++ * aee_dump_ccci_debug_info() (downstream ccci_core.c:580-599).  Returns 0 and
++ * fills @vir/@size, or -ENODEV when the modem has no shared-memory window.
++ */
++int ccci_exception_ccci_debug_window(struct ccci_md *md, void __iomem **vir,
++				     size_t *size);
++/* CCCI_EX_* stage name, also used by the debugfs stage file */
++const char *ccci_exception_stage_name(unsigned int stage);
++
++#endif /* __CCCI_EXCEPTION_H__ */
+diff --git a/drivers/misc/mediatek/ccci/ccci_port_char.c b/drivers/misc/mediatek/ccci/ccci_port_char.c
+index be290ff6e..f11303db5 100644
+--- a/drivers/misc/mediatek/ccci/ccci_port_char.c
++++ b/drivers/misc/mediatek/ccci/ccci_port_char.c
+@@ -57,6 +57,20 @@ static int ccci_char_close_check(struct ccci_port *port)
+ 
+ 	if (md->critical_user[0] || md->critical_user[1])
+ 		return 1;
++	/*
++	 * downstream dev_char_close_check() (port_char.c:65-96): in META mode
++	 * only the DHL control port (CCCI_UART1_RX, /dev/ccci_md_log_ctrl)
++	 * must be closed before the modem may be reset; the MD logger port is
++	 * not part of a META session.
++	 */
++	if (md->md_boot_mode == CCCI_MD_BOOT_MODE_META) {
++		if (md->critical_user[3]) {
++			ccci_md_err(md, "DHL ctrl is still open in META mode\n");
++			return 1;
++		}
++		ccci_md_info(md, "ready to reset MD in META mode\n");
++		return 0;
++	}
+ 	if (md->critical_user[2] || md->critical_user[3])
+ 		return 1;
+ 	return 0;
+@@ -431,6 +445,24 @@ static long ccci_char_ioctl(struct file *file, unsigned int cmd,
+ 		ret = put_user(md->md_boot_mode, (unsigned int __user *)arg);
+ 		break;
+ 
++	case CCCI_IOC_GET_MD_SBP_CFG:
++		/* default resolved from CONFIG_MTK_MD[_2]_SBP_CUSTOM_VALUE at
++		 * modem creation, downstream port_char.c:914-947
++		 */
++		ret = put_user(md->sbp_code_default,
++			       (unsigned int __user *)arg);
++		break;
++
++	case CCCI_IOC_SET_MD_SBP_CFG:
++		if (copy_from_user(&val, (void __user *)arg, sizeof(val))) {
++			ret = -EFAULT;
++			break;
++		}
++		md->sbp_code = val;
++		ccci_md_info(md, "SBP code set to 0x%x by %s\n", val,
++			     current->comm);
++		break;
++
+ 	case CCCI_IOC_GET_MD_MEM_SIZE:
+ 		ret = put_user((unsigned int)md->img_size,
+ 			       (unsigned int __user *)arg);
+diff --git a/drivers/misc/mediatek/ccci/ccci_priv.h b/drivers/misc/mediatek/ccci/ccci_priv.h
+index b936ebd5e..a4da7cd48 100644
+--- a/drivers/misc/mediatek/ccci/ccci_priv.h
++++ b/drivers/misc/mediatek/ccci/ccci_priv.h
+@@ -40,6 +40,8 @@
+ #include <linux/wait.h>
+ #include <linux/workqueue.h>
+ 
++#include "ccci_exception.h"
++
+ #define CCCI_DEV_NAME		"ccci"
+ #define CCCI_MAGIC_NUM		0xFFFFFFFFu
+ #define CCCI_DBG_TAG		"ccci"
+@@ -494,6 +496,9 @@ struct ccci_md {
+ 	void __iomem *infra_ao;
+ 	phys_addr_t infra_ao_phys;
+ 	size_t infra_ao_size;
++
++	/* exception/AEE dump engine state (ccci_exception.c) */
++	struct ccci_exception ex;
+ };
+ 
+ /* ------------------------------------------------------------------ */
+@@ -573,6 +578,26 @@ enum ccci_runtime_feature_id {
+ 	CCCI_RT_MAX,
+ };
+ 
++/*
++ * Legacy modem_runtime MISC feature indexes, downstream
++ * mt-plat/mt_ccci_common.h:734-744 (MISC_FEATURE_ID).  These are NOT the
++ * MD_CCCI_RUNTIME_FEATURE_ID values above: the legacy block addresses its
++ * slots as feature_<id>_val, i.e. "MISC_MD_SBP_SETTING" is feature_4_val[],
++ * while the handshake-v2 block indexes feature_set[] by
++ * MD_CCCI_RUNTIME_FEATURE_ID.
++ */
++enum ccci_misc_feature_id {
++	CCCI_MISC_DMA_ADDR = 0,
++	CCCI_MISC_32K_LESS,
++	CCCI_MISC_RAND_SEED,
++	CCCI_MISC_MD_COCLK_SETTING,
++	CCCI_MISC_MD_SBP_SETTING,
++	CCCI_MISC_MD_SEQ_CHECK,
++	CCCI_MISC_MD_CLIB_TIME,
++	CCCI_MISC_MD_C2K_ON,
++	CCCI_MISC_MD_SLPHISTLOG,
++};
++
+ /* downstream CCCI_FEATURE_* / MISC_FEATURE_STATE */
+ #define CCCI_FEATURE_NOT_EXIST		0
+ #define CCCI_FEATURE_NOT_SUPPORT	1
+@@ -789,4 +814,34 @@ static inline unsigned int ccci_port_rxq(struct ccci_port *p)
+ 	return p->md->state == CCCI_MD_EXCEPTION ? p->rxq_exp : p->rxq;
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* Gap-closure additions (append-only, CCCI gap leaves)                */
++/* ------------------------------------------------------------------ */
++
++/* downstream mt6735/ccci_config.h:70: EE dump size of the smem window */
++#define CCCI_SMEM_DUMP_SIZE		4096
++
++/* downstream mt6735/ccci_config.h:76-77: 16 byte CCIF SRAM header
++ * snapshot, CCCI_SMEM_OFFSET_EXREC + 1024 - 16 == 3056
++ */
++#define CCCI_SMEM_CCIF_SRAM_SIZE	16
++#define CCCI_SMEM_OFFSET_CCIF_SRAM	(CCCI_SMEM_OFFSET_EXREC + 1024 - \
++					 CCCI_SMEM_CCIF_SRAM_SIZE)
++
++/* downstream modem_cldma.c:1862: SW watchdog marker in smem+0xC64 */
++#define CCCI_SMEM_EPON_SW_WDT		0xBAEBAE10
++
++/* downstream eccci/ccci_core.h:640 */
++#define CCCI_MD_IMG_DUMP_SIZE		(1 << 8)
++
++/* downstream eccci/ccci_core.h:774-777 MD_BOOT_MODE_* */
++#define CCCI_MD_BOOT_MODE_META		2
++
++/* downstream mt_ccci_common.h:334: CCCI_ERR_CCCI_REGION_START_ID + 16 */
++#define CCCI_ERR_MD_INDEX_NOT_FOUND	316
++
++/* downstream mt_ccci_common.h:240-241 (both are _IOW there as well) */
++#define CCCI_IOC_SET_MD_SBP_CFG		_IOW(CCCI_IOC_MAGIC, 40, unsigned int)
++#define CCCI_IOC_GET_MD_SBP_CFG		_IOW(CCCI_IOC_MAGIC, 41, unsigned int)
++
+ #endif /* __CCCI_PRIV_H__ */
+diff --git a/tools/mediatek/ccci/.gitignore b/tools/mediatek/ccci/.gitignore
+new file mode 100644
+index 000000000..567609b12
+--- /dev/null
++++ b/tools/mediatek/ccci/.gitignore
+@@ -0,0 +1 @@
++build/
+diff --git a/tools/mediatek/ccci/Makefile b/tools/mediatek/ccci/Makefile
+new file mode 100644
+index 000000000..88509afc0
+--- /dev/null
++++ b/tools/mediatek/ccci/Makefile
+@@ -0,0 +1,53 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# ccci-dump, the CCCI modem dump recorder/decoder.
++#
++# This is a host build with the system compiler.  It consumes no kernel
++# header and no proprietary blob; ccci_exrec.h is a cited copy of the wire
++# layout in drivers/misc/mediatek/ccci/ccci_exception.h (see that file and
++# the ports in drivers/misc/mediatek/eccci/ccci_core.h).
++#
++#   make            build build/bin/ccci-dump
++#   make check      help, argument validation and no-device behaviour
++#   make clean
++
++CC ?= gcc
++CFLAGS ?= -O2
++CFLAGS += -Wall -Wextra -std=gnu11
++CPPFLAGS +=
++
++BUILD := build
++OBJ := $(BUILD)/obj
++BIN := $(BUILD)/bin
++
++SRCS := ccci-dump.c
++OBJS := $(SRCS:%.c=$(OBJ)/%.o)
++
++.PHONY: all check clean
++
++all: $(BIN)/ccci-dump
++
++$(OBJ)/%.o: %.c ccci_exrec.h
++	@mkdir -p $(dir $@)
++	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
++
++$(BIN)/ccci-dump: $(OBJS)
++	@mkdir -p $(dir $@)
++	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS) $(LDLIBS)
++
++# No device is assumed.  The tool must explain a missing interface instead of
++# pretending it recorded something.
++check: all
++	@$(BIN)/ccci-dump -h >/dev/null
++	@if $(BIN)/ccci-dump -D $(BUILD)/does-not-exist >/dev/null 2>&1; then \
++		echo "check: decoding a missing file unexpectedly succeeded"; \
++		exit 1; \
++	fi
++	@if $(BIN)/ccci-dump -m 9 >/dev/null 2>&1; then \
++		echo "check: modem 9 was accepted"; \
++		exit 1; \
++	fi
++	@echo "check: help, input validation and error paths OK"
++
++clean:
++	rm -rf $(BUILD)
+diff --git a/tools/mediatek/ccci/ccci-dump.c b/tools/mediatek/ccci/ccci-dump.c
+new file mode 100644
+index 000000000..aa53cda37
+--- /dev/null
++++ b/tools/mediatek/ccci/ccci-dump.c
+@@ -0,0 +1,529 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * ccci-dump - record and decode the MediaTek CCCI modem exception dump.
++ *
++ * Interfaces consumed (both are implemented by this kernel tree):
++ *
++ *  - /dev/ccci_dump, the per-modem dump ring exposed by
++ *    drivers/misc/mediatek/ccci_util/ccci_util_log.c:269-435.
++ *    A read returns a text snapshot of every dump ring of the selected
++ *    modem.  The modem is selected with
++ *    CCCI_UTIL_IOC_SET_MD/_GET_MD (ccci_util_log.c:274-275):
++ *
++ *        #define CCCI_UTIL_IOC_MAGIC   'C'
++ *        #define CCCI_UTIL_IOC_SET_MD  _IOW('C', 0x40, __u32)
++ *        #define CCCI_UTIL_IOC_GET_MD  _IOR('C', 0x41, __u32)
++ *
++ *  - debugfs, created by the CCCI core and the exception engine:
++ *      /sys/kernel/debug/ccci/mdN/exception_packet  raw MD_EX_REC_OK packet
++ *                                                   (16 byte ccci_header +
++ *                                                    512 byte EX_LOG_T)
++ *      /sys/kernel/debug/ccci/mdN/exception_stage   textual state
++ *      /sys/kernel/debug/ccci/mdN/exception_dump    text snapshot
++ *    The mdN directory is shared with the util driver, whose "dump" file is
++ *    the ring view, hence the "exception_" prefix.
++ *
++ * The record layout is in ccci_exrec.h (a cited copy of the kernel header).
++ * Nothing here is synthesised: when an interface is absent or empty the tool
++ * reports it and exits non-zero instead of printing a made-up record.
++ *
++ * Ported from the Samsung/MTK 3.18 userspace AEE/meta dump convention; the
++ * ROM kernel side is aee_dump_ccci_debug_info() (vmlinux.elf 0xc0508b54) and
++ * aed_md_exception_api() (vmlinux.elf 0xc0628298).
++ */
++#define _GNU_SOURCE
++#include <errno.h>
++#include <fcntl.h>
++#include <getopt.h>
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "ccci_exrec.h"
++
++#define DUMP_DEV		"/dev/ccci_dump"
++#define DEBUGFS_DEFAULT		"/sys/kernel/debug"
++
++#define CCCI_UTIL_IOC_MAGIC	'C'
++#define CCCI_UTIL_IOC_SET_MD	_IOW(CCCI_UTIL_IOC_MAGIC, 0x40, uint32_t)
++#define CCCI_UTIL_IOC_GET_MD	_IOR(CCCI_UTIL_IOC_MAGIC, 0x41, uint32_t)
++
++#define MBUF_MAX		(8u * 1024u * 1024u)
++#define DEBUGFS_READ_MAX	(256u * 1024u)
++
++struct mbuf {
++	uint8_t *data;
++	size_t len;
++};
++
++static void die(const char *fmt, ...)
++{
++	va_list ap;
++
++	fputs("ccci-dump: ", stderr);
++	va_start(ap, fmt);
++	vfprintf(stderr, fmt, ap);
++	va_end(ap);
++	fputc('\n', stderr);
++}
++
++static int mbuf_reserve(struct mbuf *b, size_t want)
++{
++	size_t cap = b->len ? b->len : 4096;
++	uint8_t *n;
++
++	if (want <= b->len)
++		return 0;
++	if (want > MBUF_MAX) {
++		die("dump larger than %u bytes, refusing", MBUF_MAX);
++		return -1;
++	}
++	while (cap < want)
++		cap *= 2;
++	if (cap > MBUF_MAX)
++		cap = MBUF_MAX;
++	n = realloc(b->data, cap);
++	if (!n) {
++		die("out of memory");
++		return -1;
++	}
++	b->data = n;
++	return 0;
++}
++
++static int read_all_fd(int fd, struct mbuf *b)
++{
++	for (;;) {
++		ssize_t n;
++
++		if (mbuf_reserve(b, b->len + 4096))
++			return -1;
++		n = read(fd, b->data + b->len, 4096);
++		if (n < 0) {
++			if (errno == EINTR)
++				continue;
++			return -1;
++		}
++		if (!n)
++			return 0;
++		b->len += (size_t)n;
++	}
++}
++
++static int read_all_path(const char *path, struct mbuf *b, size_t max)
++{
++	int fd;
++	int ret;
++
++	fd = open(path, O_RDONLY);
++	if (fd < 0)
++		return -1;
++	for (;;) {
++		ssize_t n;
++
++		if (b->len >= max)
++			break;
++		if (mbuf_reserve(b, b->len + 4096))
++			break;
++		n = read(fd, b->data + b->len, 4096);
++		if (n < 0) {
++			if (errno == EINTR)
++				continue;
++			close(fd);
++			return -1;
++		}
++		if (!n)
++			break;
++		b->len += (size_t)n;
++	}
++	ret = 0;
++	close(fd);
++	return ret;
++}
++
++/* ------------------------------------------------------------------ */
++/* Record decoding                                                     */
++/* ------------------------------------------------------------------ */
++
++static const char *type_name(unsigned int type)
++{
++	switch (type) {
++	case CCCI_EX_TYPE_INVALID:		return "INVALID";
++	case CCCI_EX_TYPE_UNDEF:		return "Fatal error (undefine)";
++	case CCCI_EX_TYPE_SWI:			return "Fatal error (swi)";
++	case CCCI_EX_TYPE_PREF_ABT:		return "Fatal error (prefetch abort)";
++	case CCCI_EX_TYPE_DATA_ABT:		return "Fatal error (data abort)";
++	case CCCI_EX_TYPE_ASSERT:		return "ASSERT";
++	case CCCI_EX_TYPE_FATALERR_TASK:	return "Fatal error (task)";
++	case CCCI_EX_TYPE_FATALERR_BUF:		return "Fatal error (buff)";
++	case CCCI_EX_TYPE_LOCKUP:		return "Lockup";
++	case CCCI_EX_TYPE_ASSERT_DUMP:		return "ASSERT DUMP";
++	case CCCI_EX_TYPE_ASSERT_FAIL:		return "ASSERT FAIL";
++	case CCCI_EX_TYPE_DSP_ASSERT:		return "MD DMD ASSERT";
++	case CCCI_EX_TYPE_DSP_EXCEPTION:	return "MD DMD Exception";
++	case CCCI_EX_TYPE_DSP_FATAL_ERROR:	return "MD DMD FATAL ERROR";
++	case CCCI_EX_TYPE_CROSS_CORE:		return "Fatal error (LTE_EXP)";
++	case CCCI_EX_TYPE_C2K_ERROR:		return "Fatal error (C2K_EXP)";
++	case CCCI_EX_TYPE_EMI_MPU_VIOLATION:	return "Fatal error (rmpu violation)";
++	case CCCI_EX_TYPE_EMI_CHECK:		return "EMI_CHK";
++	default:				return "UNKNOWN Exception";
++	}
++}
++
++static bool type_is_assert(unsigned int type)
++{
++	/* port_kernel.c:3153-3215 plus DSP_EX_TYPE_ASSERT */
++	return type == CCCI_EX_TYPE_ASSERT ||
++	       type == CCCI_EX_TYPE_ASSERT_DUMP ||
++	       type == CCCI_EX_TYPE_ASSERT_FAIL ||
++	       type == CCCI_EX_TYPE_DSP_ASSERT;
++}
++
++static void print_ascii(const char *label, const uint8_t *src, size_t len)
++{
++	char out[128];
++	size_t i;
++
++	if (len >= sizeof(out))
++		len = sizeof(out) - 1;
++	for (i = 0; i < len && src[i]; i++)
++		out[i] = (src[i] >= 0x20 && src[i] <= 0x7e) ? (char)src[i] : '.';
++	out[i] = '\0';
++	printf("  %-18s \"%s\"\n", label, out);
++}
++
++/*
++ * @buf may be a raw 512 byte record or a captured MD_EX_REC_OK packet
++ * (16 byte ccci_header + record).  Return the offset of the record.
++ */
++static int record_offset(const uint8_t *buf, size_t len)
++{
++	const struct ccci_header_wire *h = (const void *)buf;
++
++	if (len >= CCCI_HEADER_SIZE + sizeof(struct ccci_ex_log) &&
++	    ccci_ex_le16(h->channel) == CCCI_CONTROL_RX &&
++	    ccci_ex_le32(h->reserved) == CCCI_MD_EX_REC_OK_CHK_ID)
++		return CCCI_HEADER_SIZE;
++	return 0;
++}
++
++static int decode_record(const char *source, const uint8_t *buf, size_t len)
++{
++	const struct ccci_ex_log *log;
++	const uint8_t *rec;
++	size_t off;
++	unsigned int type;
++	uint32_t code1, code2;
++
++	off = record_offset(buf, len);
++	if (len - off < sizeof(*log)) {
++		die("%s: %zu bytes is shorter than the %zu byte EX_LOG_T",
++		    source, len, sizeof(*log));
++		return -1;
++	}
++	rec = buf + off;
++	log = (const struct ccci_ex_log *)rec;
++	type = log->header.ex_type;
++
++	printf("CCCI exception record from %s (%zu of %zu bytes used)\n",
++	       source, sizeof(*log), len - off);
++	printf("  %-18s %u (0x%02x, %s)\n", "ex_type", type, type,
++	       type_name(type));
++	printf("  %-18s %u\n", "ex_nvram", log->header.ex_nvram);
++	printf("  %-18s %u\n", "ex_serial_num",
++	       ccci_ex_le16(log->header.ex_serial_num));
++	printf("  %-18s %u\n", "boot_mode", log->envinfo.boot_mode);
++	print_ascii("execution_unit", log->envinfo.execution_unit,
++		    sizeof(log->envinfo.execution_unit));
++	printf("  %-18s 0x%02x\n", "status", log->envinfo.status);
++	printf("  %-18s 0x%02x\n", "ELM_status", log->envinfo.elm_status);
++
++	code1 = ccci_ex_le32(log->content.fatalerr.error_code.code1);
++	code2 = ccci_ex_le32(log->content.fatalerr.error_code.code2);
++	if (type_is_assert(type)) {
++		print_ascii("assert file", log->content.assert.filename,
++			    sizeof(log->content.assert.filename));
++		printf("  %-18s %u\n", "assert line",
++		       ccci_ex_le32(log->content.assert.linenumber));
++		printf("  %-18s 0x%08x 0x%08x 0x%08x\n", "assert params",
++		       ccci_ex_le32(log->content.assert.parameters[0]),
++		       ccci_ex_le32(log->content.assert.parameters[1]),
++		       ccci_ex_le32(log->content.assert.parameters[2]));
++	} else {
++		printf("  %-18s 0x%08x\n", "error code1", code1);
++		printf("  %-18s 0x%08x\n", "error code2", code2);
++	}
++	if (type == CCCI_EX_TYPE_EMI_MPU_VIOLATION)
++		printf("  %-18s EMI MPU / RMPU region violation (ECT_SRC_RMPU, ccci_core.h:352)\n",
++		       "rmpu");
++	if (type == CCCI_EX_TYPE_C2K_ERROR)
++		printf("  %-18s C2K exception, no AEE dump for this class (port_kernel.c:3100-3104)\n",
++		       "c2k");
++
++	if (rec[CCCI_EXREC_OFFSET_OFFENDER] == CCCI_EX_OFFENDER_NONE)
++		printf("  %-18s none (0x%02x marker, port_kernel.c:3138)\n",
++		       "offender", CCCI_EX_OFFENDER_NONE);
++	else
++		print_ascii("offender", rec + CCCI_EXREC_OFFSET_OFFENDER,
++			    CCCI_EX_OFFENDER_LEN);
++
++	return 0;
++}
++
++static void hexdump(const uint8_t *p, size_t len)
++{
++	size_t i, j;
++
++	for (i = 0; i < len; i += 16) {
++		printf("  %08zx:", i);
++		for (j = 0; j < 16 && i + j < len; j++)
++			printf(" %02x", p[i + j]);
++		printf("\n");
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* Interfaces                                                          */
++/* ------------------------------------------------------------------ */
++
++static int md_number(const char *arg)
++{
++	long v;
++	char *end;
++
++	if (!strncasecmp(arg, "md", 2))
++		arg += 2;
++	v = strtol(arg, &end, 10);
++	if (*arg == '\0' || *end != '\0' || v < 1 || v > 5) {
++		die("invalid modem \"%s\": expected 1..5 or md1..md5", arg);
++		return -1;
++	}
++	return (int)v;
++}
++
++static int record_snapshot(int md1, const char *out, const char *dbgroot)
++{
++	struct mbuf b = { 0 };
++	uint32_t md0 = (uint32_t)(md1 - 1);
++	int fd, ret = -1;
++	FILE *f = NULL;
++
++	fd = open(DUMP_DEV, O_RDONLY);
++	if (fd < 0) {
++		die("%s: %s", DUMP_DEV, strerror(errno));
++		return -1;
++	}
++	if (ioctl(fd, CCCI_UTIL_IOC_SET_MD, &md0) < 0) {
++		die("%s: CCCI_UTIL_IOC_SET_MD(md%d): %s", DUMP_DEV, md1,
++		    strerror(errno));
++		close(fd);
++		return -1;
++	}
++	if (read_all_fd(fd, &b) < 0) {
++		die("%s: read: %s", DUMP_DEV, strerror(errno));
++		close(fd);
++		return -1;
++	}
++	close(fd);
++
++	if (!b.len) {
++		die("%s: md%d has no dump data yet", DUMP_DEV, md1);
++		free(b.data);
++		return -1;
++	}
++
++	if (out && strcmp(out, "-")) {
++		f = fopen(out, "w");
++		if (!f) {
++			die("%s: %s", out, strerror(errno));
++			free(b.data);
++			return -1;
++		}
++	}
++	printf("ccci-dump: md%d snapshot: %zu bytes recorded from %s\n",
++	       md1, b.len, DUMP_DEV);
++	if (f)
++		printf("ccci-dump: written to %s\n", out);
++	if (fwrite(b.data, 1, b.len, f ? f : stdout) != b.len) {
++		die("short write");
++		goto out;
++	}
++	if (f && fflush(f)) {
++		die("%s: %s", out, strerror(errno));
++		goto out;
++	}
++
++	/* Decode the exception record when debugfs has one; the recorded file
++	 * keeps the kernel snapshot verbatim.
++	 */
++	{
++		char path[512];
++		struct mbuf pkt = { 0 };
++
++		snprintf(path, sizeof(path), "%s/ccci/md%d/exception_packet",
++			 dbgroot, md1);
++		if (read_all_path(path, &pkt, DEBUGFS_READ_MAX) == 0 &&
++		    pkt.len) {
++			printf("\n=== decoded exception packet ===\n");
++			if (decode_record(path, pkt.data, pkt.len)) {
++				free(pkt.data);
++				goto out;
++			}
++			hexdump(pkt.data, pkt.len);
++		} else {
++			printf("ccci-dump: %s: no exception packet captured\n",
++			       path);
++		}
++		free(pkt.data);
++	}
++	ret = 0;
++out:
++	if (f && fclose(f) && ret == 0) {
++		die("%s: %s", out, strerror(errno));
++		ret = -1;
++	}
++	free(b.data);
++	return ret;
++}
++
++static int show_stage(int md1, const char *dbgroot)
++{
++	char path[512];
++	struct mbuf b = { 0 };
++
++	snprintf(path, sizeof(path), "%s/ccci/md%d/exception_stage",
++		 dbgroot, md1);
++	if (read_all_path(path, &b, DEBUGFS_READ_MAX) < 0) {
++		die("%s: %s", path, strerror(errno));
++		return -1;
++	}
++	if (!b.len) {
++		die("%s: empty", path);
++		free(b.data);
++		return -1;
++	}
++	fwrite(b.data, 1, b.len, stdout);
++	free(b.data);
++	return 0;
++}
++
++static int show_packet(int md1, const char *dbgroot)
++{
++	char path[512];
++	struct mbuf b = { 0 };
++	int ret;
++
++	snprintf(path, sizeof(path), "%s/ccci/md%d/exception_packet",
++		 dbgroot, md1);
++	if (read_all_path(path, &b, DEBUGFS_READ_MAX) < 0) {
++		die("%s: %s", path, strerror(errno));
++		return -1;
++	}
++	if (!b.len) {
++		die("%s: no exception packet captured", path);
++		free(b.data);
++		return -1;
++	}
++	ret = decode_record(path, b.data, b.len);
++	if (!ret)
++		hexdump(b.data, b.len);
++	free(b.data);
++	return ret;
++}
++
++static int decode_file(const char *path)
++{
++	struct mbuf b = { 0 };
++	int ret;
++
++	if (read_all_path(path, &b, MBUF_MAX) < 0) {
++		die("%s: %s", path, strerror(errno));
++		return -1;
++	}
++	if (!b.len) {
++		die("%s: empty", path);
++		free(b.data);
++		return -1;
++	}
++	ret = decode_record(path, b.data, b.len);
++	free(b.data);
++	return ret;
++}
++
++static void usage(FILE *out)
++{
++	fprintf(out,
++"Usage: ccci-dump [options]\n"
++"\n"
++"Record the CCCI modem dump from /dev/ccci_dump and decode the exception\n"
++"record the kernel collected (EX_LOG_T, 512 bytes).\n"
++"\n"
++"  -m N          modem number, 1-based (default 1, i.e. md1)\n"
++"  -o FILE       record the dump snapshot to FILE ('-' = stdout)\n"
++"  -s            print the debugfs exception stage and exit\n"
++"  -p            print/decode the debugfs exception packet and exit\n"
++"  -D FILE       decode a saved packet or record file and exit\n"
++"  -R DIR        debugfs root (default %s)\n"
++"  -h            this help\n"
++"\n"
++"Without -o the snapshot goes to stdout.  Exit status is 0 only when the\n"
++"requested interface produced data; a missing device or an empty record is\n"
++"reported on stderr and returns 1.\n", DEBUGFS_DEFAULT);
++}
++
++int main(int argc, char **argv)
++{
++	const char *out = NULL, *decode = NULL, *dbgroot = DEBUGFS_DEFAULT;
++	int do_stage = 0, do_packet = 0;
++	int md1 = 1;
++	int opt;
++
++	while ((opt = getopt(argc, argv, "m:o:spD:R:h")) != -1) {
++		switch (opt) {
++		case 'm':
++			md1 = md_number(optarg);
++			if (md1 < 0)
++				return 1;
++			break;
++		case 'o':
++			out = optarg;
++			break;
++		case 's':
++			do_stage = 1;
++			break;
++		case 'p':
++			do_packet = 1;
++			break;
++		case 'D':
++			decode = optarg;
++			break;
++		case 'R':
++			dbgroot = optarg;
++			break;
++		case 'h':
++			usage(stdout);
++			return 0;
++		default:
++			usage(stderr);
++			return 1;
++		}
++	}
++	if (optind != argc) {
++		usage(stderr);
++		return 1;
++	}
++
++	if (decode)
++		return decode_file(decode) ? 1 : 0;
++	if (do_stage)
++		return show_stage(md1, dbgroot) ? 1 : 0;
++	if (do_packet)
++		return show_packet(md1, dbgroot) ? 1 : 0;
++	return record_snapshot(md1, out, dbgroot) ? 1 : 0;
++}
+diff --git a/tools/mediatek/ccci/ccci_exrec.h b/tools/mediatek/ccci/ccci_exrec.h
+new file mode 100644
+index 000000000..146495106
+--- /dev/null
++++ b/tools/mediatek/ccci/ccci_exrec.h
+@@ -0,0 +1,161 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Modem exception record layout shared by the CCCI dump tooling.
++ *
++ * This is a userspace copy of the on-wire record the modem writes into the
++ * AP<->MD shared memory.  It must stay byte-identical to
++ * drivers/misc/mediatek/ccci/ccci_exception.h, which in turn is a port of the
++ * Samsung/MTK 3.18 kernel:
++ *
++ *   drivers/misc/mediatek/eccci/ccci_core.h:86-135   EX_HEADER_T, EX_ENVINFO_T,
++ *                                                    EX_FATALERR_T,
++ *                                                    EX_ASSERTFAIL_T, EX_LOG_T
++ *   drivers/misc/mediatek/eccci/port_kernel.h:29     CCCI_EXREC_OFFSET_OFFENDER
++ *   drivers/misc/mediatek/eccci/port_kernel.h:31-58  MD_EX_TYPE_*
++ *   drivers/misc/mediatek/eccci/ccci_core.h:246      EMI_MPU_VIOLATION
++ *   drivers/misc/mediatek/eccci/ccci_core.h:352      ECT_SRC_RMPU
++ *   drivers/misc/mediatek/eccci/port_kernel.c:3138   offender 0xCC marker
++ *
++ * The record is 512 bytes.  Everything is little endian on the wire; the
++ * helpers use the byte-order macros so the tool also works on a big-endian
++ * host.
++ */
++#ifndef CCCI_EXREC_H
++#define CCCI_EXREC_H
++
++#include <endian.h>
++#include <stddef.h>
++#include <stdint.h>
++
++/* MODEM MAUI Exception header (4 bytes), ccci_core.h:86-91 */
++struct ccci_ex_header {
++	uint8_t ex_type;
++	uint8_t ex_nvram;
++	uint16_t ex_serial_num;
++} __attribute__((packed));
++
++/* MODEM MAUI Environment information (164 bytes), ccci_core.h:93-101 */
++struct ccci_ex_env_info {
++	uint8_t boot_mode;		/* offset +0x10 */
++	uint8_t reserved1[8];
++	uint8_t execution_unit[8];
++	uint8_t status;			/* offset +0x21 */
++	uint8_t elm_status;		/* offset +0x22 */
++	uint8_t reserved2[145];
++} __attribute__((packed));
++
++/* MODEM MAUI fatal error code (8 bytes), ccci_core.h:103-107 */
++struct ccci_ex_fatalerr_code {
++	uint32_t code1;
++	uint32_t code2;
++} __attribute__((packed));
++
++/* MODEM MAUI fatal error (296 bytes), ccci_core.h:109-113 */
++struct ccci_ex_fatalerr {
++	struct ccci_ex_fatalerr_code error_code;
++	uint8_t reserved1[288];
++} __attribute__((packed));
++
++/* MODEM MAUI assert fail (296 bytes), ccci_core.h:115-121 */
++struct ccci_ex_assert_fail {
++	uint8_t filename[24];
++	uint32_t linenumber;
++	uint32_t parameters[3];
++	uint8_t reserved1[256];
++} __attribute__((packed));
++
++/* ccci_core.h:123-128 */
++union ccci_ex_content {
++	struct ccci_ex_fatalerr fatalerr;
++	struct ccci_ex_assert_fail assert;
++} __attribute__((packed));
++
++/* MODEM MAUI standard exception log (512 bytes), ccci_core.h:130-135 */
++struct ccci_ex_log {
++	struct ccci_ex_header header;
++	uint8_t reserved1[12];
++	struct ccci_ex_env_info envinfo;
++	uint8_t reserved2[36];
++	union ccci_ex_content content;
++} __attribute__((packed));
++
++/* Downstream port_kernel.h:29.  The offender string is stored in the content
++ * reserved area, 288 bytes from the start of the record.
++ */
++#define CCCI_EXREC_OFFSET_OFFENDER	288
++/* Downstream port_kernel.c:3138: a 0xCC lead byte means "no offender". */
++#define CCCI_EX_OFFENDER_NONE		0xCC
++/* Offender field size in downstream DEBUG_INFO_T (fatal_error.offender). */
++#define CCCI_EX_OFFENDER_LEN		64
++
++/* EX_LOG_T.ex_type, downstream port_kernel.h:31-58 and ccci_core.h:230-246 */
++#define CCCI_EX_TYPE_INVALID		0
++#define CCCI_EX_TYPE_UNDEF		1
++#define CCCI_EX_TYPE_SWI		2
++#define CCCI_EX_TYPE_PREF_ABT		3
++#define CCCI_EX_TYPE_DATA_ABT		4
++#define CCCI_EX_TYPE_ASSERT		5
++#define CCCI_EX_TYPE_FATALERR_TASK	6
++#define CCCI_EX_TYPE_FATALERR_BUF	7
++#define CCCI_EX_TYPE_LOCKUP		8
++#define CCCI_EX_TYPE_ASSERT_DUMP	9
++#define CCCI_EX_TYPE_ASSERT_FAIL	10
++#define CCCI_EX_TYPE_DSP_ASSERT		11
++#define CCCI_EX_TYPE_DSP_EXCEPTION	12
++#define CCCI_EX_TYPE_DSP_FATAL_ERROR	13
++#define CCCI_EX_TYPE_CROSS_CORE		15
++#define CCCI_EX_TYPE_C2K_ERROR		0x25
++#define CCCI_EX_TYPE_EMI_MPU_VIOLATION	0x30	/* ccci_core.h:246 */
++#define CCCI_EX_TYPE_EMI_CHECK		99
++
++/* Downstream mt-plat/mt_ccci_common.h:590-591 */
++#define CCCI_MD_EX_CHK_ID		0x45584350u
++#define CCCI_MD_EX_REC_OK_CHK_ID	0x45524543u
++/* Control channel message ids, mt_ccci_common.h:580-589 */
++#define CCCI_MD_EX_REC_OK		0x6
++
++/* ccci_header, 16 bytes: it precedes the record in an MD_EX_REC_OK packet. */
++struct ccci_header_wire {
++	uint32_t data[2];
++	uint16_t channel;
++	uint16_t seq_num;
++	uint32_t reserved;
++} __attribute__((packed));
++
++#define CCCI_HEADER_SIZE	16
++#define CCCI_CONTROL_RX		0
++
++_Static_assert(sizeof(struct ccci_ex_header) == 4, "EX_HEADER_T size");
++_Static_assert(sizeof(struct ccci_ex_env_info) == 164, "EX_ENVINFO_T size");
++_Static_assert(sizeof(struct ccci_ex_fatalerr) == 296, "EX_FATALERR_T size");
++_Static_assert(sizeof(struct ccci_ex_assert_fail) == 296, "EX_ASSERTFAIL_T size");
++_Static_assert(sizeof(union ccci_ex_content) == 296, "EX_CONTENT_T size");
++_Static_assert(sizeof(struct ccci_ex_log) == 512, "EX_LOG_T size");
++_Static_assert(offsetof(struct ccci_ex_log, envinfo) == 0x10,
++	       "EX_LOG_T envinfo offset");
++_Static_assert(offsetof(struct ccci_ex_log, content) == 0xd8,
++	       "EX_LOG_T content offset");
++_Static_assert(sizeof(struct ccci_header_wire) == CCCI_HEADER_SIZE,
++	       "ccci_header size");
++_Static_assert(CCCI_EXREC_OFFSET_OFFENDER < sizeof(struct ccci_ex_log),
++	       "offender inside record");
++
++static inline uint16_t ccci_ex_le16(uint16_t v)
++{
++#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
++	return v;
++#else
++	return __builtin_bswap16(v);
++#endif
++}
++
++static inline uint32_t ccci_ex_le32(uint32_t v)
++{
++#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
++	return v;
++#else
++	return __builtin_bswap32(v);
++#endif
++}
++
++#endif /* CCCI_EXREC_H */

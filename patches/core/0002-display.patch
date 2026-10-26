@@ -1,0 +1,817 @@
+diff --git a/drivers/gpu/drm/panel/panel-samsung-s6d78a0-gh9607501a.c b/drivers/gpu/drm/panel/panel-samsung-s6d78a0-gh9607501a.c
+index 37fe2b024..28caa0157 100644
+--- a/drivers/gpu/drm/panel/panel-samsung-s6d78a0-gh9607501a.c
++++ b/drivers/gpu/drm/panel/panel-samsung-s6d78a0-gh9607501a.c
+@@ -1,26 +1,217 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+-// Copyright (c) 2022 FIXME
+-// Generated with linux-mdss-dsi-panel-driver-generator from vendor device tree:
+-//   Copyright (c) 2013, The Linux Foundation. All rights reserved. (FIXME)
++/*
++ * Samsung S6D78A0 (BOE GH9607501A) 540x960 MIPI-DSI video mode panel
++ *
++ * Copyright (c) 2022 FIXME
++ *
++ * Port from Samsung/MTK downstream (grandpplte, SM-G532M):
++ *   drivers/misc/mediatek/lcm/mtk_gen_panel/mtk_gen_panel.c
++ *   drivers/video/backlight/gen_panel/gen-panel.c
++ *   drivers/video/backlight/ktd3102_bl.c
++ *   drivers/misc/mediatek/lcm/s6d78a0_qhd_dsi_vdo/s6d78a0_qhd_dsi_vdo.c
++ *   arch/arm/boot/dts/mtk-dsi-panel_s6d78a0x02_grandpplte_286108_video.dtsi
++ *   arch/arm/boot/dts/mtk-dsi-panel_s6d78a0_granpplte_53b810_video.dtsi
++ *   Copyright (C) 2015 MediaTek Inc.
++ *   Copyright (C) 2015-2016 Samsung Electronics Co., Ltd.
++ *
++ * The downstream kernel uses mtk_gen_panel (CONFIG_CUSTOM_KERNEL_LCM=
++ * "mtk_gen_panel"), so the real init sequence comes from the board DTB, not
++ * from the LCM C file.  Both panel IDs found in the ROM DTB (0x286108 and
++ * 0x53b810) are supported and selected at runtime from DCS reads of 0xda,
++ * 0xdb and 0xdc, exactly like gen_panel_set_id() does.
++ */
+ 
+ #include <linux/backlight.h>
+ #include <linux/delay.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/regulator/consumer.h>
+ 
+-#include <video/mipi_display.h>
+-
+ #include <drm/drm_mipi_dsi.h>
+ #include <drm/drm_modes.h>
+ #include <drm/drm_panel.h>
+ 
++/* Panel timing, from the ROM DTB gen-panel node (see report). */
++#define S6D78A0_WIDTH		540
++#define S6D78A0_HEIGHT		960
++#define S6D78A0_HFP		35
++#define S6D78A0_HSYNC		28
++#define S6D78A0_HBP		35
++#define S6D78A0_VFP		8
++#define S6D78A0_VSYNC		2
++#define S6D78A0_VBP		6
++#define S6D78A0_WIDTH_MM	64
++#define S6D78A0_HEIGHT_MM	110
++#define S6D78A0_REFRESH		60
++
++#define S6D78A0_PANEL_ID_286108	0x286108
++#define S6D78A0_PANEL_ID_53B810	0x53b810
++
++/* Largest DCS payload used by the two init tables (0xfa/0xfb: 39 bytes). */
++#define S6D78A0_MAX_PAYLOAD	39
++
++/*
++ * One DCS write as encoded in gen-panel-init-cmds.  delay_ms is applied
++ * after the command, matching mtk_panel_dsi_tx_cmd_array() in the
++ * downstream mtk_gen_panel driver.
++ */
++struct s6d78a0_cmd {
++	u8 cmd;
++	u8 len;
++	u16 delay_ms;
++	u8 data[S6D78A0_MAX_PAYLOAD];
++};
++
++/*
++ * "lcd_s6d78a0x02_286108_mipi" / gen-panel-id = <0x286108>.
++ * Verbatim from the ROM DTB gen-panel-init-cmds property.
++ */
++static const struct s6d78a0_cmd s6d78a0_init_286108[] = {
++	{ .cmd = 0xf0, .len = 2, .data = { 0x5a, 0x5a } },
++	{ .cmd = 0xf1, .len = 2, .data = { 0x5a, 0x5a } },
++	{ .cmd = 0xfc, .len = 2, .data = { 0xa5, 0xa5 } },
++	{ .cmd = 0x11, .delay_ms = 120 },
++	{ .cmd = 0xb1, .len = 1, .data = { 0x93 } },
++	{ .cmd = 0xb5, .len = 1, .data = { 0x10 } },
++	{ .cmd = 0xf4, .len = 17, .data = {
++		0x01, 0x10, 0x32, 0x00, 0x24, 0x26, 0x28, 0x27, 0x27,
++		0x27, 0xb7, 0x2b, 0x2c, 0x65, 0x6a, 0x34, 0x20 } },
++	{ .cmd = 0xef, .len = 20, .data = {
++		0x01, 0x01, 0x81, 0x22, 0x83, 0x04, 0x05, 0x00, 0x00,
++		0x00, 0x28, 0x81, 0x00, 0x21, 0x21, 0x03, 0x03, 0x40,
++		0x00, 0x10 } },
++	{ .cmd = 0xf2, .len = 8, .data = {
++		0x19, 0x04, 0x08, 0x08, 0x08, 0x3f, 0x23, 0x00 } },
++	{ .cmd = 0xf6, .len = 6, .data = {
++		0x63, 0x23, 0x15, 0x00, 0x00, 0x06 } },
++	{ .cmd = 0xe1, .len = 6, .data = {
++		0x01, 0xff, 0x01, 0x1b, 0x20, 0x17 } },
++	{ .cmd = 0xe2, .len = 3, .data = { 0xed, 0xc7, 0x23 } },
++	{ .cmd = 0xf7, .len = 38, .data = {
++		0x01, 0x01, 0x01, 0x0a, 0x0b, 0x00, 0x1a, 0x05, 0x1b,
++		0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
++		0x01, 0x01, 0x01, 0x01, 0x08, 0x09, 0x00, 0x1a, 0x04,
++		0x1b, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
++		0x01, 0x01 } },
++	{ .cmd = 0x36, .len = 1, .data = { 0x10 } },
++	{ .cmd = 0xfa, .len = 39, .data = {
++		0x11, 0x3b, 0x33, 0x2a, 0x1a, 0x09, 0x08, 0x04, 0x03,
++		0x07, 0x05, 0x06, 0x17, 0x12, 0x3b, 0x33, 0x2a, 0x1d,
++		0x0b, 0x07, 0x04, 0x03, 0x07, 0x05, 0x07, 0x17, 0x10,
++		0x3b, 0x33, 0x2a, 0x1a, 0x07, 0x05, 0x02, 0x02, 0x05,
++		0x03, 0x04, 0x15 } },
++	{ .cmd = 0xfb, .len = 39, .data = {
++		0x11, 0x3b, 0x33, 0x2a, 0x1a, 0x0a, 0x08, 0x04, 0x03,
++		0x06, 0x05, 0x06, 0x17, 0x12, 0x3b, 0x33, 0x2a, 0x1d,
++		0x0b, 0x07, 0x04, 0x03, 0x07, 0x05, 0x07, 0x17, 0x10,
++		0x3b, 0x33, 0x2a, 0x1a, 0x08, 0x05, 0x02, 0x02, 0x05,
++		0x03, 0x04, 0x14 } },
++	{ .cmd = 0x29, .delay_ms = 20 },	/* display on */
++	{ .cmd = 0xf0, .len = 2, .data = { 0xa5, 0xa5 } },
++	{ .cmd = 0xf1, .len = 2, .data = { 0xa5, 0xa5 } },
++	{ .cmd = 0xfc, .len = 2, .data = { 0x5a, 0x5a } },
++};
++
++/*
++ * "lcd_s6d78a0_53b810_mipi" / gen-panel-id = <0x53b810>.
++ * Verbatim from the ROM DTB gen-panel-init-cmds property.
++ */
++static const struct s6d78a0_cmd s6d78a0_init_53b810[] = {
++	{ .cmd = 0xf0, .len = 2, .data = { 0x5a, 0x5a } },
++	{ .cmd = 0xf1, .len = 2, .data = { 0x5a, 0x5a } },
++	{ .cmd = 0xfc, .len = 2, .data = { 0xa5, 0xa5 } },
++	{ .cmd = 0x11, .delay_ms = 120 },
++	{ .cmd = 0xb1, .len = 1, .data = { 0x93 } },
++	{ .cmd = 0xb5, .len = 1, .data = { 0x10 } },
++	{ .cmd = 0xf4, .len = 17, .data = {
++		0x01, 0x10, 0x32, 0x00, 0x24, 0x26, 0x28, 0x27, 0x27,
++		0x27, 0xb7, 0x2b, 0x2c, 0x65, 0x6a, 0x34, 0x20 } },
++	{ .cmd = 0xef, .len = 20, .data = {
++		0x01, 0x01, 0x81, 0x22, 0x83, 0x04, 0x00, 0x00, 0x00,
++		0x00, 0x28, 0x81, 0x00, 0x21, 0x21, 0x03, 0x03, 0x40,
++		0x00, 0x10 } },
++	{ .cmd = 0xf2, .len = 8, .data = {
++		0x19, 0x04, 0x08, 0x08, 0x08, 0x3f, 0x23, 0x00 } },
++	{ .cmd = 0xf6, .len = 6, .data = {
++		0x63, 0x23, 0x15, 0x00, 0x00, 0x0c } },
++	{ .cmd = 0xe1, .len = 6, .data = {
++		0x01, 0xff, 0x01, 0x1b, 0x20, 0x17 } },
++	{ .cmd = 0xe2, .len = 3, .data = { 0xed, 0xc7, 0x23 } },
++	{ .cmd = 0xf7, .len = 38, .data = {
++		0x01, 0x01, 0x0a, 0x0b, 0x05, 0x1b, 0x1a, 0x01, 0x01,
++		0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
++		0x01, 0x01, 0x01, 0x08, 0x09, 0x04, 0x1b, 0x1a, 0x01,
++		0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
++		0x01, 0x01 } },
++	{ .cmd = 0x36, .len = 1, .data = { 0x10 } },
++	{ .cmd = 0xfa, .len = 39, .data = {
++		0x00, 0x19, 0x21, 0x1e, 0x14, 0x0b, 0x10, 0x0e, 0x09,
++		0x0b, 0x00, 0x00, 0x0a, 0x00, 0x1d, 0x21, 0x1e, 0x14,
++		0x0b, 0x10, 0x0e, 0x09, 0x0b, 0x00, 0x00, 0x0a, 0x00,
++		0x1c, 0x21, 0x1e, 0x14, 0x0b, 0x10, 0x0e, 0x09, 0x0b,
++		0x00, 0x00, 0x0a } },
++	{ .cmd = 0xfb, .len = 39, .data = {
++		0x07, 0x2d, 0x22, 0x24, 0x18, 0x0e, 0x11, 0x0c, 0x05,
++		0x05, 0x00, 0x00, 0x0a, 0x00, 0x29, 0x22, 0x24, 0x18,
++		0x0e, 0x11, 0x0c, 0x05, 0x05, 0x00, 0x00, 0x0a, 0x07,
++		0x2a, 0x22, 0x24, 0x18, 0x0e, 0x11, 0x0c, 0x05, 0x05,
++		0x00, 0x00, 0x0a } },
++	{ .cmd = 0x29, .delay_ms = 20 },	/* display on */
++	{ .cmd = 0xf0, .len = 2, .data = { 0xa5, 0xa5 } },
++	{ .cmd = 0xf1, .len = 2, .data = { 0xa5, 0xa5 } },
++	{ .cmd = 0xfc, .len = 2, .data = { 0x5a, 0x5a } },
++};
++
++/* gen-panel-disable-cmds = [05 00 00 32 00 01 28 05 00 00 32 00 01 10] */
++static const struct s6d78a0_cmd s6d78a0_off[] = {
++	{ .cmd = 0x28, .delay_ms = 50 },	/* display off */
++	{ .cmd = 0x10, .delay_ms = 50 },	/* enter sleep */
++};
++
++/*
++ * KTD3102 single-wire dimming table from the ROM DTB
++ * ktd3102-bl/brt_table@0: backlight-brt-range:
++ *   <0 0>, <5 2>, <5 2>, <0x90 0x10>, <0xff 0x1b>, <0x132 0x20>
++ * The 6th entry (HBM, brightness 306 -> code 32) is only reachable through
++ * Samsung's auto_brightness sysfs and is not exposed here.
++ */
++struct s6d78a0_brt_value {
++	unsigned int brightness;
++	unsigned int level;
++};
++
++enum s6d78a0_brt_idx {
++	S6D78A0_BRT_OFF,
++	S6D78A0_BRT_MIN,
++	S6D78A0_BRT_DIM,
++	S6D78A0_BRT_DEF,
++	S6D78A0_BRT_MAX,
++	S6D78A0_BRT_NUM,
++};
++
++static const struct s6d78a0_brt_value s6d78a0_brt_table[S6D78A0_BRT_NUM] = {
++	[S6D78A0_BRT_OFF] = { 0, 0 },
++	[S6D78A0_BRT_MIN] = { 5, 2 },
++	[S6D78A0_BRT_DIM] = { 5, 2 },
++	[S6D78A0_BRT_DEF] = { 144, 16 },
++	[S6D78A0_BRT_MAX] = { 255, 27 },
++};
++
++#define S6D78A0_BL_MAX		255
++#define S6D78A0_BL_DEFAULT	144
++#define S6D78A0_BL_PULSES	32
++
+ struct s6d78a0_gh9607501a {
+ 	struct drm_panel panel;
+ 	struct mipi_dsi_device *dsi;
+ 	struct regulator_bulk_data supplies[2];
+ 	struct gpio_desc *reset_gpio;
++	struct gpio_desc *bl_ctrl_gpio;
++	struct gpio_desc *bl_en_gpio;
++	struct mutex lock;	/* protects prepared and bl_level */
++	unsigned int bl_level;
+ 	bool prepared;
+ };
+ 
+@@ -30,134 +221,272 @@ struct s6d78a0_gh9607501a *to_s6d78a0_gh9607501a(struct drm_panel *panel)
+ 	return container_of(panel, struct s6d78a0_gh9607501a, panel);
+ }
+ 
+-#define dsi_dcs_write_seq(dsi, seq...) do {				\
+-		static const u8 d[] = { seq };				\
+-		int ret;						\
+-		ret = mipi_dsi_dcs_write_buffer(dsi, d, ARRAY_SIZE(d));	\
+-		if (ret < 0)						\
+-			return ret;					\
+-	} while (0)
++static int s6d78a0_write_seq(struct s6d78a0_gh9607501a *ctx,
++			     const struct s6d78a0_cmd *seq, size_t count)
++{
++	struct mipi_dsi_device *dsi = ctx->dsi;
++	size_t i;
++	u8 buf[S6D78A0_MAX_PAYLOAD + 1];
++	int ret;
++
++	for (i = 0; i < count; i++) {
++		const struct s6d78a0_cmd *c = &seq[i];
++
++		buf[0] = c->cmd;
++		memcpy(&buf[1], c->data, c->len);
++
++		ret = mipi_dsi_dcs_write_buffer(dsi, buf, c->len + 1);
++		if (ret < 0) {
++			dev_err(&dsi->dev,
++				"failed to write DCS 0x%02x: %d\n", c->cmd, ret);
++			return ret;
++		}
+ 
+-static void s6d78a0_gh9607501a_reset(struct s6d78a0_gh9607501a *ctx)
++		if (c->delay_ms)
++			msleep(c->delay_ms);
++	}
++
++	return 0;
++}
++
++static int s6d78a0_read_id(struct s6d78a0_gh9607501a *ctx, u32 *id)
+ {
+-	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
++	struct mipi_dsi_device *dsi = ctx->dsi;
++	u8 buf[3] = { };
++	int ret;
++
++	/*
++	 * gen_panel_set_id(): read the three ID bytes from 0xda/0xdb/0xdc
++	 * and assemble them as DA << 16 | DB << 8 | DC.
++	 */
++	ret = mipi_dsi_dcs_read(dsi, 0xda, &buf[0], 1);
++	if (ret < 0)
++		return ret;
++	if (ret != 1)
++		return -EIO;
++
++	ret = mipi_dsi_dcs_read(dsi, 0xdb, &buf[1], 1);
++	if (ret < 0)
++		return ret;
++	if (ret != 1)
++		return -EIO;
++
++	ret = mipi_dsi_dcs_read(dsi, 0xdc, &buf[2], 1);
++	if (ret < 0)
++		return ret;
++	if (ret != 1)
++		return -EIO;
++
++	*id = (buf[0] << 16) | (buf[1] << 8) | buf[2];
++	return 0;
++}
++
++/*
++ * Power-on/reset sequence.  Delays from the downstream S6D78A0 LCM
++ * lcm_init_power(): reset low, 5 ms bias off, 5 ms bias on, reset high
++ * 10 ms, reset low 10 ms, reset high 30 ms.  The bias rail is the
++ * regulator enabled by the caller, so its 10 ms off/on window is folded
++ * into the 15 ms reset-assert time.  The final 30 ms also matches
++ * mtk_panel_resume_power() in mtk_gen_panel.c.
++ */
++static void s6d78a0_power_on(struct s6d78a0_gh9607501a *ctx)
++{
++	gpiod_set_value_cansleep(ctx->reset_gpio, 1);	/* reset asserted */
++	usleep_range(15000, 16000);
++	gpiod_set_value_cansleep(ctx->reset_gpio, 0);	/* reset released */
+ 	usleep_range(10000, 11000);
+ 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+-	usleep_range(5000, 6000);
++	usleep_range(10000, 11000);
+ 	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
+ 	msleep(30);
+ }
+ 
+-static int s6d78a0_gh9607501a_on(struct s6d78a0_gh9607501a *ctx)
++/*
++ * ktd3102_get_tune_level(): linear interpolation between the table points,
++ * clamped to the minimum entry for brightness <= 5.
++ */
++static int s6d78a0_brightness_to_level(unsigned int brightness)
+ {
+-	struct mipi_dsi_device *dsi = ctx->dsi;
+-	struct device *dev = &dsi->dev;
+-	int ret;
++	unsigned int idx;
+ 
+-	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
++	if (brightness > S6D78A0_BL_MAX)
++		return -EINVAL;
+ 
+-	dsi_dcs_write_seq(dsi, 0xf0, 0x5a, 0x5a);
+-	dsi_dcs_write_seq(dsi, 0xf1, 0x5a, 0x5a);
+-	dsi_dcs_write_seq(dsi, 0xfc, 0xa5, 0xa5);
++	for (idx = 0; idx < S6D78A0_BRT_NUM; idx++)
++		if (brightness <= s6d78a0_brt_table[idx].brightness)
++			break;
+ 
+-	ret = mipi_dsi_dcs_exit_sleep_mode(dsi);
+-	if (ret < 0) {
+-		dev_err(dev, "Failed to exit sleep mode: %d\n", ret);
+-		return ret;
++	if (idx == S6D78A0_BRT_NUM)
++		return -EINVAL;
++
++	if (idx <= S6D78A0_BRT_MIN)
++		return s6d78a0_brt_table[idx].level;
++
++	return s6d78a0_brt_table[idx].level -
++		(s6d78a0_brt_table[idx].brightness - brightness) *
++		(s6d78a0_brt_table[idx].level -
++		 s6d78a0_brt_table[idx - 1].level) /
++		(s6d78a0_brt_table[idx].brightness -
++		 s6d78a0_brt_table[idx - 1].brightness);
++}
++
++/*
++ * ktd3102_set_bl_level(): the dimming code is sent as a number of pulses on
++ * the CTRL line; the counter wraps at 32.
++ */
++static void s6d78a0_bl_set_level(struct s6d78a0_gh9607501a *ctx,
++				 unsigned int level)
++{
++	unsigned int i;
++	int pulses;
++
++	if (!ctx->bl_ctrl_gpio || !ctx->bl_en_gpio)
++		return;
++
++	if (level == ctx->bl_level)
++		return;
++
++	if (level == 0) {
++		gpiod_set_value_cansleep(ctx->bl_ctrl_gpio, 0);
++		gpiod_set_value_cansleep(ctx->bl_en_gpio, 0);
++		usleep_range(3000, 4000);
++		ctx->bl_level = 0;
++		return;
+ 	}
+-	msleep(120);
+-
+-	dsi_dcs_write_seq(dsi, 0xb1, 0x93);
+-	dsi_dcs_write_seq(dsi, 0xb5, 0x10);
+-	dsi_dcs_write_seq(dsi, 0xf4,
+-			  0x01, 0x10, 0x32, 0x00, 0x24, 0x26, 0x28, 0x27, 0x27,
+-			  0x27, 0xb7, 0x2b, 0x2c, 0x65, 0x6a, 0x34, 0x20);
+-	dsi_dcs_write_seq(dsi, 0xef,
+-			  0x01, 0x01, 0x81, 0x22, 0x83, 0x04, 0x00, 0x00, 0x00,
+-			  0x00, 0x28, 0x81, 0x00, 0x21, 0x21, 0x03, 0x03, 0x40,
+-			  0x00, 0x10);
+-	dsi_dcs_write_seq(dsi, 0xf2,
+-			  0x19, 0x04, 0x08, 0x08, 0x08, 0x14, 0x14, 0x00);
+-	dsi_dcs_write_seq(dsi, 0xf6, 0x93, 0x23, 0x15, 0x07, 0x07, 0x0c);
+-	dsi_dcs_write_seq(dsi, 0xe1, 0x01, 0xff, 0x01, 0x1b, 0x20, 0x17);
+-	dsi_dcs_write_seq(dsi, 0xe2, 0xed, 0xc7, 0x23);
+-	dsi_dcs_write_seq(dsi, 0xf7,
+-			  0x01, 0x01, 0x0a, 0x0b, 0x05, 0x1b, 0x1a, 0x01, 0x01,
+-			  0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+-			  0x01, 0x01, 0x01, 0x08, 0x09, 0x04, 0x1b, 0x1a, 0x01,
+-			  0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+-			  0x01, 0x01);
+-	dsi_dcs_write_seq(dsi, MIPI_DCS_SET_ADDRESS_MODE, 0x10);
+-	dsi_dcs_write_seq(dsi, 0xfa,
+-			  0x00, 0x19, 0x21, 0x1e, 0x14, 0x0b, 0x10, 0x0e, 0x09,
+-			  0x0b, 0x00, 0x00, 0x0a, 0x00, 0x1d, 0x21, 0x1e, 0x14,
+-			  0x0b, 0x10, 0x0e, 0x09, 0x0b, 0x00, 0x00, 0x0a, 0x00,
+-			  0x1c, 0x21, 0x1e, 0x14, 0x0b, 0x10, 0x0e, 0x09, 0x0b,
+-			  0x00, 0x00, 0x0a);
+-	dsi_dcs_write_seq(dsi, 0xfb,
+-			  0x07, 0x2d, 0x22, 0x24, 0x18, 0x0e, 0x11, 0x0c, 0x05,
+-			  0x05, 0x00, 0x00, 0x0a, 0x00, 0x29, 0x22, 0x24, 0x18,
+-			  0x0e, 0x11, 0x0c, 0x05, 0x05, 0x00, 0x00, 0x0a, 0x07,
+-			  0x2a, 0x22, 0x24, 0x18, 0x0e, 0x11, 0x0c, 0x05, 0x05,
+-			  0x00, 0x00, 0x0a);
+-
+-	ret = mipi_dsi_dcs_set_display_on(dsi);
+-	if (ret < 0) {
+-		dev_err(dev, "Failed to set display on: %d\n", ret);
+-		return ret;
++
++	if (ctx->bl_level == 0) {
++		gpiod_set_value_cansleep(ctx->bl_ctrl_gpio, 0);
++		gpiod_set_value_cansleep(ctx->bl_en_gpio, 0);
++		usleep_range(3000, 4000);
++		gpiod_set_value_cansleep(ctx->bl_en_gpio, 1);
++		gpiod_set_value_cansleep(ctx->bl_ctrl_gpio, 1);
++		usleep_range(100, 200);
+ 	}
+-	msleep(20);
+ 
+-	dsi_dcs_write_seq(dsi, 0xf0, 0xa5, 0xa5);
+-	dsi_dcs_write_seq(dsi, 0xf1, 0xa5, 0xa5);
+-	dsi_dcs_write_seq(dsi, 0xfc, 0x5a, 0x5a);
++	pulses = (int)ctx->bl_level - (int)level;
++	if (pulses < 0)
++		pulses += S6D78A0_BL_PULSES;
+ 
+-	dev_info(dev, "display set on\n");
++	for (i = 0; i < pulses; i++) {
++		udelay(2);
++		gpiod_set_value_cansleep(ctx->bl_ctrl_gpio, 0);
++		udelay(2);
++		gpiod_set_value_cansleep(ctx->bl_ctrl_gpio, 1);
++	}
+ 
+-	return 0;
++	ctx->bl_level = level;
+ }
+ 
+-static int s6d78a0_gh9607501a_off(struct s6d78a0_gh9607501a *ctx)
++static int s6d78a0_bl_update_status(struct backlight_device *bl)
+ {
+-	struct mipi_dsi_device *dsi = ctx->dsi;
++	struct s6d78a0_gh9607501a *ctx = bl_get_data(bl);
++	unsigned int brightness = backlight_get_brightness(bl);
++	int level = 0;
++
++	mutex_lock(&ctx->lock);
++	if (ctx->prepared && brightness) {
++		level = s6d78a0_brightness_to_level(brightness);
++		if (level < 0) {
++			dev_warn(&ctx->dsi->dev,
++				 "invalid brightness %u\n", brightness);
++			level = 0;
++		}
++	}
++	s6d78a0_bl_set_level(ctx, level);
++	mutex_unlock(&ctx->lock);
+ 
+-	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
++	return 0;
++}
+ 
+-	dsi_dcs_write_seq(dsi, 0x28, 0x00);
+-	msleep(40);
+-	dsi_dcs_write_seq(dsi, 0x10, 0x00);
+-	msleep(100);
++static const struct backlight_ops s6d78a0_bl_ops = {
++	.update_status = s6d78a0_bl_update_status,
++};
+ 
+-	return 0;
++static struct backlight_device *
++s6d78a0_create_backlight(struct s6d78a0_gh9607501a *ctx)
++{
++	struct device *dev = &ctx->dsi->dev;
++	const struct backlight_properties props = {
++		.type = BACKLIGHT_RAW,
++		.brightness = S6D78A0_BL_DEFAULT,
++		.max_brightness = S6D78A0_BL_MAX,
++	};
++
++	return devm_backlight_device_register(dev, dev_name(dev), dev, ctx,
++					      &s6d78a0_bl_ops, &props);
+ }
+ 
+ static int s6d78a0_gh9607501a_prepare(struct drm_panel *panel)
+ {
+ 	struct s6d78a0_gh9607501a *ctx = to_s6d78a0_gh9607501a(panel);
+ 	struct device *dev = &ctx->dsi->dev;
++	const struct s6d78a0_cmd *init;
++	size_t init_count;
++	u32 id;
+ 	int ret;
+ 
+-	if (ctx->prepared)
++	mutex_lock(&ctx->lock);
++	if (ctx->prepared) {
++		mutex_unlock(&ctx->lock);
+ 		return 0;
++	}
+ 
+ 	ret = regulator_bulk_enable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
+ 	if (ret < 0) {
+-		dev_err(dev, "Failed to enable regulators: %d\n", ret);
++		dev_err(dev, "failed to enable regulators: %d\n", ret);
++		mutex_unlock(&ctx->lock);
+ 		return ret;
+ 	}
+ 
+-	s6d78a0_gh9607501a_reset(ctx);
++	s6d78a0_power_on(ctx);
+ 
+-	ret = s6d78a0_gh9607501a_on(ctx);
++	ret = s6d78a0_read_id(ctx, &id);
+ 	if (ret < 0) {
+-		dev_err(dev, "Failed to initialize panel: %d\n", ret);
+-		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+-		regulator_bulk_disable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
+-		return ret;
++		dev_warn(dev, "panel ID read failed: %d, assuming 53b810\n",
++			 ret);
++		id = 0;
++	} else {
++		dev_info(dev, "panel ID 0x%06x\n", id);
++	}
++
++	switch (id) {
++	case S6D78A0_PANEL_ID_286108:
++		init = s6d78a0_init_286108;
++		init_count = ARRAY_SIZE(s6d78a0_init_286108);
++		break;
++	case S6D78A0_PANEL_ID_53B810:
++		init = s6d78a0_init_53b810;
++		init_count = ARRAY_SIZE(s6d78a0_init_53b810);
++		break;
++	default:
++		if (id)
++			dev_warn(dev, "unknown panel ID 0x%06x, assuming 53b810\n",
++				 id);
++		init = s6d78a0_init_53b810;
++		init_count = ARRAY_SIZE(s6d78a0_init_53b810);
++		break;
+ 	}
+ 
++	ret = s6d78a0_write_seq(ctx, init, init_count);
++	if (ret < 0) {
++		dev_err(dev, "failed to initialize panel: %d\n", ret);
++		goto err_disable;
++	}
++
++	/* Keep the backlight off until drm_panel_enable(). */
++	s6d78a0_bl_set_level(ctx, 0);
++
+ 	ctx->prepared = true;
++	mutex_unlock(&ctx->lock);
++
+ 	return 0;
++
++err_disable:
++	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
++	regulator_bulk_disable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
++	mutex_unlock(&ctx->lock);
++
++	return ret;
+ }
+ 
+ static int s6d78a0_gh9607501a_unprepare(struct drm_panel *panel)
+@@ -166,32 +495,62 @@ static int s6d78a0_gh9607501a_unprepare(struct drm_panel *panel)
+ 	struct device *dev = &ctx->dsi->dev;
+ 	int ret;
+ 
+-	if (!ctx->prepared)
++	mutex_lock(&ctx->lock);
++	if (!ctx->prepared) {
++		mutex_unlock(&ctx->lock);
+ 		return 0;
++	}
+ 
+-	ret = s6d78a0_gh9607501a_off(ctx);
++	s6d78a0_bl_set_level(ctx, 0);
++
++	ret = s6d78a0_write_seq(ctx, s6d78a0_off, ARRAY_SIZE(s6d78a0_off));
+ 	if (ret < 0)
+-		dev_err(dev, "Failed to un-initialize panel: %d\n", ret);
++		dev_err(dev, "failed to put panel to sleep: %d\n", ret);
+ 
++	/* mtk_panel_suspend(): reset low, then bias rail off. */
+ 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+ 	regulator_bulk_disable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
+ 
+ 	ctx->prepared = false;
++	mutex_unlock(&ctx->lock);
++
+ 	return 0;
+ }
+ 
++static int s6d78a0_gh9607501a_enable(struct drm_panel *panel)
++{
++	struct s6d78a0_gh9607501a *ctx = to_s6d78a0_gh9607501a(panel);
++
++	if (!ctx->panel.backlight)
++		return 0;
++
++	return backlight_enable(ctx->panel.backlight);
++}
++
++static int s6d78a0_gh9607501a_disable(struct drm_panel *panel)
++{
++	struct s6d78a0_gh9607501a *ctx = to_s6d78a0_gh9607501a(panel);
++
++	if (!ctx->panel.backlight)
++		return 0;
++
++	return backlight_disable(ctx->panel.backlight);
++}
++
+ static const struct drm_display_mode s6d78a0_gh9607501a_mode = {
+-	.clock = (540 + 10 + 14 + 10) * (960 + 8 + 2 + 6) * 60 / 1000,
+-	.hdisplay = 540,
+-	.hsync_start = 540 + 10,
+-	.hsync_end = 540 + 10 + 14,
+-	.htotal = 540 + 10 + 14 + 10,
+-	.vdisplay = 960,
+-	.vsync_start = 960 + 8,
+-	.vsync_end = 960 + 8 + 2,
+-	.vtotal = 960 + 8 + 2 + 6,
+-	.width_mm = 62,
+-	.height_mm = 110,
++	.clock = (S6D78A0_WIDTH + S6D78A0_HFP + S6D78A0_HSYNC + S6D78A0_HBP) *
++		 (S6D78A0_HEIGHT + S6D78A0_VFP + S6D78A0_VSYNC + S6D78A0_VBP) *
++		 S6D78A0_REFRESH / 1000,
++	.hdisplay = S6D78A0_WIDTH,
++	.hsync_start = S6D78A0_WIDTH + S6D78A0_HFP,
++	.hsync_end = S6D78A0_WIDTH + S6D78A0_HFP + S6D78A0_HSYNC,
++	.htotal = S6D78A0_WIDTH + S6D78A0_HFP + S6D78A0_HSYNC + S6D78A0_HBP,
++	.vdisplay = S6D78A0_HEIGHT,
++	.vsync_start = S6D78A0_HEIGHT + S6D78A0_VFP,
++	.vsync_end = S6D78A0_HEIGHT + S6D78A0_VFP + S6D78A0_VSYNC,
++	.vtotal = S6D78A0_HEIGHT + S6D78A0_VFP + S6D78A0_VSYNC + S6D78A0_VBP,
++	.width_mm = S6D78A0_WIDTH_MM,
++	.height_mm = S6D78A0_HEIGHT_MM,
+ };
+ 
+ static int s6d78a0_gh9607501a_get_modes(struct drm_panel *panel,
+@@ -216,44 +575,11 @@ static int s6d78a0_gh9607501a_get_modes(struct drm_panel *panel,
+ static const struct drm_panel_funcs s6d78a0_gh9607501a_panel_funcs = {
+ 	.prepare = s6d78a0_gh9607501a_prepare,
+ 	.unprepare = s6d78a0_gh9607501a_unprepare,
++	.enable = s6d78a0_gh9607501a_enable,
++	.disable = s6d78a0_gh9607501a_disable,
+ 	.get_modes = s6d78a0_gh9607501a_get_modes,
+ };
+ 
+-static int s6d78a0_gh9607501a_bl_update_status(struct backlight_device *bl)
+-{
+-	struct mipi_dsi_device *dsi = bl_get_data(bl);
+-	u16 brightness = backlight_get_brightness(bl);
+-	int ret;
+-
+-	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+-
+-	ret = mipi_dsi_dcs_set_display_brightness(dsi, brightness);
+-	if (ret < 0)
+-		return ret;
+-
+-	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+-
+-	return 0;
+-}
+-
+-static const struct backlight_ops s6d78a0_gh9607501a_bl_ops = {
+-	.update_status = s6d78a0_gh9607501a_bl_update_status,
+-};
+-
+-static struct backlight_device *
+-s6d78a0_gh9607501a_create_backlight(struct mipi_dsi_device *dsi)
+-{
+-	struct device *dev = &dsi->dev;
+-	const struct backlight_properties props = {
+-		.type = BACKLIGHT_RAW,
+-		.brightness = 255,
+-		.max_brightness = 255,
+-	};
+-
+-	return devm_backlight_device_register(dev, dev_name(dev), dev, dsi,
+-					      &s6d78a0_gh9607501a_bl_ops, &props);
+-}
+-
+ static int s6d78a0_gh9607501a_probe(struct mipi_dsi_device *dsi)
+ {
+ 	struct device *dev = &dsi->dev;
+@@ -264,47 +590,72 @@ static int s6d78a0_gh9607501a_probe(struct mipi_dsi_device *dsi)
+ 	if (!ctx)
+ 		return -ENOMEM;
+ 
++	mutex_init(&ctx->lock);
++
+ 	ctx->supplies[0].supply = "vddio";
+ 	ctx->supplies[1].supply = "vdd";
+ 	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(ctx->supplies),
+ 				      ctx->supplies);
+ 	if (ret < 0)
+-		return dev_err_probe(dev, ret, "Failed to get regulators\n");
++		return dev_err_probe(dev, ret, "failed to get regulators\n");
+ 
+ 	ctx->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+ 	if (IS_ERR(ctx->reset_gpio))
+ 		return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio),
+-				     "Failed to get reset-gpios\n");
++				     "failed to get reset-gpios\n");
++
++	ctx->bl_ctrl_gpio = devm_gpiod_get_optional(dev, "backlight-ctrl",
++						    GPIOD_OUT_LOW);
++	if (IS_ERR(ctx->bl_ctrl_gpio))
++		return dev_err_probe(dev, PTR_ERR(ctx->bl_ctrl_gpio),
++				     "failed to get backlight-ctrl-gpios\n");
++
++	ctx->bl_en_gpio = devm_gpiod_get_optional(dev, "backlight-en",
++						  GPIOD_OUT_LOW);
++	if (IS_ERR(ctx->bl_en_gpio))
++		return dev_err_probe(dev, PTR_ERR(ctx->bl_en_gpio),
++				     "failed to get backlight-en-gpios\n");
++
++	if (!!ctx->bl_ctrl_gpio != !!ctx->bl_en_gpio)
++		return dev_err_probe(dev, -EINVAL,
++				     "backlight-ctrl-gpios and backlight-en-gpios must be specified together\n");
+ 
+ 	ctx->dsi = dsi;
+ 	mipi_dsi_set_drvdata(dsi, ctx);
+ 
+ 	dsi->lanes = 2;
+ 	dsi->format = MIPI_DSI_FMT_RGB888;
+-	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_SYNC_PULSE |
+-			  MIPI_DSI_MODE_NO_EOT_PACKET |
+-			  MIPI_DSI_CLOCK_NON_CONTINUOUS;
++	/*
++	 * SYNC_PULSE_VDO_MODE, continuous clock (cont_clock = 1,
++	 * clk_lp_per_line_enable = 0) and EOT packets enabled
++	 * (DSI_TXRX_CTRL.DIS_EOT = 0) as configured by the downstream
++	 * ddp_dsi.c / mtk_gen_panel.c on this panel.
++	 */
++	dsi->mode_flags = MIPI_DSI_MODE_VIDEO |
++			  MIPI_DSI_MODE_VIDEO_SYNC_PULSE;
+ 
+ 	drm_panel_init(&ctx->panel, dev, &s6d78a0_gh9607501a_panel_funcs,
+ 		       DRM_MODE_CONNECTOR_DSI);
+ 
+ 	ret = drm_panel_of_backlight(&ctx->panel);
+ 	if (ret)
+-		return dev_err_probe(dev, ret, "Failed to get backlight\n");
++		return dev_err_probe(dev, ret, "failed to get backlight\n");
+ 
+-	/* Fallback to DCS backlight if no backlight is defined in DT */
+-	if (!ctx->panel.backlight) {
+-		ctx->panel.backlight = s6d78a0_gh9607501a_create_backlight(dsi);
++	if (!ctx->panel.backlight && ctx->bl_ctrl_gpio && ctx->bl_en_gpio) {
++		ctx->panel.backlight = s6d78a0_create_backlight(ctx);
+ 		if (IS_ERR(ctx->panel.backlight))
+ 			return dev_err_probe(dev, PTR_ERR(ctx->panel.backlight),
+-					     "Failed to create backlight\n");
++					     "failed to create backlight\n");
+ 	}
+ 
++	if (!ctx->panel.backlight)
++		dev_warn(dev, "no backlight configured\n");
++
+ 	drm_panel_add(&ctx->panel);
+ 
+ 	ret = mipi_dsi_attach(dsi);
+ 	if (ret < 0) {
+-		dev_err(dev, "Failed to attach to DSI host: %d\n", ret);
++		dev_err(dev, "failed to attach to DSI host: %d\n", ret);
+ 		drm_panel_remove(&ctx->panel);
+ 		return ret;
+ 	}
+@@ -319,13 +670,13 @@ static void s6d78a0_gh9607501a_remove(struct mipi_dsi_device *dsi)
+ 
+ 	ret = mipi_dsi_detach(dsi);
+ 	if (ret < 0)
+-		dev_err(&dsi->dev, "Failed to detach from DSI host: %d\n", ret);
++		dev_err(&dsi->dev, "failed to detach from DSI host: %d\n", ret);
+ 
+ 	drm_panel_remove(&ctx->panel);
+ }
+ 
+ static const struct of_device_id s6d78a0_gh9607501a_of_match[] = {
+-	{ .compatible = "samsung,s6d78a0-gh9607501a" }, // FIXME
++	{ .compatible = "samsung,s6d78a0-gh9607501a" },
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, s6d78a0_gh9607501a_of_match);
+@@ -340,6 +691,6 @@ static struct mipi_dsi_driver s6d78a0_gh9607501a_driver = {
+ };
+ module_mipi_dsi_driver(s6d78a0_gh9607501a_driver);
+ 
+-MODULE_AUTHOR("linux-mdss-dsi-panel-driver-generator <fix@me>"); // FIXME
+-MODULE_DESCRIPTION("DRM driver for S6D78A0 qhd video mode dsi panel");
++MODULE_AUTHOR("linux-mdss-dsi-panel-driver-generator <fix@me>");
++MODULE_DESCRIPTION("DRM driver for Samsung S6D78A0 GH9607501A video mode DSI panel");
+ MODULE_LICENSE("GPL");

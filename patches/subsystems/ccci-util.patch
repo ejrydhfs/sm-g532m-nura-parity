@@ -1,0 +1,3146 @@
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 5cc79d151..be43098b5 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -660,4 +660,5 @@ source "drivers/misc/mchp_pci1xxxx/Kconfig"
+ source "drivers/misc/keba/Kconfig"
+ source "drivers/misc/amd-sbi/Kconfig"
+ source "drivers/misc/rp1/Kconfig"
++source "drivers/misc/mediatek/Kconfig"
+ endmenu
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index b32a2597d..18dc0a61e 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -75,3 +75,4 @@ obj-$(CONFIG_MCHP_LAN966X_PCI)	+= lan966x-pci.o
+ obj-y				+= keba/
+ obj-y				+= amd-sbi/
+ obj-$(CONFIG_MISC_RP1)		+= rp1/
++obj-y				+= mediatek/
+diff --git a/drivers/misc/mediatek/Kconfig b/drivers/misc/mediatek/Kconfig
+new file mode 100644
+index 000000000..4da87ae2e
+--- /dev/null
++++ b/drivers/misc/mediatek/Kconfig
+@@ -0,0 +1,10 @@
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# MediaTek device drivers
++#
++
++menu "MediaTek device drivers"
++
++source "drivers/misc/mediatek/ccci_util/Kconfig"
++
++endmenu
+diff --git a/drivers/misc/mediatek/Makefile b/drivers/misc/mediatek/Makefile
+new file mode 100644
+index 000000000..07bb69e5a
+--- /dev/null
++++ b/drivers/misc/mediatek/Makefile
+@@ -0,0 +1,6 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# Makefile for MediaTek device drivers
++#
++
++obj-y += ccci_util/
+diff --git a/drivers/misc/mediatek/ccci_util/Kconfig b/drivers/misc/mediatek/ccci_util/Kconfig
+new file mode 100644
+index 000000000..9ad053e2a
+--- /dev/null
++++ b/drivers/misc/mediatek/ccci_util/Kconfig
+@@ -0,0 +1,15 @@
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# MediaTek CCCI utility driver
++#
++
++config MTK_CCCI_UTIL
++	bool "MediaTek CCCI utility driver"
++	help
++	  CCCI (Cross Chip Communication Interface) utility driver for
++	  MediaTek modems.  Provides the modem log/dump ring buffers,
++	  the /dev/ccci_log and /dev/ccci_dump character devices, the
++	  MD image check-header parser and the debugfs views used to
++	  diagnose the CCCI core, CLDMA engine and CCMNI network ports.
++
++	  The driver is selected by the CCCI core (MTK_CCCI).
+diff --git a/drivers/misc/mediatek/ccci_util/Makefile b/drivers/misc/mediatek/ccci_util/Makefile
+new file mode 100644
+index 000000000..9d41f7b22
+--- /dev/null
++++ b/drivers/misc/mediatek/ccci_util/Makefile
+@@ -0,0 +1,9 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# Makefile for the MediaTek CCCI utility driver
++#
++
++obj-$(CONFIG_MTK_CCCI_UTIL) += ccci_util.o
++obj-$(CONFIG_MTK_CCCI_UTIL) += ccci_util_dump.o
++obj-$(CONFIG_MTK_CCCI_UTIL) += ccci_util_img.o
++obj-$(CONFIG_MTK_CCCI_UTIL) += ccci_util_log.o
+diff --git a/drivers/misc/mediatek/ccci_util/ccci_util.c b/drivers/misc/mediatek/ccci_util/ccci_util.c
+new file mode 100644
+index 000000000..3ca128726
+--- /dev/null
++++ b/drivers/misc/mediatek/ccci_util/ccci_util.c
+@@ -0,0 +1,967 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * CCCI utility driver: MD log/dump ring buffers, debugfs views and the
++ * module entry points.
++ *
++ * Ported from the Samsung/MTK 3.18 downstream kernel:
++ *   drivers/misc/mediatek/ccci_util/ccci_private_log.c
++ *   drivers/misc/mediatek/ccci_util/ccci_util_lib_main.c
++ *
++ * Downstream kept one 4 KiB debug ring plus six per-MD dump buffers
++ * (init/bootup/normal/repeat/mem_dump/history).  This driver keeps the same
++ * buffer set per MD, but allocates it lazily in ccci_util_log_init() and
++ * exposes the contents through debugfs instead of /proc.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/sched.h>
++#include <linux/sched/clock.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/string.h>
++#include <linux/uaccess.h>
++#include <linux/vmalloc.h>
++#include <linux/debugfs.h>
++#include <linux/ccci.h>
++
++#include "ccci_util.h"
++
++struct ccci_util_ring {
++	u8 *buf;
++	u32 size;		/* power of two */
++	u32 write_pos;
++	u32 data_size;		/* valid bytes, capped at @size */
++	u64 overflow;		/* bytes overwritten before being read */
++	u64 total;		/* bytes accepted since allocation */
++	spinlock_t lock;
++};
++
++struct ccci_util_md_ctx {
++	struct device *dev;
++	unsigned int md_id;
++	bool inited;
++	struct ccci_util_ring log;
++	struct ccci_util_ring dump[CCCI_DUMP_MAX];
++	struct dentry *dbg_dir;
++	struct dentry *dbg_log;
++	struct dentry *dbg_dump;
++	struct dentry *dbg_stats;
++};
++
++static struct ccci_util_md_ctx ccci_md_ctx[CCCI_MAX_MD_NUM];
++static struct dentry *ccci_util_root;
++static bool ccci_util_root_owned;
++static DEFINE_MUTEX(ccci_util_init_lock);
++static bool ccci_util_inited;
++
++static const char * const ccci_dump_buf_name[CCCI_DUMP_MAX] = {
++	[CCCI_DUMP_INIT]	= "init",
++	[CCCI_DUMP_BOOTUP]	= "bootup",
++	[CCCI_DUMP_NORMAL]	= "normal",
++	[CCCI_DUMP_REPEAT]	= "repeat",
++	[CCCI_DUMP_MEM_DUMP]	= "mem_dump",
++	[CCCI_DUMP_HISTORY]	= "history",
++};
++
++static const char * const ccci_dump_sep_str[CCCI_DUMP_MAX] = {
++	[CCCI_DUMP_INIT]	= " Dump init log ",
++	[CCCI_DUMP_BOOTUP]	= " Dump boot up log ",
++	[CCCI_DUMP_NORMAL]	= " Dump normal log ",
++	[CCCI_DUMP_REPEAT]	= " Dump repeat log ",
++	[CCCI_DUMP_MEM_DUMP]	= " Dump mem dump log ",
++	[CCCI_DUMP_HISTORY]	= " Dump history log ",
++};
++
++/* ------------------------------------------------------------------ */
++/* Ring buffer helpers                                                 */
++/* ------------------------------------------------------------------ */
++
++static int ccci_util_ring_alloc(struct ccci_util_ring *ring, u32 size)
++{
++	if (!is_power_of_2(size))
++		return -EINVAL;
++
++	ring->buf = kvzalloc(size, GFP_KERNEL);
++	if (!ring->buf)
++		return -ENOMEM;
++
++	ring->size = size;
++	ring->write_pos = 0;
++	ring->data_size = 0;
++	ring->overflow = 0;
++	ring->total = 0;
++	spin_lock_init(&ring->lock);
++
++	return 0;
++}
++
++static void ccci_util_ring_free(struct ccci_util_ring *ring)
++{
++	kvfree(ring->buf);
++	ring->buf = NULL;
++	ring->size = 0;
++	ring->write_pos = 0;
++	ring->data_size = 0;
++	ring->overflow = 0;
++	ring->total = 0;
++}
++
++static u32 ccci_util_ring_write(struct ccci_util_ring *ring, const void *data,
++				u32 len)
++{
++	unsigned long flags;
++	u32 first;
++
++	if (!ring->buf || !ring->size)
++		return 0;
++
++	if (!len)
++		return 0;
++
++	spin_lock_irqsave(&ring->lock, flags);
++
++	if (len > ring->size) {
++		/* Keep the tail of an oversized record, like a truncated line. */
++		u32 drop = len - ring->size;
++
++		data += drop;
++		len = ring->size;
++		ring->overflow += drop;
++	}
++
++	if (ring->data_size + len > ring->size) {
++		ring->overflow += ring->data_size + len - ring->size;
++		ring->data_size = ring->size;
++	} else {
++		ring->data_size += len;
++	}
++
++	first = min(len, ring->size - ring->write_pos);
++	memcpy(ring->buf + ring->write_pos, data, first);
++	if (len > first)
++		memcpy(ring->buf, data + first, len - first);
++
++	ring->write_pos = (ring->write_pos + len) & (ring->size - 1);
++	ring->total += len;
++
++	spin_unlock_irqrestore(&ring->lock, flags);
++
++	return len;
++}
++
++/*
++ * Copy the current ring content, oldest byte first, into a newly allocated
++ * buffer.  Returns 0 and a NULL buffer when the ring is empty.
++ */
++static int ccci_util_ring_snapshot(struct ccci_util_ring *ring, char **out,
++				   size_t *out_len)
++{
++	unsigned long flags;
++	unsigned int start, len, first;
++	char *buf;
++
++	*out = NULL;
++	*out_len = 0;
++
++	if (!ring->buf || !ring->size)
++		return 0;
++
++	buf = kvmalloc(ring->size, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	spin_lock_irqsave(&ring->lock, flags);
++	len = min(ring->data_size, ring->size);
++	start = (ring->write_pos + ring->size - len) & (ring->size - 1);
++	first = min(len, ring->size - start);
++	memcpy(buf, ring->buf + start, first);
++	if (len > first)
++		memcpy(buf + first, ring->buf, len - first);
++	spin_unlock_irqrestore(&ring->lock, flags);
++
++	if (!len) {
++		kvfree(buf);
++		return 0;
++	}
++
++	*out = buf;
++	*out_len = len;
++
++	return 0;
++}
++
++void ccci_util_snapshot_free(char *buf)
++{
++	kvfree(buf);
++}
++EXPORT_SYMBOL_GPL(ccci_util_snapshot_free);
++
++/* ------------------------------------------------------------------ */
++/* Timestamped record writer used by the log rings and dump rings      */
++/* ------------------------------------------------------------------ */
++
++static int __printf(4, 0)
++ccci_util_format_record(char *buf, size_t bufsize, unsigned int flags,
++			const char *fmt, va_list args)
++{
++	unsigned long rem_nsec;
++	u64 ts_nsec;
++	int len = 0;
++	int cpu;
++
++	if (flags & CCCI_DUMP_TIME_FLAG) {
++		char state = irqs_disabled() ? '-' : ' ';
++
++		ts_nsec = local_clock();
++		rem_nsec = do_div(ts_nsec, NSEC_PER_SEC);
++		cpu = get_cpu();
++		put_cpu();
++		len += scnprintf(buf + len, bufsize - len,
++				 "[%5lu.%06lu]%c(%x)[%d:%s]",
++				 (unsigned long)ts_nsec, rem_nsec / 1000,
++				 state, cpu, current->pid, current->comm);
++	}
++
++	if (flags & CCCI_DUMP_CURR_FLAG)
++		len += scnprintf(buf + len, bufsize - len, "[%d:%s]",
++				 current->pid, current->comm);
++
++	len += vscnprintf(buf + len, bufsize - len, fmt, args);
++
++	return len;
++}
++
++static int __printf(4, 0)
++__ccci_util_dump_write(int md_id, int buf_type, unsigned int flag,
++		       const char *fmt, va_list args)
++{
++	struct ccci_util_ring *ring;
++	struct ccci_util_md_ctx *ctx;
++	char tmp[CCCI_UTIL_MAX_WRITE];
++	int len;
++
++	if (md_id < 0 || md_id >= CCCI_MAX_MD_NUM)
++		return -EINVAL;
++	if (buf_type < 0 || buf_type >= CCCI_DUMP_MAX)
++		return -EINVAL;
++
++	ctx = &ccci_md_ctx[md_id];
++	if (!ctx->inited)
++		return -ENODEV;
++
++	ring = &ctx->dump[buf_type];
++	if (!ring->buf)
++		return -ENODEV;
++
++	if (flag & CCCI_DUMP_CLR_BUF_FLAG) {
++		unsigned long flags;
++
++		spin_lock_irqsave(&ring->lock, flags);
++		ring->write_pos = 0;
++		ring->data_size = 0;
++		spin_unlock_irqrestore(&ring->lock, flags);
++	}
++
++	len = ccci_util_format_record(tmp, sizeof(tmp), flag, fmt, args);
++	if (len > 0)
++		ccci_util_ring_write(ring, tmp, min_t(int, len, sizeof(tmp) - 1));
++
++	return len;
++}
++
++int ccci_util_dump_write(int md_id, int buf_type, unsigned int flag,
++			 const char *fmt, ...)
++{
++	va_list args;
++	int len;
++
++	va_start(args, fmt);
++	len = __ccci_util_dump_write(md_id, buf_type, flag, fmt, args);
++	va_end(args);
++
++	return len;
++}
++EXPORT_SYMBOL_GPL(ccci_util_dump_write);
++
++/* Downstream entry point name, ccci_private_log.c:328. */
++int ccci_dump_write(int md_id, int buf_type, unsigned int flag,
++		    const char *fmt, ...)
++{
++	va_list args;
++	int len;
++
++	va_start(args, fmt);
++	len = __ccci_util_dump_write(md_id, buf_type, flag, fmt, args);
++	va_end(args);
++
++	return len;
++}
++EXPORT_SYMBOL_GPL(ccci_dump_write);
++
++int ccci_util_dump_append_raw(unsigned int md_id, unsigned int buf_type,
++			      const void *data, size_t len)
++{
++	struct ccci_util_md_ctx *ctx;
++
++	if (md_id >= CCCI_MAX_MD_NUM)
++		return -EINVAL;
++	if (buf_type >= CCCI_DUMP_MAX)
++		return -EINVAL;
++
++	ctx = &ccci_md_ctx[md_id];
++	if (!ctx->inited || !ctx->dump[buf_type].buf)
++		return -ENODEV;
++
++	if (!len)
++		return 0;
++	if (len > U32_MAX)
++		return -EINVAL;
++
++	return ccci_util_ring_write(&ctx->dump[buf_type], data, len);
++}
++EXPORT_SYMBOL_GPL(ccci_util_dump_append_raw);
++
++bool ccci_util_dump_ring_ready(unsigned int md_id, unsigned int buf_type)
++{
++	if (md_id >= CCCI_MAX_MD_NUM || buf_type >= CCCI_DUMP_MAX)
++		return false;
++
++	return ccci_md_ctx[md_id].inited &&
++	       ccci_md_ctx[md_id].dump[buf_type].buf;
++}
++EXPORT_SYMBOL_GPL(ccci_util_dump_ring_ready);
++
++/* ------------------------------------------------------------------ */
++/* Public log API (contract, <linux/ccci.h>)                           */
++/* ------------------------------------------------------------------ */
++
++void ccci_util_log(unsigned int md_id, const char *fmt, ...)
++{
++	struct ccci_util_md_ctx *ctx;
++	char tmp[CCCI_UTIL_MAX_WRITE];
++	unsigned long rem_nsec;
++	u64 ts_nsec;
++	va_list args;
++	int cpu;
++	int len;
++
++	if (md_id >= CCCI_MAX_MD_NUM)
++		return;
++
++	ctx = &ccci_md_ctx[md_id];
++	if (!ctx->inited || !ctx->log.buf)
++		return;
++
++	ts_nsec = local_clock();
++	rem_nsec = do_div(ts_nsec, NSEC_PER_SEC);
++	cpu = get_cpu();
++	put_cpu();
++	len = scnprintf(tmp, sizeof(tmp), "[%5lu.%06lu]%c(%x)[%d:%s][ccci%u/util] ",
++			(unsigned long)ts_nsec, rem_nsec / 1000,
++			irqs_disabled() ? '-' : ' ', cpu, current->pid,
++			current->comm, md_id + 1);
++
++	va_start(args, fmt);
++	len += vscnprintf(tmp + len, sizeof(tmp) - len, fmt, args);
++	va_end(args);
++
++	ccci_util_ring_write(&ctx->log, tmp, min_t(int, len, sizeof(tmp) - 1));
++}
++EXPORT_SYMBOL_GPL(ccci_util_log);
++
++void ccci_util_dump_mem(unsigned int md_id, const void *buf, size_t len)
++{
++	if (md_id >= CCCI_MAX_MD_NUM)
++		return;
++
++	ccci_util_dump_hex(md_id, CCCI_DUMP_MEM_DUMP, buf, len);
++}
++EXPORT_SYMBOL_GPL(ccci_util_dump_mem);
++
++/* ------------------------------------------------------------------ */
++/* Snapshot builders for debugfs and /dev/ccci_dump                    */
++/* ------------------------------------------------------------------ */
++
++static void ccci_util_sep_fill(char *dst, const char *text)
++{
++	memset(dst, '_', 64);
++	dst[0] = '\n';
++	dst[63] = '\n';
++	if (text)
++		memcpy(dst + 8, text, min_t(size_t, strlen(text), 55));
++}
++
++static void ccci_util_md_sep_fill(char *dst, int md_id)
++{
++	memset(dst, '=', 64);
++	dst[0] = '\n';
++	dst[8] = ' ';
++	dst[9] = 'B';
++	dst[10] = 'U';
++	dst[11] = 'F';
++	dst[12] = 'F';
++	dst[13] = '0' + (md_id % 10);
++	dst[14] = ' ';
++	dst[63] = '\n';
++}
++
++int ccci_util_log_snapshot(int md_id, char **out_buf)
++{
++	struct ccci_util_md_ctx *ctx;
++	size_t len = 0;
++	int ret;
++
++	if (md_id < 0 || md_id >= CCCI_MAX_MD_NUM)
++		return -EINVAL;
++
++	*out_buf = NULL;
++	ctx = &ccci_md_ctx[md_id];
++	if (!ctx->inited)
++		return -ENODEV;
++
++	ret = ccci_util_ring_snapshot(&ctx->log, out_buf, &len);
++	if (ret)
++		return ret;
++	if (len > INT_MAX) {
++		kvfree(*out_buf);
++		*out_buf = NULL;
++		return -EOVERFLOW;
++	}
++
++	return len;
++}
++EXPORT_SYMBOL_GPL(ccci_util_log_snapshot);
++
++/*
++ * Concatenate the dump buffers in the same shape as downstream
++ * ccci_dump_read(): one "BUFF=<n>" separator per MD, then a named separator
++ * followed by the buffer content for each enabled dump type.
++ * @md_id < 0 selects every initialised MD.
++ */
++int ccci_util_dump_snapshot(int md_id, char **out_buf)
++{
++	unsigned int md, type;
++	size_t total = 0;
++	size_t pos = 0;
++	char *buf;
++	char sep[64];
++	unsigned long flags;
++
++	*out_buf = NULL;
++
++	for (md = 0; md < CCCI_MAX_MD_NUM; md++) {
++		if (md_id >= 0 && md != (unsigned int)md_id)
++			continue;
++		if (!ccci_md_ctx[md].inited)
++			continue;
++
++		total += 64;
++		for (type = 0; type < CCCI_DUMP_MAX; type++) {
++			struct ccci_util_ring *ring = &ccci_md_ctx[md].dump[type];
++
++			total += 64;
++			if (!ring->buf)
++				continue;
++			spin_lock_irqsave(&ring->lock, flags);
++			total += min(ring->data_size, ring->size);
++			spin_unlock_irqrestore(&ring->lock, flags);
++		}
++	}
++
++	if (!total)
++		return 0;
++
++	buf = kvmalloc(total, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	for (md = 0; md < CCCI_MAX_MD_NUM; md++) {
++		if (md_id >= 0 && md != (unsigned int)md_id)
++			continue;
++		if (!ccci_md_ctx[md].inited)
++			continue;
++
++		ccci_util_md_sep_fill(sep, md);
++		memcpy(buf + pos, sep, 64);
++		pos += 64;
++
++		for (type = 0; type < CCCI_DUMP_MAX; type++) {
++			struct ccci_util_ring *ring = &ccci_md_ctx[md].dump[type];
++			unsigned int len, start, first;
++
++			ccci_util_sep_fill(sep, ccci_dump_sep_str[type]);
++			memcpy(buf + pos, sep, 64);
++			pos += 64;
++
++			if (!ring->buf)
++				continue;
++
++			spin_lock_irqsave(&ring->lock, flags);
++			len = min(ring->data_size, ring->size);
++			start = (ring->write_pos + ring->size - len) &
++				(ring->size - 1);
++			if (pos + len > total) {
++				spin_unlock_irqrestore(&ring->lock, flags);
++				continue;
++			}
++			first = min(len, ring->size - start);
++			memcpy(buf + pos, ring->buf + start, first);
++			if (len > first)
++				memcpy(buf + pos + first, ring->buf, len - first);
++			spin_unlock_irqrestore(&ring->lock, flags);
++			pos += len;
++		}
++	}
++
++	*out_buf = buf;
++
++	if (pos > INT_MAX) {
++		kvfree(buf);
++		*out_buf = NULL;
++		return -EOVERFLOW;
++	}
++
++	return pos;
++}
++EXPORT_SYMBOL_GPL(ccci_util_dump_snapshot);
++
++/* Downstream get_dump_buf_usage(), ccci_private_log.c:734. */
++int get_dump_buf_usage(char buf[], int size)
++{
++	unsigned int md, type;
++	int ret = 0;
++	unsigned long flags;
++
++	for (md = 0; md < CCCI_MAX_MD_NUM; md++) {
++		if (!ccci_md_ctx[md].inited)
++			continue;
++
++		if (ret >= size)
++			break;
++		ret += scnprintf(buf + ret, size - ret, "For dump buf [%u]\n", md);
++		for (type = 0; type < CCCI_DUMP_MAX; type++) {
++			struct ccci_util_ring *ring = &ccci_md_ctx[md].dump[type];
++			u32 used;
++			u64 overflow;
++
++			spin_lock_irqsave(&ring->lock, flags);
++			used = ring->data_size;
++			overflow = ring->overflow;
++			spin_unlock_irqrestore(&ring->lock, flags);
++
++			if (ret >= size)
++				break;
++			ret += scnprintf(buf + ret, size - ret, "  %s:%u overflow:%llu\n",
++					 ccci_dump_buf_name[type], used, overflow);
++		}
++	}
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(get_dump_buf_usage);
++
++/* ------------------------------------------------------------------ */
++/* debugfs views: ccci/mdN/log, ccci/mdN/dump, ccci/mdN/log_stats      */
++/* ------------------------------------------------------------------ */
++
++struct ccci_util_dbg_buf {
++	char *buf;
++	size_t len;
++};
++
++static ssize_t ccci_util_dbg_read(struct file *file, char __user *ubuf,
++				  size_t size, loff_t *ppos)
++{
++	struct ccci_util_dbg_buf *dbg = file->private_data;
++	size_t len;
++
++	if (!dbg || !dbg->buf)
++		return 0;
++	if (*ppos >= dbg->len)
++		return 0;
++
++	len = min(size, dbg->len - *ppos);
++	if (copy_to_user(ubuf, dbg->buf + *ppos, len))
++		return -EFAULT;
++
++	*ppos += len;
++
++	return len;
++}
++
++static int ccci_util_dbg_open(struct inode *inode, struct file *file,
++			      int (*snapshot)(int, char **),
++			      int md_id)
++{
++	struct ccci_util_dbg_buf *dbg;
++	char *buf = NULL;
++	int ret;
++
++	dbg = kzalloc(sizeof(*dbg), GFP_KERNEL);
++	if (!dbg)
++		return -ENOMEM;
++
++	ret = snapshot(md_id, &buf);
++	if (ret < 0) {
++		kfree(dbg);
++		return ret;
++	}
++
++	dbg->buf = buf;
++	dbg->len = ret;
++	file->private_data = dbg;
++
++	return 0;
++}
++
++static int ccci_util_log_dbg_open(struct inode *inode, struct file *file)
++{
++	struct ccci_util_md_ctx *ctx = inode->i_private;
++
++	return ccci_util_dbg_open(inode, file, ccci_util_log_snapshot,
++				  ctx->md_id);
++}
++
++static int ccci_util_dump_dbg_open(struct inode *inode, struct file *file)
++{
++	struct ccci_util_md_ctx *ctx = inode->i_private;
++
++	return ccci_util_dbg_open(inode, file, ccci_util_dump_snapshot,
++				  ctx->md_id);
++}
++
++static int ccci_util_dbg_release(struct inode *inode, struct file *file)
++{
++	struct ccci_util_dbg_buf *dbg = file->private_data;
++
++	if (dbg) {
++		ccci_util_snapshot_free(dbg->buf);
++		kfree(dbg);
++	}
++
++	return 0;
++}
++
++static ssize_t ccci_util_log_dbg_write(struct file *file,
++				       const char __user *ubuf, size_t len,
++				       loff_t *ppos)
++{
++	struct ccci_util_md_ctx *ctx = file->f_inode->i_private;
++	char *kbuf;
++	size_t n;
++	int ret;
++
++	if (!len)
++		return 0;
++
++	n = min_t(size_t, len, CCCI_UTIL_MAX_WRITE - 1);
++	kbuf = memdup_user_nul(ubuf, n);
++	if (IS_ERR(kbuf))
++		return PTR_ERR(kbuf);
++
++	strim(kbuf);
++	ccci_util_log(ctx->md_id, "%s", kbuf);
++	ret = len;
++	kfree(kbuf);
++
++	return ret;
++}
++
++static const struct file_operations ccci_util_log_dbg_fops = {
++	.open		= ccci_util_log_dbg_open,
++	.read		= ccci_util_dbg_read,
++	.write		= ccci_util_log_dbg_write,
++	.release	= ccci_util_dbg_release,
++	.llseek		= noop_llseek,
++};
++
++static const struct file_operations ccci_util_dump_dbg_fops = {
++	.open		= ccci_util_dump_dbg_open,
++	.read		= ccci_util_dbg_read,
++	.release	= ccci_util_dbg_release,
++	.llseek		= noop_llseek,
++};
++
++static ssize_t ccci_util_stats_dbg_read(struct file *file, char __user *ubuf,
++					size_t size, loff_t *ppos)
++{
++	struct ccci_util_md_ctx *ctx = file->private_data;
++	char *buf;
++	int len = 0;
++	int ret = 0;
++	unsigned int type;
++
++	buf = kzalloc(PAGE_SIZE, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	len += scnprintf(buf + len, PAGE_SIZE - len,
++			 "md%u log: size=%u used=%u overflow=%llu total=%llu\n",
++			 ctx->md_id + 1, ctx->log.size, ctx->log.data_size,
++			 ctx->log.overflow, ctx->log.total);
++
++	for (type = 0; type < CCCI_DUMP_MAX; type++) {
++		struct ccci_util_ring *ring = &ctx->dump[type];
++
++		len += scnprintf(buf + len, PAGE_SIZE - len,
++				 "md%u dump[%s]: size=%u used=%u overflow=%llu total=%llu\n",
++				 ctx->md_id + 1, ccci_dump_buf_name[type],
++				 ring->size, ring->data_size, ring->overflow,
++				 ring->total);
++	}
++
++	if (*ppos < len) {
++		ret = min(size, (size_t)(len - *ppos));
++		if (copy_to_user(ubuf, buf + *ppos, ret))
++			ret = -EFAULT;
++		else
++			*ppos += ret;
++	}
++
++	kfree(buf);
++
++	return ret;
++}
++
++static const struct debugfs_short_fops ccci_util_stats_dbg_fops = {
++	.read	= ccci_util_stats_dbg_read,
++	.llseek	= noop_llseek,
++};
++
++static void ccci_util_dbg_remove_md(struct ccci_util_md_ctx *ctx)
++{
++	debugfs_remove(ctx->dbg_log);
++	debugfs_remove(ctx->dbg_dump);
++	debugfs_remove(ctx->dbg_stats);
++	ctx->dbg_log = NULL;
++	ctx->dbg_dump = NULL;
++	ctx->dbg_stats = NULL;
++	ctx->dbg_dir = NULL;
++}
++
++static void ccci_util_dbg_create_md(struct ccci_util_md_ctx *ctx)
++{
++	struct dentry *dir;
++	char name[16];
++
++	if (!ccci_util_root)
++		return;
++
++	snprintf(name, sizeof(name), "md%u", ctx->md_id + 1);
++
++	dir = debugfs_create_dir(name, ccci_util_root);
++	if (IS_ERR_OR_NULL(dir)) {
++		/* The CCCI core may have created ccci/mdN first. */
++		dir = debugfs_lookup(name, ccci_util_root);
++		if (IS_ERR_OR_NULL(dir)) {
++			pr_warn("[ccci%u/util] no debugfs dir %s\n",
++				ctx->md_id + 1, name);
++			return;
++		}
++	}
++
++	ctx->dbg_dir = dir;
++	ctx->dbg_log = debugfs_create_file("log", 0600, dir, ctx,
++					   &ccci_util_log_dbg_fops);
++	ctx->dbg_dump = debugfs_create_file("dump", 0444, dir, ctx,
++					    &ccci_util_dump_dbg_fops);
++	ctx->dbg_stats = debugfs_create_file("log_stats", 0444, dir, ctx,
++					     &ccci_util_stats_dbg_fops);
++}
++
++/* ------------------------------------------------------------------ */
++/* Lifecycle                                                           */
++/* ------------------------------------------------------------------ */
++
++static void ccci_util_md_release(struct ccci_util_md_ctx *ctx)
++{
++	unsigned int type;
++
++	ccci_util_dbg_remove_md(ctx);
++
++	ccci_util_ring_free(&ctx->log);
++	for (type = 0; type < CCCI_DUMP_MAX; type++)
++		ccci_util_ring_free(&ctx->dump[type]);
++
++	ctx->dev = NULL;
++	ctx->inited = false;
++}
++
++static int ccci_util_md_alloc(struct ccci_util_md_ctx *ctx)
++{
++	static const u32 dump_size[CCCI_DUMP_MAX] = {
++		[CCCI_DUMP_INIT]	= CCCI_UTIL_INIT_SETTING_BUF,
++		[CCCI_DUMP_BOOTUP]	= CCCI_UTIL_BOOT_UP_BUF,
++		[CCCI_DUMP_NORMAL]	= CCCI_UTIL_NORMAL_BUF,
++		[CCCI_DUMP_REPEAT]	= CCCI_UTIL_REPEAT_BUF,
++		[CCCI_DUMP_MEM_DUMP]	= CCCI_UTIL_REG_DUMP_BUF,
++		[CCCI_DUMP_HISTORY]	= CCCI_UTIL_HISTORY_BUF,
++	};
++	unsigned int type;
++	int ret;
++
++	ret = ccci_util_ring_alloc(&ctx->log, CCCI_UTIL_LOG_SIZE);
++	if (ret)
++		return ret;
++
++	for (type = 0; type < CCCI_DUMP_MAX; type++) {
++		ret = ccci_util_ring_alloc(&ctx->dump[type], dump_size[type]);
++		if (ret)
++			goto err;
++	}
++
++	return 0;
++
++err:
++	ccci_util_ring_free(&ctx->log);
++	while (type--)
++		ccci_util_ring_free(&ctx->dump[type]);
++
++	return ret;
++}
++
++static int __ccci_util_init(void)
++{
++	int ret;
++
++	if (ccci_util_inited)
++		return 0;
++
++	ccci_util_root = debugfs_create_dir("ccci", NULL);
++	if (IS_ERR_OR_NULL(ccci_util_root)) {
++		/* debugfs is optional: the char devices still work. */
++		ccci_util_root = NULL;
++		ccci_util_root_owned = false;
++	} else {
++		ccci_util_root_owned = true;
++	}
++
++	ret = ccci_util_dump_debugfs_init(ccci_util_root);
++	if (ret)
++		goto err_root;
++
++	ret = ccci_util_logdev_init();
++	if (ret)
++		goto err_dump;
++
++	ccci_util_inited = true;
++
++	return 0;
++
++err_dump:
++	ccci_util_dump_debugfs_exit();
++err_root:
++	if (ccci_util_root_owned)
++		debugfs_remove(ccci_util_root);
++	ccci_util_root = NULL;
++	ccci_util_root_owned = false;
++
++	return ret;
++}
++
++int ccci_util_init(void)
++{
++	int ret;
++
++	mutex_lock(&ccci_util_init_lock);
++	ret = __ccci_util_init();
++	mutex_unlock(&ccci_util_init_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ccci_util_init);
++
++void ccci_util_exit(void)
++{
++	unsigned int md;
++
++	mutex_lock(&ccci_util_init_lock);
++	if (!ccci_util_inited)
++		goto out;
++
++	for (md = 0; md < CCCI_MAX_MD_NUM; md++) {
++		if (ccci_md_ctx[md].inited)
++			ccci_util_md_release(&ccci_md_ctx[md]);
++	}
++
++	ccci_util_dump_debugfs_exit();
++	ccci_util_logdev_exit();
++
++	if (ccci_util_root_owned)
++		debugfs_remove(ccci_util_root);
++	ccci_util_root = NULL;
++	ccci_util_root_owned = false;
++	ccci_util_inited = false;
++out:
++	mutex_unlock(&ccci_util_init_lock);
++}
++EXPORT_SYMBOL_GPL(ccci_util_exit);
++
++int ccci_util_log_init(unsigned int md_id, struct device *dev)
++{
++	struct ccci_util_md_ctx *ctx;
++	int ret;
++
++	if (md_id >= CCCI_MAX_MD_NUM)
++		return -EINVAL;
++
++	mutex_lock(&ccci_util_init_lock);
++
++	ret = __ccci_util_init();
++	if (ret)
++		goto out;
++
++	ctx = &ccci_md_ctx[md_id];
++	if (ctx->inited) {
++		ret = 0;
++		goto out;
++	}
++
++	ret = ccci_util_md_alloc(ctx);
++	if (ret) {
++		dev_err(dev, "md%u log buffers: %d\n", md_id + 1, ret);
++		goto out;
++	}
++
++	ctx->md_id = md_id;
++	ctx->dev = dev;
++	ctx->inited = true;
++	ccci_util_dbg_create_md(ctx);
++
++	dev_info(dev, "md%u CCCI log/dump rings ready\n", md_id + 1);
++out:
++	mutex_unlock(&ccci_util_init_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ccci_util_log_init);
++
++void ccci_util_log_exit(unsigned int md_id)
++{
++	mutex_lock(&ccci_util_init_lock);
++	if (md_id < CCCI_MAX_MD_NUM && ccci_md_ctx[md_id].inited)
++		ccci_util_md_release(&ccci_md_ctx[md_id]);
++	mutex_unlock(&ccci_util_init_lock);
++}
++EXPORT_SYMBOL_GPL(ccci_util_log_exit);
++
++static int __init ccci_util_module_init(void)
++{
++	return ccci_util_init();
++}
++
++static void __exit ccci_util_module_exit(void)
++{
++	ccci_util_exit();
++}
++
++module_exit(ccci_util_module_exit);
++/* Downstream: subsys_initcall(ccci_util_init), ccci_util_lib_main.c:38. */
++subsys_initcall(ccci_util_module_init);
++
++MODULE_DESCRIPTION("MediaTek CCCI utility/log driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/mediatek/ccci_util/ccci_util.h b/drivers/misc/mediatek/ccci_util/ccci_util.h
+new file mode 100644
+index 000000000..8afa9280d
+--- /dev/null
++++ b/drivers/misc/mediatek/ccci_util/ccci_util.h
+@@ -0,0 +1,271 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * CCCI utility driver: private interfaces shared between ccci_util.c,
++ * ccci_util_dump.c, ccci_util_img.c and ccci_util_log.c.
++ *
++ * Ported from the Samsung/MTK 3.18 downstream kernel:
++ *   drivers/misc/mediatek/ccci_util/ccci_util_lib_main.h
++ *   drivers/misc/mediatek/ccci_util/ccci_util_log.h
++ *   drivers/misc/mediatek/ccci_util/ccci_private_log.c
++ *   drivers/misc/mediatek/include/mt-plat/mt_ccci_common.h
++ *
++ * The public (core-facing) API lives in <linux/ccci.h>.
++ */
++#ifndef __CCCI_UTIL_H__
++#define __CCCI_UTIL_H__
++
++#include <linux/types.h>
++#include <linux/device.h>
++#include <linux/debugfs.h>
++#include <linux/io.h>
++#include <linux/ccci.h>
++
++/* Downstream CCCI_LOG_BUF_SIZE / CCCI_LOG_MAX_WRITE (ccci_private_log.c:36-37). */
++#define CCCI_UTIL_LOG_SIZE		4096	/* must be a power of two */
++#define CCCI_UTIL_MAX_WRITE		512
++
++/* Downstream dump buffer sizes, ccci_private_log.c:248-253. */
++#define CCCI_UTIL_INIT_SETTING_BUF	(4096 * 2)
++#define CCCI_UTIL_BOOT_UP_BUF		(4096 * 4)
++#define CCCI_UTIL_NORMAL_BUF		(4096 * 2)
++#define CCCI_UTIL_REPEAT_BUF		(4096 * 32)
++#define CCCI_UTIL_REG_DUMP_BUF		(4096 * 64)
++#define CCCI_UTIL_HISTORY_BUF		64
++
++/* Dump buffer selectors, verbatim downstream mt_ccci_common.h:900-906. */
++enum ccci_dump_type {
++	CCCI_DUMP_INIT = 0,
++	CCCI_DUMP_BOOTUP,
++	CCCI_DUMP_NORMAL,
++	CCCI_DUMP_REPEAT,
++	CCCI_DUMP_MEM_DUMP,
++	CCCI_DUMP_HISTORY,
++	CCCI_DUMP_MAX,
++};
++
++/* Dump flags, verbatim downstream mt_ccci_common.h:896-898. */
++#define CCCI_DUMP_TIME_FLAG		(1 << 0)
++#define CCCI_DUMP_CLR_BUF_FLAG		(1 << 1)
++#define CCCI_DUMP_CURR_FLAG		(1 << 2)
++
++/* Image errors, verbatim downstream mt_ccci_common.h:344-358. */
++#define CCCI_ERR_LOAD_IMG_START_ID	400
++#define CCCI_ERR_LOAD_IMG_CHECK_HEAD	(CCCI_ERR_LOAD_IMG_START_ID + 8)
++#define CCCI_ERR_LOAD_IMG_MD_CHECK	(CCCI_ERR_LOAD_IMG_START_ID + 11)
++
++/* Image header constants, downstream mt_ccci_common.h:89-93. */
++#define MD_HEADER_MAGIC_NO		"CHECK_HEADER"
++#define MD_HEADER_MAGIC_LEN		12
++#define MD_DEBUG_STR			"Debug"
++#define MD_RELEASE_STR			"Release"
++#define MD_INVALID_STR			"INVALID"
++
++#define IMG_POSTFIX_LEN			16
++#define MD_INFO_STR_LEN			256
++#define MD_PLATFORM_STR_LEN		16
++#define MD_BUILD_TIME_STR_LEN		64
++#define MD_BUILD_VER_STR_LEN		64
++
++#define MD_MAX_REGION_NUM		8
++#define MD_MAX_DOMAIN_NUM		4
++/* Downstream MAX_IMG_NUM == modem_ulfctg == 21 (mt_ccci_common.h:65). */
++#define CCCI_MD_MAX_IMG_TYPE		21
++/* Downstream mt_ccci_common.h:164, MPU_REGION_INFO_ID_LAST. */
++#define MPU_REGION_INFO_ID_LAST		4
++/* Downstream mt_ccci_common.h:190, MPU_DOMAIN_INFO_ID_TOTAL_NUM. */
++#define MPU_DOMAIN_INFO_ID_TOTAL_NUM	3
++
++/*
++ * Downstream mt_ccci_common.h:136-139, referenced by the check header v4/v5
++ * region tables. Name and layout kept verbatim.
++ */
++struct _md_regin_info {
++	unsigned int region_offset;
++	unsigned int region_size;
++};
++
++/* Verbatim downstream ccci_util_lib_main.h:15-37 (check header v3). */
++struct md_check_header_v3 {
++	unsigned char check_header[12];  /* magic number is "CHECK_HEADER"*/
++	unsigned int  header_verno;	  /* header structure version number */
++	unsigned int  product_ver;	   /* 0x0:invalid; 0x1:debug version; 0x2:release version */
++	unsigned int  image_type;		/* 0x0:invalid; 0x1:2G modem; 0x2: 3G modem */
++	unsigned char platform[16];	  /* MT6573_S01 or MT6573_S02 */
++	unsigned char build_time[64];	/* build time string */
++	unsigned char build_ver[64];	 /* project version, ex:11A_MD.W11.28 */
++
++	unsigned char bind_sys_id;	   /* bind to md sys id, MD SYS1: 1, MD SYS2: 2, MD SYS5: 5 */
++	unsigned char ext_attr;		  /* no shrink: 0, shrink: 1 */
++	unsigned char reserved[2];	   /* for reserved */
++
++	unsigned int  mem_size;		  /* md ROM/RAM image size requested by md */
++	unsigned int  md_img_size;	   /* md image size, exclude head size */
++	unsigned int  rpc_sec_mem_addr;  /* RPC secure memory address */
++
++	unsigned int  dsp_img_offset;
++	unsigned int  dsp_img_size;
++	unsigned char reserved2[88];
++
++	unsigned int  size;			  /* the size of this structure */
++} __packed;
++
++/* Verbatim downstream ccci_util_lib_main.h:39-66 (check header v4). */
++struct md_check_header_v4 {
++	unsigned char check_header[12]; /* magic number is "CHECK_HEADER"*/
++	unsigned int header_verno; /* header structure version number */
++	unsigned int product_ver; /* 0x0:invalid; 0x1:debug version; 0x2:release version */
++	unsigned int image_type; /* 0x0:invalid; 0x1:2G modem; 0x2: 3G modem */
++	unsigned char platform[16]; /* MT6573_S01 or MT6573_S02 */
++	unsigned char build_time[64]; /* build time string */
++	unsigned char build_ver[64]; /* project version, ex:11A_MD.W11.28 */
++
++	unsigned char bind_sys_id; /* bind to md sys id, MD SYS1: 1, MD SYS2: 2, MD SYS5: 5 */
++	unsigned char ext_attr; /* no shrink: 0, shrink: 1 */
++	unsigned char reserved[2]; /* for reserved */
++
++	unsigned int mem_size; /* md ROM/RAM image size requested by md */
++	unsigned int md_img_size; /* md image size, exclude head size */
++	unsigned int rpc_sec_mem_addr; /* RPC secure memory address */
++
++	unsigned int dsp_img_offset;
++	unsigned int dsp_img_size;
++
++	unsigned int region_num; /* total region number */
++	struct _md_regin_info region_info[8]; /* max support 8 regions */
++	unsigned int domain_attr[4]; /* max support 4 domain settings, each region has 4 control bits*/
++
++	unsigned char reserved2[4];
++
++	unsigned int size; /* the size of this structure */
++} __packed;
++
++/* Verbatim downstream ccci_util_lib_main.h:68-99 (check header v5). */
++struct md_check_header_v5 {
++	unsigned char check_header[12]; /* magic number is "CHECK_HEADER"*/
++	unsigned int  header_verno; /* header structure version number */
++	unsigned int  product_ver; /* 0x0:invalid; 0x1:debug version; 0x2:release version */
++	unsigned int  image_type; /* 0x0:invalid; 0x1:2G modem; 0x2: 3G modem */
++	unsigned char platform[16]; /* MT6573_S01 or MT6573_S02 */
++	unsigned char build_time[64]; /* build time string */
++	unsigned char build_ver[64]; /* project version, ex:11A_MD.W11.28 */
++
++	unsigned char bind_sys_id; /* bind to md sys id, MD SYS1: 1, MD SYS2: 2, MD SYS5: 5 */
++	unsigned char ext_attr; /* no shrink: 0, shrink: 1 */
++	unsigned char reserved[2]; /* for reserved */
++
++	unsigned int  mem_size; /* md ROM/RAM image size requested by md */
++	unsigned int  md_img_size; /* md image size, exclude head size */
++	unsigned int  rpc_sec_mem_addr; /* RPC secure memory address */
++
++	unsigned int  dsp_img_offset;
++	unsigned int  dsp_img_size;
++
++	unsigned int  region_num; /* total region number */
++	struct _md_regin_info region_info[8]; /* max support 8 regions */
++	unsigned int  domain_attr[4]; /* max support 4 domain settings, each region has 4 control bits*/
++
++	unsigned int  arm7_img_offset;
++	unsigned int  arm7_img_size;
++
++	unsigned char reserved_1[56];
++
++
++	unsigned int  size; /* the size of this structure */
++} __packed;
++
++/*
++ * Decoded MD image check header. Only the fields the AP actually consumes are
++ * kept; strings are copied out so the caller can release the firmware blob.
++ */
++struct ccci_util_md_img_info {
++	unsigned int header_size;
++	unsigned int header_verno;
++	unsigned int product_ver;
++	unsigned int image_type;
++	char platform[MD_PLATFORM_STR_LEN + 1];
++	char build_time[MD_BUILD_TIME_STR_LEN + 1];
++	char build_ver[MD_BUILD_VER_STR_LEN + 1];
++
++	u8 bind_sys_id;
++	u8 ext_attr;
++
++	unsigned int mem_size;
++	unsigned int md_img_size;
++	unsigned int rpc_sec_mem_addr;
++
++	unsigned int dsp_img_offset;
++	unsigned int dsp_img_size;
++
++	unsigned int region_num;
++	struct _md_regin_info region_info[MD_MAX_REGION_NUM];
++	unsigned int domain_attr[MD_MAX_DOMAIN_NUM];
++
++	unsigned int arm7_img_offset;
++	unsigned int arm7_img_size;
++
++	const char *image_type_str;
++	const char *product_ver_str;
++};
++
++/* ------------------------------------------------------------------ */
++/* ccci_util_img.c                                                     */
++/* ------------------------------------------------------------------ */
++int ccci_util_md_check_header(int md_id, const void *hdr, size_t hdr_len,
++			      unsigned int md_mem_size,
++			      unsigned int ap_img_size,
++			      const char *ap_platform,
++			      struct ccci_util_md_img_info *info);
++char *ccci_get_md_info_str(int md_id);
++int ccci_util_md_region_info(const struct ccci_util_md_img_info *info,
++			     unsigned int *region_num,
++			     struct _md_regin_info *regions,
++			     unsigned int max_regions,
++			     unsigned int *domain_attr,
++			     unsigned int max_domains);
++const char *ccci_util_md_type_str(unsigned int image_type);
++const char *ccci_util_md_product_str(unsigned int product_ver);
++
++/* ------------------------------------------------------------------ */
++/* ccci_util_dump.c                                                    */
++/* ------------------------------------------------------------------ */
++void ccci_util_dump_hex(int md_id, int buf_type, const void *buf, size_t len);
++void ccci_util_mem_dump(int md_id, int buf_type, void *start_addr, int len);
++void ccci_util_cmpt_mem_dump(int md_id, int buf_type, void *start_addr,
++			     int len);
++int get_dump_buf_usage(char buf[], int size);
++int ccci_util_dump_set_window(unsigned int md_id, phys_addr_t phys,
++			      size_t size);
++void ccci_util_dump_clear_window(unsigned int md_id);
++int ccci_util_dump_debugfs_init(struct dentry *root);
++void ccci_util_dump_debugfs_exit(void);
++
++/* ------------------------------------------------------------------ */
++/* ccci_util.c: per-MD dump/log rings                                  */
++/* ------------------------------------------------------------------ */
++int ccci_util_dump_write(int md_id, int buf_type, unsigned int flag,
++			 const char *fmt, ...) __printf(4, 5);
++int ccci_dump_write(int md_id, int buf_type, unsigned int flag,
++		    const char *fmt, ...) __printf(4, 5);
++int ccci_util_dump_append_raw(unsigned int md_id, unsigned int buf_type,
++			      const void *data, size_t len);
++bool ccci_util_dump_ring_ready(unsigned int md_id, unsigned int buf_type);
++/* Both return the snapshot length in bytes (or a negative errno). */
++int ccci_util_log_snapshot(int md_id, char **out_buf);
++int ccci_util_dump_snapshot(int md_id, char **out_buf);
++void ccci_util_snapshot_free(char *buf);
++
++/* ------------------------------------------------------------------ */
++/* ccci_util_log.c: /dev/ccci_log, /dev/ccci_dump, event log           */
++/* ------------------------------------------------------------------ */
++int ccci_util_logdev_init(void);
++void ccci_util_logdev_exit(void);
++void ccci_log_init(void);
++int ccci_log_write(const char *fmt, ...) __printf(1, 2);
++int ccci_log_write_raw(unsigned int set_flags, const char *fmt, ...)
++	__printf(2, 3);
++int ccci_event_log(const char *fmt, ...) __printf(1, 2);
++int ccci_event_log_cpy(char buf[], int size);
++
++#endif /* __CCCI_UTIL_H__ */
+diff --git a/drivers/misc/mediatek/ccci_util/ccci_util_dump.c b/drivers/misc/mediatek/ccci_util/ccci_util_dump.c
+new file mode 100644
+index 000000000..02f61be2f
+--- /dev/null
++++ b/drivers/misc/mediatek/ccci_util/ccci_util_dump.c
+@@ -0,0 +1,414 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * CCCI memory dump helpers and the debugfs request interface for dumping the
++ * modem shared-memory window.
++ *
++ * Ported from the Samsung/MTK 3.18 downstream kernel:
++ *   drivers/misc/mediatek/ccci_util/ccci_private_log.c
++ *     - ccci_util_mem_dump()       (line 752)
++ *     - ccci_util_cmpt_mem_dump()  (line 793)
++ *   drivers/misc/mediatek/eccci/ccci_core.c: get_smem_start_addr() (line 773)
++ *
++ * Downstream obtained the modem shared-memory mapping from the CCCI core via
++ * get_smem_start_addr(); the util driver must not depend on the core, so the
++ * window is registered with ccci_util_dump_set_window() instead.  A request
++ * for an MD without a registered window returns -ENODEV.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/uaccess.h>
++#include <linux/debugfs.h>
++#include <linux/io.h>
++#include <linux/printk.h>
++#include <linux/ccci.h>
++
++#include "ccci_util.h"
++
++/* Upper bound for a single debugfs dump request. */
++#define CCCI_UTIL_DUMP_REQ_MAX		SZ_64K
++
++struct ccci_util_dump_win {
++	phys_addr_t phys;
++	size_t size;
++	void *base;
++	bool valid;
++};
++
++static struct ccci_util_dump_win ccci_util_win[CCCI_MAX_MD_NUM];
++static DEFINE_MUTEX(ccci_util_win_lock);
++static struct dentry *ccci_util_dump_req;
++static struct dentry *ccci_util_dump_window;
++
++/**
++ * ccci_util_dump_set_window() - register the modem shared-memory window
++ * @md_id:	modem index (0 == MD_SYS1)
++ * @phys:	physical base of the AP view of the MD shared memory
++ * @size:	window size in bytes
++ *
++ * The CCCI core (or the platform code that reserved the MD shared memory)
++ * calls this once the region is known.  Returns 0 on success.
++ */
++int ccci_util_dump_set_window(unsigned int md_id, phys_addr_t phys, size_t size)
++{
++	struct ccci_util_dump_win *win;
++	void *base;
++
++	if (md_id >= CCCI_MAX_MD_NUM)
++		return -EINVAL;
++	if (!size || !IS_ALIGNED(phys, PAGE_SIZE))
++		return -EINVAL;
++	if (phys + size < phys)
++		return -EINVAL;
++
++	base = memremap(phys, size, MEMREMAP_WB);
++	if (!base)
++		return -ENOMEM;
++
++	mutex_lock(&ccci_util_win_lock);
++
++	win = &ccci_util_win[md_id];
++	if (win->valid)
++		memunmap(win->base);
++
++	win->phys = phys;
++	win->size = size;
++	win->base = base;
++	win->valid = true;
++
++	mutex_unlock(&ccci_util_win_lock);
++
++	pr_info("[ccci%u/util] dump window %pa+0x%zx\n", md_id + 1, &phys, size);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(ccci_util_dump_set_window);
++
++void ccci_util_dump_clear_window(unsigned int md_id)
++{
++	struct ccci_util_dump_win *win;
++
++	if (md_id >= CCCI_MAX_MD_NUM)
++		return;
++
++	mutex_lock(&ccci_util_win_lock);
++	win = &ccci_util_win[md_id];
++	if (win->valid) {
++		memunmap(win->base);
++		win->base = NULL;
++		win->phys = 0;
++		win->size = 0;
++		win->valid = false;
++	}
++	mutex_unlock(&ccci_util_win_lock);
++}
++EXPORT_SYMBOL_GPL(ccci_util_dump_clear_window);
++
++/* ------------------------------------------------------------------ */
++/* Hex/ASCII dump helpers                                              */
++/* ------------------------------------------------------------------ */
++
++/**
++ * ccci_util_dump_hex() - append a hex+ASCII dump of a kernel buffer
++ * @md_id:	modem index selecting the dump ring
++ * @buf_type:	CCCI_DUMP_* ring selector
++ * @buf:	buffer to dump
++ * @len:	number of bytes
++ */
++void ccci_util_dump_hex(int md_id, int buf_type, const void *buf, size_t len)
++{
++	const u8 *p = buf;
++	char line[128];
++	size_t off, n;
++
++	if (!buf) {
++		ccci_util_dump_write(md_id, buf_type, 0, "start_addr <NULL>\n");
++		return;
++	}
++	if (!len) {
++		ccci_util_dump_write(md_id, buf_type, 0, "len [0]\n");
++		return;
++	}
++
++	for (off = 0; off < len; off += 16) {
++		n = min_t(size_t, 16, len - off);
++		hex_dump_to_buffer(p + off, n, 16, 1, line, sizeof(line), true);
++		ccci_util_dump_write(md_id, buf_type, 0, "%08zX: %s\n", off,
++				     line);
++	}
++}
++EXPORT_SYMBOL_GPL(ccci_util_dump_hex);
++
++/* Downstream ccci_util_mem_dump(), ccci_private_log.c:752. */
++void ccci_util_mem_dump(int md_id, int buf_type, void *start_addr, int len)
++{
++	unsigned int *curr_p = (unsigned int *)start_addr;
++	unsigned char *curr_ch_p;
++	int _16_fix_num = len / 16;
++	int tail_num = len % 16;
++	unsigned char tail[16];
++	int i, j;
++
++	if (curr_p == NULL) {
++		ccci_util_dump_write(md_id, buf_type, 0, "start_addr <NULL>\n");
++		return;
++	}
++	if (len == 0) {
++		ccci_util_dump_write(md_id, buf_type, 0, "len [0]\n");
++		return;
++	}
++
++	ccci_util_dump_write(md_id, buf_type, 0, "Base: %px\n", start_addr);
++	for (i = 0; i < _16_fix_num; i++) {
++		ccci_util_dump_write(md_id, buf_type, 0,
++				     "%03X: %08X %08X %08X %08X\n",
++				     i * 16, *curr_p, *(curr_p + 1),
++				     *(curr_p + 2), *(curr_p + 3));
++		curr_p += 4;
++	}
++
++	if (tail_num > 0) {
++		curr_ch_p = (unsigned char *)curr_p;
++		for (j = 0; j < tail_num; j++)
++			tail[j] = *curr_ch_p++;
++		for (; j < 16; j++)
++			tail[j] = 0;
++		curr_p = (unsigned int *)tail;
++		ccci_util_dump_write(md_id, buf_type, 0,
++				     "%03X: %08X %08X %08X %08X\n",
++				     i * 16, *curr_p, *(curr_p + 1),
++				     *(curr_p + 2), *(curr_p + 3));
++	}
++}
++EXPORT_SYMBOL_GPL(ccci_util_mem_dump);
++
++/* Downstream ccci_util_cmpt_mem_dump(), ccci_private_log.c:793. */
++void ccci_util_cmpt_mem_dump(int md_id, int buf_type, void *start_addr, int len)
++{
++	unsigned int *curr_p = (unsigned int *)start_addr;
++	unsigned char *curr_ch_p;
++	int _64_fix_num = len / 64;
++	int tail_num = len % 64;
++	unsigned char tail[64];
++	int i, j;
++
++	if (curr_p == NULL) {
++		ccci_util_dump_write(md_id, buf_type, 0, "start_addr <NULL>\n");
++		return;
++	}
++	if (len == 0) {
++		ccci_util_dump_write(md_id, buf_type, 0, "len [0]\n");
++		return;
++	}
++
++	for (i = 0; i < _64_fix_num; i++) {
++		ccci_util_dump_write(md_id, buf_type, 0,
++				     "%03X: %X %X %X %X %X %X %X %X %X %X %X %X %X %X %X %X\n",
++				     i * 64,
++				     *curr_p, *(curr_p + 1), *(curr_p + 2),
++				     *(curr_p + 3), *(curr_p + 4), *(curr_p + 5),
++				     *(curr_p + 6), *(curr_p + 7), *(curr_p + 8),
++				     *(curr_p + 9), *(curr_p + 10),
++				     *(curr_p + 11), *(curr_p + 12),
++				     *(curr_p + 13), *(curr_p + 14),
++				     *(curr_p + 15));
++		curr_p += 64 / 4;
++	}
++
++	if (tail_num > 0) {
++		curr_ch_p = (unsigned char *)curr_p;
++		for (j = 0; j < tail_num; j++)
++			tail[j] = *curr_ch_p++;
++		for (; j < 64; j++)
++			tail[j] = 0;
++		curr_p = (unsigned int *)tail;
++		ccci_util_dump_write(md_id, buf_type, 0,
++				     "%03X: %X %X %X %X %X %X %X %X %X %X %X %X %X %X %X %X\n",
++				     i * 64,
++				     *curr_p, *(curr_p + 1), *(curr_p + 2),
++				     *(curr_p + 3), *(curr_p + 4), *(curr_p + 5),
++				     *(curr_p + 6), *(curr_p + 7), *(curr_p + 8),
++				     *(curr_p + 9), *(curr_p + 10),
++				     *(curr_p + 11), *(curr_p + 12),
++				     *(curr_p + 13), *(curr_p + 14),
++				     *(curr_p + 15));
++	}
++}
++EXPORT_SYMBOL_GPL(ccci_util_cmpt_mem_dump);
++
++/* ------------------------------------------------------------------ */
++/* debugfs request interface: "md_id addr len"                         */
++/* ------------------------------------------------------------------ */
++
++static int ccci_util_dump_window_read(unsigned int md_id, u64 addr, u32 len,
++				      void **out)
++{
++	struct ccci_util_dump_win *win;
++	u64 offset;
++	void *buf;
++	int ret = 0;
++
++	*out = NULL;
++
++	if (md_id >= CCCI_MAX_MD_NUM || !len)
++		return -EINVAL;
++	if (len > CCCI_UTIL_DUMP_REQ_MAX)
++		return -EINVAL;
++
++	mutex_lock(&ccci_util_win_lock);
++	win = &ccci_util_win[md_id];
++	if (!win->valid) {
++		ret = -ENODEV;
++		goto out_unlock;
++	}
++	if (addr < win->phys || addr - win->phys >= win->size) {
++		ret = -EINVAL;
++		goto out_unlock;
++	}
++	offset = addr - win->phys;
++	if (len > win->size - offset) {
++		ret = -EINVAL;
++		goto out_unlock;
++	}
++
++	buf = kmalloc(len, GFP_KERNEL);
++	if (!buf) {
++		ret = -ENOMEM;
++		goto out_unlock;
++	}
++
++	memcpy(buf, win->base + offset, len);
++	*out = buf;
++out_unlock:
++	mutex_unlock(&ccci_util_win_lock);
++
++	return ret;
++}
++
++static ssize_t ccci_util_dump_req_write(struct file *file,
++					const char __user *ubuf, size_t count,
++					loff_t *ppos)
++{
++	unsigned int md_id, len;
++	unsigned long long addr;
++	char *kbuf;
++	void *data = NULL;
++	int ret;
++
++	if (!count)
++		return 0;
++	if (count > 64)
++		return -EINVAL;
++
++	kbuf = memdup_user_nul(ubuf, count);
++	if (IS_ERR(kbuf))
++		return PTR_ERR(kbuf);
++
++	if (sscanf(kbuf, "%u %llx %x", &md_id, &addr, &len) != 3) {
++		kfree(kbuf);
++		return -EINVAL;
++	}
++	kfree(kbuf);
++
++	ret = ccci_util_dump_window_read(md_id, addr, len, &data);
++	if (ret)
++		return ret;
++
++	if (!ccci_util_dump_ring_ready(md_id, CCCI_DUMP_MEM_DUMP)) {
++		kfree(data);
++		return -ENODEV;
++	}
++
++	ccci_util_dump_write(md_id, CCCI_DUMP_MEM_DUMP, 0,
++			     "Base: 0x%llx len: %u\n", addr, len);
++	ccci_util_dump_hex(md_id, CCCI_DUMP_MEM_DUMP, data, len);
++	kfree(data);
++
++	return count;
++}
++
++static const struct file_operations ccci_util_dump_req_fops = {
++	.write		= ccci_util_dump_req_write,
++	.llseek		= noop_llseek,
++};
++
++/*
++ * Window registration through debugfs, for configurations where the CCCI
++ * core does not know the AP view of the MD shared memory yet:
++ *	echo "md_id phys size" > /sys/kernel/debug/ccci/dump_window
++ * A zero size unregisters the window.
++ */
++static ssize_t ccci_util_dump_window_write(struct file *file,
++					   const char __user *ubuf,
++					   size_t count, loff_t *ppos)
++{
++	unsigned long long phys, size;
++	unsigned int md_id;
++	char *kbuf;
++	int ret;
++
++	if (!count)
++		return 0;
++	if (count > 64)
++		return -EINVAL;
++
++	kbuf = memdup_user_nul(ubuf, count);
++	if (IS_ERR(kbuf))
++		return PTR_ERR(kbuf);
++
++	if (sscanf(kbuf, "%u %llx %llx", &md_id, &phys, &size) != 3) {
++		kfree(kbuf);
++		return -EINVAL;
++	}
++	kfree(kbuf);
++
++	if (md_id >= CCCI_MAX_MD_NUM)
++		return -EINVAL;
++
++	if (!size) {
++		ccci_util_dump_clear_window(md_id);
++		return count;
++	}
++
++	ret = ccci_util_dump_set_window(md_id, (phys_addr_t)phys,
++					(size_t)size);
++	if (ret)
++		return ret;
++
++	return count;
++}
++
++static const struct file_operations ccci_util_dump_window_fops = {
++	.write		= ccci_util_dump_window_write,
++	.llseek		= noop_llseek,
++};
++
++int ccci_util_dump_debugfs_init(struct dentry *root)
++{
++	if (!root)
++		return 0;
++
++	ccci_util_dump_req = debugfs_create_file("dump", 0200, root, NULL,
++						 &ccci_util_dump_req_fops);
++	ccci_util_dump_window = debugfs_create_file("dump_window", 0200, root,
++						    NULL,
++						    &ccci_util_dump_window_fops);
++
++	return 0;
++}
++
++void ccci_util_dump_debugfs_exit(void)
++{
++	debugfs_remove(ccci_util_dump_req);
++	debugfs_remove(ccci_util_dump_window);
++	ccci_util_dump_req = NULL;
++	ccci_util_dump_window = NULL;
++}
++
++MODULE_DESCRIPTION("MediaTek CCCI memory dump helpers");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/mediatek/ccci_util/ccci_util_img.c b/drivers/misc/mediatek/ccci_util/ccci_util_img.c
+new file mode 100644
+index 000000000..fc5c0bd9e
+--- /dev/null
++++ b/drivers/misc/mediatek/ccci_util/ccci_util_img.c
+@@ -0,0 +1,438 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * CCCI MD image check-header parsing and validation.
++ *
++ * Ported from the Samsung/MTK 3.18 downstream kernel:
++ *   drivers/misc/mediatek/ccci_util/ccci_util_lib_load_img.c
++ *     - check_md_header_v3()      (line 102)
++ *     - md_check_header_parser()  (line 285)
++ *     - md_check_header()         (line 508)
++ *     - ccci_get_md_info_str()    (line 646)
++ *     - ccci_get_md_check_hdr_inf (line 1059)
++ *
++ * Only the image-header part of the downstream loader is reproduced here.
++ * Downstream also opened the modem image through block-device file I/O and
++ * verified it with the secure boot library; on this tree the firmware blob is
++ * supplied by the CCCI core through request_firmware() and secure-image
++ * authentication is a separate hook, so those paths are not duplicated.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/string.h>
++#include <linux/unaligned.h>
++#include <linux/ccci.h>
++
++#include "ccci_util.h"
++
++/* Downstream type_str[], ccci_util_lib_load_img.c:54-75. */
++static const char * const md_type_str[] = {
++	[0]  = "invalid",
++	[1]  = "2g",
++	[2]  = "3g",
++	[3]  = "wg",
++	[4]  = "tg",
++	[5]  = "lwg",
++	[6]  = "ltg",
++	[7]  = "sglte",
++	[8]  = "ultg",
++	[9]  = "ulwg",
++	[10] = "ulwtg",
++	[11] = "ulwcg",
++	[12] = "ulwctg",
++	[13] = "ulttg",
++	[14] = "ulfwg",
++	[15] = "ulfwcg",
++	[16] = "ulctg",
++	[17] = "ultctg",
++	[18] = "ultwg",
++	[19] = "ultwcg",
++	[20] = "ulftg",
++	[21] = "ulfctg",
++};
++
++static_assert(ARRAY_SIZE(md_type_str) == CCCI_MD_MAX_IMG_TYPE + 1,
++	       "md_type_str must cover MAX_IMG_NUM");
++
++/*
++ * Field offsets of the common check-header prefix.  They are identical in
++ * v3, v4 and v5 because v4 only reuses v3's reserved2[] area and v5 only
++ * appends fields after domain_attr[] (ccci_util_lib_main.h:16-96).
++ */
++#define MD_HDR_OFF_VERNO	12
++#define MD_HDR_OFF_PRODUCT_VER	16
++#define MD_HDR_OFF_IMAGE_TYPE	20
++#define MD_HDR_OFF_PLATFORM	24
++#define MD_HDR_OFF_BUILD_TIME	40
++#define MD_HDR_OFF_BUILD_VER	104
++#define MD_HDR_OFF_BIND_SYS_ID	168
++#define MD_HDR_OFF_EXT_ATTR	169
++#define MD_HDR_OFF_MEM_SIZE	172
++#define MD_HDR_OFF_MD_IMG_SIZE	176
++#define MD_HDR_OFF_RPC_SEC	180
++#define MD_HDR_OFF_DSP_OFFSET	184
++#define MD_HDR_OFF_DSP_SIZE	188
++#define MD_HDR_OFF_REGION_NUM	192
++#define MD_HDR_OFF_REGION_INFO	196
++#define MD_HDR_OFF_DOMAIN_ATTR	260
++#define MD_HDR_OFF_ARM7_OFFSET	276
++#define MD_HDR_OFF_ARM7_SIZE	280
++
++/* DSP not loaded into EMI, ccci_util_lib_load_img.c:243. */
++#define MD_DSP_ON_EMI_DISABLED	0xCDCDCDAA
++
++static_assert(sizeof(struct md_check_header_v3) == 284, "v3 layout");
++static_assert(sizeof(struct md_check_header_v4) == 284, "v4 layout");
++static_assert(sizeof(struct md_check_header_v5) == 344, "v5 layout");
++
++static char md_img_info_str[CCCI_MAX_MD_NUM][MD_INFO_STR_LEN];
++static DEFINE_MUTEX(md_img_info_lock);
++
++const char *ccci_util_md_type_str(unsigned int image_type)
++{
++	if (image_type >= ARRAY_SIZE(md_type_str))
++		return "invalid";
++
++	return md_type_str[image_type];
++}
++EXPORT_SYMBOL_GPL(ccci_util_md_type_str);
++
++/* Downstream product_str[], ccci_util_lib_load_img.c:84-88. */
++const char *ccci_util_md_product_str(unsigned int product_ver)
++{
++	switch (product_ver) {
++	case 1:
++		return MD_DEBUG_STR;
++	case 2:
++		return MD_RELEASE_STR;
++	default:
++		return MD_INVALID_STR;
++	}
++}
++EXPORT_SYMBOL_GPL(ccci_util_md_product_str);
++
++static void md_hdr_copy_str(char *dst, size_t dst_size, const u8 *src,
++			    size_t src_size)
++{
++	size_t len = strnlen((const char *)src, src_size);
++
++	len = min(len, dst_size - 1);
++	memcpy(dst, src, len);
++	dst[len] = '\0';
++}
++
++static void md_hdr_build_info_str(int md_id, const char *ap_platform,
++				  unsigned int ap_mem_size,
++				  const struct ccci_util_md_img_info *info)
++{
++	char *str = md_img_info_str[md_id];
++
++	snprintf(str, MD_INFO_STR_LEN,
++		 "MD:%s*%s*%s*%s*%s\nAP:%s*%s*%08x (MD)%08x\n",
++		 info->image_type_str, info->platform, info->build_ver,
++		 info->build_time, info->product_ver_str,
++		 info->image_type_str, ap_platform ?: "unknown",
++		 ap_mem_size, info->mem_size);
++}
++
++char *ccci_get_md_info_str(int md_id)
++{
++	if (md_id < 0 || md_id >= CCCI_MAX_MD_NUM)
++		return NULL;
++
++	return md_img_info_str[md_id];
++}
++EXPORT_SYMBOL_GPL(ccci_get_md_info_str);
++
++/**
++ * ccci_util_md_check_header() - parse and validate an MD image check header
++ * @md_id:	modem index (0 == MD_SYS1); bind_sys_id must equal md_id + 1
++ * @hdr:	start of the check header ("CHECK_HEADER")
++ * @hdr_len:	bytes available at @hdr
++ * @md_mem_size: AP reserved MD memory size, 0 if unknown (downstream md_size)
++ * @ap_img_size: AP reserved image size, 0 if unknown (downstream image->size)
++ * @ap_platform: AP platform string for the info line, may be NULL
++ * @info:	decoded header
++ *
++ * Mirrors check_md_header_v3()/md_check_header_parser() from the downstream
++ * loader.  Returns 0 on success, -EOPNOTSUPP for header versions this driver
++ * does not implement (v1/v2 and v6), -EINVAL for malformed input, or the
++ * downstream CCCI_ERR_LOAD_IMG_* error codes.
++ */
++int ccci_util_md_check_header(int md_id, const void *hdr, size_t hdr_len,
++			      unsigned int md_mem_size,
++			      unsigned int ap_img_size,
++			      const char *ap_platform,
++			      struct ccci_util_md_img_info *info)
++{
++	const u8 *p = hdr;
++	unsigned int verno, layout_size, size_field;
++	unsigned int image_type, product_ver, mem_size, md_img_size;
++	unsigned int dsp_offset, dsp_size;
++	unsigned int i;
++	int ret = 0;
++
++	if (!hdr || !info)
++		return -EINVAL;
++	if (md_id < 0 || md_id >= CCCI_MAX_MD_NUM)
++		return -EINVAL;
++	if (hdr_len < MD_HDR_OFF_VERNO + sizeof(u32))
++		return -EINVAL;
++
++	memset(info, 0, sizeof(*info));
++
++	if (memcmp(p, MD_HEADER_MAGIC_NO, MD_HEADER_MAGIC_LEN)) {
++		ccci_util_dump_write(md_id, CCCI_DUMP_INIT, CCCI_DUMP_TIME_FLAG,
++				     "md check header not exist!\n");
++		return -CCCI_ERR_LOAD_IMG_CHECK_HEAD;
++	}
++
++	verno = get_unaligned_le32(p + MD_HDR_OFF_VERNO);
++	switch (verno) {
++	case 3:
++	case 4:
++		layout_size = sizeof(struct md_check_header_v4);
++		break;
++	case 5:
++		layout_size = sizeof(struct md_check_header_v5);
++		break;
++	default:
++		ccci_util_dump_write(md_id, CCCI_DUMP_INIT, CCCI_DUMP_TIME_FLAG,
++				     "md check header version %u not supported\n",
++				     verno);
++		return -EOPNOTSUPP;
++	}
++
++	if (hdr_len < layout_size) {
++		ccci_util_dump_write(md_id, CCCI_DUMP_INIT, CCCI_DUMP_TIME_FLAG,
++				     "md check header truncated: %zu < %u\n",
++				     hdr_len, layout_size);
++		return -EINVAL;
++	}
++
++	/* The last word of the header is its own size (downstream dispatch). */
++	size_field = get_unaligned_le32(p + layout_size - sizeof(u32));
++	if (size_field != layout_size) {
++		ccci_util_dump_write(md_id, CCCI_DUMP_INIT, CCCI_DUMP_TIME_FLAG,
++				     "md check header size mismatch: field %u, layout %u\n",
++				     size_field, layout_size);
++		return -CCCI_ERR_LOAD_IMG_CHECK_HEAD;
++	}
++
++	if (p[MD_HDR_OFF_BIND_SYS_ID] != (u8)(md_id + 1)) {
++		ccci_util_dump_write(md_id, CCCI_DUMP_INIT, CCCI_DUMP_TIME_FLAG,
++				     "md image is for MD SYS%u, not MD SYS%d!\n",
++				     p[MD_HDR_OFF_BIND_SYS_ID], md_id + 1);
++		return -CCCI_ERR_LOAD_IMG_MD_CHECK;
++	}
++
++	image_type = get_unaligned_le32(p + MD_HDR_OFF_IMAGE_TYPE);
++	if (image_type > CCCI_MD_MAX_IMG_TYPE) {
++		ccci_util_dump_write(md_id, CCCI_DUMP_INIT, CCCI_DUMP_TIME_FLAG,
++				     "md image type %u out of range\n", image_type);
++		return -CCCI_ERR_LOAD_IMG_MD_CHECK;
++	}
++
++	product_ver = get_unaligned_le32(p + MD_HDR_OFF_PRODUCT_VER);
++	mem_size = get_unaligned_le32(p + MD_HDR_OFF_MEM_SIZE);
++	md_img_size = get_unaligned_le32(p + MD_HDR_OFF_MD_IMG_SIZE);
++
++	/* Downstream ENABLE_MEM_SIZE_CHECK block, ccci_util_lib_load_img.c:143. */
++	if (md_mem_size) {
++		if (mem_size > md_mem_size) {
++			ccci_util_dump_write(md_id, CCCI_DUMP_INIT,
++					     CCCI_DUMP_TIME_FLAG,
++					     "md mem size 0x%x > AP reserve 0x%x\n",
++					     mem_size, md_mem_size);
++			return -CCCI_ERR_LOAD_IMG_MD_CHECK;
++		}
++		if (mem_size < md_mem_size)
++			ccci_util_dump_write(md_id, CCCI_DUMP_INIT,
++					     CCCI_DUMP_TIME_FLAG,
++					     "[Warning]md size in md header isn't sync to DFO setting: (%08x, %08x)\n",
++					     mem_size, md_mem_size);
++	}
++
++	/* Downstream compares head->md_img_size with the reserved image size. */
++	if (ap_img_size && md_img_size && md_img_size > ap_img_size) {
++		ccci_util_dump_write(md_id, CCCI_DUMP_INIT, CCCI_DUMP_TIME_FLAG,
++				     "md image size 0x%x > AP reserve 0x%x\n",
++				     md_img_size, ap_img_size);
++		return -CCCI_ERR_LOAD_IMG_MD_CHECK;
++	}
++
++	/* DSP image sanity, ccci_util_lib_load_img.c:225-251. */
++	dsp_offset = get_unaligned_le32(p + MD_HDR_OFF_DSP_OFFSET);
++	dsp_size = get_unaligned_le32(p + MD_HDR_OFF_DSP_SIZE);
++	if (dsp_offset == MD_DSP_ON_EMI_DISABLED) {
++		ccci_util_dump_write(md_id, CCCI_DUMP_INIT, CCCI_DUMP_TIME_FLAG,
++				     "DSP on EMI disabled\n");
++	} else if (verno == 3 && (dsp_offset & 0xFFFF)) {
++		ccci_util_dump_write(md_id, CCCI_DUMP_INIT, CCCI_DUMP_TIME_FLAG,
++				     "DSP image offset not 64KB align\n");
++		return -CCCI_ERR_LOAD_IMG_MD_CHECK;
++	} else if (md_mem_size &&
++		   (u64)dsp_offset + dsp_size > md_mem_size) {
++		ccci_util_dump_write(md_id, CCCI_DUMP_INIT, CCCI_DUMP_TIME_FLAG,
++				     "DSP image size too large %x\n", md_mem_size);
++		return -CCCI_ERR_LOAD_IMG_MD_CHECK;
++	}
++
++	/* RMPU region table, only meaningful from check header v4 on. */
++	if (verno >= 4) {
++		unsigned int region_num =
++			get_unaligned_le32(p + MD_HDR_OFF_REGION_NUM);
++		unsigned int region_cnt;
++
++		if (region_num > MD_MAX_REGION_NUM) {
++			ccci_util_dump_write(md_id, CCCI_DUMP_INIT,
++					     CCCI_DUMP_TIME_FLAG,
++					     "md region number %u out of range\n",
++					     region_num);
++			return -CCCI_ERR_LOAD_IMG_MD_CHECK;
++		}
++
++		/*
++		 * Downstream always consumes MPU_REGION_INFO_ID_LAST + 1
++		 * entries regardless of region_num.
++		 */
++		region_cnt = clamp_t(unsigned int, region_num,
++				     MPU_REGION_INFO_ID_LAST + 1,
++				     MD_MAX_REGION_NUM);
++		info->region_num = region_cnt;
++
++		for (i = 0; i < region_cnt; i++) {
++			const u8 *r = p + MD_HDR_OFF_REGION_INFO + i * 8;
++
++			info->region_info[i].region_offset =
++				get_unaligned_le32(r);
++			info->region_info[i].region_size =
++				get_unaligned_le32(r + 4);
++			ccci_util_dump_write(md_id, CCCI_DUMP_INIT,
++					     CCCI_DUMP_TIME_FLAG,
++					     "[CCCI_UTIL] load_image: check_header_v%u, region(%u): size = %x , offset = %x\n",
++					     verno, i,
++					     info->region_info[i].region_size,
++					     info->region_info[i].region_offset);
++		}
++
++		for (i = 0; i < MPU_DOMAIN_INFO_ID_TOTAL_NUM; i++) {
++			info->domain_attr[i] = get_unaligned_le32(p +
++				MD_HDR_OFF_DOMAIN_ATTR + i * 4);
++			ccci_util_dump_write(md_id, CCCI_DUMP_INIT,
++					     CCCI_DUMP_TIME_FLAG,
++					     "[CCCI_UTIL] load_image: check_header_v%u, domain(%u): attr = %x\n",
++					     verno, i, info->domain_attr[i]);
++		}
++	}
++
++	if (verno >= 5) {
++		info->arm7_img_offset =
++			get_unaligned_le32(p + MD_HDR_OFF_ARM7_OFFSET);
++		info->arm7_img_size =
++			get_unaligned_le32(p + MD_HDR_OFF_ARM7_SIZE);
++		ccci_util_dump_write(md_id, CCCI_DUMP_INIT, CCCI_DUMP_TIME_FLAG,
++				     "[CCCI_UTIL] load_image: check_header_v5, arm7_offset = 0x%08X, arm_size = 0x%08X\n",
++				     info->arm7_img_offset, info->arm7_img_size);
++	}
++
++	info->header_size = layout_size;
++	info->header_verno = verno;
++	info->product_ver = product_ver;
++	info->image_type = image_type;
++	info->bind_sys_id = p[MD_HDR_OFF_BIND_SYS_ID];
++	info->ext_attr = p[MD_HDR_OFF_EXT_ATTR];
++	info->mem_size = mem_size;
++	info->md_img_size = md_img_size;
++	info->rpc_sec_mem_addr = get_unaligned_le32(p + MD_HDR_OFF_RPC_SEC);
++	info->dsp_img_offset = dsp_offset;
++	info->dsp_img_size = dsp_size;
++	info->image_type_str = ccci_util_md_type_str(image_type);
++	info->product_ver_str = ccci_util_md_product_str(product_ver);
++
++	md_hdr_copy_str(info->platform, sizeof(info->platform),
++			p + MD_HDR_OFF_PLATFORM, 16);
++	md_hdr_copy_str(info->build_time, sizeof(info->build_time),
++			p + MD_HDR_OFF_BUILD_TIME, 64);
++	md_hdr_copy_str(info->build_ver, sizeof(info->build_ver),
++			p + MD_HDR_OFF_BUILD_VER, 64);
++
++	mutex_lock(&md_img_info_lock);
++	md_hdr_build_info_str(md_id, ap_platform, md_mem_size, info);
++	mutex_unlock(&md_img_info_lock);
++
++	ccci_util_dump_write(md_id, CCCI_DUMP_INIT, CCCI_DUMP_TIME_FLAG,
++			     "Modem header check OK! v%u size=%zu\n",
++			     verno, hdr_len);
++	ccci_util_dump_write(md_id, CCCI_DUMP_INIT, CCCI_DUMP_TIME_FLAG,
++			     "(MD)[type]=%s, (AP)[type]=%s\n",
++			     info->image_type_str, info->image_type_str);
++	ccci_util_dump_write(md_id, CCCI_DUMP_INIT, CCCI_DUMP_TIME_FLAG,
++			     "(MD)[size]=%x, (AP)[size]=%x\n",
++			     mem_size, md_mem_size);
++	ccci_util_dump_write(md_id, CCCI_DUMP_INIT, CCCI_DUMP_TIME_FLAG,
++			     "(MD)[img_size]=%x, (AP)[img_size]=%x\n",
++			     md_img_size, ap_img_size);
++	ccci_util_dump_write(md_id, CCCI_DUMP_INIT, CCCI_DUMP_TIME_FLAG,
++			     "(MD)[build_ver]=%s, [build_time]=%s\n",
++			     info->build_ver, info->build_time);
++	ccci_util_dump_write(md_id, CCCI_DUMP_INIT, CCCI_DUMP_TIME_FLAG,
++			     "(MD)[product_ver]=%s\n", info->product_ver_str);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ccci_util_md_check_header);
++
++/**
++ * ccci_util_md_region_info() - extract the RMPU region/domain table
++ * @info:	decoded header from ccci_util_md_check_header()
++ * @region_num:	output, number of valid entries in @info->region_info
++ * @regions:	output array for the region table (may be NULL)
++ * @max_regions: size of @regions
++ * @domain_attr: output array for the domain attributes (may be NULL)
++ * @max_domains: size of @domain_attr
++ *
++ * v4 and v5 headers carry the region table; v3 does not.  Mirrors the
++ * "RMPU only available after check header v4" loop in
++ * ccci_util_lib_load_img.c:254-274.
++ */
++int ccci_util_md_region_info(const struct ccci_util_md_img_info *info,
++			     unsigned int *region_num,
++			     struct _md_regin_info *regions,
++			     unsigned int max_regions,
++			     unsigned int *domain_attr,
++			     unsigned int max_domains)
++{
++	unsigned int num;
++
++	if (!info)
++		return -EINVAL;
++	if (info->header_verno < 4)
++		return -EOPNOTSUPP;
++
++	num = min(info->region_num, (unsigned int)MD_MAX_REGION_NUM);
++
++	if (regions) {
++		if (max_regions < num)
++			return -EINVAL;
++		memcpy(regions, info->region_info, num * sizeof(*regions));
++	}
++	if (region_num)
++		*region_num = num;
++
++	if (domain_attr) {
++		if (max_domains < MPU_DOMAIN_INFO_ID_TOTAL_NUM)
++			return -EINVAL;
++		memcpy(domain_attr, info->domain_attr,
++		       MPU_DOMAIN_INFO_ID_TOTAL_NUM * sizeof(*domain_attr));
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(ccci_util_md_region_info);
++
++MODULE_DESCRIPTION("MediaTek CCCI MD image header helpers");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/mediatek/ccci_util/ccci_util_log.c b/drivers/misc/mediatek/ccci_util/ccci_util_log.c
+new file mode 100644
+index 000000000..da7a51b22
+--- /dev/null
++++ b/drivers/misc/mediatek/ccci_util/ccci_util_log.c
+@@ -0,0 +1,652 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * CCCI character devices: /dev/ccci_log (debug log ring) and /dev/ccci_dump
++ * (per-MD dump buffers), plus the event log ring.
++ *
++ * Ported from the Samsung/MTK 3.18 downstream kernel:
++ *   drivers/misc/mediatek/ccci_util/ccci_private_log.c
++ *     - ccci_log_write()       (line 54)
++ *     - ccci_log_write_raw()   (line 104)
++ *     - ccci_log_read()        (line 165)
++ *     - ccci_log_poll/open/close (lines 212, 223, 231)
++ *     - ccci_dump_read/poll/open/close (lines 472, 615, 620, 636)
++ *     - ccci_event_log()       (line 867)
++ *     - ccci_event_log_cpy()   (line 941)
++ *     - ccci_log_init()        (line 969)
++ *
++ * Downstream exposed the two interfaces as /proc/ccci_log and /proc/ccci_dump
++ * with proc_create() (ROM: proc_create_data at 0xc0197e64, called from
++ * ccci_log_init at 0xc0504e30 and 0xc0504e98).  This driver exposes them as
++ * misc character devices, which is what Android/MTK userspace expects on
++ * current kernels; the byte stream is unchanged.
++ *
++ * /dev/ccci_dump write format (one record per write):
++ *	struct ccci_util_dump_rec {
++ *		__le32 type;	// CCCI_DUMP_* selector
++ *		__le32 len;	// payload length
++ *		u8     data[];
++ *	};
++ * The target MD is selected with CCCI_UTIL_IOC_SET_MD (default MD_SYS1).
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/miscdevice.h>
++#include <linux/fs.h>
++#include <linux/poll.h>
++#include <linux/sched.h>
++#include <linux/sched/clock.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/string.h>
++#include <linux/time.h>
++#include <linux/timekeeping.h>
++#include <linux/uaccess.h>
++#include <linux/wait.h>
++#include <linux/ccci.h>
++
++#include "ccci_util.h"
++
++#define CCCI_LOG_BUF_SIZE	CCCI_UTIL_LOG_SIZE
++
++struct ccci_log_ring {
++	u8 *buffer;
++	u32 write_pos;
++	u32 data_size;		/* valid bytes, capped at CCCI_LOG_BUF_SIZE */
++	atomic_t reader_cnt;
++	wait_queue_head_t log_wq;
++	spinlock_t write_lock;
++};
++
++static struct ccci_log_ring ccci_log_buf;
++
++static int ccci_util_ring_put(u8 *buffer, u32 size, u32 *write_pos,
++			      u32 *data_size, const void *data, u32 len,
++			      spinlock_t *lock)
++{
++	unsigned long flags;
++	u32 start, first;
++
++	spin_lock_irqsave(lock, flags);
++
++	start = *write_pos & (size - 1);
++	first = min(len, size - start);
++	memcpy(buffer + start, data, first);
++	if (len > first)
++		memcpy(buffer, data + first, len - first);
++
++	*write_pos = (start + len) & (size - 1);
++	if (*data_size + len > size)
++		*data_size = size;	/* full: oldest byte at *write_pos */
++	else
++		*data_size += len;
++
++	spin_unlock_irqrestore(lock, flags);
++
++	return len;
++}
++
++static int ccci_log_ring_write(const void *data, u32 len)
++{
++	if (!ccci_log_buf.buffer)
++		return -ENODEV;
++
++	if (!len)
++		return 0;
++	if (len > CCCI_LOG_BUF_SIZE) {
++		data += len - CCCI_LOG_BUF_SIZE;
++		len = CCCI_LOG_BUF_SIZE;
++	}
++
++	ccci_util_ring_put(ccci_log_buf.buffer, CCCI_LOG_BUF_SIZE,
++			   &ccci_log_buf.write_pos, &ccci_log_buf.data_size,
++			   data, len, &ccci_log_buf.write_lock);
++
++	wake_up_interruptible_all(&ccci_log_buf.log_wq);
++
++	return len;
++}
++
++int ccci_log_write(const char *fmt, ...)
++{
++	char temp_log[CCCI_UTIL_MAX_WRITE];
++	unsigned long rem_nsec;
++	u64 ts_nsec;
++	va_list args;
++	int cpu;
++	int write_len;
++
++	ts_nsec = local_clock();
++	rem_nsec = do_div(ts_nsec, NSEC_PER_SEC);
++	cpu = get_cpu();
++	put_cpu();
++	write_len = scnprintf(temp_log, sizeof(temp_log),
++			      "[%5lu.%06lu]%c(%x)[%d:%s]",
++			      (unsigned long)ts_nsec, rem_nsec / 1000,
++			      irqs_disabled() ? '-' : ' ', cpu, current->pid,
++			      current->comm);
++
++	va_start(args, fmt);
++	write_len += vscnprintf(temp_log + write_len,
++				sizeof(temp_log) - write_len, fmt, args);
++	va_end(args);
++
++	return ccci_log_ring_write(temp_log,
++				   min_t(int, write_len, sizeof(temp_log) - 1));
++}
++EXPORT_SYMBOL_GPL(ccci_log_write);
++
++int ccci_log_write_raw(unsigned int set_flags, const char *fmt, ...)
++{
++	char temp_log[CCCI_UTIL_MAX_WRITE];
++	unsigned long rem_nsec;
++	u64 ts_nsec;
++	va_list args;
++	int write_len = 0;
++	int cpu;
++
++	if (set_flags & CCCI_DUMP_TIME_FLAG) {
++		ts_nsec = local_clock();
++		rem_nsec = do_div(ts_nsec, NSEC_PER_SEC);
++		cpu = get_cpu();
++		put_cpu();
++		write_len += scnprintf(temp_log + write_len,
++				       sizeof(temp_log) - write_len,
++				       "[%5lu.%06lu]%c(%x)",
++				       (unsigned long)ts_nsec, rem_nsec / 1000,
++				       irqs_disabled() ? '-' : ' ', cpu);
++	}
++
++	if (set_flags & CCCI_DUMP_CURR_FLAG)
++		write_len += scnprintf(temp_log + write_len,
++				       sizeof(temp_log) - write_len, "[%d:%s]",
++				       current->pid, current->comm);
++
++	va_start(args, fmt);
++	write_len += vscnprintf(temp_log + write_len,
++				sizeof(temp_log) - write_len, fmt, args);
++	va_end(args);
++
++	return ccci_log_ring_write(temp_log,
++				   min_t(int, write_len, sizeof(temp_log) - 1));
++}
++EXPORT_SYMBOL_GPL(ccci_log_write_raw);
++
++/* ------------------------------------------------------------------ */
++/* /dev/ccci_log                                                       */
++/* ------------------------------------------------------------------ */
++
++static ssize_t ccci_log_read(struct file *file, char __user *buf, size_t size,
++			     loff_t *ppos)
++{
++	unsigned int available, read_len, read_pos, first;
++	unsigned long flags;
++	int ret;
++
++retry:
++	spin_lock_irqsave(&ccci_log_buf.write_lock, flags);
++	available = ccci_log_buf.data_size;
++	if (available >= CCCI_LOG_BUF_SIZE) {
++		/* Overflow: the write pointer is the oldest byte. */
++		available = CCCI_LOG_BUF_SIZE;
++		read_pos = ccci_log_buf.write_pos;
++	} else {
++		read_pos = (ccci_log_buf.write_pos + CCCI_LOG_BUF_SIZE -
++			    available) & (CCCI_LOG_BUF_SIZE - 1);
++	}
++	spin_unlock_irqrestore(&ccci_log_buf.write_lock, flags);
++
++	if (!available) {
++		if (file->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++
++		ret = wait_event_interruptible(ccci_log_buf.log_wq,
++					       READ_ONCE(ccci_log_buf.data_size));
++		if (ret)
++			return -ERESTARTSYS;
++		goto retry;
++	}
++
++	read_len = min_t(size_t, size, available);
++	first = min(read_len, CCCI_LOG_BUF_SIZE - read_pos);
++
++	if (copy_to_user(buf, ccci_log_buf.buffer + read_pos, first))
++		return -EFAULT;
++	if (read_len > first &&
++	    copy_to_user(buf + first, ccci_log_buf.buffer, read_len - first))
++		return -EFAULT;
++
++	spin_lock_irqsave(&ccci_log_buf.write_lock, flags);
++	ccci_log_buf.data_size -= read_len;
++	spin_unlock_irqrestore(&ccci_log_buf.write_lock, flags);
++
++	return read_len;
++}
++
++static __poll_t ccci_log_poll(struct file *file, poll_table *wait)
++{
++	__poll_t mask = 0;
++
++	poll_wait(file, &ccci_log_buf.log_wq, wait);
++	if (READ_ONCE(ccci_log_buf.data_size))
++		mask |= EPOLLIN | EPOLLRDNORM;
++
++	return mask;
++}
++
++static int ccci_log_open(struct inode *inode, struct file *file)
++{
++	if (!ccci_log_buf.buffer)
++		return -ENODEV;
++
++	if (atomic_inc_return(&ccci_log_buf.reader_cnt) > 1) {
++		atomic_dec(&ccci_log_buf.reader_cnt);
++		return -EBUSY;
++	}
++
++	return 0;
++}
++
++static int ccci_log_close(struct inode *inode, struct file *file)
++{
++	atomic_dec(&ccci_log_buf.reader_cnt);
++
++	return 0;
++}
++
++static const struct file_operations ccci_log_fops = {
++	.owner		= THIS_MODULE,
++	.read		= ccci_log_read,
++	.open		= ccci_log_open,
++	.release	= ccci_log_close,
++	.poll		= ccci_log_poll,
++	.llseek		= noop_llseek,
++};
++
++/* ------------------------------------------------------------------ */
++/* /dev/ccci_dump                                                      */
++/* ------------------------------------------------------------------ */
++
++#define CCCI_UTIL_IOC_MAGIC	'C'
++#define CCCI_UTIL_IOC_SET_MD	_IOW(CCCI_UTIL_IOC_MAGIC, 0x40, __u32)
++#define CCCI_UTIL_IOC_GET_MD	_IOR(CCCI_UTIL_IOC_MAGIC, 0x41, __u32)
++
++struct ccci_util_dump_rec {
++	__le32 type;
++	__le32 len;
++	u8 data[];
++} __packed;
++
++struct ccci_dump_file {
++	u32 md_id;
++	char *buf;
++	size_t len;
++	size_t pos;
++	bool snapshotted;
++};
++
++static void ccci_dump_file_reset_snapshot(struct ccci_dump_file *df)
++{
++	ccci_util_snapshot_free(df->buf);
++	df->buf = NULL;
++	df->len = 0;
++	df->pos = 0;
++	df->snapshotted = false;
++}
++
++static int ccci_dump_open(struct inode *inode, struct file *file)
++{
++	struct ccci_dump_file *df;
++
++	df = kzalloc(sizeof(*df), GFP_KERNEL);
++	if (!df)
++		return -ENOMEM;
++
++	df->md_id = CCCI_MD_SYS1;
++	file->private_data = df;
++
++	return nonseekable_open(inode, file);
++}
++
++static int ccci_dump_release(struct inode *inode, struct file *file)
++{
++	struct ccci_dump_file *df = file->private_data;
++
++	if (df) {
++		ccci_dump_file_reset_snapshot(df);
++		kfree(df);
++	}
++
++	return 0;
++}
++
++static ssize_t ccci_dump_read(struct file *file, char __user *buf, size_t size,
++			      loff_t *ppos)
++{
++	struct ccci_dump_file *df = file->private_data;
++	size_t len;
++
++	if (!df)
++		return -EBADF;
++
++	if (!df->snapshotted) {
++		int ret = ccci_util_dump_snapshot(df->md_id, &df->buf);
++
++		if (ret < 0)
++			return ret;
++		df->len = ret;
++		df->snapshotted = true;
++	}
++
++	if (df->pos >= df->len)
++		return 0;
++
++	len = min(size, df->len - df->pos);
++	if (copy_to_user(buf, df->buf + df->pos, len))
++		return -EFAULT;
++
++	df->pos += len;
++
++	return len;
++}
++
++static ssize_t ccci_dump_dev_write(struct file *file, const char __user *buf,
++			       size_t count, loff_t *ppos)
++{
++	struct ccci_dump_file *df = file->private_data;
++	struct ccci_util_dump_rec rec;
++	u32 type, len;
++	void *data;
++	int ret;
++
++	if (!df)
++		return -EBADF;
++	if (count < sizeof(rec))
++		return -EINVAL;
++
++	if (copy_from_user(&rec, buf, sizeof(rec)))
++		return -EFAULT;
++
++	type = le32_to_cpu(rec.type);
++	len = le32_to_cpu(rec.len);
++
++	if (type >= CCCI_DUMP_MAX)
++		return -EINVAL;
++	if (len != count - sizeof(rec))
++		return -EINVAL;
++	if (!len)
++		return -EINVAL;
++
++	data = memdup_user(buf + sizeof(rec), len);
++	if (IS_ERR(data))
++		return PTR_ERR(data);
++
++	ret = ccci_util_dump_append_raw(df->md_id, type, data, len);
++	kfree(data);
++	if (ret < 0)
++		return ret;
++
++	return count;
++}
++
++static __poll_t ccci_dump_poll(struct file *file, poll_table *wait)
++{
++	/* Downstream ccci_dump_poll() always reports readable data. */
++	return EPOLLIN | EPOLLRDNORM;
++}
++
++static long ccci_dump_ioctl(struct file *file, unsigned int cmd,
++			    unsigned long arg)
++{
++	struct ccci_dump_file *df = file->private_data;
++	u32 md_id;
++
++	if (!df)
++		return -EBADF;
++
++	switch (cmd) {
++	case CCCI_UTIL_IOC_SET_MD:
++		if (get_user(md_id, (u32 __user *)arg))
++			return -EFAULT;
++		if (md_id >= CCCI_MAX_MD_NUM)
++			return -EINVAL;
++		df->md_id = md_id;
++		ccci_dump_file_reset_snapshot(df);
++		return 0;
++	case CCCI_UTIL_IOC_GET_MD:
++		if (put_user(df->md_id, (u32 __user *)arg))
++			return -EFAULT;
++		return 0;
++	default:
++		return -ENOTTY;
++	}
++}
++
++static const struct file_operations ccci_dump_fops = {
++	.owner		= THIS_MODULE,
++	.read		= ccci_dump_read,
++	.write		= ccci_dump_dev_write,
++	.open		= ccci_dump_open,
++	.release	= ccci_dump_release,
++	.poll		= ccci_dump_poll,
++	.unlocked_ioctl	= ccci_dump_ioctl,
++	.llseek		= noop_llseek,
++};
++
++/* ------------------------------------------------------------------ */
++/* Event log ring (ccci_event_log / ccci_event_log_cpy)                */
++/* ------------------------------------------------------------------ */
++
++#define CCCI_EVENT_BUF_SIZE	4096
++
++struct ccci_event_buf {
++	u8 *buffer;
++	u32 write_pos;
++	u32 data_size;
++	spinlock_t lock;
++};
++
++static struct ccci_event_buf ccci_event_buffer;
++static bool ccci_logdev_registered;
++
++int ccci_event_log(const char *fmt, ...)
++{
++	char temp_log[CCCI_UTIL_MAX_WRITE];
++	struct timespec64 ts;
++	struct tm tm, tm_android;
++	unsigned long rem_nsec;
++	unsigned long flags;
++	u64 ts_nsec;
++	va_list args;
++	u32 wr_pos, can_be_write;
++	int write_len;
++	int cpu;
++
++	if (!ccci_event_buffer.buffer)
++		return 0;
++
++	/* Kernel monotonic stamp, as in downstream. */
++	ts_nsec = local_clock();
++	rem_nsec = do_div(ts_nsec, NSEC_PER_SEC);
++	cpu = get_cpu();
++	put_cpu();
++
++	/* Wall clock plus the configured timezone offset. */
++	ktime_get_real_ts64(&ts);
++	time64_to_tm(ts.tv_sec, 0, &tm);
++	time64_to_tm(ts.tv_sec - sys_tz.tz_minuteswest * 60, 0, &tm_android);
++
++	write_len = scnprintf(temp_log, sizeof(temp_log),
++			      "%ld%02d%02d-%02d:%02d:%02d.%03d [%5lu.%06lu]%c(%x)[%d:%s]",
++			      tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
++			      tm_android.tm_hour, tm_android.tm_min,
++			      tm_android.tm_sec,
++			      (unsigned int)(ts.tv_nsec / NSEC_PER_MSEC),
++			      (unsigned long)ts_nsec, rem_nsec / 1000,
++			      irqs_disabled() ? '-' : ' ', cpu, current->pid,
++			      current->comm);
++
++	va_start(args, fmt);
++	write_len += vscnprintf(temp_log + write_len,
++				sizeof(temp_log) - write_len, fmt, args);
++	va_end(args);
++
++	write_len = min_t(int, write_len, sizeof(temp_log) - 1);
++	if (!write_len)
++		return 0;
++
++	spin_lock_irqsave(&ccci_event_buffer.lock, flags);
++
++	wr_pos = ccci_event_buffer.write_pos;
++	ccci_event_buffer.data_size += write_len;
++	if (ccci_event_buffer.data_size > CCCI_EVENT_BUF_SIZE)
++		ccci_event_buffer.data_size = CCCI_EVENT_BUF_SIZE + 1;
++
++	ccci_event_buffer.write_pos = (wr_pos + write_len) &
++				      (CCCI_EVENT_BUF_SIZE - 1);
++
++	if (wr_pos + write_len > CCCI_EVENT_BUF_SIZE) {
++		can_be_write = CCCI_EVENT_BUF_SIZE - wr_pos;
++		memcpy(ccci_event_buffer.buffer + wr_pos, temp_log, can_be_write);
++		memcpy(ccci_event_buffer.buffer, temp_log + can_be_write,
++		       write_len - can_be_write);
++	} else {
++		memcpy(ccci_event_buffer.buffer + wr_pos, temp_log, write_len);
++	}
++
++	spin_unlock_irqrestore(&ccci_event_buffer.lock, flags);
++
++	return write_len;
++}
++EXPORT_SYMBOL_GPL(ccci_event_log);
++
++int ccci_event_log_cpy(char buf[], int size)
++{
++	unsigned long flags;
++	unsigned int rd_pos;
++	int cpy_size, first_half;
++
++	if (!ccci_event_buffer.buffer || !buf || size <= 0)
++		return 0;
++
++	spin_lock_irqsave(&ccci_event_buffer.lock, flags);
++
++	if (ccci_event_buffer.data_size > CCCI_EVENT_BUF_SIZE) {
++		cpy_size = min_t(int, CCCI_EVENT_BUF_SIZE, size);
++		rd_pos = ccci_event_buffer.write_pos;
++		first_half = CCCI_EVENT_BUF_SIZE - rd_pos;
++		first_half = min(first_half, cpy_size);
++		memcpy(buf, ccci_event_buffer.buffer + rd_pos, first_half);
++		if (cpy_size > first_half)
++			memcpy(buf + first_half, ccci_event_buffer.buffer,
++			       cpy_size - first_half);
++	} else {
++		cpy_size = min_t(int, ccci_event_buffer.data_size, size);
++		memcpy(buf, ccci_event_buffer.buffer, cpy_size);
++	}
++
++	spin_unlock_irqrestore(&ccci_event_buffer.lock, flags);
++
++	return cpy_size;
++}
++EXPORT_SYMBOL_GPL(ccci_event_log_cpy);
++
++/* ------------------------------------------------------------------ */
++/* Device registration                                                 */
++/* ------------------------------------------------------------------ */
++
++static struct miscdevice ccci_log_dev = {
++	.minor	= MISC_DYNAMIC_MINOR,
++	.name	= "ccci_log",
++	.fops	= &ccci_log_fops,
++	.mode	= 0400,
++};
++
++static struct miscdevice ccci_dump_dev = {
++	.minor	= MISC_DYNAMIC_MINOR,
++	.name	= "ccci_dump",
++	.fops	= &ccci_dump_fops,
++	.mode	= 0600,
++};
++
++int ccci_util_logdev_init(void)
++{
++	int ret;
++
++	if (ccci_logdev_registered)
++		return 0;
++
++	ccci_log_buf.buffer = kzalloc(CCCI_LOG_BUF_SIZE, GFP_KERNEL);
++	if (!ccci_log_buf.buffer)
++		return -ENOMEM;
++
++	spin_lock_init(&ccci_log_buf.write_lock);
++	init_waitqueue_head(&ccci_log_buf.log_wq);
++	ccci_log_buf.write_pos = 0;
++	ccci_log_buf.data_size = 0;
++	atomic_set(&ccci_log_buf.reader_cnt, 0);
++
++	ccci_event_buffer.buffer = kzalloc(CCCI_EVENT_BUF_SIZE, GFP_KERNEL);
++	if (!ccci_event_buffer.buffer) {
++		ret = -ENOMEM;
++		goto err_log;
++	}
++	spin_lock_init(&ccci_event_buffer.lock);
++	ccci_event_buffer.write_pos = 0;
++	ccci_event_buffer.data_size = 0;
++
++	ret = misc_register(&ccci_log_dev);
++	if (ret)
++		goto err_event;
++
++	ret = misc_register(&ccci_dump_dev);
++	if (ret)
++		goto err_dump;
++
++	ccci_logdev_registered = true;
++
++	return 0;
++
++err_dump:
++	misc_deregister(&ccci_log_dev);
++err_event:
++	kfree(ccci_event_buffer.buffer);
++	ccci_event_buffer.buffer = NULL;
++err_log:
++	kfree(ccci_log_buf.buffer);
++	ccci_log_buf.buffer = NULL;
++
++	return ret;
++}
++
++void ccci_util_logdev_exit(void)
++{
++	if (!ccci_logdev_registered)
++		return;
++
++	misc_deregister(&ccci_dump_dev);
++	misc_deregister(&ccci_log_dev);
++	ccci_logdev_registered = false;
++
++	kfree(ccci_event_buffer.buffer);
++	ccci_event_buffer.buffer = NULL;
++	ccci_event_buffer.write_pos = 0;
++	ccci_event_buffer.data_size = 0;
++
++	kfree(ccci_log_buf.buffer);
++	ccci_log_buf.buffer = NULL;
++	ccci_log_buf.write_pos = 0;
++	ccci_log_buf.data_size = 0;
++}
++
++/* Downstream entry point name, ccci_private_log.c:969. */
++void ccci_log_init(void)
++{
++	int ret = ccci_util_logdev_init();
++
++	if (ret)
++		pr_err("[ccci0/util] fail to init log devices: %d\n", ret);
++}
++EXPORT_SYMBOL_GPL(ccci_log_init);
+diff --git a/include/linux/ccci.h b/include/linux/ccci.h
+new file mode 100644
+index 000000000..d5bc2b4af
+--- /dev/null
++++ b/include/linux/ccci.h
+@@ -0,0 +1,285 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * CCCI (Cross Chip Communication Interface) public kernel API.
++ *
++ * Ported from the Samsung/MTK 3.18 downstream kernel:
++ *   drivers/misc/mediatek/include/mt-plat/mt_ccci_common.h
++ *   drivers/misc/mediatek/eccci/ccci_core.h
++ *   drivers/misc/mediatek/ccmni/ccmni.h
++ *
++ * This file is the frozen contract between the CCCI core, the CLDMA engine,
++ * the CCMNI netdev driver, the CCCI util driver and the C2K/dual-modem driver.
++ * Do not change existing declarations; append only if unavoidable.
++ */
++#ifndef __LINUX_CCCI_H
++#define __LINUX_CCCI_H
++
++#include <linux/types.h>
++#include <linux/skbuff.h>
++#include <linux/netdevice.h>
++#include <linux/device.h>
++
++/* Modem ids. Downstream md_id is 0-based (MD_SYS1 == 0). */
++enum ccci_md_id {
++	CCCI_MD_SYS1 = 0,
++	CCCI_MD_SYS2,
++	CCCI_MD_SYS3,
++	CCCI_MD_SYS4,
++	CCCI_MD_SYS5,
++	CCCI_MAX_MD_NUM,
++};
++
++/* Modem states, mirror downstream MD_STATE (eccci/ccci_core.h). */
++enum ccci_md_state {
++	CCCI_MD_INVALID = 0,
++	CCCI_MD_BOOTING,
++	CCCI_MD_READY,
++	CCCI_MD_EXCEPTION,
++	CCCI_MD_STOPPED,
++};
++
++/* Logical channel ids, verbatim from downstream mt_ccci_common.h. */
++enum ccci_ch {
++	CCCI_CONTROL_RX = 0,
++	CCCI_CONTROL_TX = 1,
++	CCCI_SYSTEM_RX = 2,
++	CCCI_SYSTEM_TX = 3,
++	CCCI_PCM_RX = 4,
++	CCCI_PCM_TX = 5,
++	CCCI_UART1_RX = 6,
++	CCCI_UART1_RX_ACK = 7,
++	CCCI_UART1_TX = 8,
++	CCCI_UART1_TX_ACK = 9,
++	CCCI_UART2_RX = 10,
++	CCCI_UART2_RX_ACK = 11,
++	CCCI_UART2_TX = 12,
++	CCCI_UART2_TX_ACK = 13,
++	CCCI_FS_RX = 14,
++	CCCI_FS_TX = 15,
++	CCCI_PMIC_RX = 16,
++	CCCI_PMIC_TX = 17,
++	CCCI_UEM_RX = 18,
++	CCCI_UEM_TX = 19,
++	CCCI_CCMNI1_RX = 20,
++	CCCI_CCMNI1_RX_ACK = 21,
++	CCCI_CCMNI1_TX = 22,
++	CCCI_CCMNI1_TX_ACK = 23,
++	CCCI_CCMNI2_RX = 24,
++	CCCI_CCMNI2_RX_ACK = 25,
++	CCCI_CCMNI2_TX = 26,
++	CCCI_CCMNI2_TX_ACK = 27,
++	CCCI_CCMNI3_RX = 28,
++	CCCI_CCMNI3_RX_ACK = 29,
++	CCCI_CCMNI3_TX = 30,
++	CCCI_CCMNI3_TX_ACK = 31,
++	CCCI_RPC_RX = 32,
++	CCCI_RPC_TX = 33,
++	CCCI_IPC_RX = 34,
++	CCCI_IPC_RX_ACK = 35,
++	CCCI_IPC_TX = 36,
++	CCCI_IPC_TX_ACK = 37,
++	CCCI_IPC_UART_RX = 38,
++	CCCI_IPC_UART_RX_ACK = 39,
++	CCCI_IPC_UART_TX = 40,
++	CCCI_IPC_UART_TX_ACK = 41,
++	CCCI_MD_LOG_RX = 42,
++	CCCI_MD_LOG_TX = 43,
++	CCCI_IT_RX = 50,
++	CCCI_IT_TX = 51,
++	CCCI_IMSV_UL = 52,
++	CCCI_IMSV_DL = 53,
++	CCCI_IMSC_UL = 54,
++	CCCI_IMSC_DL = 55,
++	CCCI_IMSA_UL = 56,
++	CCCI_IMSA_DL = 57,
++	CCCI_IMSDC_UL = 58,
++	CCCI_IMSDC_DL = 59,
++	CCCI_ICUSB_RX = 60,
++	CCCI_ICUSB_TX = 61,
++	CCCI_LB_IT_RX = 62,
++	CCCI_LB_IT_TX = 63,
++	CCCI_CCMNI1_DL_ACK = 64,
++	CCCI_CCMNI2_DL_ACK = 65,
++	CCCI_CCMNI3_DL_ACK = 66,
++	CCCI_STATUS_RX = 67,
++	CCCI_STATUS_TX = 68,
++	CCCI_CCMNI4_RX = 69,
++	CCCI_CCMNI4_RX_ACK = 70,
++	CCCI_CCMNI4_TX = 71,
++	CCCI_CCMNI4_TX_ACK = 72,
++	CCCI_CCMNI4_DLACK_RX = 73,
++	CCCI_CCMNI5_RX = 74,
++	CCCI_CCMNI5_RX_ACK = 75,
++	CCCI_CCMNI5_TX = 76,
++	CCCI_CCMNI5_TX_ACK = 77,
++	CCCI_CCMNI5_DLACK_RX = 78,
++	CCCI_CCMNI6_RX = 79,
++	CCCI_CCMNI6_RX_ACK = 80,
++	CCCI_CCMNI6_TX = 81,
++	CCCI_CCMNI6_TX_ACK = 82,
++	CCCI_CCMNI6_DLACK_RX = 83,
++	CCCI_CCMNI7_RX = 84,
++	CCCI_CCMNI7_RX_ACK = 85,
++	CCCI_CCMNI7_TX = 86,
++	CCCI_CCMNI7_TX_ACK = 87,
++	CCCI_CCMNI7_DLACK_RX = 88,
++	CCCI_CCMNI8_RX = 89,
++	CCCI_CCMNI8_RX_ACK = 90,
++	CCCI_CCMNI8_TX = 91,
++	CCCI_CCMNI8_TX_ACK = 92,
++	CCCI_CCMNI8_DLACK_RX = 93,
++	CCCI_MDL_MONITOR_DL = 94,
++	CCCI_MDL_MONITOR_UL = 95,
++	CCCI_RIL_IPC0_RX = 148,
++	CCCI_RIL_IPC0_TX = 149,
++	CCCI_RIL_IPC1_RX = 150,
++	CCCI_RIL_IPC1_TX = 151,
++	CCCI_VT_CTL_RX = 152,
++	CCCI_VT_CTL_TX = 153,
++	CCCI_C2K_PPP_DATA,
++	CCCI_C2K_AT,
++	CCCI_C2K_AT2,
++	CCCI_C2K_AT3,
++	CCCI_C2K_LB_DL,
++	CCCI_MONITOR_CH,
++	CCCI_DUMMY_CH,
++	CCCI_MAX_CH_NUM,
++	CCCI_MONITOR_CH_ID = 0xf0000000,
++	CCCI_FORCE_ASSERT_CH = 20090215,
++	CCCI_INVALID_CH_ID = 0xffffffff,
++};
++
++/* C2K channel ids, verbatim from downstream mt_ccci_common.h. */
++enum c2k_channel {
++	CTRL_CH_C2K = 0,
++	AUDIO_CH_C2K = 1,
++	DATA_PPP_CH_C2K = 2,
++	MDLOG_CTRL_CH_C2K = 3,
++	FS_CH_C2K = 4,
++	AT_CH_C2K = 5,
++	AGPS_CH_C2K = 6,
++	AT2_CH_C2K = 7,
++	AT3_CH_C2K = 8,
++	MDLOG_CH_C2K = 9,
++	STATUS_CH_C2K = 11,
++	NET1_CH_C2K = 12,
++	NET2_CH_C2K = 13,
++	NET3_CH_C2K = 14,
++	NET4_CH_C2K = 15,
++	NET5_CH_C2K = 16,
++	C2K_MAX_CH_NUM,
++};
++
++/* Downstream struct ccci_header (16 bytes, little endian). */
++struct ccci_header {
++	__le32 data[2];
++	u16 channel;
++	u16 seq_num:15;
++	u16 assert_bit:1;
++	__le32 reserved;
++} __packed;
++
++/* Modem capabilities, verbatim downstream MODEM_CAP_*. */
++#define CCCI_MD_CAP_NAPI		(1 << 0)
++#define CCCI_MD_CAP_TXBUSY_STOP		(1 << 1)
++#define CCCI_MD_CAP_SGIO		(1 << 2)
++#define CCCI_MD_CAP_CCMNI_DISABLE	(1 << 16)
++#define CCCI_MD_CAP_DATA_ACK_DVD	(1 << 17)
++#define CCCI_MD_CAP_CCMNI_SEQNO		(1 << 18)
++#define CCCI_MD_CAP_CCMNI_IRAT		(1 << 19)
++#define CCCI_MD_CAP_WORLD_PHONE		(1 << 20)
++#define CCCI_MD_CAP_CCMNI_MQ		(1 << 21)
++
++/* ------------------------------------------------------------------ */
++/* CCMNI <-> CCCI core binding (implemented by ccmni, used by core)    */
++/* ------------------------------------------------------------------ */
++struct ccmni_ch {
++	int rx;
++	int rx_ack;
++	int tx;
++	int tx_ack;
++	int dl_ack;
++	int multiq;
++};
++
++#define CCMNI_DRV_V0	0
++#define CCMNI_DRV_V1	1
++#define CCMNI_DRV_V2	2
++
++struct ccmni_ccci_ops {
++	int ccmni_ver;
++	int ccmni_num;
++	unsigned char name[16];
++	unsigned int md_ability;
++	unsigned int irat_md_id;
++	unsigned int napi_poll_weigh;
++	int (*send_pkt)(int md_id, int tx_ch, void *data);
++	int (*napi_poll)(int md_id, int rx_ch, struct napi_struct *napi, int weight);
++	int (*get_ccmni_ch)(int md_id, int ccmni_idx, struct ccmni_ch *channel);
++};
++
++int ccmni_init(int md_id, struct ccmni_ccci_ops *ccci_info);
++void ccmni_exit(int md_id);
++int ccmni_rx_callback(int md_id, int ccmni_idx, struct sk_buff *skb);
++void ccmni_md_state_callback(int md_id, int ccmni_idx, enum ccci_md_state state);
++
++/* ------------------------------------------------------------------ */
++/* Modem instantiation (implemented by the core, used by platform/C2K) */
++/* ------------------------------------------------------------------ */
++struct ccci_md_cfg {
++	unsigned int md_id;			/* enum ccci_md_id */
++	const char *name;			/* "md1", "md3" */
++	const char *firmware_name;		/* request_firmware() name */
++	phys_addr_t ccif_phys;			/* AP CCIF register block */
++	resource_size_t ccif_size;
++	unsigned int ccif_irq;
++	phys_addr_t md_boot_vector_phys;	/* 0 if unused */
++	phys_addr_t md_boot_vector_key_phys;
++	phys_addr_t md_boot_vector_en_phys;
++	phys_addr_t rgu_phys;
++	unsigned int sram_size;			/* CCIF SRAM bytes */
++	unsigned int capability;		/* CCCI_MD_CAP_* */
++	unsigned int irat_md_id;		/* CCCI_MAX_MD_NUM if none */
++};
++
++int ccci_register_modem(const struct ccci_md_cfg *cfg);
++void ccci_unregister_modem(unsigned int md_id);
++int ccci_md_get_state(unsigned int md_id);
++int ccci_md_set_irat(unsigned int md_id, unsigned int irat_md_id);
++
++/* ------------------------------------------------------------------ */
++/* CLDMA engine (implemented by ccci_cldma, used by the core)          */
++/* ------------------------------------------------------------------ */
++#define CCCI_CLDMA_Q_BASIC	0
++#define CCCI_CLDMA_Q_NET	1
++
++struct ccci_cldma;
++struct ccci_cldma_cfg {
++	struct device *dev;
++	void __iomem *ap_base;		/* AP_CLDMA_AO */
++	void __iomem *ap_pdn_base;	/* AP_CLDMA_PDN */
++	unsigned int irq;
++	phys_addr_t smem_phys;
++	size_t smem_size;
++};
++
++struct ccci_cldma *ccci_cldma_create(const struct ccci_cldma_cfg *cfg);
++void ccci_cldma_destroy(struct ccci_cldma *cd);
++int ccci_cldma_start(struct ccci_cldma *cd);
++void ccci_cldma_stop(struct ccci_cldma *cd);
++int ccci_cldma_send(struct ccci_cldma *cd, unsigned int qno, struct sk_buff *skb);
++void ccci_cldma_set_rx_cb(struct ccci_cldma *cd,
++			  void (*cb)(void *ctx, unsigned int qno, struct sk_buff *skb),
++			  void *ctx);
++
++/* ------------------------------------------------------------------ */
++/* CCCI util (implemented by ccci_util, used by core)                  */
++/* ------------------------------------------------------------------ */
++int ccci_util_init(void);
++void ccci_util_exit(void);
++int ccci_util_log_init(unsigned int md_id, struct device *dev);
++void ccci_util_log_exit(unsigned int md_id);
++void ccci_util_log(unsigned int md_id, const char *fmt, ...) __printf(2, 3);
++void ccci_util_dump_mem(unsigned int md_id, const void *buf, size_t len);
++
++#endif /* __LINUX_CCCI_H */

@@ -1,0 +1,5859 @@
+diff --git a/drivers/mfd/mt6397-core.c b/drivers/mfd/mt6397-core.c
+index 3e58d0764..5bc7a2f99 100644
+--- a/drivers/mfd/mt6397-core.c
++++ b/drivers/mfd/mt6397-core.c
+@@ -102,6 +102,10 @@ static const struct resource mt6328_keys_resources[] = {
+ 	DEFINE_RES_IRQ_NAMED(MT6328_IRQ_STATUS_HOMEKEY_R, "homekey_r"),
+ };
+ 
++static const struct resource mt6328_accdet_resources[] = {
++	DEFINE_RES_IRQ_NAMED(MT6328_IRQ_STATUS_ACCDET, "accdet"),
++};
++
+ static const struct resource mt6357_keys_resources[] = {
+ 	DEFINE_RES_IRQ_NAMED(MT6357_IRQ_PWRKEY, "powerkey"),
+ 	DEFINE_RES_IRQ_NAMED(MT6357_IRQ_HOMEKEY, "homekey"),
+@@ -157,6 +161,14 @@ static const struct mfd_cell mt6328_devs[] = {
+ 		.num_resources = ARRAY_SIZE(mt6328_keys_resources),
+ 		.resources = mt6328_keys_resources,
+ 		.of_compatible = "mediatek,mt6328-keys"
++	}, {
++		.name = "mt6328-codec",
++		.of_compatible = "mediatek,mt6328-codec"
++	}, {
++		.name = "mt6328-accdet",
++		.num_resources = ARRAY_SIZE(mt6328_accdet_resources),
++		.resources = mt6328_accdet_resources,
++		.of_compatible = "mediatek,mt6328-accdet"
+ 	},
+ };
+ 
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 5cc79d151..4cf3f3141 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -660,4 +660,5 @@ source "drivers/misc/mchp_pci1xxxx/Kconfig"
+ source "drivers/misc/keba/Kconfig"
+ source "drivers/misc/amd-sbi/Kconfig"
+ source "drivers/misc/rp1/Kconfig"
++source "drivers/misc/mediatek/accdet/Kconfig"
+ endmenu
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index b32a2597d..3298f70aa 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -75,3 +75,4 @@ obj-$(CONFIG_MCHP_LAN966X_PCI)	+= lan966x-pci.o
+ obj-y				+= keba/
+ obj-y				+= amd-sbi/
+ obj-$(CONFIG_MISC_RP1)		+= rp1/
++obj-$(CONFIG_MTK_ACCDET)	+= mediatek/accdet/
+diff --git a/drivers/misc/mediatek/accdet/Kconfig b/drivers/misc/mediatek/accdet/Kconfig
+new file mode 100644
+index 000000000..86ab1cb89
+--- /dev/null
++++ b/drivers/misc/mediatek/accdet/Kconfig
+@@ -0,0 +1,13 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config MTK_ACCDET
++	tristate "MediaTek MT6328 PMIC accessory detection support"
++	depends on MFD_MT6397 || COMPILE_TEST
++	help
++	  Say Y here to enable the accessory detection (headset jack) block
++	  inside the MediaTek MT6328 PMIC.  It reports headset plug/unplug,
++	  3-pole/4-pole cable type and headset button events through the
++	  accdet notifier API.
++
++	  The MT6328 PMIC itself is supported by the MFD_MT6397 driver.
++
++	  If unsure, say N.
+diff --git a/drivers/misc/mediatek/accdet/Makefile b/drivers/misc/mediatek/accdet/Makefile
+new file mode 100644
+index 000000000..9f0ec33db
+--- /dev/null
++++ b/drivers/misc/mediatek/accdet/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_MTK_ACCDET)	+= accdet.o
+diff --git a/drivers/misc/mediatek/accdet/accdet-regs.h b/drivers/misc/mediatek/accdet/accdet-regs.h
+new file mode 100644
+index 000000000..7c6b7bb60
+--- /dev/null
++++ b/drivers/misc/mediatek/accdet/accdet-regs.h
+@@ -0,0 +1,135 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * MT6328 PMIC accessory detection (ACCDET) register and bit definitions.
++ *
++ * Port from Samsung/MTK downstream
++ * drivers/misc/mediatek/accdet/mt6735/reg_accdet.h (MediaTek, GPL-2.0).
++ *
++ * All addresses are absolute MT6328 PMIC register addresses and are accessed
++ * through the parent PMIC regmap (16-bit register/16-bit value).
++ */
++
++#ifndef __MT6328_ACCDET_REGS_H
++#define __MT6328_ACCDET_REGS_H
++
++/* Register addresses, downstream reg_accdet.h:4-45. */
++#define ACCDET_TOP_RST_ACCDET		0x0298	/* reg_accdet.h:5 */
++#define ACCDET_TOP_RST_ACCDET_SET	0x029a	/* reg_accdet.h:6 */
++#define ACCDET_TOP_RST_ACCDET_CLR	0x029c	/* reg_accdet.h:7 */
++
++#define ACCDET_INT_CON			0x02ac	/* reg_accdet.h:9 */
++#define ACCDET_INT_CON_SET		0x02ae	/* reg_accdet.h:10 */
++#define ACCDET_INT_CON_CLR		0x02b0	/* reg_accdet.h:11 */
++
++#define ACCDET_TOP_CKPDN		0x0248	/* reg_accdet.h:16 */
++#define ACCDET_TOP_CKPDN_SET		0x024a	/* reg_accdet.h:17 */
++#define ACCDET_TOP_CKPDN_CLR		0x024c	/* reg_accdet.h:18 */
++
++#define ACCDET_RSV			0x0f14	/* reg_accdet.h:20 */
++#define ACCDET_CTRL			0x0f16	/* reg_accdet.h:21 */
++#define ACCDET_STATE_SWCTRL		0x0f18	/* reg_accdet.h:22 */
++#define ACCDET_PWM_WIDTH		0x0f1a	/* reg_accdet.h:23 */
++#define ACCDET_PWM_THRESH		0x0f1c	/* reg_accdet.h:24 */
++#define ACCDET_EN_DELAY_NUM		0x0f1e	/* reg_accdet.h:25 */
++#define ACCDET_DEBOUNCE0		0x0f20	/* reg_accdet.h:26 */
++#define ACCDET_DEBOUNCE1		0x0f22	/* reg_accdet.h:27 */
++#define ACCDET_DEBOUNCE3		0x0f26	/* reg_accdet.h:29 */
++#define ACCDET_DEBOUNCE4		0x0f28	/* reg_accdet.h:30 */
++#define ACCDET_IRQ_STS			0x0f2c	/* reg_accdet.h:32 */
++#define ACCDET_STATE_RG			0x0f30	/* reg_accdet.h:34 */
++
++#define ACCDET_AUXADC_CTL		0x0e88	/* reg_accdet.h:40 */
++#define ACCDET_AUXADC_CTL_SET		0x0e8a	/* reg_accdet.h:41 */
++#define ACCDET_AUXADC_REG		0x0e0a	/* reg_accdet.h:42 */
++#define ACCDET_AUXADC_AUTO_SPL		0x0eca	/* reg_accdet.h:43 */
++
++/* Downstream calls this ACCDET_ADC_REG (reg_accdet.h:45); it is
++ * MT6328_AUDENC_ANA_CON9 (upmu_hw.h:612) and holds the mic bias fields.
++ */
++#define ACCDET_ADC_REG			0x0d00
++
++/* Register bits, downstream reg_accdet.h:47-131. */
++#define ACCDET_AUXADC_AUTO_SET		BIT(0)	/* reg_accdet.h:49 */
++#define ACCDET_DATA_READY		BIT(15)	/* reg_accdet.h:50 */
++#define ACCDET_CH_REQ_EN		BIT(5)	/* reg_accdet.h:51 */
++#define ACCDET_DATA_MASK		GENMASK(11, 0)	/* reg_accdet.h:52 */
++
++#define ACCDET_INPUT_MICP		BIT(3)	/* reg_accdet.h:62 */
++
++#define ACCDET_ENABLE			BIT(0)	/* reg_accdet.h:89 */
++#define ACCDET_DISABLE			0	/* reg_accdet.h:90 */
++
++#define ACCDET_RESET_SET		BIT(4)	/* reg_accdet.h:92 */
++#define ACCDET_RESET_CLR		BIT(4)	/* reg_accdet.h:93 */
++
++#define ACCDET_IRQ_CLR_BIT		0x100	/* reg_accdet.h:95 */
++#define ACCDET_IRQ_STATUS_BIT		BIT(0)	/* reg_accdet.h:98 */
++/* Bit 15 of ACCDET_IRQ_STS is preserved on every downstream
++ * read-modify-write (accdet.c:883, 889).
++ */
++#define ACCDET_IRQ_STS_RSVD		BIT(15)
++
++#define ACCDET_RG_IRQ_SET		BIT(12)	/* reg_accdet.h:108 */
++#define ACCDET_RG_IRQ_CLR		BIT(12)	/* reg_accdet.h:109 */
++
++#define ACCDET_RG_CLK_SET		BIT(9)	/* reg_accdet.h:121 */
++#define ACCDET_RG_CLK_CLR		BIT(9)	/* reg_accdet.h:122 */
++
++#define ACCDET_SWCTRL_EN		0x07	/* reg_accdet.h:128 */
++#define ACCDET_SWCTRL_IDLE_EN		(0x07 << 4)	/* reg_accdet.h:143 */
++#define ACCDET_DE4			0x42	/* 2 ms, reg_accdet.h:131 */
++
++/* ACCDET_STATE_RG[7:6] = A/B comparator state (accdet.c:944). */
++#define ACCDET_AB_MASK			GENMASK(7, 6)
++#define ACCDET_AB_SHIFT			6
++
++/* A/B comparator codes (accdet.c:35-38). */
++#define ACCDET_AB_3POLE			0x0	/* TYPE_AB_00 */
++#define ACCDET_AB_4POLE			0x1	/* TYPE_AB_01 */
++#define ACCDET_AB_EXTERNAL		0x2	/* TYPE_AB_10 */
++#define ACCDET_AB_PLUG_OUT		0x3	/* TYPE_AB_11 */
++
++/* MT6328_AUDENC_ANA_CON9 (ACCDET_ADC_REG) mic bias fields, upmu_hw.h:7106-7117. */
++#define ACCDET_AUDMICBIAS1DCSWPEN	BIT(5)	/* upmu_hw.h:7108 */
++#define ACCDET_AUDMICBIASVREF_SHIFT	8	/* upmu_hw.h:7117 */
++#define ACCDET_AUDMICBIASVREF_MASK	GENMASK(10, 8)	/* upmu_hw.h:7116 */
++
++/* Test mode bit that raises the mic bias reference to 2.8 V (accdet.c:1457). */
++#define ACCDET_ADC_2V8_TEST		BIT(7)
++
++/* Timing and conversion constants. */
++#define ACCDET_IRQ_TIMEOUT_NS		0x61a80		/* 400 us, accdet.h:24 */
++#define ACCDET_BUTTON_PRESS_DEBOUNCE	0x400		/* accdet.c:69 */
++#define ACCDET_KEY_RELEASE_DEBOUNCE	0x800		/* accdet.c:1071 */
++#define ACCDET_ADC_FULL_SCALE_MV	1800		/* accdet.c:296 */
++#define ACCDET_ADC_FULL_SCALE		4096		/* accdet.c:296 */
++
++/* Downstream polls the ready bit without a bound (accdet.c:288-289); the
++ * timeout below only prevents a stuck interrupt thread. [INFERENCE]
++ */
++#define ACCDET_ADC_POLL_US		100
++#define ACCDET_ADC_TIMEOUT_US		100000
++
++/* PMIC OTP/efuse read sequence used for the headset ADC offset,
++ * downstream power/mt6735/pmic.c:5155-5195.  Register names from upmu_hw.h.
++ */
++#define ACCDET_CKHWEN_CON0_CLR		0x027c	/* upmu_hw.h:115 */
++#define ACCDET_CKPDN_CON3_CLR		0x0252	/* upmu_hw.h:94 */
++#define ACCDET_CKPDN_CON3_SET		0x0250	/* upmu_hw.h:93 */
++#define ACCDET_CKHWEN_CON0_SET		0x027a	/* upmu_hw.h:114 */
++#define ACCDET_OTP_CON0			0x0c00	/* upmu_hw.h:484 */
++#define ACCDET_OTP_CON8			0x0c10	/* upmu_hw.h:492 */
++#define ACCDET_OTP_CON11		0x0c16	/* upmu_hw.h:495 */
++#define ACCDET_OTP_CON12		0x0c18	/* upmu_hw.h:496 */
++#define ACCDET_OTP_CON13		0x0c1a	/* upmu_hw.h:497 */
++
++#define ACCDET_OTP_ENGINE_EN		BIT(0)	/* OTP_CON11, pmic.c:5166 */
++#define ACCDET_OTP_READ_TRIGGER		BIT(0)	/* OTP_CON8,  pmic.c:5176 */
++#define ACCDET_OTP_READY		BIT(0)	/* OTP_CON13, pmic.c:5182 */
++#define ACCDET_OTP_ROW_MASK		GENMASK(5, 1)	/* pmic.c:5172 */
++#define ACCDET_OTP_ROW_SHIFT		1
++#define ACCDET_OTP_ROW		0x10	/* accdet.c:1362 */
++#define ACCDET_OTP_READY_POLL_US	1000
++#define ACCDET_OTP_READY_TIMEOUT_US	20000	/* [INFERENCE] downstream loops forever */
++
++#endif /* __MT6328_ACCDET_REGS_H */
+diff --git a/drivers/misc/mediatek/accdet/accdet.c b/drivers/misc/mediatek/accdet/accdet.c
+new file mode 100644
+index 000000000..dd63da6e0
+--- /dev/null
++++ b/drivers/misc/mediatek/accdet/accdet.c
+@@ -0,0 +1,1056 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MT6328 PMIC accessory detection (ACCDET) driver.
++ *
++ * Port from Samsung/MTK downstream
++ * drivers/misc/mediatek/accdet/mt6735/accdet.c
++ * (Samsung SM-G532M "grandpplte" GPL kernel, MT6737T + MT6328 PMIC).
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * The ROM build enables CONFIG_ACCDET_EINT
++ * (arch/arm/configs/grandpplte_00_defconfig:1402) and detects plug/unplug
++ * through an AP GPIO EINT while the PMIC ACCDET interrupt reports the
++ * hook-switch/button state.  This driver uses the PMIC ACCDET interrupt for
++ * both: the MT6735 EINT in this kernel has no programmable debounce
++ * (mt6735_eint_hw has no .db_time, so gpiod_set_debounce() returns
++ * -EOPNOTSUPP) whereas the ACCDET block has its own debounce registers that
++ * are programmed from DT.  The unit therefore stays enabled while idle, which
++ * is the downstream non-EINT configuration (accdet.c:1451-1453).
++ *
++ * Not ported (deliberate): the /dev/accdet misc device and ioctls, the
++ * Samsung SEC_JACK_SYSFS jack factory, the TS3A225E accessory switch, pin
++ * swap / pin recognition and the call-state handling; all of those are HAL or
++ * factory interfaces.  The input device that downstream uses to inject key
++ * codes is replaced by the accdet notifier.
++ */
++
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/interrupt.h>
++#include <linux/iopoll.h>
++#include <linux/mfd/mt6328/accdet.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/notifier.h>
++#include <linux/of.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/workqueue.h>
++
++#include "accdet-regs.h"
++
++/* Downstream enum accdet_status, accdet.h:96-103.  STAND_BY is only reached
++ * from the HAL ioctl and is not implemented.
++ */
++enum accdet_hw_state {
++	ACCDET_HW_PLUG_OUT = 0,
++	ACCDET_HW_MIC_BIAS = 1,
++	ACCDET_HW_HOOK_SWITCH = 2,
++	ACCDET_HW_EXT_CABLE = 3,
++};
++
++/* Downstream struct headset_mode_settings, accdet.h:79-87. */
++struct accdet_settings {
++	u32 pwm_width;
++	u32 pwm_thresh;
++	u32 fall_delay;
++	u32 rise_delay;
++	u32 debounce0;
++	u32 debounce1;
++	u32 debounce3;
++};
++
++struct accdet_priv {
++	struct device *dev;
++	struct regmap *regmap;
++	int irq;
++
++	struct accdet_settings set;
++
++	/* headset-vol-threshold, accdet.c:1318-1337 */
++	u32 vol_min_3pole;
++	u32 vol_max_3pole;
++	u32 vol_min_4pole;
++	u32 vol_max_4pole;
++	u32 vol_bias;
++
++	/* headset-{three,four}-key-threshold, accdet.c:1310-1324 */
++	bool four_key;
++	u32 key_mid;
++	u32 key_voice;
++	u32 key_up;
++	u32 key_down;
++
++	u32 mic_mode_vol;		/* accdet-mic-vol */
++	u32 mic_mode;			/* accdet-mic-mode */
++	/*
++	 * accdet-plugout-debounce: debounce of the plug-out edge for the AP
++	 * GPIO EINT path.  Parsed for DT parity; unused because this driver
++	 * takes plug-out from the PMIC ACCDET comparator.
++	 */
++	u32 plugout_debounce;
++
++	s8 auxadc_offset;
++
++	enum accdet_cable_type cable;
++	bool plugged;
++	int button;
++	int mic_mv;
++	unsigned int hw_state;
++
++	bool pending_plug;
++	bool pending_button;
++
++	struct work_struct work;
++	struct workqueue_struct *wq;
++	struct mutex lock;
++	bool suspended;
++};
++
++/* Defaults are the ROM DTB values (rom_dtb_0.dts:4024). */
++static const u32 accdet_default_mode_setting[] = {
++	0x500, 0x500, 0x1, 0x1f0, 0x800, 0x800, 0x20,
++};
++
++static const u32 accdet_default_vol_threshold[] = {
++	0x0, 0x252, 0x253, 0x270f, 0xaf0,
++};
++
++static const u32 accdet_default_three_key[] = { 0x0, 0x7a, 0xd4, 0x1e8 };
++static const u32 accdet_default_four_key[] = { 0x0, 0x55, 0x7a, 0xd4, 0x1e8 };
++
++static struct accdet_priv *accdet_instance;
++static BLOCKING_NOTIFIER_HEAD(accdet_notifier);
++
++static void accdet_fill_state(struct accdet_priv *priv,
++			      struct accdet_state *state)
++{
++	state->cable = priv->cable;
++	state->plugged = priv->plugged;
++	state->button = priv->button;
++	state->mic_adc = priv->mic_mv;
++}
++
++/*
++ * One-shot AUXADC conversion of the mic line, downstream
++ * Accdet_PMIC_IMM_GetOneChannelValue(), accdet.c:252-300.
++ */
++static int accdet_measure_mic(struct accdet_priv *priv, unsigned int *mv)
++{
++	u32 val;
++	int ret;
++
++	ret = regmap_write(priv->regmap, ACCDET_AUXADC_CTL_SET,
++			   ACCDET_CH_REQ_EN);
++	if (ret)
++		return ret;
++
++	usleep_range(3000, 3500);	/* downstream mdelay(3), accdet.c:287 */
++
++	ret = regmap_read_poll_timeout(priv->regmap, ACCDET_AUXADC_REG, val,
++				       (val & ACCDET_DATA_READY) ==
++							ACCDET_DATA_READY,
++				       ACCDET_ADC_POLL_US,
++				       ACCDET_ADC_TIMEOUT_US);
++	if (ret)
++		return ret;
++
++	val &= ACCDET_DATA_MASK;
++	/* accdet.c:296-298: 12-bit code, 1.8 V reference, efuse offset */
++	val = val * ACCDET_ADC_FULL_SCALE_MV / ACCDET_ADC_FULL_SCALE;
++	if (val > priv->auxadc_offset)
++		val -= priv->auxadc_offset;
++	else
++		val = 0;
++
++	*mv = val;
++	return 0;
++}
++
++/* Downstream key_check(), accdet.c:728-744. */
++static int accdet_key_check(struct accdet_priv *priv, unsigned int mv)
++{
++	if (mv < priv->key_down && mv >= priv->key_up)
++		return ACCDET_BUTTON_VOLDOWN;
++
++	if (priv->four_key) {
++		if (mv < priv->key_up && mv >= priv->key_voice)
++			return ACCDET_BUTTON_VOLUP;
++		if (mv < priv->key_voice && mv >= priv->key_mid)
++			return ACCDET_BUTTON_VOICE;
++	} else if (mv < priv->key_up && mv >= priv->key_mid) {
++		return ACCDET_BUTTON_VOLUP;
++	}
++
++	if (mv < priv->key_mid)
++		return ACCDET_BUTTON_MEDIA;
++
++	return ACCDET_BUTTON_NONE;
++}
++
++/*
++ * Downstream multi_key_detection(), accdet.c:772-806.  A press is seen as the
++ * comparator dropping back to the 3-pole code, a release as it returning to
++ * the 4-pole code.
++ */
++static void accdet_multi_key_detection(struct accdet_priv *priv,
++				       unsigned int current_status)
++{
++	unsigned int mv;
++	u32 sts;
++	int ret;
++
++	if (current_status == ACCDET_AB_3POLE) {
++		ret = accdet_measure_mic(priv, &mv);
++		if (ret) {
++			dev_warn_ratelimited(priv->dev,
++					     "key ADC read failed: %d\n", ret);
++			return;
++		}
++		priv->mic_mv = mv;
++		priv->button = accdet_key_check(priv, mv);
++	} else {
++		priv->button = ACCDET_BUTTON_NONE;
++	}
++
++	msleep(30);	/* downstream mdelay(30), accdet.c:789 */
++
++	ret = regmap_read(priv->regmap, ACCDET_IRQ_STS, &sts);
++	if (ret || !(sts & ACCDET_IRQ_STATUS_BIT)) {
++		priv->pending_button = true;
++	} else {
++		/* Plug-out side effect, downstream accdet.c:799-801 */
++		dev_dbg(priv->dev, "ignoring key %d, cable event pending\n",
++			priv->button);
++		priv->button = ACCDET_BUTTON_NONE;
++	}
++
++	if (current_status != ACCDET_AB_3POLE)
++		priv->button = ACCDET_BUTTON_NONE;
++}
++
++/* Downstream headset_plug_out(), accdet.c:285-304. */
++static void accdet_plug_out(struct accdet_priv *priv)
++{
++	priv->hw_state = ACCDET_HW_PLUG_OUT;
++	priv->cable = ACCDET_CABLE_NONE;
++	priv->plugged = false;
++	priv->mic_mv = -1;
++
++	if (priv->button != ACCDET_BUTTON_NONE) {
++		priv->button = ACCDET_BUTTON_NONE;
++		priv->pending_button = true;
++	}
++}
++
++/*
++ * Downstream check_cable_type(), accdet.c:894-1267, ported for the
++ * NO_USE_COMPARATOR configuration with the state changes guarded by
++ * eint_accdet_sync_flag (always 1 here, accdet.c:1885).  Plug-out is taken
++ * from the ACCDET comparator instead of the AP EINT.
++ */
++static void accdet_check_cable_type(struct accdet_priv *priv)
++{
++	enum accdet_cable_type old_cable = priv->cable;
++	bool old_plugged = priv->plugged;
++	unsigned int status, mv;
++	u32 ab;
++	int ret;
++
++	ret = regmap_read(priv->regmap, ACCDET_STATE_RG, &ab);
++	if (ret)
++		return;
++
++	ab = (ab & ACCDET_AB_MASK) >> ACCDET_AB_SHIFT;
++
++	if (ab == ACCDET_AB_PLUG_OUT) {
++		accdet_plug_out(priv);
++		goto out;
++	}
++
++	ret = accdet_measure_mic(priv, &mv);
++	if (ret) {
++		dev_warn_ratelimited(priv->dev, "mic ADC read failed: %d\n",
++				     ret);
++		return;
++	}
++	priv->mic_mv = mv;
++
++	/* Downstream check_pole_type(), accdet.c:356-381. */
++	if (mv < priv->vol_max_4pole + 1 &&
++	    (int)mv > (int)priv->vol_min_4pole - 1)
++		status = ACCDET_AB_4POLE;
++	else if (mv < priv->vol_max_3pole + 1 && mv > priv->vol_min_3pole)
++		status = ACCDET_AB_3POLE;
++	else
++		status = ACCDET_AB_EXTERNAL;
++
++	switch (priv->hw_state) {
++	case ACCDET_HW_PLUG_OUT:
++		/* accdet.c:918-1015 */
++		switch (status) {
++		case ACCDET_AB_3POLE:
++			priv->cable = ACCDET_CABLE_HEADPHONE;
++			priv->hw_state = ACCDET_HW_HOOK_SWITCH;
++			break;
++		case ACCDET_AB_4POLE:
++			priv->cable = ACCDET_CABLE_HEADSET;
++			priv->hw_state = ACCDET_HW_MIC_BIAS;
++			/* AB=11 debounce 30 ms, accdet.c:1004-1006 */
++			regmap_write(priv->regmap, ACCDET_DEBOUNCE3,
++				     priv->set.debounce3 * 30);
++			regmap_write(priv->regmap, ACCDET_DEBOUNCE0,
++				     ACCDET_BUTTON_PRESS_DEBOUNCE);
++			break;
++		default:
++			/* External cable, downstream EXT_CABLE/NO_DEVICE */
++			priv->cable = ACCDET_CABLE_NONE;
++			priv->hw_state = ACCDET_HW_EXT_CABLE;
++			break;
++		}
++		break;
++
++	case ACCDET_HW_MIC_BIAS:
++		/* accdet.c:1018-1097: restore the hook switch debounce */
++		regmap_write(priv->regmap, ACCDET_DEBOUNCE0,
++			     priv->set.debounce0);
++		switch (status) {
++		case ACCDET_AB_3POLE:
++			priv->hw_state = ACCDET_HW_HOOK_SWITCH;
++			/* reduce the release key debounce, accdet.c:1071 */
++			regmap_write(priv->regmap, ACCDET_DEBOUNCE1,
++				     ACCDET_KEY_RELEASE_DEBOUNCE);
++			accdet_multi_key_detection(priv, status);
++			/* recover PWM frequency and duty, accdet.c:1077-1078 */
++			regmap_write(priv->regmap, ACCDET_PWM_WIDTH,
++				     priv->set.pwm_width - 1);
++			regmap_write(priv->regmap, ACCDET_PWM_THRESH,
++				     priv->set.pwm_thresh - 1);
++			break;
++		case ACCDET_AB_4POLE:
++			/* no change, accdet.c:1088-1096 */
++			break;
++		default:
++			priv->cable = ACCDET_CABLE_NONE;
++			priv->hw_state = ACCDET_HW_EXT_CABLE;
++			break;
++		}
++		break;
++
++	case ACCDET_HW_HOOK_SWITCH:
++		/* accdet.c:1100-1174: restore the mic bias debounce */
++		regmap_write(priv->regmap, ACCDET_DEBOUNCE1,
++			     priv->set.debounce1);
++		switch (status) {
++		case ACCDET_AB_3POLE:
++			/* keep the state, accdet.c:1134-1143 */
++			break;
++		case ACCDET_AB_4POLE:
++			accdet_multi_key_detection(priv, status);
++			priv->hw_state = ACCDET_HW_MIC_BIAS;
++			priv->cable = ACCDET_CABLE_HEADSET;
++			regmap_write(priv->regmap, ACCDET_DEBOUNCE0,
++				     ACCDET_BUTTON_PRESS_DEBOUNCE);
++			break;
++		default:
++			priv->cable = ACCDET_CABLE_NONE;
++			priv->hw_state = ACCDET_HW_EXT_CABLE;
++			break;
++		}
++		break;
++
++	case ACCDET_HW_EXT_CABLE:
++		/* accdet.c:1177-1210 */
++		switch (status) {
++		case ACCDET_AB_3POLE:
++			priv->cable = ACCDET_CABLE_HEADPHONE;
++			priv->hw_state = ACCDET_HW_HOOK_SWITCH;
++			break;
++		case ACCDET_AB_4POLE:
++			accdet_multi_key_detection(priv, status);
++			priv->hw_state = ACCDET_HW_MIC_BIAS;
++			priv->cable = ACCDET_CABLE_HEADSET;
++			break;
++		default:
++			break;
++		}
++		break;
++	}
++
++	priv->plugged = priv->cable == ACCDET_CABLE_HEADPHONE ||
++			priv->cable == ACCDET_CABLE_HEADSET;
++
++out:
++	if (old_cable != priv->cable || old_plugged != priv->plugged)
++		priv->pending_plug = true;
++}
++
++static void accdet_work_fn(struct work_struct *work)
++{
++	struct accdet_priv *priv = container_of(work, struct accdet_priv, work);
++	struct accdet_state state;
++	bool plug = false, button = false;
++
++	mutex_lock(&priv->lock);
++	if (!priv->suspended) {
++		priv->pending_plug = false;
++		priv->pending_button = false;
++		accdet_check_cable_type(priv);
++		plug = priv->pending_plug;
++		button = priv->pending_button;
++	}
++	accdet_fill_state(priv, &state);
++	mutex_unlock(&priv->lock);
++
++	/* Downstream reports the key first, then the plug state. */
++	if (button)
++		blocking_notifier_call_chain(&accdet_notifier,
++					     ACCDET_EVENT_BUTTON, &state);
++	if (plug)
++		blocking_notifier_call_chain(&accdet_notifier,
++					     ACCDET_EVENT_PLUG, &state);
++}
++
++/* Downstream clear_accdet_interrupt(), accdet.c:881-887. */
++static void accdet_clear_irq(struct accdet_priv *priv)
++{
++	u32 val;
++
++	if (regmap_read(priv->regmap, ACCDET_IRQ_STS, &val))
++		return;
++
++	regmap_write(priv->regmap, ACCDET_IRQ_STS,
++		     (val & ACCDET_IRQ_STS_RSVD) | ACCDET_IRQ_CLR_BIT);
++}
++
++/*
++ * Downstream accdet_irq_handler() for the non-EINT configuration,
++ * accdet.c:854-878.
++ */
++static irqreturn_t accdet_irq_thread(int irq, void *data)
++{
++	struct accdet_priv *priv = data;
++	u32 val;
++
++	if (!regmap_read(priv->regmap, ACCDET_IRQ_STS, &val) &&
++	    (val & ACCDET_IRQ_STATUS_BIT))
++		accdet_clear_irq(priv);
++
++	if (priv->hw_state == ACCDET_HW_MIC_BIAS) {
++		/* accdet.c:859-862 */
++		regmap_write(priv->regmap, ACCDET_PWM_WIDTH,
++			     priv->set.pwm_width - 1);
++		regmap_write(priv->regmap, ACCDET_PWM_THRESH,
++			     priv->set.pwm_width - 1);
++	}
++
++	queue_work(priv->wq, &priv->work);
++
++	/* Wait for the unit to drop the status bit, 400 us, accdet.c:874-877 */
++	regmap_read_poll_timeout(priv->regmap, ACCDET_IRQ_STS, val,
++				 !(val & ACCDET_IRQ_STATUS_BIT), 10,
++				 ACCDET_IRQ_TIMEOUT_NS / 1000);
++
++	return IRQ_HANDLED;
++}
++
++/*
++ * Downstream disable_accdet(), accdet.c:319-355.  The build with
++ * CONFIG_ACCDET_EINT also clears ACCDET_STATE_SWCTRL and gates the clock.
++ */
++static void accdet_disable(struct accdet_priv *priv)
++{
++	u32 val;
++
++	regmap_write(priv->regmap, ACCDET_INT_CON_CLR, ACCDET_RG_IRQ_CLR);
++	accdet_clear_irq(priv);
++	udelay(200);
++
++	regmap_read_poll_timeout(priv->regmap, ACCDET_IRQ_STS, val,
++				 !(val & ACCDET_IRQ_STATUS_BIT), 20000,
++				 ACCDET_ADC_TIMEOUT_US);
++
++	regmap_read(priv->regmap, ACCDET_IRQ_STS, &val);
++	regmap_write(priv->regmap, ACCDET_IRQ_STS, val & ~ACCDET_IRQ_CLR_BIT);
++
++	regmap_write(priv->regmap, ACCDET_STATE_SWCTRL, 0);
++	regmap_write(priv->regmap, ACCDET_CTRL, ACCDET_DISABLE);
++	regmap_write(priv->regmap, ACCDET_TOP_CKPDN_SET, ACCDET_RG_CLK_SET);
++}
++
++/*
++ * Downstream accdet_init(), accdet.c:1368-1462, with the non-EINT tail
++ * (accdet.c:1451-1453) so the unit keeps running to detect the next plug.
++ * Re-running this is also how the driver restores its registers after
++ * suspend/hibernation.
++ */
++static int accdet_hw_init(struct accdet_priv *priv)
++{
++	struct regmap *map = priv->regmap;
++	u32 val;
++	int ret;
++
++	/* Clock gate */
++	ret = regmap_write(map, ACCDET_TOP_CKPDN_CLR, ACCDET_RG_CLK_CLR);
++	if (ret)
++		return ret;
++
++	/* Reset the ACCDET unit */
++	ret = regmap_write(map, ACCDET_TOP_RST_ACCDET_SET, ACCDET_RESET_SET);
++	if (ret)
++		return ret;
++	ret = regmap_write(map, ACCDET_TOP_RST_ACCDET_CLR, ACCDET_RESET_CLR);
++	if (ret)
++		return ret;
++
++	/* PWM frequency and duty */
++	ret = regmap_write(map, ACCDET_PWM_WIDTH, priv->set.pwm_width - 1);
++	if (ret)
++		return ret;
++	ret = regmap_write(map, ACCDET_PWM_THRESH, priv->set.pwm_thresh - 1);
++	if (ret)
++		return ret;
++	ret = regmap_write(map, ACCDET_STATE_SWCTRL, ACCDET_SWCTRL_EN);
++	if (ret)
++		return ret;
++
++	/* Rise and fall delay of the PWM */
++	ret = regmap_write(map, ACCDET_EN_DELAY_NUM,
++			   (priv->set.fall_delay << 15) | priv->set.rise_delay);
++	if (ret)
++		return ret;
++
++	/* Debounce times */
++	ret = regmap_write(map, ACCDET_DEBOUNCE0, priv->set.debounce0);
++	if (ret)
++		return ret;
++	ret = regmap_write(map, ACCDET_DEBOUNCE1, priv->set.debounce1);
++	if (ret)
++		return ret;
++	ret = regmap_write(map, ACCDET_DEBOUNCE3, priv->set.debounce3);
++	if (ret)
++		return ret;
++	ret = regmap_write(map, ACCDET_DEBOUNCE4, ACCDET_DE4);
++	if (ret)
++		return ret;
++
++	/* Enable the ACCDET interrupt inside the PMIC block */
++	ret = regmap_read(map, ACCDET_IRQ_STS, &val);
++	if (ret)
++		return ret;
++	ret = regmap_write(map, ACCDET_IRQ_STS, val & ~ACCDET_IRQ_CLR_BIT);
++	if (ret)
++		return ret;
++	ret = regmap_write(map, ACCDET_INT_CON_SET, ACCDET_RG_IRQ_SET);
++	if (ret)
++		return ret;
++
++	/* Mic bias reference from accdet-mic-vol */
++	ret = regmap_update_bits(map, ACCDET_ADC_REG,
++				 ACCDET_AUDMICBIASVREF_MASK,
++				 priv->mic_mode_vol << ACCDET_AUDMICBIASVREF_SHIFT);
++	if (ret)
++		return ret;
++
++	ret = regmap_write(map, ACCDET_RSV, 0x1290);
++	if (ret)
++		return ret;
++
++	/* accdet-mic-mode, accdet.c:1425-1435 */
++	switch (priv->mic_mode) {
++	case 1:		/* ACC mode */
++		ret = regmap_update_bits(map, ACCDET_ADC_REG,
++					 ACCDET_AUDMICBIAS1DCSWPEN, 0);
++		break;
++	case 2:		/* low cost mode without internal bias */
++		ret = regmap_update_bits(map, ACCDET_RSV, ACCDET_INPUT_MICP,
++					 ACCDET_INPUT_MICP);
++		break;
++	case 6:		/* low cost mode with internal bias */
++		ret = regmap_update_bits(map, ACCDET_RSV, ACCDET_INPUT_MICP,
++					 ACCDET_INPUT_MICP);
++		if (!ret)
++			ret = regmap_update_bits(map, ACCDET_ADC_REG,
++						 ACCDET_AUDMICBIAS1DCSWPEN,
++						 ACCDET_AUDMICBIAS1DCSWPEN);
++		break;
++	default:
++		dev_warn(priv->dev, "unsupported accdet-mic-mode %u\n",
++			 priv->mic_mode);
++		break;
++	}
++	if (ret)
++		return ret;
++
++	/* External bias of 2.8 V, accdet.c:1456-1458 */
++	if (priv->vol_bias == 2800) {
++		ret = regmap_update_bits(map, ACCDET_ADC_REG,
++					 ACCDET_ADC_2V8_TEST,
++					 ACCDET_ADC_2V8_TEST);
++		if (ret)
++			return ret;
++	}
++
++	/* Enable AUXADC auto sampling, accdet.c:1460 */
++	ret = regmap_update_bits(map, ACCDET_AUXADC_AUTO_SPL,
++				 ACCDET_AUXADC_AUTO_SET,
++				 ACCDET_AUXADC_AUTO_SET);
++	if (ret)
++		return ret;
++
++	/* Downstream non-EINT tail: keep the unit enabled. */
++	return regmap_write(map, ACCDET_CTRL, ACCDET_ENABLE);
++}
++
++/*
++ * Headset ADC offset from the PMIC OTP, downstream
++ * accdet_pmic_Read_Efuse_HPOffset(), accdet.c:1358-1366, and
++ * pmic_Read_Efuse_HPOffset(), power/mt6735/pmic.c:5155-5195.
++ */
++static int accdet_read_efuse_offset(struct accdet_priv *priv)
++{
++	struct regmap *map = priv->regmap;
++	unsigned int val;
++	s16 efuse;
++	int ret;
++
++	/* 1. Enable the efuse control engine clock */
++	ret = regmap_write(map, ACCDET_CKHWEN_CON0_CLR, 0x0040);
++	if (!ret)
++		ret = regmap_write(map, ACCDET_CKPDN_CON3_CLR, 0x0004);
++	if (ret)
++		goto disable;
++
++	/* 2. Enable the OTP engine */
++	ret = regmap_update_bits(map, ACCDET_OTP_CON11, ACCDET_OTP_ENGINE_EN,
++				 ACCDET_OTP_ENGINE_EN);
++	if (ret)
++		goto disable;
++
++	/* 3. Row to read */
++	ret = regmap_update_bits(map, ACCDET_OTP_CON0, ACCDET_OTP_ROW_MASK,
++				 ACCDET_OTP_ROW << ACCDET_OTP_ROW_SHIFT);
++	if (ret)
++		goto disable;
++
++	/* 4. Toggle the read trigger */
++	udelay(100);
++	ret = regmap_read(map, ACCDET_OTP_CON8, &val);
++	if (ret)
++		goto disable;
++	ret = regmap_update_bits(map, ACCDET_OTP_CON8, ACCDET_OTP_READ_TRIGGER,
++				 (val & ACCDET_OTP_READ_TRIGGER) ? 0 :
++						ACCDET_OTP_READ_TRIGGER);
++	if (ret)
++		goto disable;
++
++	/* 5. Wait for the engine */
++	udelay(300);
++	ret = regmap_read_poll_timeout(map, ACCDET_OTP_CON13, val,
++				       !(val & ACCDET_OTP_READY),
++				       ACCDET_OTP_READY_POLL_US,
++				       ACCDET_OTP_READY_TIMEOUT_US);
++	if (ret)
++		goto disable;
++
++	/* 0x0C1A and 0x0C18 need at least 1 ms between them */
++	udelay(1000);
++
++	/* 6. Read the data */
++	ret = regmap_read(map, ACCDET_OTP_CON12, &val);
++	if (ret)
++		goto disable;
++
++	efuse = (s16)val;
++	priv->auxadc_offset = ((efuse >> 8) & 0xff) / 2;
++	dev_dbg(priv->dev, "efuse 0x%x, auxadc offset %d mV\n",
++		val, priv->auxadc_offset);
++
++	/* 7. Disable the efuse control engine clock */
++disable:
++	regmap_write(map, ACCDET_CKPDN_CON3_SET, 0x0004);
++	regmap_write(map, ACCDET_CKHWEN_CON0_SET, 0x0040);
++
++	return ret;
++}
++
++/*
++ * Map the A/B comparator to a cable state, as downstream
++ * mt_accdet_pm_restore_noirq() does, accdet.c:1989-2013.
++ */
++static void accdet_sync_state_from_ab(struct accdet_priv *priv)
++{
++	unsigned int ab;
++	u32 val;
++
++	if (regmap_read(priv->regmap, ACCDET_STATE_RG, &val))
++		return;
++
++	ab = (val & ACCDET_AB_MASK) >> ACCDET_AB_SHIFT;
++
++	switch (ab) {
++	case ACCDET_AB_3POLE:
++		priv->cable = ACCDET_CABLE_HEADPHONE;
++		priv->hw_state = ACCDET_HW_HOOK_SWITCH;
++		break;
++	case ACCDET_AB_4POLE:
++		priv->cable = ACCDET_CABLE_HEADSET;
++		priv->hw_state = ACCDET_HW_MIC_BIAS;
++		break;
++	case ACCDET_AB_EXTERNAL:
++		priv->cable = ACCDET_CABLE_NONE;
++		priv->hw_state = ACCDET_HW_EXT_CABLE;
++		break;
++	default:
++		priv->cable = ACCDET_CABLE_NONE;
++		priv->hw_state = ACCDET_HW_PLUG_OUT;
++		break;
++	}
++
++	priv->plugged = priv->cable == ACCDET_CABLE_HEADPHONE ||
++			priv->cable == ACCDET_CABLE_HEADSET;
++}
++
++static void accdet_parse_dt(struct accdet_priv *priv)
++{
++	struct device_node *np = priv->dev->of_node;
++	u32 vals[7];
++	u32 four[5];
++	u32 three[4];
++
++	memcpy(vals, accdet_default_mode_setting, sizeof(vals));
++	of_property_read_u32_array(np, "headset-mode-setting", vals,
++				   ARRAY_SIZE(vals));
++	priv->set.pwm_width = vals[0];
++	priv->set.pwm_thresh = vals[1];
++	priv->set.fall_delay = vals[2];
++	priv->set.rise_delay = vals[3];
++	priv->set.debounce0 = vals[4];
++	priv->set.debounce1 = vals[5];
++	priv->set.debounce3 = vals[6];
++
++	priv->mic_mode_vol = 7;
++	of_property_read_u32(np, "accdet-mic-vol", &priv->mic_mode_vol);
++
++	priv->mic_mode = 1;
++	of_property_read_u32(np, "accdet-mic-mode", &priv->mic_mode);
++
++	priv->plugout_debounce = 20;
++	of_property_read_u32(np, "accdet-plugout-debounce",
++			     &priv->plugout_debounce);
++
++	memcpy(vals, accdet_default_vol_threshold,
++	       sizeof(accdet_default_vol_threshold));
++	of_property_read_u32_array(np, "headset-vol-threshold", vals,
++				   ARRAY_SIZE(accdet_default_vol_threshold));
++	priv->vol_min_3pole = vals[0];
++	priv->vol_max_3pole = vals[1];
++	priv->vol_min_4pole = vals[2];
++	priv->vol_max_4pole = vals[3];
++	priv->vol_bias = vals[4];
++
++	/* accdet.c:1330-1335 */
++	if (priv->vol_bias > 2500)
++		priv->vol_bias = 2800;
++
++	/*
++	 * Both tables are filled with their ROM defaults; a board that only
++	 * describes the three-key table gets the three-key mapping, everything
++	 * else (including an empty DT) uses the four-key mapping of the ROM
++	 * build (defconfig:1406).
++	 */
++	memcpy(four, accdet_default_four_key, sizeof(four));
++	memcpy(three, accdet_default_three_key, sizeof(three));
++	of_property_read_u32_array(np, "headset-four-key-threshold", four,
++				   ARRAY_SIZE(four));
++	of_property_read_u32_array(np, "headset-three-key-threshold", three,
++				   ARRAY_SIZE(three));
++
++	priv->four_key = !of_property_present(np, "headset-three-key-threshold") ||
++			 of_property_present(np, "headset-four-key-threshold");
++
++	if (priv->four_key) {
++		priv->key_mid = four[1];
++		priv->key_voice = four[2];
++		priv->key_up = four[3];
++		priv->key_down = four[4];
++	} else {
++		priv->key_mid = three[1];
++		priv->key_up = three[2];
++		priv->key_down = three[3];
++	}
++
++	dev_dbg(priv->dev,
++		"pwm 0x%x/0x%x delay %u/0x%x deb 0x%x/0x%x/0x%x, mic vol %u, mic mode %u, %s-key\n",
++		priv->set.pwm_width, priv->set.pwm_thresh,
++		priv->set.fall_delay, priv->set.rise_delay,
++		priv->set.debounce0, priv->set.debounce1, priv->set.debounce3,
++		priv->mic_mode_vol, priv->mic_mode,
++		priv->four_key ? "four" : "three");
++}
++
++/*
++ * Downstream accdet_setup_eint() selects "state_eint_as_int" to mux the
++ * headset-detect pins as plain GPIO (accdet.c:601-611).  This driver does not
++ * use the AP EINT, but the state is part of the board description and keeps
++ * the pins in the ROM configuration.
++ */
++static void accdet_setup_pinctrl(struct accdet_priv *priv)
++{
++	struct pinctrl_state *state;
++	struct pinctrl *pctl;
++
++	pctl = devm_pinctrl_get(priv->dev);
++	if (IS_ERR(pctl))
++		return;
++
++	state = pinctrl_lookup_state(pctl, "state_eint_as_int");
++	if (IS_ERR(state))
++		return;
++
++	if (pinctrl_select_state(pctl, state))
++		dev_warn(priv->dev, "cannot select state_eint_as_int\n");
++}
++
++static int accdet_probe(struct platform_device *pdev)
++{
++	struct accdet_priv *priv;
++	int ret;
++
++	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->dev = &pdev->dev;
++	priv->regmap = dev_get_regmap(pdev->dev.parent, NULL);
++	if (!priv->regmap)
++		return dev_err_probe(&pdev->dev, -ENODEV,
++				     "no parent PMIC regmap\n");
++
++	if (!pdev->dev.of_node) {
++		dev_dbg(&pdev->dev, "no DT node, nothing to do\n");
++		return -ENODEV;
++	}
++
++	priv->irq = platform_get_irq(pdev, 0);
++	if (priv->irq < 0)
++		return priv->irq;
++
++	accdet_parse_dt(priv);
++
++	if (!priv->set.pwm_width || !priv->set.pwm_thresh)
++		return dev_err_probe(&pdev->dev, -EINVAL,
++				     "invalid headset-mode-setting\n");
++	if (priv->mic_mode_vol > (ACCDET_AUDMICBIASVREF_MASK >>
++				  ACCDET_AUDMICBIASVREF_SHIFT))
++		return dev_err_probe(&pdev->dev, -EINVAL,
++				     "invalid accdet-mic-vol %u\n",
++				     priv->mic_mode_vol);
++
++	accdet_setup_pinctrl(priv);
++
++	priv->cable = ACCDET_CABLE_NONE;
++	priv->plugged = false;
++	priv->button = ACCDET_BUTTON_NONE;
++	priv->mic_mv = -1;
++	priv->hw_state = ACCDET_HW_PLUG_OUT;
++	mutex_init(&priv->lock);
++
++	priv->wq = alloc_ordered_workqueue("mt6328-accdet", 0);
++	if (!priv->wq)
++		return -ENOMEM;
++	INIT_WORK(&priv->work, accdet_work_fn);
++
++	platform_set_drvdata(pdev, priv);
++
++	ret = accdet_hw_init(priv);
++	if (ret) {
++		dev_err(&pdev->dev, "hardware init failed: %d\n", ret);
++		goto err_wq;
++	}
++
++	ret = accdet_read_efuse_offset(priv);
++	if (ret)
++		dev_warn(&pdev->dev, "efuse read failed, offset 0: %d\n", ret);
++
++	/* Boot-time jack state from the comparator.  No notification: the
++	 * consumer queries it through accdet_get_state().
++	 */
++	accdet_sync_state_from_ab(priv);
++
++	ret = devm_request_threaded_irq(&pdev->dev, priv->irq, NULL,
++					accdet_irq_thread,
++					IRQF_ONESHOT, "mt6328-accdet", priv);
++	if (ret) {
++		dev_err(&pdev->dev, "failed to request irq %d: %d\n",
++			priv->irq, ret);
++		goto err_disable;
++	}
++
++	accdet_instance = priv;
++
++	dev_info(&pdev->dev, "MT6328 ACCDET ready, irq %d, initial cable %d\n",
++		 priv->irq, priv->cable);
++	return 0;
++
++err_disable:
++	accdet_disable(priv);
++err_wq:
++	destroy_workqueue(priv->wq);
++	return ret;
++}
++
++static void accdet_remove(struct platform_device *pdev)
++{
++	struct accdet_priv *priv = platform_get_drvdata(pdev);
++
++	disable_irq(priv->irq);
++	cancel_work_sync(&priv->work);
++
++	mutex_lock(&priv->lock);
++	accdet_disable(priv);
++	mutex_unlock(&priv->lock);
++
++	destroy_workqueue(priv->wq);
++	accdet_instance = NULL;
++}
++
++static int accdet_suspend(struct device *dev)
++{
++	struct accdet_priv *priv = dev_get_drvdata(dev);
++
++	disable_irq(priv->irq);
++	cancel_work_sync(&priv->work);
++
++	mutex_lock(&priv->lock);
++	priv->suspended = true;
++	/* Keep the unit running while a headset is attached. */
++	if (!priv->plugged)
++		accdet_disable(priv);
++	mutex_unlock(&priv->lock);
++
++	return 0;
++}
++
++static int accdet_resume(struct device *dev)
++{
++	struct accdet_priv *priv = dev_get_drvdata(dev);
++	struct accdet_state state;
++	enum accdet_cable_type old_cable;
++	bool old_plugged;
++	int ret = 0;
++
++	mutex_lock(&priv->lock);
++	old_cable = priv->cable;
++	old_plugged = priv->plugged;
++	if (!priv->plugged) {
++		ret = accdet_hw_init(priv);
++		if (!ret)
++			accdet_sync_state_from_ab(priv);
++	}
++	priv->suspended = false;
++	accdet_fill_state(priv, &state);
++	mutex_unlock(&priv->lock);
++
++	enable_irq(priv->irq);
++
++	if (ret) {
++		dev_err(priv->dev, "resume init failed: %d\n", ret);
++		return ret;
++	}
++
++	if (old_cable != priv->cable || old_plugged != priv->plugged)
++		blocking_notifier_call_chain(&accdet_notifier,
++					     ACCDET_EVENT_PLUG, &state);
++
++	return 0;
++}
++
++/*
++ * Downstream mt_accdet_pm_restore_noirq(), accdet.c:1980-2060, for the
++ * hibernation path.  Unlike downstream, the full init sequence is replayed
++ * because the PMIC register contents are not preserved across hibernation.
++ */
++static int accdet_restore_noirq(struct device *dev)
++{
++	struct accdet_priv *priv = dev_get_drvdata(dev);
++	struct accdet_state state;
++	enum accdet_cable_type old_cable;
++	bool old_plugged;
++	int ret;
++
++	mutex_lock(&priv->lock);
++	old_cable = priv->cable;
++	old_plugged = priv->plugged;
++	ret = accdet_hw_init(priv);
++	if (!ret)
++		accdet_sync_state_from_ab(priv);
++	priv->suspended = false;
++	accdet_fill_state(priv, &state);
++	mutex_unlock(&priv->lock);
++
++	if (ret)
++		return ret;
++
++	if (old_cable != priv->cable || old_plugged != priv->plugged)
++		blocking_notifier_call_chain(&accdet_notifier,
++					     ACCDET_EVENT_PLUG, &state);
++
++	return 0;
++}
++
++int accdet_register_notifier(struct notifier_block *nb)
++{
++	return blocking_notifier_chain_register(&accdet_notifier, nb);
++}
++EXPORT_SYMBOL_GPL(accdet_register_notifier);
++
++void accdet_unregister_notifier(struct notifier_block *nb)
++{
++	blocking_notifier_chain_unregister(&accdet_notifier, nb);
++}
++EXPORT_SYMBOL_GPL(accdet_unregister_notifier);
++
++int accdet_get_state(struct accdet_state *state)
++{
++	struct accdet_priv *priv = READ_ONCE(accdet_instance);
++
++	if (!priv)
++		return -ENODEV;
++
++	mutex_lock(&priv->lock);
++	accdet_fill_state(priv, state);
++	mutex_unlock(&priv->lock);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(accdet_get_state);
++
++static const struct of_device_id accdet_of_match[] = {
++	{ .compatible = "mediatek,mt6328-accdet" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, accdet_of_match);
++
++static const struct dev_pm_ops accdet_pm_ops = {
++	.suspend = accdet_suspend,
++	.resume = accdet_resume,
++	.restore_noirq = accdet_restore_noirq,
++};
++
++static struct platform_driver accdet_driver = {
++	.probe = accdet_probe,
++	.remove = accdet_remove,
++	.driver = {
++		.name = "mt6328-accdet",
++		.of_match_table = accdet_of_match,
++		.pm = &accdet_pm_ops,
++	},
++};
++module_platform_driver(accdet_driver);
++
++MODULE_DESCRIPTION("MediaTek MT6328 PMIC accessory detection driver");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("platform:mt6328-accdet");
+diff --git a/include/linux/mfd/mt6328/accdet.h b/include/linux/mfd/mt6328/accdet.h
+new file mode 100644
+index 000000000..b72c8fead
+--- /dev/null
++++ b/include/linux/mfd/mt6328/accdet.h
+@@ -0,0 +1,87 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * MT6328 PMIC accessory detection (ACCDET) client interface.
++ *
++ * The ACCDET block lives in the MT6328 PMIC.  The machine driver consumes
++ * the jack state reported here and forwards it to the ASoC jack.
++ *
++ * Port from Samsung/MTK downstream drivers/misc/mediatek/accdet/mt6735/
++ */
++
++#ifndef __LINUX_MFD_MT6328_ACCDET_H
++#define __LINUX_MFD_MT6328_ACCDET_H
++
++#include <linux/notifier.h>
++#include <linux/types.h>
++
++enum accdet_cable_type {
++	ACCDET_CABLE_NONE = 0,
++	ACCDET_CABLE_HEADPHONE,		/* 3-pole, no microphone */
++	ACCDET_CABLE_HEADSET,		/* 4-pole with microphone */
++	ACCDET_CABLE_HEADSET_5POLE,	/* 5-pole with microphone */
++	ACCDET_CABLE_UNKNOWN,
++};
++
++/*
++ * Headset key indices reported in &struct accdet_state.button, ordered by
++ * increasing mic-ADC voltage.  This order comes from the downstream four-key
++ * mapping (accdet.c:728-744) with the ROM thresholds
++ * headset-four-key-threshold = <0 85 122 212 488>.
++ */
++enum accdet_button {
++	ACCDET_BUTTON_NONE = 0,		/* released */
++	ACCDET_BUTTON_MEDIA = 1,	/* KEY_PLAYPAUSE */
++	ACCDET_BUTTON_VOICE = 2,	/* KEY_VOICECOMMAND */
++	ACCDET_BUTTON_VOLUP = 3,	/* KEY_VOLUMEUP */
++	ACCDET_BUTTON_VOLDOWN = 4,	/* KEY_VOLUMEDOWN */
++};
++
++/**
++ * struct accdet_state - current accessory state
++ * @cable: detected cable type
++ * @plugged: true when something is plugged in
++ * @button: headset key index, 0 = released, 1..4 = key pressed.  A release
++ *          notification carries 0; the consumer must remember the index of
++ *          the preceding press notification.
++ * @mic_adc: mic ADC voltage in millivolts used for cable detection,
++ *           negative if unknown
++ */
++struct accdet_state {
++	enum accdet_cable_type cable;
++	bool plugged;
++	int button;
++	int mic_adc;
++};
++
++/*
++ * Notifier events.  For both events @data points to a struct accdet_state
++ * that is only valid for the duration of the notification.
++ */
++#define ACCDET_EVENT_PLUG	0	/* plugged/unplugged or cable type change */
++#define ACCDET_EVENT_BUTTON	1	/* headset key state change */
++
++/*
++ * IS_REACHABLE(): a built-in consumer of a modular accdet driver gets the
++ * stubs instead of an unresolved symbol, so the sound card stays linkable.
++ */
++#if IS_REACHABLE(CONFIG_MTK_ACCDET)
++int accdet_register_notifier(struct notifier_block *nb);
++void accdet_unregister_notifier(struct notifier_block *nb);
++int accdet_get_state(struct accdet_state *state);
++#else
++static inline int accdet_register_notifier(struct notifier_block *nb)
++{
++	return -ENODEV;
++}
++
++static inline void accdet_unregister_notifier(struct notifier_block *nb)
++{
++}
++
++static inline int accdet_get_state(struct accdet_state *state)
++{
++	return -ENODEV;
++}
++#endif
++
++#endif /* __LINUX_MFD_MT6328_ACCDET_H */
+diff --git a/sound/soc/codecs/Kconfig b/sound/soc/codecs/Kconfig
+index adb3fb923..8ef41db60 100644
+--- a/sound/soc/codecs/Kconfig
++++ b/sound/soc/codecs/Kconfig
+@@ -2756,6 +2756,15 @@ config SND_SOC_ML26124
+ 	tristate
+ 	depends on I2C
+ 
++config SND_SOC_MT6331
++	tristate "MediaTek MT6328 PMIC Codec (vendor name MT6331)"
++	depends on MFD_MT6397
++	help
++	  Enable support for the audio codec block of the MT6328 PMIC as
++	  found on MT6735/MT6737 SoCs.  The vendor driver for this block is
++	  named mt6331, but the silicon is an MT6328 and only the MT6328
++	  audio register map is implemented.
++
+ config SND_SOC_MT6351
+ 	tristate "MediaTek MT6351 Codec"
+ 
+diff --git a/sound/soc/codecs/Makefile b/sound/soc/codecs/Makefile
+index 3ddee5298..4f69ca5bf 100644
+--- a/sound/soc/codecs/Makefile
++++ b/sound/soc/codecs/Makefile
+@@ -187,6 +187,7 @@ snd-soc-mc13783-y := mc13783.o
+ snd-soc-ml26124-y := ml26124.o
+ snd-soc-msm8916-analog-y := msm8916-wcd-analog.o
+ snd-soc-msm8916-digital-y := msm8916-wcd-digital.o
++snd-soc-mt6331-y := mt6331.o
+ snd-soc-mt6351-y := mt6351.o
+ snd-soc-mt6357-y := mt6357.o
+ snd-soc-mt6358-y := mt6358.o
+@@ -618,6 +619,7 @@ obj-$(CONFIG_SND_SOC_MC13783)	+= snd-soc-mc13783.o
+ obj-$(CONFIG_SND_SOC_ML26124)	+= snd-soc-ml26124.o
+ obj-$(CONFIG_SND_SOC_MSM8916_WCD_ANALOG) +=snd-soc-msm8916-analog.o
+ obj-$(CONFIG_SND_SOC_MSM8916_WCD_DIGITAL) +=snd-soc-msm8916-digital.o
++obj-$(CONFIG_SND_SOC_MT6331)	+= snd-soc-mt6331.o
+ obj-$(CONFIG_SND_SOC_MT6351)	+= snd-soc-mt6351.o
+ obj-$(CONFIG_SND_SOC_MT6357)	+= snd-soc-mt6357.o
+ obj-$(CONFIG_SND_SOC_MT6358)	+= snd-soc-mt6358.o
+diff --git a/sound/soc/codecs/mt6331.c b/sound/soc/codecs/mt6331.c
+new file mode 100644
+index 000000000..825b2fb60
+--- /dev/null
++++ b/sound/soc/codecs/mt6331.c
+@@ -0,0 +1,1714 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MT6328 PMIC audio codec driver (MT6735 / MT6737)
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ * Copyright (c) 2024 The Nura project
++ *
++ * Port from Samsung/MTK downstream:
++ *   sound/soc/mediatek/mt_soc_audio_v3/mt_soc_codec_63xx.c
++ *   sound/soc/mediatek/mt_soc_audio_v3/mt_soc_codec_speaker_63xx.c
++ *   sound/soc/mediatek/mt_soc_audio_v3/AudDrv_Ana.{c,h}
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * The vendor driver is named "mt6331" (ROM symbols mt6331_codec_probe,
++ * mt6331_read, mt6331_write) but the PMIC on MT6737T/grandpplte is an MT6328
++ * and only the MT6328 audio register map is programmed here.  In the vendor
++ * kernel every one of these registers is a PMIC register reached over pwrap
++ * (AudDrv_Ana.c:67-104 Ana_Set_Reg/Ana_Get_Reg), therefore the driver is a
++ * plain regmap client of the parent PMIC and never touches the SoC AFE MMIO.
++ *
++ * Sequence/source citations use the form "vendor:LINE" for
++ * sound/soc/mediatek/mt_soc_audio_v3/mt_soc_codec_63xx.c, "spk:LINE" for
++ * mt_soc_codec_speaker_63xx.c and "upmu:LINE" for
++ * drivers/misc/mediatek/include/mt-plat/mt6735/include/mach/upmu_hw.h.
++ */
++
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/mfd/mt6397/core.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <sound/jack.h>
++#include <sound/pcm.h>
++#include <sound/soc.h>
++#include <sound/soc-dapm.h>
++#include <sound/tlv.h>
++
++#include "mt6331.h"
++
++/* Vendor names (AudDrv_Def.h:273-295) */
++#define MT6331_CODEC_NAME		"mt-soc-codec"
++#define MT6331_TXDAI_NAME		"mt-soc-codec-tx-dai"
++#define MT6331_TXDAI2_NAME		"mt-soc-codec-tx-dai2"
++#define MT6331_RXDAI_NAME		"mt-soc-codec-rx-dai"
++#define MT6331_DL1_STREAM_NAME		"MultiMedia1_PLayback"
++#define MT6331_DL2_STREAM_NAME		"MultiMedia2_PLayback"
++#define MT6331_UL1_STREAM_NAME		"MultiMedia1_Capture"
++
++/* Vendor trim indexes (mt_soc_pcm_common.h:204-206) */
++#define MT6331_HP_TRIM_INDEX		8	/* 0 dB */
++#define MT6331_SPK_TRIM_INDEX		4	/* 6 dB */
++
++/* Vendor microphone bias reference, always programmed when a bias is enabled
++ * (vendor:3280 "MISBIAS0 = 1P9V", vendor:3287).
++ */
++#define MT6331_MICBIAS_VREF_DEFAULT	7
++
++/* Analog/digital block states, used to mirror the vendor driver's
++ * mAudio_Ana_DevicePower[] bookkeeping and to gate the shared "last user"
++ * power-down paths (vendor:203 GetDLStatus, vendor:3210 GetAdcStatus).
++ */
++#define MT6331_ST_DAC			BIT(0)
++#define MT6331_ST_ADC_SUPPLY		BIT(1)
++#define MT6331_ST_PGA_L			BIT(2)
++#define MT6331_ST_PGA_R			BIT(3)
++#define MT6331_ST_MICBIAS1		BIT(4)
++#define MT6331_ST_MICBIAS2		BIT(5)
++#define MT6331_ST_ADC			BIT(6)
++#define MT6331_ST_HP			BIT(7)
++#define MT6331_ST_EARPIECE		BIT(8)
++#define MT6331_ST_SPEAKER		BIT(9)
++
++#define MT6331_ST_OUTPUTS		(MT6331_ST_HP | MT6331_ST_EARPIECE | \
++					 MT6331_ST_SPEAKER)
++
++struct mt6331_priv {
++	struct device *dev;
++	struct regmap *regmap;
++	struct gpio_desc *hp_depop;
++
++	/* Serializes the analog sequences (vendor Ana_Ctrl_Mutex). */
++	struct mutex ana_lock;
++	/* Vendor ClsqCount / TopCkCount / NvRegCount counters. */
++	struct mutex clk_lock;		/* vendor Ana_Clk_Mutex (TopCk + NvReg) */
++	struct mutex clksq_lock;	/* vendor AudAna_lock (ClsqEnable) */
++	unsigned int clksq_users;
++	unsigned int topck_users;
++	unsigned int audglb_users;
++
++	unsigned int state;		/* MT6331_ST_* */
++	unsigned int suspend_state;	/* saved on suspend */
++
++	unsigned int dl_rate;		/* vendor mBlockSampleRate[OUT_DAC] */
++	unsigned int ul_rate;		/* vendor mBlockSampleRate[IN_ADC] */
++
++	unsigned int micbias_ref;	/* vendor MicbiasRef */
++	bool micbias_ref_saved;		/* vendor GetMicbias */
++	bool headset_mic;		/* jack reports a headset microphone */
++	unsigned int mic_gain;		/* vendor mAudio_Ana_Volume[MICAMPx] */
++
++	struct snd_soc_jack *jack;
++	struct notifier_block jack_nb;
++};
++
++static int mt6331_ana_write(struct mt6331_priv *priv, unsigned int reg,
++			    unsigned int val, unsigned int mask)
++{
++	/* Identical to the vendor Ana_Set_Reg() read-modify-write. */
++	return regmap_update_bits(priv->regmap, reg, mask, val);
++}
++
++/* ------------------------------------------------------------------ */
++/* Reference counted PMIC clocks / global block (vendor:276-381)      */
++/* ------------------------------------------------------------------ */
++
++static int mt6331_clksq_enable(struct mt6331_priv *priv, bool enable)
++{
++	int ret = 0;
++
++	mutex_lock(&priv->clksq_lock);
++	if (enable) {
++		if (priv->clksq_users == 0) {
++			/* vendor:318 ClsqEnable: enable CLKSQ 26MHz and its
++			 * source clock.
++			 */
++			ret = mt6331_ana_write(priv, MT6328_TOP_CLKSQ,
++					       RG_CLKSQ_EN_AUD,
++					       RG_CLKSQ_EN_AUD);
++			if (!ret)
++				ret = mt6331_ana_write(priv,
++						       MT6328_TOP_CLKSQ_SET,
++						       RG_CLKSQ_EN_AUD,
++						       RG_CLKSQ_EN_AUD);
++		}
++		priv->clksq_users++;
++	} else {
++		if (priv->clksq_users)
++			priv->clksq_users--;
++		if (priv->clksq_users == 0) {
++			/* vendor:322-324 */
++			ret = mt6331_ana_write(priv, MT6328_TOP_CLKSQ_CLR,
++					       RG_CLKSQ_EN_AUD,
++					       RG_CLKSQ_EN_AUD);
++			if (!ret)
++				ret = mt6331_ana_write(priv, MT6328_TOP_CLKSQ,
++						       0, RG_CLKSQ_EN_AUD);
++		}
++	}
++	mutex_unlock(&priv->clksq_lock);
++
++	return ret;
++}
++
++static int mt6331_topck_enable(struct mt6331_priv *priv, bool enable)
++{
++	int ret = 0;
++
++	mutex_lock(&priv->clk_lock);
++	if (enable) {
++		if (priv->topck_users == 0) {
++			/* vendor:283: AUDNCP clock divider engine clock +
++			 * AUD 26M clock.
++			 */
++			ret = mt6331_ana_write(priv, MT6328_TOP_CKPDN_CON0_CLR,
++					       RG_AUD_CLK_GRP_VENDOR,
++					       RG_AUD_CLK_GRP_VENDOR);
++		}
++		priv->topck_users++;
++	} else {
++		if (priv->topck_users)
++			priv->topck_users--;
++		if (priv->topck_users == 0)
++			/* vendor:288 */
++			ret = mt6331_ana_write(priv, MT6328_TOP_CKPDN_CON0_SET,
++					       RG_AUD_CLK_GRP_VENDOR,
++					       RG_AUD_CLK_GRP_VENDOR);
++	}
++	mutex_unlock(&priv->clk_lock);
++
++	return ret;
++}
++
++static int mt6331_audglb_enable(struct mt6331_priv *priv, bool enable)
++{
++	int ret = 0;
++
++	mutex_lock(&priv->clk_lock);
++	if (enable) {
++		if (priv->audglb_users == 0)
++			/* vendor:369 NvregEnable: clear AUDGLB power down */
++			ret = mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON8, 0,
++					       RG_AUDGLB_PWRDN_VA28);
++		priv->audglb_users++;
++	} else {
++		if (priv->audglb_users)
++			priv->audglb_users--;
++		if (priv->audglb_users == 0)
++			/* vendor:373 */
++			ret = mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON8,
++					       RG_AUDGLB_PWRDN_VA28,
++					       RG_AUDGLB_PWRDN_VA28);
++	}
++	mutex_unlock(&priv->clk_lock);
++
++	return ret;
++}
++
++/* ------------------------------------------------------------------ */
++/* Downlink interface rate (vendor:1581 GetDLNewIFFrequency)          */
++/* ------------------------------------------------------------------ */
++static unsigned int mt6331_dl_if_freq(unsigned int rate)
++{
++	switch (rate) {
++	case 8000:
++		return 0;
++	case 11025:
++		return 1;
++	case 12000:
++		return 2;
++	case 16000:
++		return 3;
++	case 22050:
++		return 4;
++	case 24000:
++		return 5;
++	case 32000:
++		return 6;
++	case 44100:
++		return 7;
++	case 48000:
++	default:
++		return 8;
++	}
++}
++
++/* Uplink sample rate field (vendor:1290 ULSampleRateTransform) */
++static unsigned int mt6331_ul_rate_sel(unsigned int rate)
++{
++	switch (rate) {
++	case 16000:
++		return 1;
++	case 32000:
++		return 2;
++	case 48000:
++		return 3;
++	case 8000:
++	default:
++		return 0;
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* Downlink digital path (vendor:1618 TurnOnDacPower)                 */
++/* ------------------------------------------------------------------ */
++static int mt6331_dl_power_up(struct mt6331_priv *priv)
++{
++	int ret;
++
++	ret = mt6331_clksq_enable(priv, true);
++	if (ret)
++		return ret;
++	ret = mt6331_topck_enable(priv, true);
++	if (ret)
++		return ret;
++	udelay(250);
++	ret = mt6331_audglb_enable(priv, true);
++	if (ret)
++		return ret;
++
++	/* vendor:1628-1631 */
++	mt6331_ana_write(priv, MT6328_AFE_AUDIO_TOP_CON0,
++			 (priv->state & MT6331_ST_ADC) ? 0x0000 : 0x003a,
++			 0xffff);
++	/* vendor:1634-1637 */
++	mt6331_ana_write(priv, MT6328_AFUNC_AUD_CON2, 0x0006, 0xffff);
++	mt6331_ana_write(priv, MT6328_AFUNC_AUD_CON0, 0xc3a1, 0xffff);
++	mt6331_ana_write(priv, MT6328_AFUNC_AUD_CON2, 0x0003, 0xffff);
++	mt6331_ana_write(priv, MT6328_AFUNC_AUD_CON2, 0x000b, 0xffff);
++	/* vendor:1638-1640 */
++	mt6331_ana_write(priv, MT6328_AFE_DL_SDM_CON1, 0x001e, 0xffff);
++	mt6331_ana_write(priv, MT6328_AFE_UL_DL_CON0, 0x0001, 0xffff);
++	/* vendor:1641-1646 */
++	mt6331_ana_write(priv, MT6328_AFE_PMIC_NEWIF_CFG0,
++			 (mt6331_dl_if_freq(priv->dl_rate) <<
++			  RG_DL_IF_FREQ_SHIFT) | 0x0330, 0xffff);
++	mt6331_ana_write(priv, MT6328_AFE_DL_SRC2_CON0_H,
++			 (mt6331_dl_if_freq(priv->dl_rate) <<
++			  RG_DL_IF_FREQ_SHIFT) | 0x0300, 0xffff);
++	mt6331_ana_write(priv, MT6328_AFE_DL_SRC2_CON0_L, 0x0001, 0xffff);
++	/* vendor:1648 */
++	mt6331_ana_write(priv, MT6328_PMIC_AFE_TOP_CON0, 0x0000, 0xffff);
++
++	priv->state |= MT6331_ST_DAC;
++
++	return 0;
++}
++
++static int mt6331_dl_power_down(struct mt6331_priv *priv)
++{
++	priv->state &= ~MT6331_ST_DAC;
++
++	/* vendor:1654-1664 TurnOffDacPower */
++	mt6331_ana_write(priv, MT6328_AFE_DL_SRC2_CON0_L, 0x0000, 0xffff);
++	if (!(priv->state & MT6331_ST_ADC))
++		mt6331_ana_write(priv, MT6328_AFE_UL_DL_CON0, 0x0000, 0xffff);
++
++	udelay(250);
++
++	mt6331_ana_write(priv, MT6328_AFE_AUDIO_TOP_CON0, 0x0040, 0x0040);
++	mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON0, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON1, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON3, 0x0001, 0xffff);
++
++	mt6331_audglb_enable(priv, false);
++	mt6331_clksq_enable(priv, false);
++	mt6331_topck_enable(priv, false);
++
++	return 0;
++}
++
++/*
++ * Shared analog part of the downlink amplifiers: NCP clock generation, the
++ * cap-less LDOs and the negative voltage regulator (vendor:1749-1778 for the
++ * headphone/speaker values, vendor:1934-1963 for the earpiece values, which
++ * use 0x0A40/0x2AC0 and ZCD_CON0 = 0 instead).
++ */
++static int mt6331_dl_analog_up(struct mt6331_priv *priv, bool va33refgen,
++			       unsigned int zcd_con0)
++{
++	/* vendor:1749-1756 */
++	mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON1, 0x0001, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON2, 0x002b, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON0, 0x0001, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON4, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON3, 0x0000, 0xffff);
++	/* vendor:1757-1778: cap-less HC/LC LDO (1.5V) + NV regulator (-1.5V) */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6,
++			 va33refgen ? 0x0a41 : 0x0a40,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6,
++			 va33refgen ? 0x2ac1 : 0x2ac0,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON7, 0x8000,
++			 RG_NVREG_EN_VAUDP15);
++	mt6331_ana_write(priv, MT6328_ZCD_CON0, zcd_con0, 0xffff);
++
++	return 0;
++}
++
++/* vendor:1834-1849 (headphone), vendor:1965-1976 (earpiece),
++ * vendor:2104-2119 (speaker): the shared teardown when the last
++ * downlink output powers down.
++ */
++static int mt6331_dl_analog_down(struct mt6331_priv *priv)
++{
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON4, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac0,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON7, 0x0000,
++			 RG_NVREG_EN_VAUDP15);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x0001,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++
++	return 0;
++}
++
++/* vendor:1673-1703 HeadsetVoloumeRestore / vendor:1705-1732
++ * HeadsetVoloumeSet: the vendor ramps the zero-cross-detect gain one step at
++ * a time.  It keeps a single volume for both channels; here the left and
++ * right targets are ramped independently in the same step sequence.
++ */
++static void mt6331_hp_volume_ramp(struct mt6331_priv *priv, unsigned int l,
++				  unsigned int r)
++{
++	unsigned int val, cl, cr;
++
++	if (regmap_read(priv->regmap, MT6328_ZCD_CON2, &val))
++		return;
++	cl = val & RG_AUDHPLGAIN_MASK;
++	cr = (val >> RG_AUDHPRGAIN_SHIFT) & RG_AUDHPRGAIN_MASK;
++
++	while (cl != l || cr != r) {
++		if (cl < l)
++			cl++;
++		else if (cl > l)
++			cl--;
++		if (cr < r)
++			cr++;
++		else if (cr > r)
++			cr--;
++		mt6331_ana_write(priv, MT6328_ZCD_CON2,
++				 (cr << RG_AUDHPRGAIN_SHIFT) | cl, 0xf9f);
++		udelay(200);
++	}
++}
++
++/* Headphone depop pin: vendor:383 HP_Ana_Switch_to_On() drives the
++ * "hpdepop" pinctrl output low while the amplifier settles, and
++ * vendor:409 HP_Ana_Switch_to_Release() drives it high afterwards.
++ */
++static void mt6331_hp_depop(struct mt6331_priv *priv, bool switch_to_ground)
++{
++	if (!priv->hp_depop)
++		return;
++
++	gpiod_set_value_cansleep(priv->hp_depop, switch_to_ground ? 0 : 1);
++	usleep_range(10000, 11000);	/* vendor:404 / vendor:414 */
++}
++
++/* vendor:1734-1826 Audio_Amp_Change(..., true) */
++static int mt6331_hp_power_up(struct mt6331_priv *priv)
++{
++	unsigned int val, hp_l, hp_r;
++
++	/* The de-pop sequence drives both HP gains to the minimum; keep the
++	 * user volume (vendor mAudio_Ana_Volume[HPOUTL/R]) and restore it.
++	 */
++	if (regmap_read(priv->regmap, MT6328_ZCD_CON2, &val))
++		return -EIO;
++	hp_l = val & RG_AUDHPLGAIN_MASK;
++	hp_r = (val >> RG_AUDHPRGAIN_SHIFT) & RG_AUDHPRGAIN_MASK;
++
++	mt6331_hp_depop(priv, true);
++	mt6331_dl_analog_up(priv, true, 0x0400);
++	/* vendor:1786-1790 */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe080, 0xffff);
++	/* vendor:1792 IBIST */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac0,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++	/* vendor:1794-1796 HP & HS driver bias circuit */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON4, 0x0700, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON5, 0x5490, 0xffff);
++	udelay(50);
++	/* vendor:1798-1812 */
++	mt6331_ana_write(priv, MT6328_ZCD_CON2, 0x0f9f, 0xffff);
++	mt6331_ana_write(priv, MT6328_ZCD_CON3, 0x001f, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON1, 0x0480, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON1, 0x1480, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe090, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON1, 0x14a0, 0xffff);
++	udelay(50);
++	/* vendor:1813-1816 */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac2,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe09f, 0xffff);
++
++	/* vendor:1818-1824: DAC gain, HP mux to the audio DAC, drivers on */
++	mt6331_hp_volume_ramp(priv, MT6331_HP_TRIM_INDEX,
++			      MT6331_HP_TRIM_INDEX);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xf49f, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xf4ff, 0xffff);
++	udelay(50);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON1, 0x1480, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON1, 0x0480, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xf46f, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON4, 0x0300, 0xffff);
++
++	/* vendor:1820-1822 restore the user volume, then release the switch */
++	mt6331_hp_volume_ramp(priv, hp_l, hp_r);
++	mt6331_hp_depop(priv, false);
++
++	priv->state |= MT6331_ST_HP;
++
++	return 0;
++}
++
++/* vendor:1828-1862 Audio_Amp_Change(..., false) */
++static int mt6331_hp_power_down(struct mt6331_priv *priv)
++{
++	priv->state &= ~MT6331_ST_HP;
++
++	mt6331_hp_depop(priv, true);
++	mt6331_hp_volume_ramp(priv, MT6331_HP_TRIM_INDEX,
++			      MT6331_HP_TRIM_INDEX);
++	/* vendor:1837 disable HPR/HPL */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xf40f, 0xffff);
++
++	if (!(priv->state & MT6331_ST_OUTPUTS))
++		mt6331_dl_analog_down(priv);
++
++	return 0;
++}
++
++/* vendor:1925-1999 Voice_Amp_Change (earpiece) */
++static int mt6331_earpiece_power_up(struct mt6331_priv *priv)
++{
++	unsigned int val, hs_gain;
++
++	/* The voice power sequence below drives the handset gain to the
++	 * minimum and then to +8 dB (vendor:1988-1997), which would discard
++	 * the user setting of the "Earpiece Volume" control; keep it and
++	 * apply it again once the driver is up.
++	 */
++	if (regmap_read(priv->regmap, MT6328_ZCD_CON3, &val))
++		return -EIO;
++	hs_gain = val & RG_AUDHSGAIN_MASK;
++
++	mt6331_dl_analog_up(priv, false, 0x0000);
++	/* vendor:1965-1976 */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe080, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac0,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON4, 0x0400, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON5, 0x5490, 0xffff);
++	udelay(50);
++	mt6331_ana_write(priv, MT6328_ZCD_CON3, 0x001f, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON1, 0x1000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac2,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe089, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe109, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe119, 0xffff);
++	udelay(50);
++	/* vendor:1997 HS gain (+8 dB) after the driver is up */
++	mt6331_ana_write(priv, MT6328_ZCD_CON3, 0x0000, 0xffff);
++	/* restore the user volume */
++	mt6331_ana_write(priv, MT6328_ZCD_CON3, hs_gain, RG_AUDHSGAIN_MASK);
++
++	priv->state |= MT6331_ST_EARPIECE;
++
++	return 0;
++}
++
++static int mt6331_earpiece_power_down(struct mt6331_priv *priv)
++{
++	priv->state &= ~MT6331_ST_EARPIECE;
++
++	/* vendor:2003 disable the voice driver */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe109, 0xffff);
++
++	if (!(priv->state & MT6331_ST_OUTPUTS))
++		mt6331_dl_analog_down(priv);
++
++	return 0;
++}
++
++/* vendor:569-604 Apply_Speaker_Gain: ramp the internal speaker PGA */
++static void mt6331_speaker_gain_apply(struct mt6331_priv *priv,
++				      unsigned int target)
++{
++	unsigned int val, cur;
++
++	if (regmap_read(priv->regmap, MT6328_SPK_ANA_CON0, &val))
++		return;
++	cur = (val & (RG_SPKPGA_GAIN_MASK << RG_SPKPGA_GAIN_SHIFT)) >>
++		RG_SPKPGA_GAIN_SHIFT;
++
++	while (cur != target) {
++		usleep_range(200, 300);
++		if (target > cur)
++			cur++;
++		else
++			cur--;
++		mt6331_ana_write(priv, MT6328_SPK_ANA_CON0,
++				 cur << RG_SPKPGA_GAIN_SHIFT,
++				 RG_SPKPGA_GAIN_MASK << RG_SPKPGA_GAIN_SHIFT);
++	}
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON0,
++			 target << RG_SPKPGA_GAIN_SHIFT,
++			 RG_SPKPGA_GAIN_MASK << RG_SPKPGA_GAIN_SHIFT);
++}
++
++/* spk:75-117 Speaker_ClassD_Open */
++static int mt6331_speaker_classd_up(struct mt6331_priv *priv)
++{
++	unsigned int val;
++
++	/* spk:81-86 speaker offset trim + class D mode */
++	mt6331_ana_write(priv, MT6328_SPK_CON7, 0x4531, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x3008, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON13, 0x1800, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON2, 0x04a4, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON0,
++			 MT6331_SPK_TRIM_INDEX << RG_SPKPGA_GAIN_SHIFT,
++			 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON9, 0x2000, 0xffff);
++	/* spk:91 turn the speaker on, spk:93 Vcm high-PSRR mode */
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x3009, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON9, 0x0a00, 0xffff);
++
++	msleep(10);		/* spk:95-96 trim settling time */
++
++	/* spk:101 trim off, spk:103 clock back to triangular wave */
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x3001, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON13, 0x0000, 0xffff);
++
++	/* spk:105-110 the vendor only logs the trim result */
++	if (!regmap_read(priv->regmap, MT6328_SPK_CON1, &val))
++		dev_dbg(priv->dev, "speaker trim raw 0x%04x%s\n", val,
++			(val & 0x8000) ? "" : " (trim failed)");
++
++	/* spk:112-117 0 dB amplifier gain, trim disabled */
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x3001, 0xffff);
++
++	return 0;
++}
++
++/* spk:119-130 Speaker_ClassD_close */
++static int mt6331_speaker_classd_down(struct mt6331_priv *priv)
++{
++	mt6331_ana_write(priv, MT6328_SPK_CON9, 0x2a00, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON0,
++			 MT6331_SPK_TRIM_INDEX << RG_SPKPGA_GAIN_SHIFT,
++			 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x3001, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x3000, 0xffff);
++
++	return 0;
++}
++
++/* vendor:2030-2126 Speaker_Amp_Change (internal class-D speaker) */
++static int mt6331_speaker_power_up(struct mt6331_priv *priv)
++{
++	unsigned int val, gain;
++
++	/* Keep the user speaker gain: Speaker_ClassD_Open() below rewrites
++	 * SPK_ANA_CON0 with the trim level (spk:85).
++	 */
++	if (regmap_read(priv->regmap, MT6328_SPK_ANA_CON0, &val))
++		return -EIO;
++	gain = (val & (RG_SPKPGA_GAIN_MASK << RG_SPKPGA_GAIN_SHIFT)) >>
++		RG_SPKPGA_GAIN_SHIFT;
++	if (!gain)
++		gain = MT6331_SPK_TRIM_INDEX;
++
++	mt6331_dl_analog_up(priv, true, 0x0000);
++	/* vendor:2085-2100 */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac0,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac2,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0x0009, 0x0009);
++	mt6331_ana_write(priv, MT6328_ZCD_CON0, 0x0400, 0xffff);
++	mt6331_ana_write(priv, MT6328_ZCD_CON4, 0x0505, 0xffff);
++	/* vendor:2101-2104 IV buffer mux + enable */
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON3, 0x0100, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON3, 0x0110, 0xffff);
++	/* vendor:2106 class-AB/D clock */
++	mt6331_ana_write(priv, MT6328_TOP_CKPDN_CON2_CLR, RG_SPK_CK_GRP,
++			 RG_SPK_CK_GRP);
++
++	mt6331_speaker_classd_up(priv);
++	mt6331_speaker_gain_apply(priv, gain);
++
++	priv->state |= MT6331_ST_SPEAKER;
++
++	return 0;
++}
++
++static int mt6331_speaker_power_down(struct mt6331_priv *priv)
++{
++	priv->state &= ~MT6331_ST_SPEAKER;
++
++	/* vendor:2128-2136: the vendor grounds the de-pop switch first */
++	mt6331_hp_depop(priv, true);
++	mt6331_speaker_classd_down(priv);
++
++	mt6331_ana_write(priv, MT6328_TOP_CKPDN_CON2_SET, RG_SPK_CK_GRP,
++			 RG_SPK_CK_GRP);
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON3, 0x0100, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON3, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_ZCD_CON4, 0x0505, 0xffff);
++	usleep_range(1000, 2000);	/* vendor:2140 */
++
++	if (!(priv->state & MT6331_ST_OUTPUTS))
++		mt6331_dl_analog_down(priv);
++
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* Uplink (capture) paths                                             */
++/* ------------------------------------------------------------------ */
++
++/* vendor:3256-3271: shared analog supply of both ADC channels */
++static int mt6331_adc_supply_up(struct mt6331_priv *priv)
++{
++	int ret;
++
++	mt6331_ana_write(priv, MT6328_LDO_CON2, 0x8102, 0xffff);
++
++	ret = mt6331_audglb_enable(priv, true);
++	if (ret)
++		return ret;
++	ret = mt6331_clksq_enable(priv, true);
++	if (ret)
++		return ret;
++
++	/* vendor:3262-3264 audio ADC clock generator */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x0004, 0x0004);
++	/* vendor:3265 ADC clock from the 13 MHz clock generator */
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON3, 0x0000, 0xffff);
++	/* vendor:3267-3268 LCLDO_ENC 1.8V + remote sense */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x0104, 0x0104);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON7, 0x0006, 0x0006);
++	/* vendor:3270-3271 encoder bias defaults */
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON6, 0x0555, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON4, 0x0800, 0xffff);
++
++	priv->state |= MT6331_ST_ADC_SUPPLY;
++
++	return 0;
++}
++
++static int mt6331_adc_supply_down(struct mt6331_priv *priv)
++{
++	priv->state &= ~MT6331_ST_ADC_SUPPLY;
++
++	/* vendor:3469-3480 */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON7, 0x0000, 0x0006);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x0004, 0x0104);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON3, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x0000, 0x0104);
++
++	/* vendor:3481-3483: clocks last */
++	mt6331_topck_enable(priv, false);
++	mt6331_clksq_enable(priv, false);
++	mt6331_audglb_enable(priv, false);
++
++	return 0;
++}
++
++/* vendor:3359-3391: uplink digital part of TurnOnADcPowerACC */
++static int mt6331_adc_power_up(struct mt6331_priv *priv)
++{
++	int ret;
++
++	ret = mt6331_topck_enable(priv, true);
++	if (ret)
++		return ret;
++
++	/* vendor:3365-3369 */
++	mt6331_ana_write(priv, MT6328_AFE_AUDIO_TOP_CON0,
++			 (priv->state & MT6331_ST_DAC) ? 0x0000 : 0x005a,
++			 0xffff);
++	mt6331_ana_write(priv, MT6328_PMIC_AFE_TOP_CON0, 0x0000, 0xffff);
++	/* vendor:3373 AFE enable */
++	mt6331_ana_write(priv, MT6328_AFE_UL_DL_CON0, 0x0001, 0xffff);
++	/* vendor:3386-3391 UL sample rate + UL turn on */
++	mt6331_ana_write(priv, MT6328_AFE_UL_SRC0_CON0_H,
++			 (mt6331_ul_rate_sel(priv->ul_rate) << 3) |
++			 (mt6331_ul_rate_sel(priv->ul_rate) << 1),
++			 RG_UL_RATE_MASK);
++	mt6331_ana_write(priv, MT6328_AFE_UL_SRC0_CON0_L, 0x0001, 0xffff);
++
++	priv->state |= MT6331_ST_ADC;
++
++	return 0;
++}
++
++static int mt6331_adc_power_down(struct mt6331_priv *priv)
++{
++	priv->state &= ~MT6331_ST_ADC;
++
++	/* vendor:3395-3397 */
++	mt6331_ana_write(priv, MT6328_AFE_UL_SRC0_CON0_L, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AFE_AUDIO_TOP_CON0, 0x0020, 0x0020);
++
++	if (!(priv->state & MT6331_ST_DAC)) {
++		/* vendor:3477-3480 */
++		mt6331_ana_write(priv, MT6328_AFE_UL_DL_CON0, 0x0000, 0xffff);
++		mt6331_ana_write(priv, MT6328_AFE_AUDIO_TOP_CON0, 0x0084,
++				 0x0084);
++	}
++
++	return 0;
++}
++
++/*
++ * Microphone bias.  AUDENC_ANA_CON9 bit 0 enables bias 0, bit 4 enables
++ * bias 1 and bits 8-10 select the shared reference (upmu:7091-7123).
++ * The vendor driver saves the reference programmed by the accessory
++ * detection before it takes the block over (vendor:3234-3239) and restores
++ * it when the last ADC goes away (vendor:3433-3439).
++ */
++static int mt6331_micbias_set(struct mt6331_priv *priv, bool second, bool on)
++{
++	unsigned int bit = second ? RG_AUDPWDBMICBIAS1 : RG_AUDPWDBMICBIAS0;
++	unsigned int vref;
++	int ret;
++
++	if (on) {
++		if (!priv->micbias_ref_saved) {
++			ret = regmap_read(priv->regmap, MT6328_AUDENC_ANA_CON9,
++					  &priv->micbias_ref);
++			if (ret)
++				return ret;
++			priv->micbias_ref &= RG_AUDMICBIASVREF_MASK;
++			priv->micbias_ref_saved = true;
++			vref = priv->micbias_ref;
++			/* The vendor always programs its own reference
++			 * (vendor:3280/3287); keep one already set by
++			 * the accessory detection otherwise.
++			 */
++			if (!vref)
++				vref = MT6331_MICBIAS_VREF_DEFAULT <<
++					RG_AUDMICBIASVREF_SHIFT;
++			ret = mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON9,
++					       vref, RG_AUDMICBIASVREF_MASK);
++			if (ret)
++				return ret;
++		}
++		ret = mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON9, bit,
++				       bit);
++		if (ret)
++			return ret;
++		priv->state |= second ? MT6331_ST_MICBIAS2 :
++					MT6331_ST_MICBIAS1;
++	} else {
++		ret = mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON9, 0, bit);
++		if (ret)
++			return ret;
++		priv->state &= ~(second ? MT6331_ST_MICBIAS2 :
++				 MT6331_ST_MICBIAS1);
++
++		if (!(priv->state & (MT6331_ST_MICBIAS1 |
++				     MT6331_ST_MICBIAS2)) &&
++		    priv->micbias_ref_saved) {
++			ret = mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON9,
++					       priv->micbias_ref,
++					       RG_AUDMICBIASVREF_MASK);
++			if (ret)
++				return ret;
++			priv->micbias_ref_saved = false;
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * The vendor driver re-applies mAudio_Ana_Volume[MICAMP1/2] on every ADC
++ * power-up (mt_soc_codec_63xx.c:3183-3194 SetMicPGAGain) because the power
++ * down path resets RG_AUDPREAMPL/PRGAIN.  Keep the user setting here.
++ */
++static unsigned int mt6331_mic_gain_save(struct mt6331_priv *priv)
++{
++	unsigned int val;
++
++	if (!regmap_read(priv->regmap, MT6328_AUDENC_ANA_CON10, &val))
++		priv->mic_gain = val & (RG_AUDPREAMPLGAIN_MASK |
++					RG_AUDPREAMPRGAIN_MASK);
++
++	return priv->mic_gain;
++}
++
++static void mt6331_mic_gain_restore(struct mt6331_priv *priv)
++{
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON10, priv->mic_gain,
++			 RG_AUDPREAMPLGAIN_MASK | RG_AUDPREAMPRGAIN_MASK);
++}
++
++/* vendor:3273-3341 (left / main or headset mic), 3295-3354 (right / ref mic) */
++static int mt6331_pga_l_power_up(struct mt6331_priv *priv)
++{
++	/* vendor:3276 DC coupling mode of bias 0 (ACC/DCC: no ECM mode) */
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON9, 0x0000,
++			 RG_AUDMICBIAS0DCC_MASK);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON9, 0x0000,
++			 RG_AUDMICBIAS1DCC_MASK);
++
++	/* vendor:3325/3343 preamplifier input select + ADC input select */
++	if (priv->headset_mic) {
++		/* vendor:3335-3337 headset microphone on AIN1 */
++		mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0, 0x0500, 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0, 0x0581, 0xffff);
++	} else {
++		/* vendor:3329-3331 main microphone on AIN0 */
++		mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0, 0x0041, 0x00c1);
++		mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0, 0x0541, 0xffff);
++	}
++
++	mt6331_mic_gain_restore(priv);
++
++	priv->state |= MT6331_ST_PGA_L;
++
++	return 0;
++}
++
++static int mt6331_pga_l_power_down(struct mt6331_priv *priv)
++{
++	priv->state &= ~MT6331_ST_PGA_L;
++
++	mt6331_mic_gain_save(priv);
++
++	/* vendor:3404-3429 */
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0, 0x0041, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON3, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON10, 0x0000,
++			 RG_AUDPREAMPLGAIN_MASK);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON4, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON6, 0x2020, 0xffff);
++
++	return 0;
++}
++
++static int mt6331_pga_r_power_up(struct mt6331_priv *priv)
++{
++	/* vendor:3295-3305 reference microphone on AIN2, bias 0 */
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON9, 0x0000,
++			 RG_AUDMICBIAS0DCC_MASK);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON10, 0x0033, 0x00ff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON3, 0x0800, 0xf900);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON1, 0x00c1, 0x00c1);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON1, 0x05c1, 0xffff);
++
++	mt6331_mic_gain_restore(priv);
++
++	priv->state |= MT6331_ST_PGA_R;
++
++	return 0;
++}
++
++static int mt6331_pga_r_power_down(struct mt6331_priv *priv)
++{
++	priv->state &= ~MT6331_ST_PGA_R;
++
++	mt6331_mic_gain_save(priv);
++
++	/* vendor:3444-3467 */
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON1, 0x00c1, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON3, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON10, 0x0000,
++			 RG_AUDPREAMPRGAIN_MASK);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON1, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON4, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON6, 0x2020, 0xffff);
++
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* DAPM events                                                        */
++/* ------------------------------------------------------------------ */
++static int mt6331_dac_event(struct snd_soc_dapm_widget *w,
++			    struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_dl_power_up(priv);
++		break;
++	case SND_SOC_DAPM_POST_PMD:
++		ret = mt6331_dl_power_down(priv);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++static int mt6331_hp_event(struct snd_soc_dapm_widget *w,
++			   struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_hp_power_up(priv);
++		break;
++	case SND_SOC_DAPM_PRE_PMD:
++		ret = mt6331_hp_power_down(priv);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++static int mt6331_earpiece_event(struct snd_soc_dapm_widget *w,
++				 struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_earpiece_power_up(priv);
++		break;
++	case SND_SOC_DAPM_PRE_PMD:
++		ret = mt6331_earpiece_power_down(priv);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++static int mt6331_speaker_event(struct snd_soc_dapm_widget *w,
++				struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_speaker_power_up(priv);
++		break;
++	case SND_SOC_DAPM_PRE_PMD:
++		ret = mt6331_speaker_power_down(priv);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++static int mt6331_adc_supply_event(struct snd_soc_dapm_widget *w,
++				   struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_adc_supply_up(priv);
++		break;
++	case SND_SOC_DAPM_POST_PMD:
++		ret = mt6331_adc_supply_down(priv);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++static int mt6331_adc_event(struct snd_soc_dapm_widget *w,
++			    struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_adc_power_up(priv);
++		break;
++	case SND_SOC_DAPM_POST_PMD:
++		ret = mt6331_adc_power_down(priv);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++static int mt6331_pga_l_event(struct snd_soc_dapm_widget *w,
++			      struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_pga_l_power_up(priv);
++		break;
++	case SND_SOC_DAPM_POST_PMD:
++		ret = mt6331_pga_l_power_down(priv);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++static int mt6331_pga_r_event(struct snd_soc_dapm_widget *w,
++			      struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_pga_r_power_up(priv);
++		break;
++	case SND_SOC_DAPM_POST_PMD:
++		ret = mt6331_pga_r_power_down(priv);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++static int mt6331_micbias1_event(struct snd_soc_dapm_widget *w,
++				 struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_micbias_set(priv, false, true);
++		break;
++	case SND_SOC_DAPM_POST_PMD:
++		ret = mt6331_micbias_set(priv, false, false);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++static int mt6331_micbias2_event(struct snd_soc_dapm_widget *w,
++				 struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_micbias_set(priv, true, true);
++		break;
++	case SND_SOC_DAPM_POST_PMD:
++		ret = mt6331_micbias_set(priv, true, false);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++/* ------------------------------------------------------------------ */
++/* Controls                                                           */
++/* ------------------------------------------------------------------ */
++/*
++ * Headphone / earpiece gain: vendor DAC_DL_PGA_Headset_GAIN[]
++ * (vendor:2846-2849), 0 = +8 dB down to 18 = -10 dB in 1 dB steps;
++ * 0x1f is the -40 dB hard mute used internally by the power sequences.
++ * Microphone preamp: vendor ADC_UL_PGA_GAIN[] (vendor:3927), 6 dB steps.
++ */
++static const DECLARE_TLV_DB_SCALE(mt6331_hp_vol_tlv, 800, -100, 0);
++static const DECLARE_TLV_DB_SCALE(mt6331_mic_amp_tlv, 0, 600, 0);
++
++/* vendor:2635-2636 speaker_PGA_function[] */
++static const char *const mt6331_spk_pga_texts[] = {
++	"MUTE", "0Db", "4Db", "5Db", "6Db", "7Db", "8Db",
++	"9Db", "10Db", "11Db", "12Db", "13Db", "14Db", "15Db", "16Db", "17Db",
++};
++static SOC_ENUM_SINGLE_DECL(mt6331_spk_pga_enum, MT6328_SPK_ANA_CON0,
++			    RG_SPKPGA_GAIN_SHIFT, mt6331_spk_pga_texts);
++
++/* vendor:1234-1267 SetDCcoupleNP + vendor:3930-3931 mode names */
++static const char *const mt6331_micbias_mode_texts[] = {
++	"ACC/DCC", "DCC ECM Single", "DCC ECM Diff",
++};
++static const unsigned int mt6331_micbias_mode_values[] = { 0, 2, 3 };
++
++static SOC_VALUE_ENUM_SINGLE_DECL(mt6331_micbias1_mode_enum,
++				  MT6328_AUDENC_ANA_CON9, 1, 0x3,
++				  mt6331_micbias_mode_texts,
++				  mt6331_micbias_mode_values);
++static SOC_VALUE_ENUM_SINGLE_DECL(mt6331_micbias2_mode_enum,
++				  MT6328_AUDENC_ANA_CON9, 5, 0x3,
++				  mt6331_micbias_mode_texts,
++				  mt6331_micbias_mode_values);
++
++static const struct snd_kcontrol_new mt6331_snd_controls[] = {
++	SOC_DOUBLE_TLV("Headset Volume", MT6328_ZCD_CON2,
++		       RG_AUDHPLGAIN_SHIFT, RG_AUDHPRGAIN_SHIFT, 18, 0,
++		       mt6331_hp_vol_tlv),
++	SOC_SINGLE_TLV("Earpiece Volume", MT6328_ZCD_CON3,
++		       RG_AUDHSGAIN_SHIFT, 18, 0, mt6331_hp_vol_tlv),
++	SOC_ENUM("Speaker PGA Gain", mt6331_spk_pga_enum),
++	SOC_SINGLE_TLV("Mic Amp 1 Volume", MT6328_AUDENC_ANA_CON10,
++		       RG_AUDPREAMPLGAIN_SHIFT, 5, 0, mt6331_mic_amp_tlv),
++	SOC_SINGLE_TLV("Mic Amp 2 Volume", MT6328_AUDENC_ANA_CON10,
++		       RG_AUDPREAMPRGAIN_SHIFT, 5, 0, mt6331_mic_amp_tlv),
++	/* Shared microphone bias reference (upmu:7115-7117); the vendor
++	 * always uses 7 (vendor:3280), no voltage table exists.
++	 */
++	SOC_SINGLE("Mic Bias Voltage", MT6328_AUDENC_ANA_CON9,
++		   RG_AUDMICBIASVREF_SHIFT, 7, 0),
++	SOC_ENUM("MICBIAS1 Mode", mt6331_micbias1_mode_enum),
++	SOC_ENUM("MICBIAS2 Mode", mt6331_micbias2_mode_enum),
++};
++
++/* ------------------------------------------------------------------ */
++/* DAPM                                                               */
++/* ------------------------------------------------------------------ */
++static const struct snd_soc_dapm_widget mt6331_dapm_widgets[] = {
++	/* Downlink */
++	SND_SOC_DAPM_AIF_IN("AIF_RX", MT6331_DL1_STREAM_NAME, 0,
++			    SND_SOC_NOPM, 0, 0),
++	SND_SOC_DAPM_AIF_IN("AIF_RX2", MT6331_DL2_STREAM_NAME, 0,
++			    SND_SOC_NOPM, 0, 0),
++	SND_SOC_DAPM_DAC_E("DAC", NULL, SND_SOC_NOPM, 0, 0,
++			   mt6331_dac_event,
++			   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++	SND_SOC_DAPM_OUT_DRV_E("Headphone Amp", SND_SOC_NOPM, 0, 0, NULL, 0,
++			       mt6331_hp_event,
++			       SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_PRE_PMD),
++	SND_SOC_DAPM_OUT_DRV_E("Earpiece Amp", SND_SOC_NOPM, 0, 0, NULL, 0,
++			       mt6331_earpiece_event,
++			       SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_PRE_PMD),
++	SND_SOC_DAPM_OUT_DRV_E("Speaker Amp", SND_SOC_NOPM, 0, 0, NULL, 0,
++			       mt6331_speaker_event,
++			       SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_PRE_PMD),
++	SND_SOC_DAPM_OUTPUT("EARPIECE"),
++	SND_SOC_DAPM_OUTPUT("HEADSET"),
++	SND_SOC_DAPM_OUTPUT("SPEAKER"),
++
++	/* Uplink */
++	SND_SOC_DAPM_INPUT("MIC1"),
++	SND_SOC_DAPM_INPUT("MIC2"),
++	SND_SOC_DAPM_INPUT("Headset Mic"),
++	SND_SOC_DAPM_SUPPLY("MICBIAS1", SND_SOC_NOPM, 0, 0,
++			      mt6331_micbias1_event,
++			      SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++	SND_SOC_DAPM_SUPPLY("MICBIAS2", SND_SOC_NOPM, 0, 0,
++			      mt6331_micbias2_event,
++			      SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++	SND_SOC_DAPM_PGA_E("PGA L", SND_SOC_NOPM, 0, 0, NULL, 0,
++			   mt6331_pga_l_event,
++			   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++	SND_SOC_DAPM_PGA_E("PGA R", SND_SOC_NOPM, 0, 0, NULL, 0,
++			   mt6331_pga_r_event,
++			   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++	SND_SOC_DAPM_SUPPLY("ADC Supply", SND_SOC_NOPM, 0, 0,
++			      mt6331_adc_supply_event,
++			      SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++	SND_SOC_DAPM_ADC_E("ADC", NULL, SND_SOC_NOPM, 0, 0,
++			   mt6331_adc_event,
++			   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++	SND_SOC_DAPM_AIF_OUT("AIF1TX", MT6331_UL1_STREAM_NAME, 0,
++			     SND_SOC_NOPM, 0, 0),
++};
++
++static const struct snd_soc_dapm_route mt6331_dapm_routes[] = {
++	/* Downlink: DAC -> headphone / earpiece / speaker */
++	{ "DAC", NULL, "AIF_RX" },
++	{ "DAC", NULL, "AIF_RX2" },
++	{ "Headphone Amp", NULL, "DAC" },
++	{ "Earpiece Amp", NULL, "DAC" },
++	{ "Speaker Amp", NULL, "DAC" },
++	{ "HEADSET", NULL, "Headphone Amp" },
++	{ "EARPIECE", NULL, "Earpiece Amp" },
++	{ "SPEAKER", NULL, "Speaker Amp" },
++
++	/* Uplink: MICBIAS -> MIC -> PGA -> ADC */
++	{ "MIC1", NULL, "MICBIAS1" },
++	{ "MIC2", NULL, "MICBIAS1" },
++	{ "Headset Mic", NULL, "MICBIAS2" },
++	{ "PGA L", NULL, "MIC1" },
++	{ "PGA L", NULL, "Headset Mic" },
++	{ "PGA R", NULL, "MIC2" },
++	{ "PGA L", NULL, "ADC Supply" },
++	{ "PGA R", NULL, "ADC Supply" },
++	{ "ADC", NULL, "ADC Supply" },
++	{ "ADC", NULL, "PGA L" },
++	{ "ADC", NULL, "PGA R" },
++	{ "AIF1TX", NULL, "ADC" },
++};
++
++/* ------------------------------------------------------------------ */
++/* Jack                                                               */
++/* ------------------------------------------------------------------ */
++/*
++ * The vendor driver selects the headset microphone path (AIN1 plus the
++ * second microphone bias) from the accessory detection result, through the
++ * Audio_MicSource1_Setting control and TurnOnADcPowerACC()'s headset
++ * branches (vendor:3285-3288, vendor:3335-3337).  Here the accessory
++ * detection driver reports jack status and the codec follows it.
++ */
++static void mt6331_headset_mic_set(struct mt6331_priv *priv, bool on)
++{
++	bool pga_on;
++
++	priv->headset_mic = on;
++
++	mutex_lock(&priv->ana_lock);
++	pga_on = priv->state & MT6331_ST_PGA_L;
++
++	if (on) {
++		/* second microphone bias on, vendor:3287 */
++		mt6331_micbias_set(priv, true, true);
++		if (pga_on) {
++			/* vendor:3335-3337 headset microphone path */
++			mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0,
++					 0x0500, 0xffff);
++			mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0,
++					 0x0581, 0xffff);
++		} else {
++			mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0,
++					 RG_AUDPREAMPLINPUTSEL_AIN1,
++					 RG_AUDPREAMPLINPUTSEL_MASK);
++		}
++	} else {
++		mt6331_micbias_set(priv, true, false);
++		if (pga_on) {
++			/* vendor:3329-3331 main microphone path */
++			mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0,
++					 0x0041, 0x00c1);
++			mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0,
++					 0x0541, 0xffff);
++		} else {
++			mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0,
++					 RG_AUDPREAMPLINPUTSEL_AIN0,
++					 RG_AUDPREAMPLINPUTSEL_MASK);
++		}
++	}
++	mutex_unlock(&priv->ana_lock);
++}
++
++static int mt6331_jack_notify(struct notifier_block *nb, unsigned long status,
++			      void *data)
++{
++	struct mt6331_priv *priv = container_of(nb, struct mt6331_priv,
++						jack_nb);
++	bool mic = status & SND_JACK_MICROPHONE;
++
++	if (mic != priv->headset_mic)
++		mt6331_headset_mic_set(priv, mic);
++
++	return NOTIFY_OK;
++}
++
++static int mt6331_set_jack(struct snd_soc_component *cmpnt,
++			   struct snd_soc_jack *jack, void *data)
++{
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++
++	if (priv->jack) {
++		snd_soc_jack_notifier_unregister(priv->jack, &priv->jack_nb);
++		priv->jack = NULL;
++	}
++
++	if (!jack) {
++		if (priv->headset_mic)
++			mt6331_headset_mic_set(priv, false);
++		return 0;
++	}
++
++	priv->jack = jack;
++	snd_soc_jack_notifier_register(jack, &priv->jack_nb);
++	mt6331_headset_mic_set(priv, jack->status & SND_JACK_MICROPHONE);
++
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* DAI                                                                */
++/* ------------------------------------------------------------------ */
++static int mt6331_dai_hw_params(struct snd_pcm_substream *substream,
++				struct snd_pcm_hw_params *params,
++				struct snd_soc_dai *dai)
++{
++	struct snd_soc_component *cmpnt = dai->component;
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	unsigned int rate = params_rate(params);
++
++	switch (rate) {
++	case 8000:
++	case 11025:
++	case 12000:
++	case 16000:
++	case 22050:
++	case 24000:
++	case 32000:
++	case 44100:
++	case 48000:
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	mutex_lock(&priv->ana_lock);
++
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
++		priv->dl_rate = rate;
++		/* vendor:1641-1646: downlink interface / SDM rate */
++		mt6331_ana_write(priv, MT6328_AFE_PMIC_NEWIF_CFG0,
++				 (mt6331_dl_if_freq(rate) <<
++				  RG_DL_IF_FREQ_SHIFT) | 0x0330, 0xffff);
++		mt6331_ana_write(priv, MT6328_AFE_DL_SRC2_CON0_H,
++				 (mt6331_dl_if_freq(rate) <<
++				  RG_DL_IF_FREQ_SHIFT) | 0x0300, 0xffff);
++	} else {
++		priv->ul_rate = rate;
++		/* vendor:3386-3389: uplink sample rate and mode */
++		mt6331_ana_write(priv, MT6328_AFE_UL_SRC0_CON0_H,
++				 (mt6331_ul_rate_sel(rate) << 3) |
++				 (mt6331_ul_rate_sel(rate) << 1),
++				 RG_UL_RATE_MASK);
++	}
++
++	mutex_unlock(&priv->ana_lock);
++
++	return 0;
++}
++
++static const struct snd_soc_dai_ops mt6331_dai_ops = {
++	.hw_params = mt6331_dai_hw_params,
++};
++
++static struct snd_soc_dai_driver mt6331_dai_driver[] = {
++	{
++		.name = MT6331_TXDAI_NAME,
++		.playback = {
++			.stream_name = MT6331_DL1_STREAM_NAME,
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = SNDRV_PCM_RATE_8000_48000,
++			.formats = SNDRV_PCM_FMTBIT_S16_LE |
++				   SNDRV_PCM_FMTBIT_S24_LE,
++		},
++		.ops = &mt6331_dai_ops,
++	}, {
++		/*
++		 * Second downlink DAI: the ROM machine driver binds the
++		 * MultiMedia_DL2 link to MT_SOC_CODEC_TXDAI2_NAME
++		 * (AudDrv_Def.h:274, stream "MultiMedia2_PLayback").  It is
++		 * an independent DAI object so that ASoC does not serialise
++		 * the two playback streams, but the vendor driver programs
++		 * the very same PMIC downlink voice for both
++		 * (mt_soc_codec_63xx.c:1361-1580: the TXDAI2 entry has no
++		 * per-DAI register programming of its own).
++		 */
++		.name = MT6331_TXDAI2_NAME,
++		.playback = {
++			.stream_name = MT6331_DL2_STREAM_NAME,
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = SNDRV_PCM_RATE_8000_48000,
++			.formats = SNDRV_PCM_FMTBIT_S16_LE |
++				   SNDRV_PCM_FMTBIT_S24_LE,
++		},
++		.ops = &mt6331_dai_ops,
++	}, {
++		.name = MT6331_RXDAI_NAME,
++		.capture = {
++			.stream_name = MT6331_UL1_STREAM_NAME,
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = SNDRV_PCM_RATE_8000_48000,
++			.formats = SNDRV_PCM_FMTBIT_S16_LE |
++				   SNDRV_PCM_FMTBIT_S24_LE,
++		},
++		.ops = &mt6331_dai_ops,
++	},
++};
++
++/* ------------------------------------------------------------------ */
++/* Component                                                          */
++/* ------------------------------------------------------------------ */
++/* vendor:4970-4982 mt6331_codec_init_reg(); the ROM probe function
++ * (mt6331_codec_probe @ 0xc0864460-0xc08644bc) issues exactly these six
++ * read-modify-writes before calling InitCodecDefault @ 0xc08642d4.
++ */
++static int mt6331_codec_init_reg(struct mt6331_priv *priv)
++{
++	int ret;
++
++	/* Disable the CLKSQ 26 MHz clock. */
++	ret = mt6331_ana_write(priv, MT6328_TOP_CLKSQ, 0x0000,
++			       RG_CLKSQ_EN_AUD);
++	if (ret)
++		return ret;
++	/* Power down AUDGLB. */
++	ret = mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON8,
++			       RG_AUDGLB_PWRDN_VA28, RG_AUDGLB_PWRDN_VA28);
++	if (ret)
++		return ret;
++	/* Turn off the AUDNCP clock divider engine clock and AUD 26M. */
++	ret = mt6331_ana_write(priv, MT6328_TOP_CKPDN_CON0_SET,
++			       RG_AUD_CLK_GRP_INIT, RG_AUD_CLK_GRP_INIT);
++	if (ret)
++		return ret;
++	/* Disable headphone/voice short-circuit protection. */
++	ret = mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe000, 0xe000);
++	if (ret)
++		return ret;
++	/* Power off microphone bias 1. */
++	ret = mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON9, 0x0000,
++			       RG_AUDPWDBMICBIAS1);
++	if (ret)
++		return ret;
++	/* Reverse the PMIC clock. */
++	return mt6331_ana_write(priv, MT6328_AFE_PMIC_NEWIF_CFG2, 0x8000,
++				0x8000);
++}
++
++/* vendor:4975-4996 InitCodecDefault(): default volumes are MICAMP = 3
++ * (18 dB) and HPOUT = 8 (0 dB).
++ */
++static int mt6331_codec_defaults(struct mt6331_priv *priv)
++{
++	int ret;
++
++	priv->mic_gain = (3 << RG_AUDPREAMPRGAIN_SHIFT) | 3;
++
++	ret = mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON10,
++			       priv->mic_gain,
++			       RG_AUDPREAMPLGAIN_MASK |
++			       RG_AUDPREAMPRGAIN_MASK);
++	if (ret)
++		return ret;
++
++	return mt6331_ana_write(priv, MT6328_ZCD_CON2,
++				(MT6331_HP_TRIM_INDEX <<
++				 RG_AUDHPRGAIN_SHIFT) | MT6331_HP_TRIM_INDEX,
++				0xf9f);
++}
++
++static int mt6331_codec_probe(struct snd_soc_component *cmpnt)
++{
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret;
++
++	snd_soc_component_init_regmap(cmpnt, priv->regmap);
++
++	ret = mt6331_codec_init_reg(priv);
++	if (ret) {
++		dev_err(priv->dev, "codec init sequence failed: %d\n", ret);
++		return ret;
++	}
++
++	ret = mt6331_codec_defaults(priv);
++	if (ret) {
++		dev_err(priv->dev, "codec defaults failed: %d\n", ret);
++		return ret;
++	}
++
++	dev_info(priv->dev, "MT6328 audio codec ready\n");
++
++	return 0;
++}
++
++static int mt6331_codec_suspend(struct snd_soc_component *cmpnt)
++{
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++
++	mutex_lock(&priv->ana_lock);
++
++	/* vendor:215-262 SetAnalogSuspend(true): remember every powered
++	 * block, then power the analog and digital paths down.
++	 */
++	priv->suspend_state = priv->state;
++
++	if (priv->state & MT6331_ST_ADC)
++		mt6331_adc_power_down(priv);
++	if (priv->state & MT6331_ST_PGA_R)
++		mt6331_pga_r_power_down(priv);
++	if (priv->state & MT6331_ST_PGA_L)
++		mt6331_pga_l_power_down(priv);
++	if (priv->state & MT6331_ST_MICBIAS2)
++		mt6331_micbias_set(priv, true, false);
++	if (priv->state & MT6331_ST_MICBIAS1)
++		mt6331_micbias_set(priv, false, false);
++	if (priv->state & MT6331_ST_ADC_SUPPLY)
++		mt6331_adc_supply_down(priv);
++	if (priv->state & MT6331_ST_SPEAKER)
++		mt6331_speaker_power_down(priv);
++	if (priv->state & MT6331_ST_EARPIECE)
++		mt6331_earpiece_power_down(priv);
++	if (priv->state & MT6331_ST_HP)
++		mt6331_hp_power_down(priv);
++	if (priv->state & MT6331_ST_DAC)
++		mt6331_dl_power_down(priv);
++
++	mutex_unlock(&priv->ana_lock);
++
++	return 0;
++}
++
++static int mt6331_codec_resume(struct snd_soc_component *cmpnt)
++{
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	unsigned int saved = priv->suspend_state;
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++
++	/* vendor:242-262 SetAnalogSuspend(false): restore what was on. */
++	if (saved & MT6331_ST_DAC)
++		ret = mt6331_dl_power_up(priv);
++	if (!ret && (saved & MT6331_ST_HP))
++		ret = mt6331_hp_power_up(priv);
++	if (!ret && (saved & MT6331_ST_EARPIECE))
++		ret = mt6331_earpiece_power_up(priv);
++	if (!ret && (saved & MT6331_ST_SPEAKER))
++		ret = mt6331_speaker_power_up(priv);
++	if (!ret && (saved & MT6331_ST_ADC_SUPPLY))
++		ret = mt6331_adc_supply_up(priv);
++	if (!ret && (saved & MT6331_ST_MICBIAS1))
++		ret = mt6331_micbias_set(priv, false, true);
++	if (!ret && (saved & MT6331_ST_MICBIAS2))
++		ret = mt6331_micbias_set(priv, true, true);
++	if (!ret && (saved & MT6331_ST_PGA_L))
++		ret = mt6331_pga_l_power_up(priv);
++	if (!ret && (saved & MT6331_ST_PGA_R))
++		ret = mt6331_pga_r_power_up(priv);
++	if (!ret && (saved & MT6331_ST_ADC))
++		ret = mt6331_adc_power_up(priv);
++
++	mutex_unlock(&priv->ana_lock);
++
++	if (ret)
++		dev_err(priv->dev, "resume restore failed: %d\n", ret);
++
++	return ret;
++}
++
++static const struct snd_soc_component_driver mt6331_soc_component_driver = {
++	.name = MT6331_CODEC_NAME,
++	.probe = mt6331_codec_probe,
++	.suspend = mt6331_codec_suspend,
++	.resume = mt6331_codec_resume,
++	.set_jack = mt6331_set_jack,
++	.controls = mt6331_snd_controls,
++	.num_controls = ARRAY_SIZE(mt6331_snd_controls),
++	.dapm_widgets = mt6331_dapm_widgets,
++	.num_dapm_widgets = ARRAY_SIZE(mt6331_dapm_widgets),
++	.dapm_routes = mt6331_dapm_routes,
++	.num_dapm_routes = ARRAY_SIZE(mt6331_dapm_routes),
++};
++
++/* ------------------------------------------------------------------ */
++/* Platform driver                                                    */
++/* ------------------------------------------------------------------ */
++static int mt6331_platform_probe(struct platform_device *pdev)
++{
++	struct mt6397_chip *pmic = dev_get_drvdata(pdev->dev.parent);
++	struct mt6331_priv *priv;
++	int ret;
++
++	if (!pmic || !pmic->regmap)
++		return -EPROBE_DEFER;
++
++	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->dev = &pdev->dev;
++	priv->regmap = pmic->regmap;
++	priv->dl_rate = 48000;	/* vendor:118 mBlockSampleRate[] */
++	priv->ul_rate = 48000;
++
++	mutex_init(&priv->ana_lock);
++	mutex_init(&priv->clk_lock);
++	mutex_init(&priv->clksq_lock);
++	priv->jack_nb.notifier_call = mt6331_jack_notify;
++
++	/* Optional de-pop switch, driven low while the headphone amplifier
++	 * settles (vendor:383-440).  Only present on boards that route it.
++	 */
++	priv->hp_depop = devm_gpiod_get_optional(&pdev->dev, "hp-depop",
++						 GPIOD_OUT_HIGH);
++	if (IS_ERR(priv->hp_depop))
++		return dev_err_probe(&pdev->dev, PTR_ERR(priv->hp_depop),
++				     "failed to get the headphone de-pop GPIO\n");
++
++	dev_set_drvdata(&pdev->dev, priv);
++
++	dev_info(priv->dev, "MT6328 PMIC codec (MT6331 register map naming)\n");
++
++	ret = devm_snd_soc_register_component(&pdev->dev,
++					      &mt6331_soc_component_driver,
++					      mt6331_dai_driver,
++					      ARRAY_SIZE(mt6331_dai_driver));
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static const struct of_device_id mt6331_of_match[] = {
++	{ .compatible = "mediatek,mt6328-codec" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mt6331_of_match);
++
++static struct platform_driver mt6331_platform_driver = {
++	.driver = {
++		.name = "mt6328-codec",
++		.of_match_table = mt6331_of_match,
++	},
++	.probe = mt6331_platform_probe,
++};
++module_platform_driver(mt6331_platform_driver);
++
++MODULE_DESCRIPTION("MT6328 PMIC audio codec (vendor name: mt6331)");
++MODULE_AUTHOR("MediaTek Inc.");
++MODULE_LICENSE("GPL v2");
+diff --git a/sound/soc/codecs/mt6331.h b/sound/soc/codecs/mt6331.h
+new file mode 100644
+index 000000000..e786f9770
+--- /dev/null
++++ b/sound/soc/codecs/mt6331.h
+@@ -0,0 +1,179 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * MT6328 PMIC audio codec (MT6735 / MT6737)
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * Port from Samsung/MTK downstream:
++ *   sound/soc/mediatek/mt_soc_audio_v3/mt_soc_codec_63xx.c
++ *   sound/soc/mediatek/mt_soc_audio_v3/mt_soc_codec_speaker_63xx.c
++ *   sound/soc/mediatek/mt_soc_audio_v3/AudDrv_Ana.{c,h}
++ *
++ * Register addresses and bit fields are the MT6328 audio register map from
++ *   drivers/misc/mediatek/include/mt-plat/mt6735/include/mach/upmu_hw.h
++ * (line numbers cited per register), and the PMIC "AFE" digital block that the
++ * vendor codec driver programs through pwrap (AudDrv_Ana.h:70-101).
++ *
++ * NAMING: the vendor driver that owns these registers is called "mt6331"
++ * (ROM symbols mt6331_codec_probe, mt6331_read, mt6331_write; the
++ * of_compatible in 3.18 was "mediatek,mt_soc_codec_63xx"), but the PMIC
++ * populated on MT6737T/grandpplte is an MT6328 and it is the MT6328 audio
++ * register map that the driver programs.  No MT6331 register map exists in
++ * this driver and none must be added.
++ */
++#ifndef __SND_SOC_MT6331_H
++#define __SND_SOC_MT6331_H
++
++/* ------------------------------------------------------------------ */
++/* PMIC top level clock registers (upmu_hw.h:83-127)                  */
++/* ------------------------------------------------------------------ */
++#define MT6328_TOP_CKPDN_CON0_SET	0x023e	/* upmu_hw.h:84 */
++#define MT6328_TOP_CKPDN_CON0_CLR	0x0240	/* upmu_hw.h:85 */
++#define MT6328_TOP_CKPDN_CON2_SET	0x024a	/* upmu_hw.h:90 */
++#define MT6328_TOP_CKPDN_CON2_CLR	0x024c	/* upmu_hw.h:91 */
++#define MT6328_TOP_CLKSQ		0x028a	/* upmu_hw.h:122 */
++#define MT6328_TOP_CLKSQ_SET		0x028c	/* upmu_hw.h:123 */
++#define MT6328_TOP_CLKSQ_CLR		0x028e	/* upmu_hw.h:124 */
++
++/* AUDNCP / AUDIF / AUD 26M engine clocks (upmu_hw.h:1784-1793) */
++#define RG_AUDNCP_CK_PDN		BIT(12)
++#define RG_AUDIF_CK_PDN			BIT(13)
++#define RG_AUD_CK_PDN			BIT(14)
++/*
++ * The three audio engine clocks switched by the vendor driver
++ * (mt_soc_codec_63xx.c:283 TOP_CKPDN_CON0_CLR 0x7000).  The probe-time
++ * sequence uses a different group including the AUXADC 26M clock
++ * (mt_soc_codec_63xx.c:4981 TOP_CKPDN_CON0_SET 0x3800).
++ */
++#define RG_AUD_CLK_GRP_VENDOR		(RG_AUDNCP_CK_PDN | RG_AUDIF_CK_PDN | \
++					 RG_AUD_CK_PDN)
++#define RG_AUD_CLK_GRP_INIT		(BIT(11) | RG_AUDNCP_CK_PDN | \
++					 RG_AUDIF_CK_PDN)
++
++/* TOP_CLKSQ bit 0: 26MHz clock squarer for the audio block (upmu_hw.h:2267) */
++#define RG_CLKSQ_EN_AUD			BIT(0)
++
++/* TOP_CKPDN_CON2 bits 0/1: internal speaker class-D / PWM clock (upmu_hw.h:1844) */
++#define RG_SPK_CK_GRP			(BIT(0) | BIT(1))
++
++/* ------------------------------------------------------------------ */
++/* Impedance / zero-cross detect block (upmu_hw.h:370-375)            */
++/* ------------------------------------------------------------------ */
++#define MT6328_ZCD_CON0			0x0800
++#define MT6328_ZCD_CON2			0x0804
++#define MT6328_ZCD_CON3			0x0806
++#define MT6328_ZCD_CON4			0x0808
++
++/* upmu_hw.h:4361-4369 */
++#define RG_AUDHPLGAIN_MASK		0x1f
++#define RG_AUDHPLGAIN_SHIFT		0
++#define RG_AUDHPRGAIN_MASK		0x1f
++#define RG_AUDHPRGAIN_SHIFT		7
++#define RG_AUDHSGAIN_MASK		0x1f
++#define RG_AUDHSGAIN_SHIFT		0
++
++/* ------------------------------------------------------------------ */
++/* Speaker amplifier (upmu_hw.h:464-483)                              */
++/* ------------------------------------------------------------------ */
++#define MT6328_SPK_CON0			0x0a90
++#define MT6328_SPK_CON1			0x0a92
++#define MT6328_SPK_CON2			0x0a94
++#define MT6328_SPK_CON7			0x0a9e
++#define MT6328_SPK_CON9			0x0aa2
++#define MT6328_SPK_CON13			0x0aaa
++#define MT6328_SPK_ANA_CON0		0x0ab2
++#define MT6328_SPK_ANA_CON3		0x0ab6
++
++/* upmu_hw.h:6155-6157 */
++#define RG_SPKPGA_GAIN_MASK		0xf
++#define RG_SPKPGA_GAIN_SHIFT		11
++
++/* ------------------------------------------------------------------ */
++/* Audio LDO (upmu_hw.h has no symbolic name; AudDrv_Ana.h:383)       */
++/* ------------------------------------------------------------------ */
++#define MT6328_LDO_CON2			0x0a04
++
++/* ------------------------------------------------------------------ */
++/* Decoder analog block (upmu_hw.h:594-602)                           */
++/* ------------------------------------------------------------------ */
++#define MT6328_AUDDEC_ANA_CON0		0x0cdc
++#define MT6328_AUDDEC_ANA_CON1		0x0cde
++#define MT6328_AUDDEC_ANA_CON4		0x0ce4
++#define MT6328_AUDDEC_ANA_CON5		0x0ce6
++#define MT6328_AUDDEC_ANA_CON6		0x0ce8
++#define MT6328_AUDDEC_ANA_CON7		0x0cea
++#define MT6328_AUDDEC_ANA_CON8		0x0cec
++
++/* upmu_hw.h:6893: 1 = audio global block powered down */
++#define RG_AUDGLB_PWRDN_VA28		BIT(1)
++/* upmu_hw.h:6884-6887: NV regulator (-1.5V) enable */
++#define RG_NVREG_EN_VAUDP15		BIT(15)
++/*
++ * Vendor mask for the shared LDO/clock register: bits 2/4/8 belong to the
++ * encoder path and are never rewritten by the decoder sequences
++ * (mt_soc_codec_63xx.c:1757 "AUDDEC_ANA_CON6 0x0A41 mask 0xfeeb").
++ */
++#define RG_AUDDEC_ANA_CON6_SPK_MASK	0xfeeb
++
++/* ------------------------------------------------------------------ */
++/* Encoder analog block (upmu_hw.h:603-613)                           */
++/* ------------------------------------------------------------------ */
++#define MT6328_AUDENC_ANA_CON0		0x0cee
++#define MT6328_AUDENC_ANA_CON1		0x0cf0
++#define MT6328_AUDENC_ANA_CON3		0x0cf4
++#define MT6328_AUDENC_ANA_CON4		0x0cf6
++#define MT6328_AUDENC_ANA_CON6		0x0cfa
++#define MT6328_AUDENC_ANA_CON9		0x0d00
++#define MT6328_AUDENC_ANA_CON10		0x0d02
++
++/* upmu_hw.h:7005 / 7016: preamplifier input select on the left channel */
++#define RG_AUDPREAMPLINPUTSEL_MASK	(0x3 << 6)
++#define RG_AUDPREAMPLINPUTSEL_AIN0	(0x1 << 6)	/* main mic */
++#define RG_AUDPREAMPLINPUTSEL_AIN1	(0x2 << 6)	/* headset mic */
++
++/* upmu_hw.h:7091-7123: microphone bias control (AUDENC_ANA_CON9) */
++#define RG_AUDPWDBMICBIAS0		BIT(0)
++#define RG_AUDMICBIAS0DCC_MASK		(0x3 << 1)
++#define RG_AUDPWDBMICBIAS1		BIT(4)
++#define RG_AUDMICBIAS1DCC_MASK		(0x3 << 5)
++#define RG_AUDMICBIASVREF_MASK		(0x7 << 8)
++#define RG_AUDMICBIASVREF_SHIFT		8
++
++/* upmu_hw.h:7124-7129: microphone preamplifier gain (AUDENC_ANA_CON10) */
++#define RG_AUDPREAMPLGAIN_MASK		0x7
++#define RG_AUDPREAMPLGAIN_SHIFT		0
++#define RG_AUDPREAMPRGAIN_MASK		0x7
++#define RG_AUDPREAMPRGAIN_SHIFT		4
++
++/* ------------------------------------------------------------------ */
++/* NCP clock divider (upmu_hw.h:614-618)                              */
++/* ------------------------------------------------------------------ */
++#define MT6328_AUDNCP_CLKDIV_CON0	0x0d04
++#define MT6328_AUDNCP_CLKDIV_CON1	0x0d06
++#define MT6328_AUDNCP_CLKDIV_CON2	0x0d08
++#define MT6328_AUDNCP_CLKDIV_CON3	0x0d0a
++#define MT6328_AUDNCP_CLKDIV_CON4	0x0d0c
++
++/* ------------------------------------------------------------------ */
++/* PMIC AFE digital block (AudDrv_Ana.h:70-101, base 0x2000)          */
++/* These are PMIC registers reached over pwrap, not SoC MMIO.         */
++/* ------------------------------------------------------------------ */
++#define MT6328_AFE_UL_DL_CON0		0x2000	/* AudDrv_Ana.h:70 */
++#define MT6328_AFE_DL_SRC2_CON0_H	0x2002	/* AudDrv_Ana.h:71 */
++#define MT6328_AFE_DL_SRC2_CON0_L	0x2004	/* AudDrv_Ana.h:72 */
++#define MT6328_AFE_DL_SDM_CON1		0x2008	/* AudDrv_Ana.h:74 */
++#define MT6328_AFE_UL_SRC0_CON0_H	0x200a	/* AudDrv_Ana.h:75 */
++#define MT6328_AFE_UL_SRC0_CON0_L	0x200c	/* AudDrv_Ana.h:76 */
++#define MT6328_PMIC_AFE_TOP_CON0	0x2012	/* AudDrv_Ana.h:79 */
++#define MT6328_AFE_AUDIO_TOP_CON0	0x2014	/* AudDrv_Ana.h:80 */
++#define MT6328_AFUNC_AUD_CON0		0x201c	/* AudDrv_Ana.h:84 */
++#define MT6328_AFUNC_AUD_CON2		0x2020	/* AudDrv_Ana.h:86 */
++#define MT6328_AFE_PMIC_NEWIF_CFG0	0x2038	/* AudDrv_Ana.h:98 */
++#define MT6328_AFE_PMIC_NEWIF_CFG2	0x203c	/* AudDrv_Ana.h:100 */
++
++/* Downlink interface rate field, bits 12-15 (mt_soc_codec_63xx.c:1641) */
++#define RG_DL_IF_FREQ_SHIFT		12
++/* Uplink rate / mode field, bits 0-4 (mt_soc_codec_63xx.c:3386) */
++#define RG_UL_RATE_MASK			0x1f
++
++#endif /* __SND_SOC_MT6331_H */
+diff --git a/sound/soc/mediatek/Kconfig b/sound/soc/mediatek/Kconfig
+index 3a1e1fa3f..08121c915 100644
+--- a/sound/soc/mediatek/Kconfig
++++ b/sound/soc/mediatek/Kconfig
+@@ -36,6 +36,31 @@ config SND_SOC_MT2701_WM8960
+ 	  Select Y if you have such device.
+ 	  If unsure select "N".
+ 
++config SND_SOC_MT6735
++	tristate "ASoC support for Mediatek MT6735/MT6737T"
++	depends on ARCH_MEDIATEK
++	select SND_SOC_MEDIATEK
++	help
++	  This adds the ASoC AFE platform driver for Mediatek MT6735 and
++	  MT6737T SoCs.  It provides the DL1/DL2 playback and UL1 capture
++	  front ends plus the I2S0 back end and is used together with the
++	  MT6328 PMIC codec driver.
++	  Select Y if you have such device.
++	  If unsure select "N".
++
++config SND_SOC_MT6735_MT6331
++	tristate "ASoC Audio driver for MediaTek MT6735 with MT6331/MT6328"
++	depends on SND_SOC_MT6735
++	depends on SND_SOC_MT6331
++	help
++	  This adds support for the ASoC machine driver for MediaTek MT6735
++	  boards using the MT6331/MT6328 audio codec, such as the Samsung
++	  SM-G532M (grandpplte).  It provides the MultiMedia1, MultiMedia2,
++	  MultiMedia_DL2 and I2S0OUTPUT front-end links and drives the ASoC
++	  headset jack from the MT6328 accessory-detection block.
++	  Select Y if you have such device.
++	  If unsure select "N".
++
+ config SND_SOC_MT6797
+ 	tristate "ASoC support for Mediatek MT6797 chip"
+ 	depends on ARCH_MEDIATEK
+diff --git a/sound/soc/mediatek/Makefile b/sound/soc/mediatek/Makefile
+index 7cd67bce9..2c155bc4d 100644
+--- a/sound/soc/mediatek/Makefile
++++ b/sound/soc/mediatek/Makefile
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ obj-$(CONFIG_SND_SOC_MEDIATEK) += common/
+ obj-$(CONFIG_SND_SOC_MT2701) += mt2701/
++obj-$(CONFIG_SND_SOC_MT6735) += mt6735/
+ obj-$(CONFIG_SND_SOC_MT6797) += mt6797/
+ obj-$(CONFIG_SND_SOC_MT7986) += mt7986/
+ obj-$(CONFIG_SND_SOC_MT8173) += mt8173/
+diff --git a/sound/soc/mediatek/mt6735/Makefile b/sound/soc/mediatek/mt6735/Makefile
+new file mode 100644
+index 000000000..bcf2f0cf2
+--- /dev/null
++++ b/sound/soc/mediatek/mt6735/Makefile
+@@ -0,0 +1,11 @@
++# SPDX-License-Identifier: GPL-2.0-only
++snd-soc-mt6735-afe-objs := \
++	mt6735-afe-pcm.o \
++	mt6735-afe-clk.o \
++	mt6735-dai-pcm.o \
++	mt6735-dai-i2s.o
++
++obj-$(CONFIG_SND_SOC_MT6735) += snd-soc-mt6735-afe.o
++
++snd-soc-mt6735-mt6331-y := mt6735-mt6331.o
++obj-$(CONFIG_SND_SOC_MT6735_MT6331) += snd-soc-mt6735-mt6331.o
+diff --git a/sound/soc/mediatek/mt6735/mt6735-afe-clk.c b/sound/soc/mediatek/mt6735/mt6735-afe-clk.c
+new file mode 100644
+index 000000000..0bbfa05cc
+--- /dev/null
++++ b/sound/soc/mediatek/mt6735/mt6735-afe-clk.c
+@@ -0,0 +1,182 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT6735/MT6737T ALSA SoC AFE clock and pin control helpers.
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * Port from Samsung/MTK downstream
++ * sound/soc/mediatek/mt_soc_audio_v3/AudDrv_Clk.c and AudDrv_Gpio.c.
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/regmap.h>
++
++#include "mt6735-afe-common.h"
++
++/*
++ * Clock names are taken verbatim from the ROM audio node
++ * (rom_dtb_0.dts, mt_soc_dl1_pcm@11220000 clock-names) which is the same
++ * list AudDrv_Clk.c:137-157 looks up with devm_clk_get().
++ */
++static const char * const mt6735_afe_clk_names[MT6735_AFE_CLK_NUM] = {
++	[MT6735_AFE_CLK_AFE]			= "aud_afe_clk",
++	[MT6735_AFE_CLK_I2S]			= "aud_i2s_clk",
++	[MT6735_AFE_CLK_DAC]			= "aud_dac_clk",
++	[MT6735_AFE_CLK_DAC_PREDIS]		= "aud_dac_predis_clk",
++	[MT6735_AFE_CLK_ADC]			= "aud_adc_clk",
++	[MT6735_AFE_CLK_TML]			= "aud_tml_clk",
++	[MT6735_AFE_CLK_APLL22M]		= "aud_apll22m_clk",
++	[MT6735_AFE_CLK_APLL24M]		= "aud_apll24m_clk",
++	[MT6735_AFE_CLK_APLL1_TUNER]		= "aud_apll1_tuner_clk",
++	[MT6735_AFE_CLK_APLL2_TUNER]		= "aud_apll2_tuner_clk",
++	[MT6735_AFE_CLK_INFRA]			= "aud_infra_clk",
++	[MT6735_AFE_CLK_MUX1]			= "aud_mux1_clk",
++	[MT6735_AFE_CLK_MUX2]			= "aud_mux2_clk",
++	[MT6735_AFE_CLK_TOP_AD_APLL1]		= "top_ad_apll1_clk",
++	[MT6735_AFE_CLK_TOP_WHPLL_AUDIO]	= "top_whpll_audio_clk",
++	[MT6735_AFE_CLK_TOP_MUX_AUDIO]		= "top_mux_audio",
++	[MT6735_AFE_CLK_TOP_MUX_AUDIO_INT]	= "top_mux_audio_int",
++	[MT6735_AFE_CLK_TOP_SYS_PLL1_D4]	= "top_sys_pll1_d4",
++	[MT6735_AFE_CLK_APMIXED_APLL1]		= "apmixed_apll1_clk",
++	[MT6735_AFE_CLK_APMIXED_APLL2]		= "apmixed_apll2_clk",
++	[MT6735_AFE_CLK_TOP_CLK26M]		= "top_clk26m_clk",
++};
++
++int mt6735_afe_init_clk(struct mtk_base_afe *afe)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	int i;
++
++	for (i = 0; i < MT6735_AFE_CLK_NUM; i++)
++		priv->clks[i].id = mt6735_afe_clk_names[i];
++
++	/*
++	 * The audiosys clock gate provider is not part of this driver; the
++	 * clocks are optional so that the AFE can bind on a device tree where
++	 * the provider is not (yet) present.  AudDrv_Clk.c:171 uses a plain
++	 * devm_clk_get() because the provider is always there on Android.
++	 */
++	return devm_clk_bulk_get_optional(afe->dev, MT6735_AFE_CLK_NUM,
++					  priv->clks);
++}
++
++int mt6735_afe_enable_clk(struct mtk_base_afe *afe)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	int ret;
++
++	/* AudDrv_Clk_On() enables infra/afe/dac/dac_predis, AudDrv_Clk.c:437-470 */
++	ret = clk_bulk_prepare_enable(MT6735_AFE_CLK_NUM, priv->clks);
++	if (ret) {
++		dev_err(afe->dev, "failed to enable audio clocks: %d\n", ret);
++		return ret;
++	}
++
++	/*
++	 * "must set, system will default set bit14 to 0" - the AFE register
++	 * block is not accessible before this bit is set (AudDrv_Clk.c:265,
++	 * and the same write in AudDrv_Clk_On(), AudDrv_Clk.c:467).
++	 */
++	return regmap_update_bits(afe->regmap, AUDIO_TOP_CON0,
++				  AUDIO_TOP_CON0_AFE_POWER_ON,
++				  AUDIO_TOP_CON0_AFE_POWER_ON);
++}
++
++void mt6735_afe_disable_clk(struct mtk_base_afe *afe)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++
++	/*
++	 * AudDrv_Clk_Off() clears all pending IRQ status before gating the
++	 * clocks (AudDrv_Clk.c:511).
++	 */
++	regmap_write(afe->regmap, AFE_IRQ_MCU_CLR, AFE_IRQ_STATUS_ALL);
++
++	clk_bulk_disable_unprepare(MT6735_AFE_CLK_NUM, priv->clks);
++}
++
++static struct pinctrl_state *mt6735_afe_lookup_state(struct mtk_base_afe *afe,
++						     const char *name)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	struct pinctrl_state *state;
++
++	if (!priv->pinctrl)
++		return NULL;
++
++	state = pinctrl_lookup_state(priv->pinctrl, name);
++	if (IS_ERR(state)) {
++		dev_dbg(afe->dev, "pinctrl state %s not available\n", name);
++		return NULL;
++	}
++
++	return state;
++}
++
++int mt6735_afe_init_pinctrl(struct mtk_base_afe *afe)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++
++	/*
++	 * AudDrv_GPIO_probe() (AudDrv_Gpio.c:104-137) resolves every state
++	 * used by the audio driver.  Here only the states owned by the AFE are
++	 * looked up; the codec/amplifier states belong to the machine driver.
++	 */
++	priv->pinctrl = devm_pinctrl_get(afe->dev);
++	if (IS_ERR(priv->pinctrl)) {
++		dev_dbg(afe->dev, "no audio pinctrl, continuing without it\n");
++		priv->pinctrl = NULL;
++		return 0;
++	}
++
++	priv->pins_default = mt6735_afe_lookup_state(afe, "default");
++	priv->pins_pmic_mode0 = mt6735_afe_lookup_state(afe, "audpmicclk-mode0");
++	priv->pins_pmic_mode1 = mt6735_afe_lookup_state(afe, "audpmicclk-mode1");
++	priv->pins_i2s_mode0 = mt6735_afe_lookup_state(afe, "audi2s1-mode0");
++	priv->pins_i2s_mode1 = mt6735_afe_lookup_state(afe, "audi2s1-mode1");
++
++	if (priv->pins_default)
++		return pinctrl_select_state(priv->pinctrl, priv->pins_default);
++
++	return 0;
++}
++
++static int mt6735_afe_select_pins(struct mtk_base_afe *afe,
++				  struct pinctrl_state *state)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++
++	if (!priv->pinctrl || !state)
++		return 0;
++
++	return pinctrl_select_state(priv->pinctrl, state);
++}
++
++/*
++ * The PMIC audio bus pins (AUD_CLK_MOSI/AUD_DAT_MISO/AUD_DAT_MOSI) are muxed
++ * to their audio function by "audpmicclk-mode1" and returned to GPIO by
++ * "audpmicclk-mode0" (downstream DTS AUD_pins_pmicclk_mode0/mode1).
++ * AudDrv_GPIO_PMIC_Select() therefore selects mode1 when the AFE path is on
++ * and mode0 when it is off (AudDrv_Gpio.c:215-236), which is what
++ * EnableAfe() uses (mt_soc_afe_control.c:993,1017).
++ */
++int mt6735_afe_select_pmic_pins(struct mtk_base_afe *afe, bool active)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++
++	return mt6735_afe_select_pins(afe,
++				      active ? priv->pins_pmic_mode1 :
++					       priv->pins_pmic_mode0);
++}
++
++int mt6735_afe_select_i2s_pins(struct mtk_base_afe *afe, bool active)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++
++	return mt6735_afe_select_pins(afe,
++				      active ? priv->pins_i2s_mode1 :
++					       priv->pins_i2s_mode0);
++}
+diff --git a/sound/soc/mediatek/mt6735/mt6735-afe-clk.h b/sound/soc/mediatek/mt6735/mt6735-afe-clk.h
+new file mode 100644
+index 000000000..ca263f52c
+--- /dev/null
++++ b/sound/soc/mediatek/mt6735/mt6735-afe-clk.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * MediaTek MT6735/MT6737T ALSA SoC AFE clock and pin control helpers.
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * Port from Samsung/MTK downstream
++ * sound/soc/mediatek/mt_soc_audio_v3/AudDrv_Clk.c and AudDrv_Gpio.c.
++ */
++
++#ifndef _MT6735_AFE_CLK_H_
++#define _MT6735_AFE_CLK_H_
++
++struct mtk_base_afe;
++
++int mt6735_afe_init_clk(struct mtk_base_afe *afe);
++int mt6735_afe_enable_clk(struct mtk_base_afe *afe);
++void mt6735_afe_disable_clk(struct mtk_base_afe *afe);
++
++int mt6735_afe_init_pinctrl(struct mtk_base_afe *afe);
++int mt6735_afe_select_pmic_pins(struct mtk_base_afe *afe, bool active);
++int mt6735_afe_select_i2s_pins(struct mtk_base_afe *afe, bool active);
++
++#endif /* _MT6735_AFE_CLK_H_ */
+diff --git a/sound/soc/mediatek/mt6735/mt6735-afe-common.h b/sound/soc/mediatek/mt6735/mt6735-afe-common.h
+new file mode 100644
+index 000000000..0e968fbec
+--- /dev/null
++++ b/sound/soc/mediatek/mt6735/mt6735-afe-common.h
+@@ -0,0 +1,145 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * MediaTek MT6735/MT6737T ALSA SoC AFE platform driver - shared definitions.
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * Port from Samsung/MTK downstream
++ * sound/soc/mediatek/mt_soc_audio_v3/ (AudDrv_Clk.c, AudDrv_Gpio.c,
++ * mt_soc_afe_control.c, mt_soc_pcm_dl1.c, mt_soc_pcm_capture.c,
++ * mt_soc_pcm_dl2.c, mt_soc_pcm_dl1_i2s0.c).
++ */
++
++#ifndef _MT6735_AFE_COMMON_H_
++#define _MT6735_AFE_COMMON_H_
++
++#include <linux/clk.h>
++#include <linux/pinctrl/consumer.h>
++#include <sound/soc.h>
++
++#include "../common/mtk-base-afe.h"
++#include "mt6735-afe-clk.h"
++#include "mt6735-afe-regs.h"
++
++/* Memory interfaces implemented by this driver. */
++enum {
++	MT6735_AFE_MEMIF_DL1 = 0,
++	MT6735_AFE_MEMIF_DL2,
++	MT6735_AFE_MEMIF_VUL,
++	MT6735_AFE_MEMIF_NUM,
++};
++
++/* MCU interrupt sources used by the memory interfaces above. */
++enum {
++	MT6735_AFE_IRQ1 = 0,
++	MT6735_AFE_IRQ2,
++	MT6735_AFE_IRQ_NUM,
++};
++
++/*
++ * DAI ids.  The three PCM DAIs must use their memory interface number as
++ * id because the PCM pointer calculation indexes afe->memif[] with it.
++ */
++enum {
++	MT6735_AFE_DAI_DL1 = 0,
++	MT6735_AFE_DAI_DL2,
++	MT6735_AFE_DAI_VUL,
++	MT6735_AFE_DAI_I2S0,
++	MT6735_AFE_DAI_NUM,
++};
++
++#define MT6735_AFE_PCM_DAI_NUM	3
++
++/* Supported PCM parameters (mt_soc_pcm_common.h:168-201). */
++#define MT6735_AFE_FORMATS	(SNDRV_PCM_FMTBIT_S16_LE | \
++				 SNDRV_PCM_FMTBIT_S24_LE)
++#define MT6735_AFE_RATES	(SNDRV_PCM_RATE_8000 | \
++				 SNDRV_PCM_RATE_11025 | \
++				 SNDRV_PCM_RATE_12000 | \
++				 SNDRV_PCM_RATE_16000 | \
++				 SNDRV_PCM_RATE_22050 | \
++				 SNDRV_PCM_RATE_24000 | \
++				 SNDRV_PCM_RATE_32000 | \
++				 SNDRV_PCM_RATE_44100 | \
++				 SNDRV_PCM_RATE_48000)
++#define MT6735_AFE_RATE_MIN	8000
++#define MT6735_AFE_RATE_MAX	48000
++#define MT6735_AFE_CHANNELS_MIN	1
++#define MT6735_AFE_CHANNELS_MAX	2
++
++/* Reference rate used to compare interrupt periods (mt_soc_digital_type.h:865) */
++#define MT6735_AFE_IRQ_MAX_RATE	260000
++
++/* AudioInterruptLimiter, mt_soc_afe_control.c:164 */
++#define MT6735_AFE_IRQ_LIMIT	100
++
++/*
++ * Audio clocks listed for the ROM audio node (rom_dtb_0.dts
++ * mt_soc_dl1_pcm@11220000 clock-names) and looked up by name in
++ * AudDrv_Clk.c:137-157.
++ */
++enum mt6735_afe_clk_id {
++	MT6735_AFE_CLK_AFE,
++	MT6735_AFE_CLK_I2S,
++	MT6735_AFE_CLK_DAC,
++	MT6735_AFE_CLK_DAC_PREDIS,
++	MT6735_AFE_CLK_ADC,
++	MT6735_AFE_CLK_TML,
++	MT6735_AFE_CLK_APLL22M,
++	MT6735_AFE_CLK_APLL24M,
++	MT6735_AFE_CLK_APLL1_TUNER,
++	MT6735_AFE_CLK_APLL2_TUNER,
++	MT6735_AFE_CLK_INFRA,
++	MT6735_AFE_CLK_MUX1,
++	MT6735_AFE_CLK_MUX2,
++	MT6735_AFE_CLK_TOP_AD_APLL1,
++	MT6735_AFE_CLK_TOP_WHPLL_AUDIO,
++	MT6735_AFE_CLK_TOP_MUX_AUDIO,
++	MT6735_AFE_CLK_TOP_MUX_AUDIO_INT,
++	MT6735_AFE_CLK_TOP_SYS_PLL1_D4,
++	MT6735_AFE_CLK_APMIXED_APLL1,
++	MT6735_AFE_CLK_APMIXED_APLL2,
++	MT6735_AFE_CLK_TOP_CLK26M,
++	MT6735_AFE_CLK_NUM,
++};
++
++struct mt6735_afe_priv {
++	struct clk_bulk_data clks[MT6735_AFE_CLK_NUM];
++
++	struct pinctrl *pinctrl;
++	struct pinctrl_state *pins_default;
++	struct pinctrl_state *pins_pmic_mode0;
++	struct pinctrl_state *pins_pmic_mode1;
++	struct pinctrl_state *pins_i2s_mode0;
++	struct pinctrl_state *pins_i2s_mode1;
++
++	/* Memory interface enable state, mirrors mAudioMEMIF[].mState. */
++	bool memif_enabled[MT6735_AFE_MEMIF_NUM];
++
++	/* PMIC codec interface state, mirrors I2S_OUT_DAC/I2S_IN_ADC users. */
++	bool dac_path_on;
++	bool adc_path_on;
++
++	/* AFE_I2S_CON configuration bits, excluding the enable bit. */
++	unsigned int i2s_con;
++	bool i2s_slave;
++	unsigned int i2s_sysclk;
++
++	unsigned int spurious_irqs;
++};
++
++static inline struct mt6735_afe_priv *mt6735_afe_priv(struct mtk_base_afe *afe)
++{
++	return afe->platform_priv;
++}
++
++/* mt6735-afe-pcm.c */
++int mt6735_afe_rate_to_fs(unsigned int rate);
++void mt6735_afe_update_power(struct mtk_base_afe *afe);
++int mt6735_afe_irq_update(struct mtk_base_afe *afe, int irq);
++
++/* DAI drivers */
++extern const struct snd_soc_dai_driver mt6735_afe_pcm_dais[MT6735_AFE_PCM_DAI_NUM];
++extern const struct snd_soc_dai_driver mt6735_afe_i2s_dai;
++
++#endif /* _MT6735_AFE_COMMON_H_ */
+diff --git a/sound/soc/mediatek/mt6735/mt6735-afe-pcm.c b/sound/soc/mediatek/mt6735/mt6735-afe-pcm.c
+new file mode 100644
+index 000000000..728140374
+--- /dev/null
++++ b/sound/soc/mediatek/mt6735/mt6735-afe-pcm.c
+@@ -0,0 +1,601 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT6735/MT6737T ALSA SoC AFE platform driver.
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * Port from Samsung/MTK downstream
++ * sound/soc/mediatek/mt_soc_audio_v3/:
++ *   AudDrv_Afe.h          - AFE register map
++ *   mt_soc_afe_control.c  - memif enable, IRQ handler, sample rate/channel
++ *   AudDrv_Clk.c          - audio clock gating
++ *   AudDrv_Gpio.c         - audio pin muxing
++ *
++ * The downstream driver binds the AFE with the legacy platform driver
++ * "mt_soc_dl1_pcm" (ROM node mt_soc_dl1_pcm@11220000, compatible
++ * "mediatek,mt-soc-dl1-pcm"); this driver exposes the same hardware as a
++ * single ASoC component named "mtk-afe-pcm".
++ */
++
++#include <linux/dma-mapping.h>
++#include <linux/math64.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++
++#include "mt6735-afe-common.h"
++
++/*
++ * Memory interface descriptors.
++ *
++ *	DL1: AFE_DL1_BASE/CUR/END	AudDrv_Afe.h:443-445
++ *	DL2: AFE_DL2_BASE/CUR/END	AudDrv_Afe.h:454-456
++ *	VUL: AFE_VUL_BASE/END/CUR	AudDrv_Afe.h:462-464
++ */
++static const struct mtk_base_memif_data mt6735_afe_memif_data[MT6735_AFE_MEMIF_NUM] = {
++	[MT6735_AFE_MEMIF_DL1] = {
++		.id = MT6735_AFE_MEMIF_DL1,
++		.name = "DL1",
++		.reg_ofs_base = AFE_DL1_BASE,
++		.reg_ofs_cur = AFE_DL1_CUR,
++		.reg_ofs_end = AFE_DL1_END,
++		.reg_ofs_base_msb = -1,
++		.reg_ofs_cur_msb = -1,
++		.reg_ofs_end_msb = -1,
++		.fs_reg = AFE_DAC_CON1,			/* mt_soc_afe_control.c:1080 */
++		.fs_shift = AFE_DAC_CON1_DL1_FS_SHIFT,
++		.fs_maskbit = AFE_DAC_CON1_FS_MASK,
++		.mono_reg = AFE_DAC_CON1,		/* mt_soc_afe_control.c:1135 */
++		.mono_shift = AFE_DAC_CON1_DL1_MONO_SHIFT,
++		.quad_ch_reg = -1,
++		.int_odd_flag_reg = -1,
++		.enable_reg = AFE_DAC_CON0,		/* mt_soc_afe_control.c:1995-1997 */
++		.enable_shift = MT6735_AFE_MEMIF_DL1 + 1,
++		.hd_reg = AFE_MEMIF_PBUF_SIZE,		/* mt_soc_afe_control.c:2303 */
++		.hd_shift = AFE_MEMIF_PBUF_DL1_FMT_SHIFT,
++		.hd_align_reg = -1,
++		.agent_disable_reg = -1,
++		.msb_reg = -1,
++		.msb_end_reg = -1,
++		.ch_num_reg = -1,
++		.pbuf_reg = -1,
++		.minlen_reg = -1,
++	},
++	[MT6735_AFE_MEMIF_DL2] = {
++		.id = MT6735_AFE_MEMIF_DL2,
++		.name = "DL2",
++		/*
++		 * SetChannels() for DL2 writes the mono value with a bit 21
++		 * shift but masks bit 22 (mt_soc_afe_control.c:1139), so the
++		 * downstream driver can never set the field.  The register
++		 * mask identifies bit 22 as the DL2 mono bit; use it.
++		 */
++		.reg_ofs_base = AFE_DL2_BASE,
++		.reg_ofs_cur = AFE_DL2_CUR,
++		.reg_ofs_end = AFE_DL2_END,
++		.reg_ofs_base_msb = -1,
++		.reg_ofs_cur_msb = -1,
++		.reg_ofs_end_msb = -1,
++		.fs_reg = AFE_DAC_CON1,			/* mt_soc_afe_control.c:1084 */
++		.fs_shift = AFE_DAC_CON1_DL2_FS_SHIFT,
++		.fs_maskbit = AFE_DAC_CON1_FS_MASK,
++		.mono_reg = AFE_DAC_CON1,		/* mt_soc_afe_control.c:1139 */
++		.mono_shift = AFE_DAC_CON1_DL2_MONO_SHIFT,
++		.quad_ch_reg = -1,
++		.int_odd_flag_reg = -1,
++		.enable_reg = AFE_DAC_CON0,
++		.enable_shift = MT6735_AFE_MEMIF_DL2 + 1,
++		.hd_reg = AFE_MEMIF_PBUF_SIZE,		/* mt_soc_afe_control.c:2315 */
++		.hd_shift = AFE_MEMIF_PBUF_DL2_FMT_SHIFT,
++		.hd_align_reg = -1,
++		.agent_disable_reg = -1,
++		.msb_reg = -1,
++		.msb_end_reg = -1,
++		.ch_num_reg = -1,
++		.pbuf_reg = -1,
++		.minlen_reg = -1,
++	},
++	[MT6735_AFE_MEMIF_VUL] = {
++		.id = MT6735_AFE_MEMIF_VUL,
++		.name = "VUL",
++		.reg_ofs_base = AFE_VUL_BASE,
++		.reg_ofs_cur = AFE_VUL_CUR,
++		.reg_ofs_end = AFE_VUL_END,
++		.reg_ofs_base_msb = -1,
++		.reg_ofs_cur_msb = -1,
++		.reg_ofs_end_msb = -1,
++		.fs_reg = AFE_DAC_CON1,			/* mt_soc_afe_control.c:1096 */
++		.fs_shift = AFE_DAC_CON1_VUL_FS_SHIFT,
++		.fs_maskbit = AFE_DAC_CON1_FS_MASK,
++		.mono_reg = AFE_DAC_CON1,		/* mt_soc_afe_control.c:1147 */
++		.mono_shift = AFE_DAC_CON1_VUL_MONO_SHIFT,
++		.quad_ch_reg = -1,
++		.int_odd_flag_reg = -1,
++		.enable_reg = AFE_DAC_CON0,
++		.enable_shift = MT6735_AFE_MEMIF_VUL + 1,
++		.hd_reg = AFE_MEMIF_PBUF_SIZE,		/* mt_soc_afe_control.c:2335 */
++		.hd_shift = AFE_MEMIF_PBUF_VUL_FMT_SHIFT,
++		.hd_align_reg = -1,
++		.agent_disable_reg = -1,
++		.msb_reg = -1,
++		.msb_end_reg = -1,
++		.ch_num_reg = -1,
++		.pbuf_reg = -1,
++		.minlen_reg = -1,
++	},
++};
++
++/* IRQ line used by each memory interface, mt_soc_afe_control.c:613-636 */
++static const int mt6735_afe_memif_irq[MT6735_AFE_MEMIF_NUM] = {
++	[MT6735_AFE_MEMIF_DL1] = MT6735_AFE_IRQ1,
++	[MT6735_AFE_MEMIF_DL2] = MT6735_AFE_IRQ1,
++	[MT6735_AFE_MEMIF_VUL] = MT6735_AFE_IRQ2,
++};
++
++/*
++ * 36 KiB per direction, the downstream AFE SRAM/DRAM buffer sizes
++ * (mt_soc_pcm_common.h:123,136; AudioSramPlaybackFullSize =
++ * 1024 * 36 in mt_soc_afe_control.c:158-163).
++ */
++static const struct snd_pcm_hardware mt6735_afe_hardware = {
++	.info = SNDRV_PCM_INFO_MMAP |
++		SNDRV_PCM_INFO_INTERLEAVED |
++		SNDRV_PCM_INFO_MMAP_VALID,
++	.formats = MT6735_AFE_FORMATS,
++	.rates = MT6735_AFE_RATES,
++	.rate_min = MT6735_AFE_RATE_MIN,
++	.rate_max = MT6735_AFE_RATE_MAX,
++	.channels_min = MT6735_AFE_CHANNELS_MIN,
++	.channels_max = MT6735_AFE_CHANNELS_MAX,
++	.buffer_bytes_max = 36 * 1024,
++	.period_bytes_min = 64,
++	.period_bytes_max = 36 * 1024,
++	.periods_min = 2,
++	.periods_max = 256,
++	.fifo_size = 0,
++};
++
++/*
++ * Sample rate field encoding used by AFE_DAC_CON1, AFE_I2S_CON(x) and
++ * AFE_IRQ_MCU_CON (mt_soc_digital_type.h:265-279, SampleRateTransform(),
++ * mt_soc_afe_control.c:1035-1072).
++ */
++static const struct {
++	unsigned int rate;
++	int fs;
++} mt6735_afe_rates[] = {
++	{ 8000, 0 },
++	{ 11025, 1 },
++	{ 12000, 2 },
++	{ 16000, 4 },
++	{ 22050, 5 },
++	{ 24000, 6 },
++	{ 32000, 8 },
++	{ 44100, 9 },
++	{ 48000, 10 },
++};
++
++int mt6735_afe_rate_to_fs(unsigned int rate)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(mt6735_afe_rates); i++)
++		if (mt6735_afe_rates[i].rate == rate)
++			return mt6735_afe_rates[i].fs;
++
++	return -EINVAL;
++}
++
++static bool mt6735_afe_volatile_reg(struct device *dev, unsigned int reg)
++{
++	switch (reg) {
++	case AFE_DL1_CUR:
++	case AFE_DL2_CUR:
++	case AFE_VUL_CUR:
++	case AFE_IRQ_MCU_STATUS:
++	case AFE_IRQ_MCU_CLR:
++	case AFE_IRQ_MCU_CNT1:
++	case AFE_IRQ_MCU_CNT2:
++	case AFE_IRQ1_MCU_CNT_MON:
++	case AFE_IRQ2_MCU_CNT_MON:
++	case AFE_MEMIF_MON0:
++	case AFE_MEMIF_MON1:
++	case AFE_MEMIF_MON2:
++	case AFE_MEMIF_MON4:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static const struct regmap_config mt6735_afe_regmap_config = {
++	.reg_bits = 32,
++	.val_bits = 32,
++	.reg_stride = 4,
++	.max_register = MT6735_AFE_SIZE - 4,
++	.cache_type = REGCACHE_RBTREE,
++	.volatile_reg = mt6735_afe_volatile_reg,
++};
++
++/*
++ * Keep AFE_DAC_CON0 bit 0 in sync with the set of enabled memory
++ * interfaces.  This is the register write part of EnableAfe() from
++ * mt_soc_afe_control.c:981,1029: the AFE is only powered when at least one
++ * memory interface needs it.  Callers run in atomic context, so the PMIC bus
++ * pin mux (also part of EnableAfe()) is programmed from the sleepable DAI
++ * prepare/shutdown paths instead.
++ */
++void mt6735_afe_update_power(struct mtk_base_afe *afe)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	bool enabled = false;
++	int i;
++
++	for (i = 0; i < MT6735_AFE_MEMIF_NUM; i++)
++		enabled |= priv->memif_enabled[i];
++
++	regmap_update_bits(afe->regmap, AFE_DAC_CON0, AFE_DAC_CON0_AFE_ON,
++			   enabled ? AFE_DAC_CON0_AFE_ON : 0);
++}
++
++/*
++ * IRQ1 is shared by DL1 and DL2.  The downstream IRQ manager programs the
++ * counter for the user with the smallest period measured at the highest
++ * supported rate (IRQ_MAX_RATE, mt_soc_digital_type.h:865) and further
++ * rescaled by 100 to avoid overflow (get_tgt_count(),
++ * mt_soc_afe_control.c:3890-3895).  IRQ2 only has the capture interface.
++ */
++int mt6735_afe_irq_update(struct mtk_base_afe *afe, int irq)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	struct snd_pcm_runtime *best = NULL;
++	u64 best_period = U64_MAX;
++	unsigned int cnt_reg, fs_shift, en_bit;
++	int i, fs;
++
++	switch (irq) {
++	case MT6735_AFE_IRQ1:
++		cnt_reg = AFE_IRQ_MCU_CNT1;		/* mt_soc_afe_control.c:2159 */
++		fs_shift = AFE_IRQ_MCU_CON_IRQ1_FS_SHIFT;
++		en_bit = AFE_IRQ_MCU_CON_IRQ1_EN;
++		break;
++	case MT6735_AFE_IRQ2:
++		cnt_reg = AFE_IRQ_MCU_CNT2;		/* mt_soc_afe_control.c:2162 */
++		fs_shift = AFE_IRQ_MCU_CON_IRQ2_FS_SHIFT;
++		en_bit = AFE_IRQ_MCU_CON_IRQ2_EN;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	for (i = 0; i < MT6735_AFE_MEMIF_NUM; i++) {
++		struct snd_pcm_runtime *runtime;
++		u64 period;
++
++		if (afe->memif[i].irq_usage != irq || !priv->memif_enabled[i])
++			continue;
++		if (!afe->memif[i].substream)
++			continue;
++
++		runtime = afe->memif[i].substream->runtime;
++		if (!runtime || !runtime->rate)
++			continue;
++
++		period = div_u64((u64)runtime->period_size *
++				 MT6735_AFE_IRQ_MAX_RATE, runtime->rate);
++		if (period < best_period) {
++			best_period = period;
++			best = runtime;
++		}
++	}
++
++	if (!best) {
++		/* disable and clear, disable_aud_irq(), mt_soc_afe_control.c:3847-3856 */
++		regmap_update_bits(afe->regmap, AFE_IRQ_MCU_CON, en_bit, 0);
++		regmap_write(afe->regmap, cnt_reg, 0);
++		return 0;
++	}
++
++	fs = mt6735_afe_rate_to_fs(best->rate);
++	if (fs < 0)
++		return fs;
++
++	/* SetIrqMcuCounter(), mt_soc_afe_control.c:2154-2178 */
++	regmap_write(afe->regmap, cnt_reg, (unsigned int)best->period_size);
++	/* SetIrqMcuSampleRate(), mt_soc_afe_control.c:2128-2152 */
++	regmap_update_bits(afe->regmap, AFE_IRQ_MCU_CON,
++			   AFE_IRQ_MCU_CON_FS_MASK << fs_shift, fs << fs_shift);
++	/* SetIrqEnable(), mt_soc_afe_control.c:2099-2126 */
++	regmap_update_bits(afe->regmap, AFE_IRQ_MCU_CON, en_bit, en_bit);
++
++	return 0;
++}
++
++/*
++ * AudDrv_IRQ_handler(), mt_soc_afe_control.c:574-642.  IRQ1 serves DL1 and
++ * DL2, IRQ2 serves the capture interface.  AFE_IRQ_MCU_CLR is write-one to
++ * clear for the bits reported in AFE_IRQ_MCU_STATUS.
++ */
++static irqreturn_t mt6735_afe_irq_handler(int irq, void *data)
++{
++	struct mtk_base_afe *afe = data;
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	unsigned int status;
++	int i;
++
++	if (regmap_read(afe->regmap, AFE_IRQ_MCU_STATUS, &status))
++		return IRQ_HANDLED;
++
++	status &= AFE_IRQ_STATUS_ALL;
++	if (!status) {
++		/*
++		 * Spurious interrupt recovery, mt_soc_afe_control.c:594-610:
++		 * clear every source and stop the MCU interrupts after
++		 * AudioInterruptLimiter (100) consecutive bogus interrupts.
++		 */
++		regmap_write(afe->regmap, AFE_IRQ_MCU_CLR, AFE_IRQ_STATUS_ALL);
++		if (++priv->spurious_irqs > MT6735_AFE_IRQ_LIMIT) {
++			regmap_update_bits(afe->regmap, AFE_IRQ_MCU_CON,
++					   AFE_IRQ_MCU_CON_IRQ1_EN |
++					   AFE_IRQ_MCU_CON_IRQ2_EN, 0);
++			priv->spurious_irqs = 0;
++		}
++		return IRQ_HANDLED;
++	}
++	priv->spurious_irqs = 0;
++
++	if (status & AFE_IRQ_STATUS_IRQ1) {
++		for (i = MT6735_AFE_MEMIF_DL1; i <= MT6735_AFE_MEMIF_DL2; i++) {
++			if (!priv->memif_enabled[i] || !afe->memif[i].substream)
++				continue;
++			snd_pcm_period_elapsed(afe->memif[i].substream);
++		}
++	}
++
++	if ((status & AFE_IRQ_STATUS_IRQ2) &&
++	    priv->memif_enabled[MT6735_AFE_MEMIF_VUL] &&
++	    afe->memif[MT6735_AFE_MEMIF_VUL].substream)
++		snd_pcm_period_elapsed(afe->memif[MT6735_AFE_MEMIF_VUL].substream);
++
++	regmap_write(afe->regmap, AFE_IRQ_MCU_CLR, status);
++
++	return IRQ_HANDLED;
++}
++
++/*
++ * The hardware reports the DMA read (playback) / write (capture) pointer,
++ * mtk_pcm_pointer() in mt_soc_pcm_dl1.c:189-235 does the same computation.
++ */
++static snd_pcm_uframes_t mt6735_afe_pcm_pointer(struct snd_soc_component *component,
++					       struct snd_pcm_substream *substream)
++{
++	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++	struct mtk_base_afe *afe = snd_soc_component_get_drvdata(component);
++	const struct mtk_base_memif_data *data;
++	unsigned int hw_ptr = 0, hw_base = 0;
++	int memif_id = snd_soc_rtd_to_cpu(rtd, 0)->id;
++
++	if (memif_id < 0 || memif_id >= afe->memif_size)
++		return 0;
++
++	data = afe->memif[memif_id].data;
++	if (!data || !afe->memif[memif_id].substream)
++		return 0;
++
++	if (regmap_read(afe->regmap, data->reg_ofs_cur, &hw_ptr) ||
++	    regmap_read(afe->regmap, data->reg_ofs_base, &hw_base))
++		return 0;
++
++	if (!hw_ptr || !hw_base || hw_ptr < hw_base)
++		return 0;
++
++	return bytes_to_frames(substream->runtime, hw_ptr - hw_base);
++}
++
++static int mt6735_afe_pcm_new(struct snd_soc_component *component,
++			      struct snd_soc_pcm_runtime *rtd)
++{
++	struct mtk_base_afe *afe = snd_soc_component_get_drvdata(component);
++	size_t size = afe->mtk_afe_hardware->buffer_bytes_max;
++
++	snd_pcm_set_managed_buffer_all(rtd->pcm, SNDRV_DMA_TYPE_DEV, afe->dev,
++				       0, size);
++
++	return 0;
++}
++
++static int mt6735_afe_component_probe(struct snd_soc_component *component)
++{
++	struct mtk_base_afe *afe = snd_soc_component_get_drvdata(component);
++
++	snd_soc_component_init_regmap(component, afe->regmap);
++
++	return 0;
++}
++
++static const struct snd_soc_component_driver mt6735_afe_component = {
++	.name = "mtk-afe-pcm",
++	.probe = mt6735_afe_component_probe,
++	.pcm_construct = mt6735_afe_pcm_new,
++	.pointer = mt6735_afe_pcm_pointer,
++};
++
++static int mt6735_afe_runtime_suspend(struct device *dev)
++{
++	struct mtk_base_afe *afe = dev_get_drvdata(dev);
++
++	/* AudDrv_Clk_Off(): clear IRQ status, then gate the audio clocks. */
++	mt6735_afe_disable_clk(afe);
++	regcache_cache_only(afe->regmap, true);
++
++	return 0;
++}
++
++static int mt6735_afe_runtime_resume(struct device *dev)
++{
++	struct mtk_base_afe *afe = dev_get_drvdata(dev);
++	int ret;
++
++	regcache_cache_only(afe->regmap, false);
++
++	ret = mt6735_afe_enable_clk(afe);
++	if (ret) {
++		regcache_cache_only(afe->regmap, true);
++		return ret;
++	}
++
++	regcache_mark_dirty(afe->regmap);
++
++	return regcache_sync(afe->regmap);
++}
++
++static int mt6735_afe_pcm_dev_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct snd_soc_dai_driver *dais;
++	struct mtk_base_afe *afe;
++	struct mt6735_afe_priv *priv;
++	int ret, irq, i;
++
++	afe = devm_kzalloc(dev, sizeof(*afe), GFP_KERNEL);
++	if (!afe)
++		return -ENOMEM;
++	afe->dev = dev;
++	platform_set_drvdata(pdev, afe);
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++	afe->platform_priv = priv;
++
++	afe->base_addr = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(afe->base_addr))
++		return dev_err_probe(dev, PTR_ERR(afe->base_addr),
++				     "failed to map AFE registers\n");
++
++	afe->regmap = devm_regmap_init_mmio(dev, afe->base_addr,
++					    &mt6735_afe_regmap_config);
++	if (IS_ERR(afe->regmap))
++		return dev_err_probe(dev, PTR_ERR(afe->regmap),
++				     "failed to init regmap\n");
++
++	/*
++	 * The AFE memory interfaces take 32 bit physical addresses; the MSB
++	 * register (AFE_MEMIF_MSB, AudDrv_Afe.h:470) is never programmed by
++	 * the downstream driver.
++	 */
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return dev_err_probe(dev, ret, "no 32-bit DMA support\n");
++
++	afe->memif_size = MT6735_AFE_MEMIF_NUM;
++	afe->memif = devm_kcalloc(dev, afe->memif_size, sizeof(*afe->memif),
++				  GFP_KERNEL);
++	if (!afe->memif)
++		return -ENOMEM;
++
++	for (i = 0; i < MT6735_AFE_MEMIF_NUM; i++) {
++		afe->memif[i].data = &mt6735_afe_memif_data[i];
++		afe->memif[i].irq_usage = mt6735_afe_memif_irq[i];
++		afe->memif[i].const_irq = 1;
++	}
++
++	afe->mtk_afe_hardware = &mt6735_afe_hardware;
++
++	ret = mt6735_afe_init_pinctrl(afe);
++	if (ret)
++		return ret;
++
++	ret = mt6735_afe_init_clk(afe);
++	if (ret)
++		return ret;
++
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
++
++	/* Power the block up once to make the IRQ request and regmap valid. */
++	ret = pm_runtime_get_sync(dev);
++	if (ret < 0) {
++		pm_runtime_put_noidle(dev);
++		return ret;
++	}
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0) {
++		ret = irq;
++		goto err_put;
++	}
++
++	ret = devm_request_irq(dev, irq, mt6735_afe_irq_handler, 0,
++			       "Afe_ISR_Handle", afe);
++	if (ret)
++		goto err_put;
++
++	dais = devm_kcalloc(dev, MT6735_AFE_DAI_NUM, sizeof(*dais),
++			    GFP_KERNEL);
++	if (!dais) {
++		ret = -ENOMEM;
++		goto err_put;
++	}
++
++	memcpy(dais, mt6735_afe_pcm_dais, sizeof(mt6735_afe_pcm_dais));
++	dais[MT6735_AFE_DAI_I2S0] = mt6735_afe_i2s_dai;
++
++	ret = devm_snd_soc_register_component(dev, &mt6735_afe_component,
++					      dais, MT6735_AFE_DAI_NUM);
++	if (ret)
++		goto err_put;
++
++	pm_runtime_put(dev);
++
++	return 0;
++
++err_put:
++	pm_runtime_put_sync(dev);
++	return ret;
++}
++
++static void mt6735_afe_pcm_dev_remove(struct platform_device *pdev)
++{
++	struct mtk_base_afe *afe = platform_get_drvdata(pdev);
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++
++	if (!pm_runtime_status_suspended(afe->dev))
++		pm_runtime_force_suspend(afe->dev);
++
++	/* Return the audio pins to their boot state (AudDrv_GPIO_probe()). */
++	if (priv->pinctrl && priv->pins_default)
++		pinctrl_select_state(priv->pinctrl, priv->pins_default);
++}
++
++static const struct of_device_id mt6735_afe_pcm_dt_match[] = {
++	{ .compatible = "mediatek,mt6735-afe" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mt6735_afe_pcm_dt_match);
++
++static const struct dev_pm_ops mt6735_afe_pm_ops = {
++	RUNTIME_PM_OPS(mt6735_afe_runtime_suspend, mt6735_afe_runtime_resume, NULL)
++	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
++};
++
++static struct platform_driver mt6735_afe_pcm_driver = {
++	.driver = {
++		.name = "mt6735-afe-pcm",
++		.of_match_table = mt6735_afe_pcm_dt_match,
++		.pm = pm_ptr(&mt6735_afe_pm_ops),
++	},
++	.probe = mt6735_afe_pcm_dev_probe,
++	.remove = mt6735_afe_pcm_dev_remove,
++};
++
++module_platform_driver(mt6735_afe_pcm_driver);
++
++MODULE_DESCRIPTION("MediaTek MT6735/MT6737T ALSA SoC AFE platform driver");
++MODULE_LICENSE("GPL v2");
++MODULE_ALIAS("platform:mt6735-afe-pcm");
+diff --git a/sound/soc/mediatek/mt6735/mt6735-afe-regs.h b/sound/soc/mediatek/mt6735/mt6735-afe-regs.h
+new file mode 100644
+index 000000000..3f92e7876
+--- /dev/null
++++ b/sound/soc/mediatek/mt6735/mt6735-afe-regs.h
+@@ -0,0 +1,203 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * MediaTek MT6735/MT6737T audio front end (AFE) register definitions.
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * Port from Samsung/MTK downstream
++ * sound/soc/mediatek/mt_soc_audio_v3/AudDrv_Afe.h and
++ * sound/soc/mediatek/mt_soc_audio_v3/mt_soc_afe_control.c.
++ *
++ * Every offset below carries the downstream file:line it was transcribed
++ * from.  The AFE register block is mapped at 0x11220000 (AudDrv_Afe.h:361).
++ */
++
++#ifndef _MT6735_AFE_REGS_H_
++#define _MT6735_AFE_REGS_H_
++
++#include <linux/bits.h>
++
++#define MT6735_AFE_PHYS_BASE		0x11220000	/* AudDrv_Afe.h:361 */
++#define MT6735_AFE_SIZE			0x10000		/* rom_dtb_0.dts audio@11220000 */
++
++/* Top level clock/power control */
++#define AUDIO_TOP_CON0			0x0000		/* AudDrv_Afe.h:416 */
++#define AUDIO_TOP_CON1			0x0004		/* AudDrv_Afe.h:423 */
++#define AUDIO_TOP_CON2			0x0008		/* AudDrv_Afe.h:425 */
++#define AUDIO_TOP_CON3			0x000c		/* AudDrv_Afe.h:426 */
++
++/*
++ * AUDIO_TOP_CON0 bit 14 must be set before any other AFE register is
++ * accessed; the bootloader leaves it cleared (AudDrv_Clk.c:265).
++ */
++#define AUDIO_TOP_CON0_AFE_POWER_ON	BIT(14)		/* AudDrv_Clk.c:265,467 */
++
++/* AUDIO_TOP_CON1 */
++#define AUDIO_TOP_CON1_I2S_SOFT_RST	BIT(1)		/* mt_soc_afe_control.c:3749 */
++#define AUDIO_TOP_CON1_I2S0_CG		BIT(4)		/* mt_soc_afe_control.c:3750 */
++#define AUDIO_TOP_CON1_I2S3_CG		BIT(7)		/* mt_soc_afe_control.c:3751 */
++
++/* DAC/memory interface control */
++#define AFE_DAC_CON0			0x0010		/* AudDrv_Afe.h:427 */
++#define AFE_DAC_CON1			0x0014		/* AudDrv_Afe.h:428 */
++
++#define AFE_DAC_CON0_AFE_ON		BIT(0)		/* mt_soc_afe_control.c:981,1029 */
++#define AFE_DAC_CON0_MEMIF_EN(id)	BIT((id) + 1)	/* mt_soc_afe_control.c:1995-1997 */
++
++/* AFE_DAC_CON1 sample rate fields (ftell: mt_soc_afe_control.c:1073-1128) */
++#define AFE_DAC_CON1_DL1_FS_SHIFT	0		/* mt_soc_afe_control.c:1080 */
++#define AFE_DAC_CON1_DL2_FS_SHIFT	4		/* mt_soc_afe_control.c:1084 */
++#define AFE_DAC_CON1_I2S_FS_SHIFT	8		/* mt_soc_afe_control.c:1088 */
++#define AFE_DAC_CON1_AWB_FS_SHIFT	12		/* mt_soc_afe_control.c:1092 */
++#define AFE_DAC_CON1_VUL_FS_SHIFT	16		/* mt_soc_afe_control.c:1096 */
++#define AFE_DAC_CON1_FS_MASK		GENMASK(3, 0)
++
++/* AFE_DAC_CON1 mono (single channel) fields (mt_soc_afe_control.c:1129-1160) */
++#define AFE_DAC_CON1_DL1_MONO_SHIFT	21		/* mt_soc_afe_control.c:1135 */
++#define AFE_DAC_CON1_DL2_MONO_SHIFT	22		/* mt_soc_afe_control.c:1139 */
++#define AFE_DAC_CON1_AWB_MONO_SHIFT	24		/* mt_soc_afe_control.c:1143 */
++#define AFE_DAC_CON1_VUL_MONO_SHIFT	27		/* mt_soc_afe_control.c:1147 */
++
++/* I2S interfaces */
++#define AFE_I2S_CON			0x0018		/* AudDrv_Afe.h:429 */
++#define AFE_I2S_CON1			0x0034		/* AudDrv_Afe.h:438 */
++#define AFE_I2S_CON2			0x0038		/* AudDrv_Afe.h:439 */
++
++/*
++ * AFE_I2S_CON layout, from Enable4pin_I2S0_I2S3() in
++ * mt_soc_afe_control.c:3740-3786 and SetI2SDacOut()/SetI2SDacEnable()
++ * in mt_soc_afe_control.c:1637-1655, 2010-2034.
++ */
++#define AFE_I2S_CON_EN			BIT(0)		/* mt_soc_afe_control.c:3781 */
++#define AFE_I2S_CON_WLEN_SHIFT		1		/* mt_soc_afe_control.c:3760 */
++#define AFE_I2S_CON_SLAVE		BIT(2)		/* mt_soc_pcm_hdmi.c:889 */
++#define AFE_I2S_CON_FMT_SHIFT		3		/* mt_soc_afe_control.c:3759 */
++#define AFE_I2S_CON_LRCK_INV		BIT(5)		/* mt_soc_afe_control.c:3758 */
++#define AFE_I2S_CON_FS_SHIFT		8		/* mt_soc_pcm_dl1_i2s0.c:188 */
++#define AFE_I2S_CON_LOW_JITTER		BIT(12)		/* mt_soc_afe_control.c:3757 */
++#define AFE_I2S_CON_PAD_SEL_IO_MUX	BIT(28)		/* mt_soc_afe_control.c:3755 */
++#define AFE_I2S_CON_PHASE_SHIFT_FIX	BIT(31)		/* mt_soc_afe_control.c:3754 */
++
++#define AFE_I2S_CON1_LR_SWAP		BIT(31)		/* mt_soc_afe_control.c:1645 */
++#define AFE_I2S_CON1_EN			BIT(0)		/* mt_soc_afe_control.c:2018 */
++
++/* I2S format field values (mt_soc_digital_type.h:245-247, 260-263) */
++#define AFE_I2S_FORMAT_EIAJ		0
++#define AFE_I2S_FORMAT_I2S		1
++#define AFE_I2S_WLEN_16BIT		0
++#define AFE_I2S_WLEN_32BIT		1
++
++/* Interconnection (AFE_CONNx) */
++#define AFE_CONN0			0x0020		/* AudDrv_Afe.h:432 */
++#define AFE_CONN1			0x0024		/* AudDrv_Afe.h:433 */
++#define AFE_CONN2			0x0028		/* AudDrv_Afe.h:434 */
++#define AFE_CONN3			0x002c		/* AudDrv_Afe.h:435 */
++#define AFE_CONN_24BIT			0x006c		/* AudDrv_Afe.h:458 */
++
++/*
++ * Bit positions inside the AFE_CONNx registers.  These are entries of the
++ * mConnectionReg/mConnectionbits tables in mt_soc_afe_connection.c.
++ *
++ *	DL1 left  (I05) -> O03 : AFE_CONN1 bit 21
++ *	DL1 right (I06) -> O04 : AFE_CONN2 bit 6
++ *	DL2 left  (I07) -> O03 : AFE_CONN1 bit 23
++ *	DL2 right (I08) -> O04 : AFE_CONN2 bit 8
++ *	ADC left  (I03) -> O09 : AFE_CONN3 bit 0
++ *	ADC right (I04) -> O10 : AFE_CONN3 bit 3
++ */
++#define AFE_CONN_DL1_L_TO_O03		BIT(21)		/* mConnectionReg[I05][O03] :293, bits :188 */
++#define AFE_CONN_DL1_R_TO_O04		BIT(6)		/* mConnectionReg[I06][O04] :295, bits :190 */
++#define AFE_CONN_DL2_L_TO_O03		BIT(23)		/* mConnectionReg[I07][O03] :297, bits :192 */
++#define AFE_CONN_DL2_R_TO_O04		BIT(8)		/* mConnectionReg[I08][O04] :299, bits :194 */
++#define AFE_CONN_ADC_L_TO_O09		BIT(0)		/* mConnectionReg[I03][O09] :289, bits :184 */
++#define AFE_CONN_ADC_R_TO_O10		BIT(3)		/* mConnectionReg[I04][O10] :291, bits :186 */
++
++/*
++ * Physical I2S0 output ports O00/O01, fed from the DL1 interface when the
++ * I2S0 PCM is used (mt_soc_pcm_dl1_i2s0Dl1.c:514-518).
++ */
++#define AFE_CONN_DL1_L_TO_O00		BIT(5)		/* mConnectionReg[I05][O00] :293, bits :187 */
++#define AFE_CONN_DL1_R_TO_O01		BIT(22)		/* mConnectionReg[I06][O01] :295, bits :189 */
++
++/* AFE_CONN_24BIT: bit N selects 24 bit data for output O<N>
++ * (SetoutputConnectionFormat(), mt_soc_afe_control.c:2371-2377).
++ */
++#define AFE_CONN_24BIT_O03		BIT(3)
++#define AFE_CONN_24BIT_O04		BIT(4)
++#define AFE_CONN_24BIT_O09		BIT(9)
++#define AFE_CONN_24BIT_O10		BIT(10)
++
++/* Memory interfaces */
++#define AFE_DL1_BASE			0x0040		/* AudDrv_Afe.h:443 */
++#define AFE_DL1_CUR			0x0044		/* AudDrv_Afe.h:444 */
++#define AFE_DL1_END			0x0048		/* AudDrv_Afe.h:445 */
++#define AFE_DL2_BASE			0x0050		/* AudDrv_Afe.h:454 */
++#define AFE_DL2_CUR			0x0054		/* AudDrv_Afe.h:455 */
++#define AFE_DL2_END			0x0058		/* AudDrv_Afe.h:456 */
++#define AFE_VUL_BASE			0x0080		/* AudDrv_Afe.h:462 */
++#define AFE_VUL_END			0x0088		/* AudDrv_Afe.h:463 */
++#define AFE_VUL_CUR			0x008c		/* AudDrv_Afe.h:464 */
++
++/* Memory interface monitor registers, read only */
++#define AFE_MEMIF_MON0			0x00d0		/* AudDrv_Afe.h:473 */
++#define AFE_MEMIF_MON1			0x00d4		/* AudDrv_Afe.h:474 */
++#define AFE_MEMIF_MON2			0x00d8		/* AudDrv_Afe.h:475 */
++#define AFE_MEMIF_MON4			0x00e0		/* AudDrv_Afe.h:477 */
++
++/*
++ * Per-sample fetch format (16 bit vs 24 bit data) for each memory
++ * interface, SetMemIfFetchFormatPerSample() mt_soc_afe_control.c:2294-2369.
++ */
++#define AFE_MEMIF_PBUF_SIZE		0x03d8		/* AudDrv_Afe.h:611 */
++#define AFE_MEMIF_PBUF_DL1_FMT_SHIFT	16		/* mt_soc_afe_control.c:2303 */
++#define AFE_MEMIF_PBUF_DL2_FMT_SHIFT	18		/* mt_soc_afe_control.c:2315 */
++#define AFE_MEMIF_PBUF_VUL_FMT_SHIFT	22		/* mt_soc_afe_control.c:2332 */
++#define AFE_MEMIF_PBUF_FMT_MASK		GENMASK(1, 0)
++
++/* AFE_WLEN values used in AFE_MEMIF_PBUF_SIZE (mt_soc_digital_type.h:507-509) */
++#define AFE_WLEN_16_BIT			0
++#define AFE_WLEN_24_BIT			1
++
++/* ADDA (PMIC codec) digital interface */
++#define AFE_ADDA_DL_SRC2_CON0		0x0108		/* AudDrv_Afe.h:481 */
++#define AFE_ADDA_DL_SRC2_CON1		0x010c		/* AudDrv_Afe.h:482 */
++#define AFE_ADDA_UL_SRC_CON0		0x0114		/* AudDrv_Afe.h:483 */
++#define AFE_ADDA_TOP_CON0		0x0120		/* AudDrv_Afe.h:485 */
++#define AFE_ADDA_UL_DL_CON0		0x0124		/* AudDrv_Afe.h:486 */
++#define AFE_ADDA_NEWIF_CFG0		0x0138		/* AudDrv_Afe.h:490 */
++#define AFE_ADDA_NEWIF_CFG1		0x013c		/* AudDrv_Afe.h:491 */
++#define AFE_ADDA_PREDIS_CON0		0x0260		/* AudDrv_Afe.h:539 */
++#define AFE_ADDA_PREDIS_CON1		0x0264		/* AudDrv_Afe.h:540 */
++
++#define AFE_ADDA_DL_SRC2_CON0_EN	BIT(0)		/* mt_soc_afe_control.c:2017 */
++#define AFE_ADDA_UL_SRC_CON0_EN		BIT(0)		/* mt_soc_afe_control.c:1560 */
++#define AFE_ADDA_UL_DL_CON0_EN		BIT(0)		/* mt_soc_afe_control.c:2016 */
++#define AFE_ADDA_TOP_CON0_EXT_ADC	BIT(0)		/* mt_soc_afe_control.c:1356,1374 */
++
++/* Interrupt controller */
++#define AFE_IRQ_MCU_CON			0x03a0		/* AudDrv_Afe.h:584 */
++#define AFE_IRQ_MCU_STATUS		0x03a4		/* AudDrv_Afe.h:586 */
++#define AFE_IRQ_MCU_CLR			0x03a8		/* AudDrv_Afe.h:588 */
++#define AFE_IRQ_MCU_CNT1		0x03ac		/* AudDrv_Afe.h:590 */
++#define AFE_IRQ_MCU_CNT2		0x03b0		/* AudDrv_Afe.h:592 */
++#define AFE_IRQ_MCU_EN			0x03b4		/* AudDrv_Afe.h:593 */
++#define AFE_IRQ1_MCU_CNT_MON		0x03c0		/* AudDrv_Afe.h:599 */
++#define AFE_IRQ2_MCU_CNT_MON		0x03c4		/* AudDrv_Afe.h:602 */
++
++/* AFE_IRQ_MCU_CON fields, SetIrqEnable()/SetIrqMcuSampleRate() */
++#define AFE_IRQ_MCU_CON_IRQ1_EN		BIT(0)		/* mt_soc_afe_control.c:2105 */
++#define AFE_IRQ_MCU_CON_IRQ2_EN		BIT(1)		/* mt_soc_afe_control.c:2105 */
++#define AFE_IRQ_MCU_CON_IRQ1_FS_SHIFT	4		/* mt_soc_afe_control.c:2136 */
++#define AFE_IRQ_MCU_CON_IRQ2_FS_SHIFT	8		/* mt_soc_afe_control.c:2139 */
++#define AFE_IRQ_MCU_CON_FS_MASK		GENMASK(3, 0)
++
++/* AFE_IRQ_MCU_STATUS / AFE_IRQ_MCU_CLR bits (AudDrv_Kernel.h:246-251) */
++#define AFE_IRQ_STATUS_IRQ1		BIT(0)
++#define AFE_IRQ_STATUS_IRQ2		BIT(1)
++#define AFE_IRQ_STATUS_IRQ3		BIT(2)
++#define AFE_IRQ_STATUS_IRQ4		BIT(3)
++#define AFE_IRQ_STATUS_IRQ5		BIT(4)
++#define AFE_IRQ_STATUS_IRQ7		BIT(6)
++#define AFE_IRQ_STATUS_ALL		GENMASK(7, 0)
++
++#endif /* _MT6735_AFE_REGS_H_ */
+diff --git a/sound/soc/mediatek/mt6735/mt6735-dai-i2s.c b/sound/soc/mediatek/mt6735/mt6735-dai-i2s.c
+new file mode 100644
+index 000000000..cd7f7a88d
+--- /dev/null
++++ b/sound/soc/mediatek/mt6735/mt6735-dai-i2s.c
+@@ -0,0 +1,285 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT6735/MT6737T ALSA SoC AFE I2S0 back-end DAI.
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * Port from Samsung/MTK downstream
++ * sound/soc/mediatek/mt_soc_audio_v3/:
++ *   mt_soc_afe_control.c  - Enable4pin_I2S0_I2S3(), SetCLkMclk()
++ *   mt_soc_pcm_dl1_i2s0.c - I2S0 register programming
++ *   AudDrv_Gpio.c         - audi2s1-mode0/mode1 pin muxing
++ *
++ * The MCLK/BCLK dividers live in the audiosys clock controller
++ * (AUDIO_CLK_AUDDIV_0/1 at 0x1021xxxx, SetCLkMclk()/SetCLkBclk(),
++ * mt_soc_afe_control.c:751-813) and are therefore programmed by the clock
++ * provider, not by this driver.
++ */
++
++#include <linux/delay.h>
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++
++#include "mt6735-afe-common.h"
++
++/* Default MCLK/sample rate ratio, MCLKFS in mt_soc_afe_control.c:137 */
++#define MT6735_AFE_I2S_MCLK_FS	128
++
++static int mt6735_afe_i2s_startup(struct snd_pcm_substream *substream,
++				  struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	int ret;
++
++	ret = pm_runtime_get_sync(afe->dev);
++	if (ret < 0) {
++		pm_runtime_put_noidle(afe->dev);
++		return ret;
++	}
++
++	snd_soc_set_runtime_hwparams(substream, afe->mtk_afe_hardware);
++
++	ret = snd_pcm_hw_constraint_integer(substream->runtime,
++					    SNDRV_PCM_HW_PARAM_PERIODS);
++	if (ret < 0)
++		pm_runtime_put_noidle(afe->dev);
++
++	return ret;
++}
++
++static void mt6735_afe_i2s_shutdown(struct snd_pcm_substream *substream,
++				    struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++
++	mt6735_afe_select_i2s_pins(afe, false);
++	pm_runtime_put(afe->dev);
++}
++
++/*
++ * Translate the ASoC DAI format into the AFE_I2S_CON format fields.
++ * AFE_I2S_CON bit 2 selects slave mode ("clock from : slave mode",
++ * mt_soc_pcm_hdmi.c:889), bit 5 inverts LRCK and bit 3 selects the I2S
++ * (rather than EIAJ) framing (mt_soc_afe_control.c:3758-3763).
++ */
++static int mt6735_afe_i2s_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	unsigned int con;
++
++	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
++	case SND_SOC_DAIFMT_I2S:
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	switch (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
++	case SND_SOC_DAIFMT_CBP_CFP:
++		priv->i2s_slave = false;
++		break;
++	case SND_SOC_DAIFMT_CBC_CFC:
++		priv->i2s_slave = true;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	switch (fmt & SND_SOC_DAIFMT_INV_MASK) {
++	case SND_SOC_DAIFMT_NB_NF:
++		con = 0;
++		break;
++	case SND_SOC_DAIFMT_NB_IF:
++		con = AFE_I2S_CON_LRCK_INV;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	/*
++	 * Fixed settings for the four wire I2S0 interface, from
++	 * Enable4pin_I2S0_I2S3() (mt_soc_afe_control.c:3749-3763): phase
++	 * shift fix, data taken from the IO mux, low jitter clock and I2S
++	 * framing.
++	 */
++	con |= AFE_I2S_CON_PHASE_SHIFT_FIX |
++	       AFE_I2S_CON_PAD_SEL_IO_MUX |
++	       AFE_I2S_CON_LOW_JITTER |
++	       (AFE_I2S_FORMAT_I2S << AFE_I2S_CON_FMT_SHIFT);
++	if (priv->i2s_slave)
++		con |= AFE_I2S_CON_SLAVE;
++
++	priv->i2s_con = con;
++
++	return 0;
++}
++
++/*
++ * MCLK is routed through the audiosys clock mux; only its value is validated
++ * here so that hw_params can check it against the stream rate the same way
++ * SetCLkMclk() derives the divider (mt_soc_afe_control.c:751-786).
++ */
++static int mt6735_afe_i2s_set_sysclk(struct snd_soc_dai *dai, int clk_id,
++				     unsigned int freq, int dir)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++
++	if (clk_id != 0)
++		return -EINVAL;
++	if (dir != SND_SOC_CLOCK_OUT)
++		return -EINVAL;
++
++	priv->i2s_sysclk = freq;
++
++	return 0;
++}
++
++static int mt6735_afe_i2s_hw_params(struct snd_pcm_substream *substream,
++				    struct snd_pcm_hw_params *params,
++				    struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	unsigned int rate = params_rate(params);
++	unsigned int channels = params_channels(params);
++	unsigned int con, wlen;
++	int fs, ret;
++
++	fs = mt6735_afe_rate_to_fs(rate);
++	if (fs < 0)
++		return -EINVAL;
++
++	if (channels < MT6735_AFE_CHANNELS_MIN ||
++	    channels > MT6735_AFE_CHANNELS_MAX)
++		return -EINVAL;
++
++	switch (params_format(params)) {
++	case SNDRV_PCM_FORMAT_S16_LE:
++		wlen = AFE_I2S_WLEN_16BIT;
++		break;
++	case SNDRV_PCM_FORMAT_S24_LE:
++		wlen = AFE_I2S_WLEN_32BIT;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	if (priv->i2s_sysclk) {
++		if (priv->i2s_sysclk % rate)
++			return -EINVAL;
++		if (priv->i2s_sysclk < MT6735_AFE_I2S_MCLK_FS * rate)
++			dev_dbg(afe->dev,
++				"I2S0 MCLK %u Hz below %u x %u Hz\n",
++				priv->i2s_sysclk, MT6735_AFE_I2S_MCLK_FS, rate);
++	}
++
++	con = priv->i2s_con;
++	if (!con)
++		con = AFE_I2S_CON_PHASE_SHIFT_FIX |
++		      AFE_I2S_CON_PAD_SEL_IO_MUX |
++		      AFE_I2S_CON_LOW_JITTER |
++		      (AFE_I2S_FORMAT_I2S << AFE_I2S_CON_FMT_SHIFT);
++
++	con |= (fs << AFE_I2S_CON_FS_SHIFT) |
++	       (wlen << AFE_I2S_CON_WLEN_SHIFT);
++
++	/* AudDrv_GPIO_I2S_Select(true), AudDrv_Gpio.c:238-259 */
++	ret = mt6735_afe_select_i2s_pins(afe, true);
++	if (ret)
++		return ret;
++
++	/*
++	 * Bring-up sequence of Enable4pin_I2S0_I2S3(),
++	 * mt_soc_afe_control.c:3749-3782: soft reset, gate the I2S0 clock,
++	 * program the interface, ungate, release the reset.
++	 */
++	regmap_update_bits(afe->regmap, AUDIO_TOP_CON1,
++			   AUDIO_TOP_CON1_I2S_SOFT_RST,
++			   AUDIO_TOP_CON1_I2S_SOFT_RST);
++	regmap_update_bits(afe->regmap, AUDIO_TOP_CON1, AUDIO_TOP_CON1_I2S0_CG,
++			   AUDIO_TOP_CON1_I2S0_CG);
++	regmap_write(afe->regmap, AFE_I2S_CON, con);
++	regmap_update_bits(afe->regmap, AUDIO_TOP_CON1, AUDIO_TOP_CON1_I2S0_CG,
++			   0);
++	udelay(200);
++	regmap_update_bits(afe->regmap, AUDIO_TOP_CON1,
++			   AUDIO_TOP_CON1_I2S_SOFT_RST, 0);
++
++	return 0;
++}
++
++static int mt6735_afe_i2s_trigger(struct snd_pcm_substream *substream, int cmd,
++				  struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_START:
++	case SNDRV_PCM_TRIGGER_RESUME:
++	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++		/*
++		 * When DL1 feeds I2S0 (I2S0DL1 link) the DL1 samples are also
++		 * routed to the physical O00/O01 ports
++		 * (mt_soc_pcm_dl1_i2s0Dl1.c:514-518).
++		 */
++		if (priv->memif_enabled[MT6735_AFE_MEMIF_DL1])
++			regmap_update_bits(afe->regmap, AFE_CONN0,
++					   AFE_CONN_DL1_L_TO_O00 |
++					   AFE_CONN_DL1_R_TO_O01,
++					   AFE_CONN_DL1_L_TO_O00 |
++					   AFE_CONN_DL1_R_TO_O01);
++
++		return regmap_update_bits(afe->regmap, AFE_I2S_CON,
++					  AFE_I2S_CON_EN, AFE_I2S_CON_EN);
++	case SNDRV_PCM_TRIGGER_STOP:
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++		regmap_update_bits(afe->regmap, AFE_I2S_CON, AFE_I2S_CON_EN, 0);
++		regmap_update_bits(afe->regmap, AFE_CONN0,
++				   AFE_CONN_DL1_L_TO_O00 |
++				   AFE_CONN_DL1_R_TO_O01, 0);
++
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static const struct snd_soc_dai_ops mt6735_afe_i2s_ops = {
++	.startup = mt6735_afe_i2s_startup,
++	.shutdown = mt6735_afe_i2s_shutdown,
++	.set_fmt = mt6735_afe_i2s_set_fmt,
++	.set_sysclk = mt6735_afe_i2s_set_sysclk,
++	.hw_params = mt6735_afe_i2s_hw_params,
++	.trigger = mt6735_afe_i2s_trigger,
++};
++
++const struct snd_soc_dai_driver mt6735_afe_i2s_dai = {
++	.name = "mt-soc-i2s0dai-driver",
++	.id = MT6735_AFE_DAI_I2S0,
++	.ops = &mt6735_afe_i2s_ops,
++	.playback = {
++		.stream_name = "I2S0 Playback",
++		.channels_min = MT6735_AFE_CHANNELS_MIN,
++		.channels_max = MT6735_AFE_CHANNELS_MAX,
++		.rates = MT6735_AFE_RATES,
++		.rate_min = MT6735_AFE_RATE_MIN,
++		.rate_max = MT6735_AFE_RATE_MAX,
++		.formats = MT6735_AFE_FORMATS,
++	},
++	.capture = {
++		.stream_name = "I2S0 Capture",
++		.channels_min = MT6735_AFE_CHANNELS_MIN,
++		.channels_max = MT6735_AFE_CHANNELS_MAX,
++		.rates = MT6735_AFE_RATES,
++		.rate_min = MT6735_AFE_RATE_MIN,
++		.rate_max = MT6735_AFE_RATE_MAX,
++		.formats = MT6735_AFE_FORMATS,
++	},
++};
+diff --git a/sound/soc/mediatek/mt6735/mt6735-dai-pcm.c b/sound/soc/mediatek/mt6735/mt6735-dai-pcm.c
+new file mode 100644
+index 000000000..72af375dd
+--- /dev/null
++++ b/sound/soc/mediatek/mt6735/mt6735-dai-pcm.c
+@@ -0,0 +1,553 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT6735/MT6737T ALSA SoC AFE front-end DAIs (DL1, DL2, VUL).
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * Port from Samsung/MTK downstream
++ * sound/soc/mediatek/mt_soc_audio_v3/:
++ *   mt_soc_pcm_dl1.c      - DL1 playback (codec path)
++ *   mt_soc_pcm_dl2.c      - DL2 playback (codec path)
++ *   mt_soc_pcm_capture.c  - VUL capture
++ *   mt_soc_afe_control.c  - memif/IRQ/rate/channel programming
++ */
++
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++
++#include "mt6735-afe-common.h"
++
++/*
++ * SetDLSrc2() sample rate table, mt_soc_afe_control.c:1596-1616.  Note that
++ * this field uses a dense 0..8 encoding, unlike the AFE_DAC_CON1 / I2S fields
++ * which use the sparse mt_soc_digital_type.h encoding.
++ */
++static const unsigned int mt6735_afe_dlsrc2_rates[] = {
++	8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000,
++};
++
++static bool mt6735_afe_playback_enabled(struct mtk_base_afe *afe)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++
++	return priv->memif_enabled[MT6735_AFE_MEMIF_DL1] ||
++	       priv->memif_enabled[MT6735_AFE_MEMIF_DL2];
++}
++
++static bool mt6735_afe_capture_enabled(struct mtk_base_afe *afe)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++
++	return priv->memif_enabled[MT6735_AFE_MEMIF_VUL];
++}
++
++/*
++ * SetMemoryPathEnable(), mt_soc_afe_control.c:1968-2000: the memory
++ * interface enable bit is AFE_DAC_CON0 bit (interface + 1).
++ */
++static int mt6735_afe_memif_enable(struct mtk_base_afe *afe, int id,
++				   bool enable)
++{
++	const struct mtk_base_memif_data *data = afe->memif[id].data;
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	unsigned int bit = BIT(data->enable_shift);
++
++	regmap_update_bits(afe->regmap, data->enable_reg, bit,
++			   enable ? bit : 0);
++	priv->memif_enabled[id] = enable;
++	mt6735_afe_update_power(afe);
++
++	return 0;
++}
++
++/*
++ * SetConnection(), mt_soc_afe_connection.c:433-500.  Only the four routes
++ * used by this driver are implemented; see the table entries cited in
++ * mt6735-afe-regs.h.
++ */
++static int mt6735_afe_connect(struct mtk_base_afe *afe, int id, bool connect)
++{
++	unsigned int reg, bits;
++
++	switch (id) {
++	case MT6735_AFE_MEMIF_DL1:
++		reg = AFE_CONN1;
++		bits = AFE_CONN_DL1_L_TO_O03;
++		regmap_update_bits(afe->regmap, reg, bits, connect ? bits : 0);
++		reg = AFE_CONN2;
++		bits = AFE_CONN_DL1_R_TO_O04;
++		break;
++	case MT6735_AFE_MEMIF_DL2:
++		reg = AFE_CONN1;
++		bits = AFE_CONN_DL2_L_TO_O03;
++		regmap_update_bits(afe->regmap, reg, bits, connect ? bits : 0);
++		reg = AFE_CONN2;
++		bits = AFE_CONN_DL2_R_TO_O04;
++		break;
++	case MT6735_AFE_MEMIF_VUL:
++		reg = AFE_CONN3;
++		bits = AFE_CONN_ADC_L_TO_O09 | AFE_CONN_ADC_R_TO_O10;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	regmap_update_bits(afe->regmap, reg, bits, connect ? bits : 0);
++
++	return 0;
++}
++
++/* SetoutputConnectionFormat(), mt_soc_afe_control.c:2371-2377 */
++static void mt6735_afe_set_conn_width(struct mtk_base_afe *afe, int id,
++				      bool wlen24)
++{
++	unsigned int bits;
++
++	switch (id) {
++	case MT6735_AFE_MEMIF_DL1:
++	case MT6735_AFE_MEMIF_DL2:
++		bits = AFE_CONN_24BIT_O03 | AFE_CONN_24BIT_O04;
++		break;
++	case MT6735_AFE_MEMIF_VUL:
++		bits = AFE_CONN_24BIT_O09 | AFE_CONN_24BIT_O10;
++		break;
++	default:
++		return;
++	}
++
++	regmap_update_bits(afe->regmap, AFE_CONN_24BIT, bits,
++			   wlen24 ? bits : 0);
++}
++
++/*
++ * Downstream codec playback interface: SetI2SDacOut()/SetDLSrc2()/
++ * SetI2SDacEnable() from mt_soc_afe_control.c:1592-1655 and 2010-2034.
++ * AFE_I2S_CON1 is the I2S-style bus between the AFE and the PMIC codec.
++ */
++static int mt6735_afe_dac_prepare(struct mtk_base_afe *afe, unsigned int rate,
++				  bool wlen32)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	unsigned int val;
++	int fs, idx;
++
++	fs = mt6735_afe_rate_to_fs(rate);
++	if (fs < 0)
++		return fs;
++
++	for (idx = 0; idx < ARRAY_SIZE(mt6735_afe_dlsrc2_rates); idx++)
++		if (mt6735_afe_dlsrc2_rates[idx] == rate)
++			break;
++	if (idx == ARRAY_SIZE(mt6735_afe_dlsrc2_rates))
++		return -EINVAL;
++
++	/* CleanPreDistortion(), mt_soc_afe_control.c:1583-1590 */
++	regmap_write(afe->regmap, AFE_ADDA_PREDIS_CON0, 0);
++	regmap_write(afe->regmap, AFE_ADDA_PREDIS_CON1, 0);
++
++	/*
++	 * SetDLSrc2(), mt_soc_afe_control.c:1592-1635.  8k and 16k use the
++	 * voice mode configuration; the final 0x1 << 1 applies the -0.3 dB
++	 * speech gain MediaTek recommends for every rate.
++	 */
++	val = (idx << 28) | (0x3 << 24) | (0x3 << 11);
++	if (idx == 0 || idx == 3)
++		val |= (0x1 << 5);
++	val |= (0x1 << 1);
++	regmap_write(afe->regmap, AFE_ADDA_DL_SRC2_CON0, val);
++	regmap_write(afe->regmap, AFE_ADDA_DL_SRC2_CON1, 0xf74f0000);
++
++	/* SetI2SDacOut(), mt_soc_afe_control.c:1637-1655 */
++	val = (AFE_I2S_FORMAT_I2S << AFE_I2S_CON_FMT_SHIFT) |
++	      ((wlen32 ? AFE_I2S_WLEN_32BIT : AFE_I2S_WLEN_16BIT) <<
++	       AFE_I2S_CON_WLEN_SHIFT) |
++	      (fs << AFE_I2S_CON_FS_SHIFT);
++	regmap_write(afe->regmap, AFE_I2S_CON1, val);
++
++	/* SetSampleRate(MEM_I2S, rate), mt_soc_pcm_dl1.c:337 */
++	regmap_update_bits(afe->regmap, AFE_DAC_CON1,
++			   AFE_DAC_CON1_FS_MASK << AFE_DAC_CON1_I2S_FS_SHIFT,
++			   fs << AFE_DAC_CON1_I2S_FS_SHIFT);
++
++	/* SetI2SDacEnable(true), mt_soc_afe_control.c:2010-2026 */
++	regmap_update_bits(afe->regmap, AFE_ADDA_UL_DL_CON0,
++			   AFE_ADDA_UL_DL_CON0_EN, AFE_ADDA_UL_DL_CON0_EN);
++	regmap_update_bits(afe->regmap, AFE_ADDA_DL_SRC2_CON0,
++			   AFE_ADDA_DL_SRC2_CON0_EN,
++			   AFE_ADDA_DL_SRC2_CON0_EN);
++	regmap_update_bits(afe->regmap, AFE_I2S_CON1, AFE_I2S_CON1_EN,
++			   AFE_I2S_CON1_EN);
++
++	priv->dac_path_on = true;
++
++	return 0;
++}
++
++/* SetI2SDacEnable(false), mt_soc_afe_control.c:2010-2034 */
++static void mt6735_afe_dac_disable(struct mtk_base_afe *afe)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++
++	regmap_update_bits(afe->regmap, AFE_ADDA_DL_SRC2_CON0,
++			   AFE_ADDA_DL_SRC2_CON0_EN, 0);
++	regmap_update_bits(afe->regmap, AFE_I2S_CON1, AFE_I2S_CON1_EN, 0);
++
++	if (!priv->adc_path_on)
++		regmap_update_bits(afe->regmap, AFE_ADDA_UL_DL_CON0,
++				   AFE_ADDA_UL_DL_CON0_EN, 0);
++
++	priv->dac_path_on = false;
++}
++
++/*
++ * PMIC codec capture interface: SetI2SAdcIn() internal ADC path and
++ * SetI2SAdcEnable(), mt_soc_afe_control.c:1346-1370 and 1553-1572.
++ */
++static int mt6735_afe_adc_prepare(struct mtk_base_afe *afe, unsigned int rate)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	unsigned int voice_mode;
++	int fs;
++
++	fs = mt6735_afe_rate_to_fs(rate);
++	if (fs < 0)
++		return fs;
++
++	/*
++	 * The downstream driver leaves the voice mode selection at 0 for any
++	 * rate that is not 8k/16k/32k/48k (mt_soc_afe_control.c:1352-1366).
++	 */
++	switch (rate) {
++	case 8000:
++		voice_mode = 0;
++		break;
++	case 16000:
++		voice_mode = 1;
++		break;
++	case 32000:
++		voice_mode = 2;
++		break;
++	case 48000:
++		voice_mode = 3;
++		break;
++	default:
++		voice_mode = 0;
++		break;
++	}
++
++	/* SetI2SAdcIn(), mt_soc_afe_control.c:1346-1370 */
++	regmap_update_bits(afe->regmap, AFE_ADDA_TOP_CON0,
++			   AFE_ADDA_TOP_CON0_EXT_ADC, 0);
++	regmap_update_bits(afe->regmap, AFE_ADDA_UL_SRC_CON0, 0x001e0000,
++			   (voice_mode << 19) | (voice_mode << 17));
++	regmap_write(afe->regmap, AFE_ADDA_NEWIF_CFG0, 0x03f87201);
++	regmap_update_bits(afe->regmap, AFE_ADDA_NEWIF_CFG1, 0x00000c00,
++			   ((voice_mode < 3) ? 1 : 3) << 10);
++
++	/* SetI2SAdcEnable(true), mt_soc_afe_control.c:1553-1566 */
++	regmap_update_bits(afe->regmap, AFE_ADDA_UL_DL_CON0,
++			   AFE_ADDA_UL_DL_CON0_EN, AFE_ADDA_UL_DL_CON0_EN);
++	regmap_update_bits(afe->regmap, AFE_ADDA_UL_SRC_CON0,
++			   AFE_ADDA_UL_SRC_CON0_EN, AFE_ADDA_UL_SRC_CON0_EN);
++
++	priv->adc_path_on = true;
++
++	return 0;
++}
++
++static void mt6735_afe_adc_disable(struct mtk_base_afe *afe)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++
++	regmap_update_bits(afe->regmap, AFE_ADDA_UL_SRC_CON0,
++			   AFE_ADDA_UL_SRC_CON0_EN, 0);
++
++	if (!priv->dac_path_on)
++		regmap_update_bits(afe->regmap, AFE_ADDA_UL_DL_CON0,
++				   AFE_ADDA_UL_DL_CON0_EN, 0);
++
++	priv->adc_path_on = false;
++}
++
++static int mt6735_afe_fe_startup(struct snd_pcm_substream *substream,
++				 struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	int id = dai->id;
++	int ret;
++
++	ret = pm_runtime_get_sync(afe->dev);
++	if (ret < 0) {
++		pm_runtime_put_noidle(afe->dev);
++		return ret;
++	}
++
++	afe->memif[id].substream = substream;
++	snd_soc_set_runtime_hwparams(substream, afe->mtk_afe_hardware);
++
++	/*
++	 * The memory interface consumes whole 64 byte blocks
++	 * (Align64ByteSize(), mt_soc_afe_control.c:3702-3710) and the DL1
++	 * buffer index is masked with 0xffffffc0 in the interrupt handler
++	 * (mt_soc_afe_control.c:3025,3065).
++	 */
++	ret = snd_pcm_hw_constraint_step(runtime, 0,
++					 SNDRV_PCM_HW_PARAM_BUFFER_BYTES, 64);
++	if (ret < 0)
++		goto err_put;
++
++	ret = snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
++	if (ret < 0)
++		goto err_put;
++
++	/*
++	 * Capture keeps a ping-pong buffer in the AFE, so the reported read
++	 * pointer can trail the interrupt point by up to a period.
++	 */
++	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
++		ret = snd_pcm_hw_constraint_minmax(runtime,
++						   SNDRV_PCM_HW_PARAM_PERIODS, 3,
++						   runtime->hw.periods_max);
++		if (ret < 0)
++			goto err_put;
++	}
++
++	return 0;
++
++err_put:
++	afe->memif[id].substream = NULL;
++	pm_runtime_put_noidle(afe->dev);
++	return ret;
++}
++
++static void mt6735_afe_fe_shutdown(struct snd_pcm_substream *substream,
++				   struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++
++	afe->memif[dai->id].substream = NULL;
++
++	/*
++	 * EnableAfe(false) returns the PMIC audio pins to GPIO mode once no
++	 * memory interface is running (AudDrv_Gpio.c:215-236).
++	 */
++	if (!mt6735_afe_playback_enabled(afe) && !mt6735_afe_capture_enabled(afe))
++		mt6735_afe_select_pmic_pins(afe, false);
++
++	pm_runtime_put(afe->dev);
++}
++
++static int mt6735_afe_fe_hw_params(struct snd_pcm_substream *substream,
++				   struct snd_pcm_hw_params *params,
++				   struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mtk_base_afe_memif *memif = &afe->memif[dai->id];
++	const struct mtk_base_memif_data *data = memif->data;
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	unsigned int rate = params_rate(params);
++	unsigned int channels = params_channels(params);
++	unsigned int mono;
++	int fs;
++
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
++	    dai->id == MT6735_AFE_DAI_VUL)
++		return -EINVAL;
++	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE &&
++	    dai->id != MT6735_AFE_DAI_VUL)
++		return -EINVAL;
++
++	fs = mt6735_afe_rate_to_fs(rate);
++	if (fs < 0)
++		return -EINVAL;
++	if (channels < MT6735_AFE_CHANNELS_MIN ||
++	    channels > MT6735_AFE_CHANNELS_MAX)
++		return -EINVAL;
++
++	switch (params_format(params)) {
++	case SNDRV_PCM_FORMAT_S16_LE:
++	case SNDRV_PCM_FORMAT_S24_LE:
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	if (!runtime->dma_bytes || !runtime->dma_addr)
++		return -EINVAL;
++
++	/*
++	 * The AFE memory interfaces only decode 32 bit addresses.  A 33 bit
++	 * address would need AFE_MEMIF_MSB (AudDrv_Afe.h:470), which the
++	 * downstream driver never programs.
++	 */
++	if (upper_32_bits(runtime->dma_addr))
++		return -EINVAL;
++
++	/* SetDL1Buffer()/SetDL2Buffer(), mt_soc_pcm_dl1.c:234-255 */
++	regmap_write(afe->regmap, data->reg_ofs_base,
++		     lower_32_bits(runtime->dma_addr));
++	regmap_write(afe->regmap, data->reg_ofs_end,
++		     lower_32_bits(runtime->dma_addr) + runtime->dma_bytes - 1);
++
++	memif->phys_buf_addr = lower_32_bits(runtime->dma_addr);
++	memif->buffer_size = runtime->dma_bytes;
++	memif->dma_area = runtime->dma_area;
++	memif->dma_addr = runtime->dma_addr;
++	memif->dma_bytes = runtime->dma_bytes;
++
++	/* SetSampleRate(), mt_soc_afe_control.c:1073-1128 */
++	regmap_update_bits(afe->regmap, data->fs_reg,
++			   data->fs_maskbit << data->fs_shift,
++			   fs << data->fs_shift);
++
++	/* SetChannels(), mt_soc_afe_control.c:1129-1160 */
++	mono = (channels == 1) ? 1 : 0;
++	regmap_update_bits(afe->regmap, data->mono_reg,
++			   BIT(data->mono_shift), mono << data->mono_shift);
++
++	return 0;
++}
++
++static int mt6735_afe_fe_prepare(struct snd_pcm_substream *substream,
++				 struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	const struct mtk_base_memif_data *data = afe->memif[dai->id].data;
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	bool wlen24 = (runtime->format == SNDRV_PCM_FORMAT_S24_LE);
++	unsigned int wlen;
++
++	/*
++	 * EnableAfe(true) also switches the PMIC audio bus pins to their
++	 * audio function (AudDrv_Gpio.c:215-236, AudDrv_GPIO_PMIC_Select()).
++	 * This runs from prepare because trigger is atomic.
++	 */
++	mt6735_afe_select_pmic_pins(afe, true);
++
++	/* SetMemIfFetchFormatPerSample(), mt_soc_afe_control.c:2294-2369 */
++	wlen = wlen24 ? AFE_WLEN_24_BIT : AFE_WLEN_16_BIT;
++	regmap_update_bits(afe->regmap, data->hd_reg,
++			   AFE_MEMIF_PBUF_FMT_MASK << data->hd_shift,
++			   wlen << data->hd_shift);
++
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
++		mt6735_afe_set_conn_width(afe, dai->id, wlen24);
++		if (priv->dac_path_on)
++			return 0;
++		return mt6735_afe_dac_prepare(afe, runtime->rate, wlen24);
++	}
++
++	mt6735_afe_set_conn_width(afe, dai->id, wlen24);
++	if (priv->adc_path_on)
++		return 0;
++	return mt6735_afe_adc_prepare(afe, runtime->rate);
++}
++
++static int mt6735_afe_fe_trigger(struct snd_pcm_substream *substream, int cmd,
++				 struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	int id = dai->id;
++	int ret;
++
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_START:
++	case SNDRV_PCM_TRIGGER_RESUME:
++	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++		ret = mt6735_afe_connect(afe, id, true);
++		if (ret)
++			return ret;
++
++		ret = mt6735_afe_memif_enable(afe, id, true);
++		if (ret)
++			return ret;
++
++		/*
++		 * irq_add_user(), mt_soc_afe_control.c:4013-4062: program the
++		 * sample rate and counter, then enable the interrupt.
++		 */
++		return mt6735_afe_irq_update(afe, afe->memif[id].irq_usage);
++	case SNDRV_PCM_TRIGGER_STOP:
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++		mt6735_afe_memif_enable(afe, id, false);
++		mt6735_afe_irq_update(afe, afe->memif[id].irq_usage);
++		mt6735_afe_connect(afe, id, false);
++
++		/* mt_soc_pcm_dl1.c:347-358 / mt_soc_pcm_capture.c:101-116 */
++		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
++			if (!mt6735_afe_playback_enabled(afe))
++				mt6735_afe_dac_disable(afe);
++		} else {
++			if (!mt6735_afe_capture_enabled(afe))
++				mt6735_afe_adc_disable(afe);
++		}
++
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static const struct snd_soc_dai_ops mt6735_afe_fe_ops = {
++	.startup = mt6735_afe_fe_startup,
++	.shutdown = mt6735_afe_fe_shutdown,
++	.hw_params = mt6735_afe_fe_hw_params,
++	.prepare = mt6735_afe_fe_prepare,
++	.trigger = mt6735_afe_fe_trigger,
++};
++
++/*
++ * The PCM DAI id doubles as the memory interface index.  DL1 must stay the
++ * first entry: ASoC assigns id 0 to the first DAI of an array when its
++ * driver id is 0 (snd_soc_register_dai(), soc-core.c:2728-2735).
++ */
++const struct snd_soc_dai_driver mt6735_afe_pcm_dais[MT6735_AFE_PCM_DAI_NUM] = {
++	[MT6735_AFE_DAI_DL1] = {
++		.name = "mt-soc-dl1dai-driver",
++		.id = MT6735_AFE_DAI_DL1,
++		.ops = &mt6735_afe_fe_ops,
++		.playback = {
++			.stream_name = "DL1 Playback",
++			.channels_min = MT6735_AFE_CHANNELS_MIN,
++			.channels_max = MT6735_AFE_CHANNELS_MAX,
++			.rates = MT6735_AFE_RATES,
++			.rate_min = MT6735_AFE_RATE_MIN,
++			.rate_max = MT6735_AFE_RATE_MAX,
++			.formats = MT6735_AFE_FORMATS,
++		},
++	},
++	[MT6735_AFE_DAI_DL2] = {
++		.name = "mt-soc-dl2dai-driver",
++		.id = MT6735_AFE_DAI_DL2,
++		.ops = &mt6735_afe_fe_ops,
++		.playback = {
++			.stream_name = "DL2 Playback",
++			.channels_min = MT6735_AFE_CHANNELS_MIN,
++			.channels_max = MT6735_AFE_CHANNELS_MAX,
++			.rates = MT6735_AFE_RATES,
++			.rate_min = MT6735_AFE_RATE_MIN,
++			.rate_max = MT6735_AFE_RATE_MAX,
++			.formats = MT6735_AFE_FORMATS,
++		},
++	},
++	[MT6735_AFE_DAI_VUL] = {
++		.name = "mt-soc-ul1dai-driver",
++		.id = MT6735_AFE_DAI_VUL,
++		.ops = &mt6735_afe_fe_ops,
++		.capture = {
++			.stream_name = "UL1 Capture",
++			.channels_min = MT6735_AFE_CHANNELS_MIN,
++			.channels_max = MT6735_AFE_CHANNELS_MAX,
++			.rates = MT6735_AFE_RATES,
++			.rate_min = MT6735_AFE_RATE_MIN,
++			.rate_max = MT6735_AFE_RATE_MAX,
++			.formats = MT6735_AFE_FORMATS,
++		},
++	},
++};
+diff --git a/sound/soc/mediatek/mt6735/mt6735-mt6331.c b/sound/soc/mediatek/mt6735/mt6735-mt6331.c
+new file mode 100644
+index 000000000..7475c2b58
+--- /dev/null
++++ b/sound/soc/mediatek/mt6735/mt6735-mt6331.c
+@@ -0,0 +1,436 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * mt6735-mt6331.c -- MT6735 / MT6331 sound card machine driver
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * Port from Samsung/MTK downstream
++ *   sound/soc/mediatek/mt_soc_audio_v3/mt_soc_machine.c
++ *   sound/soc/mediatek/mt_soc_audio_v3/AudDrv_Def.h
++ *
++ * The downstream driver built its PCM/platform devices from static tables and
++ * registered the card through platform_device_alloc("soc-audio").  This port
++ * keeps the card name, DAI-link names, stream names and CPU/codec DAI names of
++ * the ROM, but registers the card as an ordinary platform driver whose device
++ * is described by "mediatek,mt6735-sound".
++ *
++ * Headset detection: the downstream machine driver had no jack at all; the
++ * ACCDET driver (drivers/misc/mediatek/accdet) registered its own input device
++ * and reported KEY_PLAYPAUSE/KEY_VOLUMEUP/KEY_VOLUMEDOWN/KEY_VOICECOMMAND on
++ * it.  This driver instead owns a single ASoC jack, lets the ASoC jack supply
++ * the input device, and translates the ACCDET blocking-notifier events into
++ * snd_soc_jack_report() calls.  That deliberately avoids the duplicate
++ * reporting path of the downstream driver, where both ACCDET and (on some
++ * projects) the codec reported the same keys.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation.
++ */
++
++#include <linux/input.h>
++#include <linux/mfd/mt6328/accdet.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/notifier.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++
++#include <sound/jack.h>
++#include <sound/soc.h>
++
++/* Card name, mt_soc_machine.c:1138 */
++#define MT6735_CARD_NAME	"mt-snd-card"
++
++/* Stream names, AudDrv_Def.h:311-329 */
++#define MT6735_MM1_STREAM	"MultiMedia1_PLayback"
++#define MT6735_MM2_STREAM	"MultiMedia1_Capture"
++#define MT6735_DL2_STREAM	"MultiMedia2_PLayback"
++#define MT6735_I2S0_STREAM	"I2S0_PLayback"
++
++#define MT6735_JACK_BTN_MASK	(SND_JACK_BTN_0 | SND_JACK_BTN_1 | \
++				 SND_JACK_BTN_2 | SND_JACK_BTN_3)
++#define MT6735_JACK_MASK	(SND_JACK_HEADSET | MT6735_JACK_BTN_MASK)
++
++struct mt6735_mt6331_priv {
++	struct snd_soc_card card;
++	struct snd_soc_jack jack;
++	struct notifier_block accdet_nb;
++	struct accdet_state state;
++	struct mutex lock;	/* protects state, have_state, jack_ready */
++	bool have_state;
++	bool jack_ready;
++	bool jack_created;
++	bool accdet_registered;
++	unsigned int button_bit;	/* last pressed key, for its release */
++};
++
++/*
++ * FrontEnd DAI links, mt_soc_machine.c:858-884 and 1098-1106.
++ *
++ * The three multimedia links carry the on-SoC codec (MT6331 downlink/uplink)
++ * and therefore leave .dai_fmt unset: downstream never programmed an interface
++ * format for them, the AFE and the codec DAI selected their own internal
++ * formats.  I2S0 is a real four-wire interface; its format follows the AFE
++ * I2S configuration that downstream writes into AFE_I2S_CON/I2S_CON3
++ * (mt_soc_pcm_dl1_i2s0.c:183-193, mt_soc_digital_type.h:236-262):
++ * I2S mode (Soc_Aud_I2S_FORMAT_I2S), LRCK not inverted
++ * (Soc_Aud_INV_LRCK_NO_INVERSE), no LR swap (Soc_Aud_LR_SWAP_NO_SWAP) and the
++ * AFE as clock master (Soc_Aud_I2S_SRC_MASTER_MODE) => NB_NF | CBC_CFC.
++ */
++SND_SOC_DAILINK_DEFS(mm1,
++	DAILINK_COMP_ARRAY(COMP_CPU("mt-soc-dl1dai-driver")),
++	DAILINK_COMP_ARRAY(COMP_CODEC("mt-soc-codec", "mt-soc-codec-tx-dai")),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++SND_SOC_DAILINK_DEFS(mm2,
++	DAILINK_COMP_ARRAY(COMP_CPU("mt-soc-ul1dai-driver")),
++	DAILINK_COMP_ARRAY(COMP_CODEC("mt-soc-codec", "mt-soc-codec-rx-dai")),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++SND_SOC_DAILINK_DEFS(dl2,
++	DAILINK_COMP_ARRAY(COMP_CPU("mt-soc-dl2dai-driver")),
++	DAILINK_COMP_ARRAY(COMP_CODEC("mt-soc-codec", "mt-soc-codec-tx-dai2")),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++SND_SOC_DAILINK_DEFS(i2s0,
++	DAILINK_COMP_ARRAY(COMP_CPU("mt-soc-i2s0dai-driver")),
++	DAILINK_COMP_ARRAY(COMP_CODEC("snd-soc-dummy", "snd-soc-dummy-dai")),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++static struct snd_soc_jack_pin mt6735_mt6331_jack_pins[] = {
++	{
++		.pin = "Headphone",
++		.mask = SND_JACK_HEADPHONE,
++	},
++	{
++		.pin = "Headset Mic",
++		.mask = SND_JACK_MICROPHONE,
++	},
++};
++
++/*
++ * Card-level jack pins.  These are not routing widgets: they are the DAPM
++ * anchors snd_soc_jack_report() toggles when the ACCDET reports a plug event,
++ * exactly like the headset pins of the other MediaTek machine drivers.  All
++ * audio routing stays in the codec and AFE, so no routes are added here.
++ */
++static const struct snd_soc_dapm_widget mt6735_mt6331_jack_widgets[] = {
++	SND_SOC_DAPM_HP("Headphone", NULL),
++	SND_SOC_DAPM_MIC("Headset Mic", NULL),
++};
++
++static int mt6735_mt6331_mm1_init(struct snd_soc_pcm_runtime *rtd);
++static void mt6735_mt6331_mm1_exit(struct snd_soc_pcm_runtime *rtd);
++
++static struct snd_soc_dai_link mt6735_mt6331_dai_links[] = {
++	{
++		.name = "MultiMedia1",
++		.stream_name = MT6735_MM1_STREAM,
++		.init = mt6735_mt6331_mm1_init,
++		.exit = mt6735_mt6331_mm1_exit,
++		.playback_only = 1,
++		SND_SOC_DAILINK_REG(mm1),
++	},
++	{
++		.name = "MultiMedia2",
++		.stream_name = MT6735_MM2_STREAM,
++		.capture_only = 1,
++		SND_SOC_DAILINK_REG(mm2),
++	},
++	{
++		.name = "MultiMedia_DL2",
++		.stream_name = MT6735_DL2_STREAM,
++		.playback_only = 1,
++		SND_SOC_DAILINK_REG(dl2),
++	},
++	{
++		.name = "I2S0OUTPUT",
++		.stream_name = MT6735_I2S0_STREAM,
++		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
++			   SND_SOC_DAIFMT_CBC_CFC,
++		SND_SOC_DAILINK_REG(i2s0),
++	},
++};
++
++/*
++ * ACCDET button index -> ASoC jack button.  The indices are ordered by
++ * increasing mic-ADC voltage (accdet.h, enum accdet_button), which matches
++ * the downstream four-key detection (accdet.c:712-769).  The keycodes are the
++ * ones downstream reports on its own input device.
++ */
++static unsigned int mt6735_mt6331_button_bit(int button)
++{
++	switch (button) {
++	case ACCDET_BUTTON_MEDIA:
++		return SND_JACK_BTN_0;	/* KEY_PLAYPAUSE */
++	case ACCDET_BUTTON_VOICE:
++		return SND_JACK_BTN_1;	/* KEY_VOICECOMMAND */
++	case ACCDET_BUTTON_VOLUP:
++		return SND_JACK_BTN_2;	/* KEY_VOLUMEUP */
++	case ACCDET_BUTTON_VOLDOWN:
++		return SND_JACK_BTN_3;	/* KEY_VOLUMEDOWN */
++	case ACCDET_BUTTON_NONE:
++	default:
++		return 0;
++	}
++}
++
++/*
++ * Cable type -> jack status.  The ROM distinguishes a three-pole headphone
++ * (HEADPHONE) from a four-pole headset with microphone (HEADSET_MIC,
++ * accdet.c:989-1057); the MT6328 ACCDET driver additionally reports a
++ * five-pole headset, which is electrically a four-pole cable with a second
++ * ground ring and is reported as a headset.
++ */
++static unsigned int mt6735_mt6331_plug_status(const struct accdet_state *state)
++{
++	if (!state->plugged)
++		return 0;
++
++	switch (state->cable) {
++	case ACCDET_CABLE_HEADPHONE:
++		return SND_JACK_HEADPHONE;
++	case ACCDET_CABLE_HEADSET:
++	case ACCDET_CABLE_HEADSET_5POLE:
++		return SND_JACK_HEADSET;
++	case ACCDET_CABLE_NONE:
++	case ACCDET_CABLE_UNKNOWN:
++	default:
++		return 0;
++	}
++}
++
++/*
++ * ACCDET emits no notification for the state it finds at probe time, so the
++ * machine driver asks for it explicitly.  The call fails with -ENODEV when
++ * ACCDET is not built in or has not probed yet; a later event will update the
++ * cache in that case.
++ */
++static void mt6735_mt6331_seed_state(struct mt6735_mt6331_priv *priv)
++{
++	struct accdet_state state;
++
++	if (priv->have_state)
++		return;
++
++	if (accdet_get_state(&state))
++		return;
++
++	priv->state = state;
++	priv->have_state = true;
++}
++
++static int mt6735_mt6331_accdet_notify(struct notifier_block *nb,
++				       unsigned long event, void *data)
++{
++	struct mt6735_mt6331_priv *priv =
++		container_of(nb, struct mt6735_mt6331_priv, accdet_nb);
++	const struct accdet_state *state = data;
++	unsigned int status, mask;
++
++	if (!state)
++		return NOTIFY_DONE;
++
++	if (event != ACCDET_EVENT_PLUG && event != ACCDET_EVENT_BUTTON)
++		return NOTIFY_DONE;
++
++	/*
++	 * Cache the state so that a notification that arrives before the card
++	 * is bound is replayed when the jack is created in mm1_init().  The
++	 * ACCDET notification is a blocking notifier, so sleeping is fine.
++	 */
++	mutex_lock(&priv->lock);
++	priv->state = *state;
++	priv->have_state = true;
++
++	if (event == ACCDET_EVENT_PLUG) {
++		status = mt6735_mt6331_plug_status(state);
++		mask = MT6735_JACK_MASK;
++		if (!state->plugged)
++			priv->button_bit = 0;
++	} else if (state->button != ACCDET_BUTTON_NONE) {
++		priv->button_bit = mt6735_mt6331_button_bit(state->button);
++		status = priv->button_bit;
++		mask = MT6735_JACK_BTN_MASK;
++	} else {
++		/*
++		 * Release carries ACCDET_BUTTON_NONE; release the key whose
++		 * press we remembered.  Fall back to all buttons if a press
++		 * was missed.
++		 */
++		status = 0;
++		mask = priv->button_bit ? priv->button_bit :
++					 MT6735_JACK_BTN_MASK;
++		priv->button_bit = 0;
++	}
++
++	if (priv->jack_ready)
++		snd_soc_jack_report(&priv->jack, status, mask);
++	mutex_unlock(&priv->lock);
++
++	return NOTIFY_OK;
++}
++
++static int mt6735_mt6331_mm1_init(struct snd_soc_pcm_runtime *rtd)
++{
++	struct snd_soc_card *card = rtd->card;
++	struct mt6735_mt6331_priv *priv = snd_soc_card_get_drvdata(card);
++	struct snd_soc_component *component =
++		snd_soc_rtd_to_codec(rtd, 0)->component;
++	int ret;
++
++	if (!priv->jack_created) {
++		ret = snd_soc_dapm_new_controls(snd_soc_card_to_dapm(card),
++						mt6735_mt6331_jack_widgets,
++						ARRAY_SIZE(mt6735_mt6331_jack_widgets));
++		if (ret) {
++			dev_err(rtd->dev, "failed to add jack pins: %d\n", ret);
++			return ret;
++		}
++
++		ret = snd_soc_card_jack_new_pins(card, "Headset Jack",
++						 MT6735_JACK_MASK, &priv->jack,
++						 mt6735_mt6331_jack_pins,
++						 ARRAY_SIZE(mt6735_mt6331_jack_pins));
++		if (ret) {
++			dev_err(rtd->dev, "failed to create jack: %d\n", ret);
++			return ret;
++		}
++
++		snd_jack_set_key(priv->jack.jack, SND_JACK_BTN_0,
++				 KEY_PLAYPAUSE);
++		snd_jack_set_key(priv->jack.jack, SND_JACK_BTN_1,
++				 KEY_VOICECOMMAND);
++		snd_jack_set_key(priv->jack.jack, SND_JACK_BTN_2,
++				 KEY_VOLUMEUP);
++		snd_jack_set_key(priv->jack.jack, SND_JACK_BTN_3,
++				 KEY_VOLUMEDOWN);
++		priv->jack_created = true;
++	}
++
++	ret = snd_soc_component_set_jack(component, &priv->jack, NULL);
++	if (ret == -ENOTSUPP || ret == -EOPNOTSUPP) {
++		/*
++		 * The codec DAI does not implement jack detection; the jack is
++		 * driven by ACCDET, so the card is still fully usable.
++		 */
++		dev_warn(rtd->dev, "codec %s has no set_jack, using ACCDET only\n",
++			 component->name);
++		ret = 0;
++	} else if (ret) {
++		dev_err(rtd->dev, "failed to set jack on %s: %d\n",
++			component->name, ret);
++		return ret;
++	}
++
++	mutex_lock(&priv->lock);
++	priv->jack_ready = true;
++	mt6735_mt6331_seed_state(priv);
++	if (priv->have_state) {
++		unsigned int status = 0;
++		unsigned int mask = MT6735_JACK_MASK;
++
++		priv->button_bit = 0;
++		if (priv->state.plugged) {
++			status = mt6735_mt6331_plug_status(&priv->state);
++			priv->button_bit =
++				mt6735_mt6331_button_bit(priv->state.button);
++			status |= priv->button_bit;
++		}
++		snd_soc_jack_report(&priv->jack, status, mask);
++	}
++	mutex_unlock(&priv->lock);
++
++	return 0;
++}
++
++static void mt6735_mt6331_mm1_exit(struct snd_soc_pcm_runtime *rtd)
++{
++	struct mt6735_mt6331_priv *priv = snd_soc_card_get_drvdata(rtd->card);
++	struct snd_soc_component *component =
++		snd_soc_rtd_to_codec(rtd, 0)->component;
++
++	mutex_lock(&priv->lock);
++	priv->jack_ready = false;
++	mutex_unlock(&priv->lock);
++
++	snd_soc_component_set_jack(component, NULL, NULL);
++}
++
++static int mt6735_mt6331_probe(struct platform_device *pdev)
++{
++	struct mt6735_mt6331_priv *priv;
++	int ret;
++
++	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	mutex_init(&priv->lock);
++	priv->accdet_nb.notifier_call = mt6735_mt6331_accdet_notify;
++
++	priv->card.name = MT6735_CARD_NAME;
++	priv->card.dev = &pdev->dev;
++	priv->card.owner = THIS_MODULE;
++	priv->card.dai_link = mt6735_mt6331_dai_links;
++	priv->card.num_links = ARRAY_SIZE(mt6735_mt6331_dai_links);
++	snd_soc_card_set_drvdata(&priv->card, priv);
++	platform_set_drvdata(pdev, priv);
++
++	/*
++	 * Subscribe before registering the card so that an ACCDET event during
++	 * binding is cached and replayed by mm1_init().
++	 */
++	ret = accdet_register_notifier(&priv->accdet_nb);
++	if (ret) {
++		if (ret != -ENODEV)
++			return ret;
++		dev_warn(&pdev->dev, "ACCDET not available, no jack reporting\n");
++	} else {
++		priv->accdet_registered = true;
++	}
++
++	mutex_lock(&priv->lock);
++	mt6735_mt6331_seed_state(priv);
++	mutex_unlock(&priv->lock);
++
++	ret = devm_snd_soc_register_card(&pdev->dev, &priv->card);
++	if (ret) {
++		if (priv->accdet_registered)
++			accdet_unregister_notifier(&priv->accdet_nb);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void mt6735_mt6331_remove(struct platform_device *pdev)
++{
++	struct mt6735_mt6331_priv *priv = platform_get_drvdata(pdev);
++
++	if (priv->accdet_registered) {
++		accdet_unregister_notifier(&priv->accdet_nb);
++		priv->accdet_registered = false;
++	}
++}
++
++static const struct of_device_id mt6735_mt6331_of_match[] = {
++	{ .compatible = "mediatek,mt6735-sound" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mt6735_mt6331_of_match);
++
++static struct platform_driver mt6735_mt6331_driver = {
++	.driver = {
++		.name = "mt6735-mt6331-sound",
++		.of_match_table = mt6735_mt6331_of_match,
++	},
++	.probe = mt6735_mt6331_probe,
++	.remove = mt6735_mt6331_remove,
++};
++module_platform_driver(mt6735_mt6331_driver);
++
++MODULE_AUTHOR("ChiPeng <chipeng.chang@mediatek.com>");
++MODULE_DESCRIPTION("ALSA SoC MT6735/MT6331 machine driver");
++MODULE_LICENSE("GPL");

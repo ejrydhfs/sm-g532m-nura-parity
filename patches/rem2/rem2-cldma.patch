@@ -1,0 +1,396 @@
+diff --git a/drivers/misc/mediatek/ccci/ccci_ccif.c b/drivers/misc/mediatek/ccci/ccci_ccif.c
+index e197d1c..429408d 100644
+--- a/drivers/misc/mediatek/ccci/ccci_ccif.c
++++ b/drivers/misc/mediatek/ccci/ccci_ccif.c
+@@ -22,6 +22,7 @@
+  * mt6735/ccif_c2k_platform.h.  Original copyright (C) 2015 MediaTek Inc.,
+  * GPL-2.0.
+  */
++#include <linux/aee.h>
+ #include <linux/ccci.h>
+ #include <linux/delay.h>
+ #include <linux/interrupt.h>
+@@ -360,7 +361,9 @@ static int ccci_ccif_poll_ready(struct ccci_md *md, unsigned int channel)
+ void ccci_ccif_exception(struct ccci_md *md, unsigned int stage)
+ {
+ 	struct ccci_ccif *ccif = md->ccif;
++	char detail[96];
+ 	unsigned int i;
++	int err;
+ 
+ 	ccci_md_err(md, "MD exception HIF stage %u\n", stage);
+ 
+@@ -374,17 +377,33 @@ void ccci_ccif_exception(struct ccci_md *md, unsigned int stage)
+ 		 */
+ 		md->ex_stage = CCCI_EX_INIT;
+ 		ccci_md_set_state(md, CCCI_MD_EXCEPTION);
+-		if (md->cldma)
+-			ccci_cldma_stop(md->cldma);
+-		/*
+-		 * The engine has no "stop the TX queues but keep the RX ring
+-		 * that carries DHL alive" primitive (downstream
+-		 * cldma_stop_for_ee(), modem_cldma.c:1449-1520); the gap is
+-		 * reported by the CLDMA leaf as a SCAFFOLD CHANGE REQUIRED.
+-		 * Until then the whole engine stops here, which is safe (no
+-		 * packet is handed to a modem that is resetting) but makes
+-		 * the DHL window below empty.
+-		 */
++		if (md->cldma) {
++			/*
++			 * modem_cldma.c:2005: stop every TX queue and every RX
++			 * queue outside the DHL set, clearing and masking only
++			 * those latches, so the DHL RX queues (0..3) stay armed
++			 * for the rest of the handshake. The exception ring map
++			 * is already latched by ccci_md_set_state() above
++			 * (ccci_core.c:139-148), so the ccci_cldma_start() at
++			 * HIF_EX_ALLQ_RESET skips the INFRA block reset
++			 * (ccci_cldma.c:1911-1927).
++			 */
++			err = ccci_cldma_stop_for_ee(md->cldma);
++			if (err) {
++				/*
++				 * modem_cldma.c:1468-1476,1495-1503: report the
++				 * stalled engine and continue the handshake. The
++				 * latch/mask programming was applied regardless.
++				 */
++				scnprintf(detail, sizeof(detail),
++					  "md%d:\nUNKNOWN Exception\nstop Tx/Rx CLDMA for EE failed.\n",
++					  md->id + 1);
++				ccci_md_err(md, "stop CLDMA for EE failed: %d\n",
++					    err);
++				aed_md_exception_api(NULL, 0, NULL, 0, detail,
++						    DB_OPT_DEFAULT);
++			}
++		}
+ 		ccci_exception_trigger(md, CCCI_EX_DUMP_MD_EX,
+ 				       ccci_exception_dump_flags(md));
+ 		/* dispatch must not depend on queue indices, so Rx can still
+@@ -404,15 +423,20 @@ void ccci_ccif_exception(struct ccci_md *md, unsigned int stage)
+ 		 * Downstream gives DHL two seconds to flush its data before the
+ 		 * AP acknowledges the queue clear (modem_cldma.c:2015) and only
+ 		 * then stops CLDMA and flushes its TX/RX workers
+-		 * (md_cd_ccif_delayed_work(), modem_cldma.c:1966-1983).  The
+-		 * engine's cldma_hw_stop() already flushes the per-queue
+-		 * delayed TX work and the RX/refill work, so the stop is the
+-		 * purge; it is a no-op when HIF_EX_INIT already stopped the
+-		 * engine.  The CCIF-ring modems do not have this stage delay
+-		 * (modem_ccif.c:401-406).
++		 * (md_cd_ccif_delayed_work(), modem_cldma.c:1966-1983).
++		 * The DHL RX window opened at HIF_EX_INIT is closed first:
++		 * ccci_cldma_dhl_rx_alive(cd, false) stops the RX queues that
++		 * were kept armed and masks their latches, and the full stop
++		 * then masks every source and flushes the per-queue delayed TX
++		 * work and the RX/refill work, which is the purge downstream
++		 * performs in the delayed work.
+ 		 */
+ 		if (md->cldma) {
+ 			msleep(2000);
++			err = ccci_cldma_dhl_rx_alive(md->cldma, false);
++			if (err)
++				ccci_md_err(md, "close DHL Rx window failed: %d\n",
++					    err);
+ 			ccci_cldma_stop(md->cldma);
+ 		}
+ 		if (ccif) {
+@@ -438,7 +462,15 @@ void ccci_ccif_exception(struct ccci_md *md, unsigned int stage)
+ 		ccci_ccif_send(md, H2D_EXCEPTION_CLEARQ_ACK);
+ 		break;
+ 	case HIF_EX_ALLQ_RESET:
+-		/* modem_cldma.c:2023 / modem_ccif.c:413 */
++		/*
++		 * modem_cldma.c:2023-2035 / modem_ccif.c:413. ccci_cldma_start()
++		 * re-arms all eight queues, re-applies the latched exception
++		 * ring map, re-programmes the L2/L3 unmask registers
++		 * (cldma_hw_start(), ccci_cldma.c:1261-1270) and re-checks that
++		 * OUT DMA accepted SO_CFG bit 0 (ccci_cldma.c:1941-1951), which
++		 * downstream does explicitly after cldma_start()
++		 * (modem_cldma.c:2026-2033).
++		 */
+ 		md->ex_stage = CCCI_EX_INIT_DONE;
+ 		if (md->cldma)
+ 			ccci_cldma_start(md->cldma);
+diff --git a/drivers/misc/mediatek/ccci_cldma/ccci_cldma.c b/drivers/misc/mediatek/ccci_cldma/ccci_cldma.c
+index dcfba72..537eba3 100644
+--- a/drivers/misc/mediatek/ccci_cldma/ccci_cldma.c
++++ b/drivers/misc/mediatek/ccci_cldma/ccci_cldma.c
+@@ -28,6 +28,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/err.h>
+ #include <linux/errno.h>
++#include <linux/export.h>
+ #include <linux/kernel.h>
+ #include <linux/limits.h>
+ #include <linux/list.h>
+@@ -1347,6 +1348,219 @@ static void cldma_hw_stop(struct ccci_cldma *cd)
+ 	}
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* Exception-time stop and the DHL RX window                           */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Port from Samsung/MTK downstream cldma_stop_for_ee() and md_cd_stop_queue()
++ * (modem_cldma.c:1449-1520, 1694-1730, inlined in the ROM inside
++ * md_cd_ccif_work, vmlinux.elf 0xc05285cc-0xc0528768 and
++ * 0xc0528714-0xc0528744):
++ *
++ *	write CLDMA_AP_{UL,SO}_STOP_CMD <- mask
++ *	read  CLDMA_AP_{UL,SO}_STOP_CMD		(dummy read, posts the write)
++ *	read  CLDMA_AP_{UL,SO}_STATUS & mask	(only the queues we stop)
++ *	repeat until the masked status is zero
++ *
++ * Every CLDMA_EE_STOP_DUMP_INTERVAL polls the engine state is dumped; the poll
++ * is bounded by CLDMA_EE_STOP_POLL_MAX. Downstream runs this loop with
++ * cldma_timeout_lock held and raises AEE from inside it; here the loop runs
++ * outside the spinlock (like cldma_hw_stop() above) under start_lock, and the
++ * timeout is reported to the caller, which owns the AEE notification.
++ */
++static int cldma_ee_stop_poll(struct ccci_cldma *cd, void __iomem *cmd_base,
++			      u32 cmd_off, void __iomem *status_base,
++			      u32 status_off, u32 mask, const char *what)
++{
++	u32 status;
++	int count = 0;
++
++	do {
++		cldma_write32(cmd_base, cmd_off, mask);
++		cldma_read32(cmd_base, cmd_off);	/* dummy read */
++		status = cldma_read32(status_base, status_off) & mask;
++		if (++count % CLDMA_EE_STOP_DUMP_INTERVAL == 0) {
++			dev_info(cd->dev,
++				 "stop %s CLDMA E, status=0x%08x, count=%d\n",
++				 what, status, count);
++			cldma_dump_register(cd);
++			if (count >= CLDMA_EE_STOP_POLL_MAX) {
++				dev_err(cd->dev,
++					"stop %s CLDMA for EE failed, status=0x%08x\n",
++					what, status);
++				return -ETIMEDOUT;
++			}
++		}
++	} while (status);
++
++	return 0;
++}
++
++/*
++ * Port from Samsung/MTK downstream cldma_stop_for_ee() (modem_cldma.c:1449-1520),
++ * inlined in the ROM in md_cd_ccif_work() at vmlinux.elf 0xc05285d0-0xc0528928.
++ *
++ * Stop all eight TX queues and the RX queues outside CLDMA_EE_ALIVE_RXQ_MASK,
++ * then clear and mask the L2/L3 latches of exactly those queues, so the DHL RX
++ * queues (0..3) stay armed and keep their DONE|ERROR interrupts unmasked for
++ * the rest of the exception handshake.
++ *
++ * Returns 0, or -ETIMEDOUT when the engine never reported the stopped queues
++ * idle. The latch and mask programming is applied in both cases, exactly like
++ * downstream, which continues the handshake after reporting to AEE.
++ */
++int ccci_cldma_stop_for_ee(struct ccci_cldma *cd)
++{
++	unsigned long flags;
++	int ret_tx, ret_rx;
++
++	if (!cd || IS_ERR(cd))
++		return -EINVAL;
++
++	mutex_lock(&cd->start_lock);
++
++	/* Stop every TX queue: UL_STOP_CMD = CLDMA_BM_ALL_QUEUE (0xFF). */
++	spin_lock_irqsave(&cd->timeout_lock, flags);
++	cd->txq_active &= ~CLDMA_BM_ALL_QUEUE;
++	spin_unlock_irqrestore(&cd->timeout_lock, flags);
++
++	ret_tx = cldma_ee_stop_poll(cd, cd->ap_pdn_base, CLDMA_AP_UL_STOP_CMD,
++				    cd->ap_pdn_base, CLDMA_AP_UL_STATUS,
++				    CLDMA_BM_ALL_QUEUE, "Tx");
++
++	/*
++	 * Stop the RX queues outside the DHL set: SO_STOP_CMD = 0xF0. The
++	 * active mask is updated first so that no refill work resumes them
++	 * while they are being stopped.
++	 */
++	spin_lock_irqsave(&cd->timeout_lock, flags);
++	cd->rxq_active &= ~(CLDMA_BM_ALL_QUEUE & CLDMA_NONSTOP_QUEUE_MASK);
++	spin_unlock_irqrestore(&cd->timeout_lock, flags);
++
++	ret_rx = cldma_ee_stop_poll(cd, cd->ap_pdn_base, CLDMA_AP_SO_STOP_CMD,
++				    cd->ap_base, CLDMA_AP_SO_STATUS,
++				    CLDMA_BM_ALL_QUEUE &
++				    CLDMA_NONSTOP_QUEUE_MASK, "Rx");
++
++	/*
++	 * Clear the latches of the stopped queues (downstream comment: "clear
++	 * all L2 and L3 interrupts, but non-stop Rx ones") and mask their
++	 * sources. The RX DONE|ERROR bits of the DHL queues are left untouched
++	 * in L2RIMSR0, i.e. they stay unmasked.
++	 */
++	spin_lock_irqsave(&cd->timeout_lock, flags);
++	cldma_write32(cd->ap_pdn_base, CLDMA_AP_L2TISAR0, CLDMA_BM_INT_ALL);
++	cldma_write32(cd->ap_pdn_base, CLDMA_AP_L2TISAR1, CLDMA_BM_INT_ALL);
++	cldma_write32(cd->ap_pdn_base, CLDMA_AP_L2RISAR0,
++		      CLDMA_BM_INT_ALL & CLDMA_NONSTOP_QUEUE_MASK_32);
++	cldma_write32(cd->ap_pdn_base, CLDMA_AP_L2RISAR1,
++		      CLDMA_BM_INT_ALL & CLDMA_NONSTOP_QUEUE_MASK_32);
++	cldma_write32(cd->ap_pdn_base, CLDMA_AP_L3TISAR0, CLDMA_BM_INT_ALL);
++	cldma_write32(cd->ap_pdn_base, CLDMA_AP_L3TISAR1, CLDMA_BM_INT_ALL);
++	cldma_write32(cd->ap_pdn_base, CLDMA_AP_L3RISAR0,
++		      CLDMA_BM_INT_ALL & CLDMA_NONSTOP_QUEUE_MASK_32);
++	cldma_write32(cd->ap_pdn_base, CLDMA_AP_L3RISAR1,
++		      CLDMA_BM_INT_ALL & CLDMA_NONSTOP_QUEUE_MASK_32);
++
++	cldma_write32(cd->ap_pdn_base, CLDMA_AP_L2TIMSR0, CLDMA_BM_INT_ALL);
++	cldma_write32(cd->ap_pdn_base, CLDMA_AP_L2TIMSR1, CLDMA_BM_INT_ALL);
++	cldma_write32(cd->ap_base, CLDMA_AP_L2RIMSR0,
++		      (CLDMA_BM_INT_DONE | CLDMA_BM_INT_ERROR) &
++		      CLDMA_NONSTOP_QUEUE_MASK_32);
++	cldma_write32(cd->ap_base, CLDMA_AP_L2RIMSR1, CLDMA_BM_INT_ALL);
++	cldma_write32(cd->ap_pdn_base, CLDMA_AP_L3TIMSR0, CLDMA_BM_INT_ALL);
++	cldma_write32(cd->ap_pdn_base, CLDMA_AP_L3TIMSR1, CLDMA_BM_INT_ALL);
++	cldma_write32(cd->ap_pdn_base, CLDMA_AP_L3RIMSR0,
++		      CLDMA_BM_INT_ALL & CLDMA_NONSTOP_QUEUE_MASK_32);
++	cldma_write32(cd->ap_pdn_base, CLDMA_AP_L3RIMSR1,
++		      CLDMA_BM_INT_ALL & CLDMA_NONSTOP_QUEUE_MASK_32);
++	spin_unlock_irqrestore(&cd->timeout_lock, flags);
++
++	mutex_unlock(&cd->start_lock);
++
++	return ret_tx ? ret_tx : ret_rx;
++}
++EXPORT_SYMBOL_GPL(ccci_cldma_stop_for_ee);
++
++/*
++ * Open/close the DHL RX window.
++ *
++ * stop_for_ee() leaves RX queues 0..3 armed and unmasked; that is the window
++ * the modem pushes its exception log through (the log control port uses RX
++ * queue 3 in exception mode, see CLDMA_EE_ALIVE_RXQ_MASK). alive == true
++ * re-arms that set with the per-queue sequence of downstream
++ * md_cd_start_queue(IN) (modem_cldma.c:1746-1770): SO_START_CMD with the queue
++ * bits, clear their latches, unmask DONE|ERROR through L2RIMCR0 and mark them
++ * active. alive == false closes it with the per-queue sequence of
++ * md_cd_stop_queue(IN) (modem_cldma.c:1694-1730): mask their L2 sources,
++ * SO_STOP_CMD with the queue bits, poll SO_STATUS until they report idle, then
++ * clear the latches.
++ *
++ * L3 has no per-queue bit attribution in any available source: downstream
++ * stop_for_ee() masks L3RIMSR0/1 with CLDMA_NONSTOP_QUEUE_MASK_32 and the full
++ * stop masks them with CLDMA_BM_INT_ALL (modem_cldma.c:1417-1435). Closing the
++ * window is immediately followed by the full stop in the exception flow, so
++ * the full-stop value is used here.
++ *
++ * Returns 0, or -ETIMEDOUT if the DHL queues never report stopped when closing.
++ */
++int ccci_cldma_dhl_rx_alive(struct ccci_cldma *cd, bool alive)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	if (!cd || IS_ERR(cd))
++		return -EINVAL;
++
++	mutex_lock(&cd->start_lock);
++
++	if (alive) {
++		spin_lock_irqsave(&cd->timeout_lock, flags);
++		cd->rxq_active |= CLDMA_EE_ALIVE_RXQ_MASK;
++		cldma_write32(cd->ap_pdn_base, CLDMA_AP_SO_START_CMD,
++			      CLDMA_EE_ALIVE_RXQ_MASK);
++		cldma_read32(cd->ap_pdn_base, CLDMA_AP_SO_START_CMD);
++		/* Drop stale latches before unmasking the sources. */
++		cldma_write32(cd->ap_pdn_base, CLDMA_AP_L2RISAR0,
++			      CLDMA_EE_ALIVE_RXQ_INT);
++		cldma_write32(cd->ap_base, CLDMA_AP_L2RIMCR0,
++			      CLDMA_EE_ALIVE_RXQ_INT);
++		spin_unlock_irqrestore(&cd->timeout_lock, flags);
++		dev_info(cd->dev, "CLDMA DHL Rx window open (rxq 0..3)\n");
++	} else {
++		spin_lock_irqsave(&cd->timeout_lock, flags);
++		cd->rxq_active &= ~CLDMA_EE_ALIVE_RXQ_MASK;
++		cldma_write32(cd->ap_base, CLDMA_AP_L2RIMSR0,
++			      CLDMA_EE_ALIVE_RXQ_INT);
++		spin_unlock_irqrestore(&cd->timeout_lock, flags);
++
++		ret = cldma_ee_stop_poll(cd, cd->ap_pdn_base,
++					 CLDMA_AP_SO_STOP_CMD, cd->ap_base,
++					 CLDMA_AP_SO_STATUS,
++					 CLDMA_EE_ALIVE_RXQ_MASK, "DHL Rx");
++
++		spin_lock_irqsave(&cd->timeout_lock, flags);
++		cldma_write32(cd->ap_pdn_base, CLDMA_AP_L2RISAR0,
++			      CLDMA_EE_ALIVE_RXQ_INT);
++		cldma_write32(cd->ap_pdn_base, CLDMA_AP_L3RISAR0,
++			      CLDMA_BM_INT_ALL);
++		cldma_write32(cd->ap_pdn_base, CLDMA_AP_L3RISAR1,
++			      CLDMA_BM_INT_ALL);
++		cldma_write32(cd->ap_pdn_base, CLDMA_AP_L3RIMSR0,
++			      CLDMA_BM_INT_ALL);
++		cldma_write32(cd->ap_pdn_base, CLDMA_AP_L3RIMSR1,
++			      CLDMA_BM_INT_ALL);
++		spin_unlock_irqrestore(&cd->timeout_lock, flags);
++		dev_info(cd->dev, "CLDMA DHL Rx window closed (rxq 0..3)\n");
++	}
++
++	mutex_unlock(&cd->start_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ccci_cldma_dhl_rx_alive);
++
+ /* modem_cldma.c:1619-1693, only valid while the engine is stopped. */
+ static void cldma_clear_tx_queue(struct ccci_cldma *cd,
+ 				 struct cldma_queue *queue)
+diff --git a/drivers/misc/mediatek/ccci_cldma/ccci_cldma.h b/drivers/misc/mediatek/ccci_cldma/ccci_cldma.h
+index 5e432b7..3d70408 100644
+--- a/drivers/misc/mediatek/ccci_cldma/ccci_cldma.h
++++ b/drivers/misc/mediatek/ccci_cldma/ccci_cldma.h
+@@ -74,6 +74,48 @@
+ /* All eight CLDMA queues, cldma_reg.h:258. */
+ #define CLDMA_BM_ALL_QUEUE		0xFF
+ 
++/*
++ * modem_cldma.c:113-114. The mask the exception-time stop hands to
++ * CLDMA_AP_SO_STOP_CMD and clears from rxq_active. The downstream comment
++ * ("queue 0,1,2,3 are non-stop") and the code at modem_cldma.c:1481-1487 are
++ * unambiguous once the bit numbering of the status registers is taken into
++ * account (queue q is bit q, see md_cd_stop_queue(), modem_cldma.c:1714-1718):
++ * the queues in this mask (4..7) are the ones that get stopped, so RX queues
++ * 0..3 keep running for the duration of the exception handshake.
++ */
++#define CLDMA_NONSTOP_QUEUE_MASK	0xF0
++#define CLDMA_NONSTOP_QUEUE_MASK_32	0xF0F0F0F0
++
++/*
++ * RX queues the exception-time stop leaves armed: 0, 1, 2 and 3. These are the
++ * queues the exception ("DHL") traffic is delivered on - the CCCI port table
++ * gives the log control port .rxq_exp = 3 (ccci_core.c:1283-1285), ccci_fs
++ * .rxq_exp = 1 (ccci_core.c:1289-1291) and ttyC1 .rxq_exp = 2
++ * (ccci_core.c:1298-1300), while every network port has .rxq_exp = 0xFF
++ * (ccci_core.c:1251-1273).
++ */
++#define CLDMA_EE_ALIVE_RXQ_MASK \
++	(CLDMA_BM_ALL_QUEUE & ~CLDMA_NONSTOP_QUEUE_MASK)
++
++/*
++ * Positions of those queues in the L2 RX registers. CLDMA_BM_INT_DONE carries
++ * queue q in bit q and CLDMA_BM_INT_ERROR carries it in bit 16 + q
++ * (cldma_rx_done() and cldma_irq_thread() address a queue as BIT(index) in
++ * both halves). Queue 0..3 therefore is 0x0000000F | 0x000F0000 = 0x000F000F,
++ * the RX counterpart of downstream's 0xF0F0F0F0 for queues 4..7.
++ */
++#define CLDMA_EE_ALIVE_RXQ_INT \
++	((CLDMA_BM_INT_DONE & CLDMA_EE_ALIVE_RXQ_MASK) | \
++	 (CLDMA_BM_INT_ERROR & (CLDMA_EE_ALIVE_RXQ_MASK << 16)))
++
++/*
++ * modem_cldma.c:1466-1476,1493-1503: the exception-time stop loops dump the
++ * engine state every 100000 polls and give up after 1600000 (downstream then
++ * raises AEE from inside the loop; here the timeout is returned to the caller).
++ */
++#define CLDMA_EE_STOP_DUMP_INTERVAL	100000
++#define CLDMA_EE_STOP_POLL_MAX		1600000
++
+ /*
+  * INFRA_AO RGU reset registers for the CLDMA block, verbatim from
+  * mt6735/cldma_reg.h:18-21:

@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config MTK_ACCDET
+	tristate "MediaTek MT6328 PMIC accessory detection support"
+	depends on MFD_MT6397 || COMPILE_TEST
+	help
+	  Say Y here to enable the accessory detection (headset jack) block
+	  inside the MediaTek MT6328 PMIC.  It reports headset plug/unplug,
+	  3-pole/4-pole cable type and headset button events through the
+	  accdet notifier API.
+
+	  The MT6328 PMIC itself is supported by the MFD_MT6397 driver.
+
+	  If unsure, say N.

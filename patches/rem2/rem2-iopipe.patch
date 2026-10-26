@@ -1,0 +1,3686 @@
+--- a/tools/mediatek/camera/Makefile
++++ b/tools/mediatek/camera/Makefile
+@@ -51,6 +51,7 @@
+ .PHONY: all static shared cli service compat32 check nodev-check clean
+ 
+ all: static shared cli service ; @$(MAKE) -C otp
++	@$(MAKE) -C iopipe
+ 
+ static: $(BIN)/libcamdrv.a
+ shared: $(BIN)/libcamdrv.so
+@@ -130,10 +131,12 @@
+ ifeq ($(COMPAT32_FLAGS),)
+ check: nodev-check compat32
+ 	@$(MAKE) -C otp check
++	@$(MAKE) -C iopipe check
+ else
+ check: nodev-check compat32
+ 	@$(BIN)/abi32 >/dev/null
+ 	@$(MAKE) -C otp check
++	@$(MAKE) -C iopipe check
+ endif
+ 
+ clean:
+diff --git a/tools/mediatek/camera/iopipe/Makefile b/tools/mediatek/camera/iopipe/Makefile
+new file mode 100644
+index 000000000..fbf1e6828
+--- /dev/null
++++ b/tools/mediatek/camera/iopipe/Makefile
+@@ -0,0 +1,87 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# iopipe: decode the MT6735 camera pipe/tuning data out of the vendor
++# libraries and rebuild the CQ0C command words.
++#
++# Host build with the system compiler; no kernel header, no proprietary blob
++# and no ARM execution takes part in the build.  The tool reads the shipped
++# ELF files at run time and fails when a symbol, size or instruction word no
++# longer matches what the report cites.
++#
++#   make            static and shared library plus the CLI
++#   make check      run the selftest against $LIBDIR
++#   make clean
++#
++# Objects live in build/obj, binaries and libraries in build/bin, so no target
++# name can collide with a source file name.
++
++CC ?= gcc
++AR ?= ar
++CFLAGS ?= -O2
++CFLAGS += -Wall -Wextra -Werror -std=gnu11 -fPIC
++CPPFLAGS += -I.
++LDFLAGS ?=
++LDLIBS ?=
++
++# Vendor libraries.  Override on the command line when the dump lives
++# elsewhere:  make LIBDIR=/path/to/vendor-libs check
++LIBDIR ?= /run/media/asdf/30620d0d-1e41-4d55-af08-b4de2fb9c517/g532m_work/zip/vendor-libs
++CPPFLAGS += -DIOPIPE_DEFAULT_LIBDIR=\"$(LIBDIR)\"
++
++BUILD := build
++OBJ := $(BUILD)/obj
++BIN := $(BUILD)/bin
++
++LIB_SRCS := iopipe_elf.c iopipe_portmap.c iopipe_mgr.c iopipe_regmap.c \
++	    iopipe_cq.c iopipe_tuning.c iopipe_selftest.c
++LIB_OBJS := $(LIB_SRCS:%.c=$(OBJ)/%.o)
++CLI_OBJS := $(OBJ)/main.o
++HDRS := iopipe_elf.h iopipe_portmap.h iopipe_mgr.h iopipe_regmap.h \
++	iopipe_cq.h iopipe_tuning.h
++
++.PHONY: all static shared cli check clean
++
++all: static shared cli
++
++static: $(BIN)/libiopipe.a
++shared: $(BIN)/libiopipe.so
++cli: $(BIN)/iopipe
++
++$(OBJ)/%.o: %.c $(HDRS)
++	@mkdir -p $(dir $@)
++	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
++
++$(BIN)/libiopipe.a: $(LIB_OBJS)
++	@mkdir -p $(dir $@)
++	$(AR) rcs $@ $(LIB_OBJS)
++
++$(BIN)/libiopipe.so: $(LIB_OBJS)
++	@mkdir -p $(dir $@)
++	$(CC) $(CFLAGS) -shared -Wl,-soname,libiopipe.so -o $@ $(LIB_OBJS) \
++		$(LDFLAGS) $(LDLIBS)
++
++$(BIN)/iopipe: $(CLI_OBJS) $(BIN)/libiopipe.a
++	@mkdir -p $(dir $@)
++	$(CC) $(CFLAGS) -o $@ $(CLI_OBJS) $(BIN)/libiopipe.a $(LDFLAGS) $(LDLIBS)
++
++check: cli
++	@$(BIN)/iopipe --lib-dir "$(LIBDIR)" selftest
++	@$(BIN)/iopipe --lib-dir "$(LIBDIR)" portmap >/dev/null
++	@$(BIN)/iopipe --lib-dir "$(LIBDIR)" modules --csv | head -1 | \
++		grep -q '^module,kind,instance,method,nvram_type,symbol,vaddr,size$$'
++	@$(BIN)/iopipe --lib-dir "$(LIBDIR)" modules --json | head -1 | \
++		grep -q '^\[$$'
++	@$(BIN)/iopipe --lib-dir "$(LIBDIR)" tuning >/dev/null
++	@$(BIN)/iopipe --lib-dir "$(LIBDIR)" tuning --accessors >/dev/null
++	@$(BIN)/iopipe cq --write 0x7300:0x12345000 | grep -q '0x00007300'
++	@if $(BIN)/iopipe cq --write 0x3fff:0x1000 >/dev/null 2>&1; then \
++		echo "check: cq accepted a register below the CAM window"; \
++		exit 1; \
++	fi
++	@if $(BIN)/iopipe --lib-dir /nonexistent selftest >/dev/null 2>&1; then \
++		echo "check: selftest accepted a missing library directory"; \
++		exit 1; \
++	fi
++
++clean:
++	rm -rf $(BUILD)
+diff --git a/tools/mediatek/camera/iopipe/iopipe_cq.c b/tools/mediatek/camera/iopipe/iopipe_cq.c
+new file mode 100644
+index 000000000..42dc2d6a8
+--- /dev/null
++++ b/tools/mediatek/camera/iopipe/iopipe_cq.c
+@@ -0,0 +1,83 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * CQ0C command-word builder.  See iopipe_cq.h for the provenance of every
++ * constant: they come from libcamdrv/camdrv_cq.c, which documents the
++ * libcamdrv.so disassembly they were recovered from.  No instruction format
++ * is invented here.
++ */
++
++#include <errno.h>
++#include <inttypes.h>
++
++#include "iopipe_cq.h"
++
++int iopipe_cq_reg_valid(uint32_t reg)
++{
++	/* 0xfc000000 (end) and anything outside the CAM window is rejected;
++	 * the window is the one the userspace ABI uses for ISP_REG_STRUCT.Addr
++	 * (drivers/media/platform/mediatek/isp/mtk-isp-regs.h). */
++	return reg >= IOPIPE_CQ_REG_MIN && reg < IOPIPE_CQ_REG_MAX;
++}
++
++int iopipe_cq_cmd_write(struct iopipe_cq_cmd *c, uint32_t reg,
++			uint32_t operand_pa)
++{
++	if (!c)
++		return -EINVAL;
++	if (!iopipe_cq_reg_valid(reg))
++		return -EINVAL;
++	/* The hardware loads a 32-bit word from operand_pa, so it must be
++	 * word aligned; a zero physical address is the "no operand" form used
++	 * by the end marker only. */
++	if (!operand_pa || (operand_pa & 3u))
++		return -EINVAL;
++	c->inst = reg;
++	c->data_ptr_pa = operand_pa;
++	return 0;
++}
++
++int iopipe_cq_cmd_end(struct iopipe_cq_cmd *c)
++{
++	if (!c)
++		return -EINVAL;
++	c->inst = IOPIPE_CQ_INST_END;
++	c->data_ptr_pa = 0;
++	return 0;
++}
++
++int iopipe_cq_build(struct iopipe_cq_cmd *out, size_t max,
++		    const struct iopipe_cq_write *w, size_t n)
++{
++	size_t i;
++
++	if (!out || !w || !n)
++		return -EINVAL;
++	if (max < n + 1)
++		return -ENOSPC;
++
++	for (i = 0; i < n; i++) {
++		int ret = iopipe_cq_cmd_write(&out[i], w[i].reg, w[i].operand_pa);
++
++		if (ret)
++			return ret;
++	}
++	iopipe_cq_cmd_end(&out[n]);
++	return (int)(n + 1);
++}
++
++void iopipe_cq_dump(const struct iopipe_cq_cmd *c, size_t n, FILE *out)
++{
++	size_t i;
++
++	if (!c || !out)
++		return;
++	fprintf(out, "  #  inst        data_ptr_pa\n");
++	for (i = 0; i < n; i++) {
++		if (c[i].inst == IOPIPE_CQ_INST_END)
++			fprintf(out, "  %-2zu 0x%08" PRIx32 "  (end marker)\n",
++				i, c[i].inst);
++		else
++			fprintf(out, "  %-2zu 0x%08" PRIx32 "  0x%08" PRIx32 "\n",
++				i, c[i].inst, c[i].data_ptr_pa);
++	}
++}
+diff --git a/tools/mediatek/camera/iopipe/iopipe_cq.h b/tools/mediatek/camera/iopipe/iopipe_cq.h
+new file mode 100644
+index 000000000..a81a0432d
+--- /dev/null
++++ b/tools/mediatek/camera/iopipe/iopipe_cq.h
+@@ -0,0 +1,73 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * CQ0C command-word builder.
++ *
++ * The MT6735 ISP consumes a list of 32-bit command pairs (CQ_CMD_ST):
++ * "inst" is the ISP register address (offset from 0x15000000) and
++ * "data_ptr_pa" is the physical address of the 32-bit operand the hardware
++ * reads and writes into that register.  The end-of-list marker is
++ * 0xfc000000.
++ *
++ * The instruction encodings are not re-derived here: they are the ones already
++ * recovered from libcamdrv.so and documented in
++ * tools/mediatek/camera/libcamdrv/camdrv_cq.c:64-84 (definitions) and
++ * camdrv_cq.c:1-57 (evidence, with the exact libcamdrv.so disassembly
++ * addresses), which in turn follows the CQ_CMD_ST/CQ_RTBC_RING_ST layout of
++ * the downstream GPL driver
++ * drivers/misc/mediatek/cameraisp/src/mt6735/inc/camera_isp_D1.h:735-758.
++ *
++ * This builder emits instruction words for a caller-supplied list of register
++ * writes; it never touches hardware and never allocates a queue.
++ */
++
++#ifndef IOPIPE_CQ_H
++#define IOPIPE_CQ_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++
++/* CQ0C instruction words, from libcamdrv/camdrv_cq.c:64-72. */
++#define IOPIPE_CQ_INST_IMGO_BASE	0x7300u
++#define IOPIPE_CQ_INST_RRZO_BASE	0x7320u
++#define IOPIPE_CQ_INST_IMGO_D_BASE	0x74d4u
++#define IOPIPE_CQ_INST_RRZO_D_BASE	0x74f4u
++#define IOPIPE_CQ_INST_NEXT_CQ0C	0x40b4u
++#define IOPIPE_CQ_INST_NEXT_CQ0C2	0x40ccu
++#define IOPIPE_CQ_INST_TABLE_END	0x4184u
++#define IOPIPE_CQ_INST_END		0xfc000000u
++
++/* Register-address window of the CQ instructions (0x15000000 relative), the
++ * same range the userspace ABI passes in ISP_REG_STRUCT.Addr
++ * (drivers/media/platform/mediatek/isp/mtk-isp-regs.h:
++ * MTK_ISP_CAM_ADDR_MIN/MAX). */
++#define IOPIPE_CQ_REG_MIN	0x4000u
++#define IOPIPE_CQ_REG_MAX	0x10000u
++
++struct iopipe_cq_cmd {
++	uint32_t inst;
++	uint32_t data_ptr_pa;
++};
++
++struct iopipe_cq_write {
++	uint32_t reg;		/* ISP register address (0x15000000 + reg) */
++	uint32_t operand_pa;	/* physical address of the 32-bit operand */
++};
++
++/* True when reg can be a CQ instruction word. */
++int iopipe_cq_reg_valid(uint32_t reg);
++
++/* Fill one command pair.  Returns 0 or -EINVAL. */
++int iopipe_cq_cmd_write(struct iopipe_cq_cmd *c, uint32_t reg,
++			uint32_t operand_pa);
++int iopipe_cq_cmd_end(struct iopipe_cq_cmd *c);
++
++/* Build n write commands plus the end marker into out[max].  Returns the
++ * number of commands written (n + 1), or -EINVAL (bad register/operand or
++ * n == 0) / -ENOSPC (max < n + 1). */
++int iopipe_cq_build(struct iopipe_cq_cmd *out, size_t max,
++		    const struct iopipe_cq_write *w, size_t n);
++
++void iopipe_cq_dump(const struct iopipe_cq_cmd *c, size_t n, FILE *out);
++
++#endif /* IOPIPE_CQ_H */
+diff --git a/tools/mediatek/camera/iopipe/iopipe_elf.c b/tools/mediatek/camera/iopipe/iopipe_elf.c
+new file mode 100644
+index 000000000..0b8bb0785
+--- /dev/null
++++ b/tools/mediatek/camera/iopipe/iopipe_elf.c
+@@ -0,0 +1,590 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Read-only ELF32 LSB ARM reader: dynamic symbols, sections and the
++ * PT_LOAD vaddr -> file offset map.  See iopipe_elf.h for the contract.
++ *
++ * The reader deliberately implements only what is needed and keeps the whole
++ * access path bounded: the header sizes are validated against the file size,
++ * every table entry read is preceded by a range check, and string table
++ * indices are validated against the string table size.
++ */
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "iopipe_elf.h"
++
++struct iopipe_elf {
++	int fd;
++	uint64_t size;
++	char *path;
++	Elf32_Ehdr eh;
++	Elf32_Phdr *ph;
++	size_t nph;
++	Elf32_Shdr *sh;
++	size_t nsh;
++	size_t dynsym_idx;
++	Elf32_Shdr dynsym;
++	char *strtab;
++	size_t strtab_sz;
++	char *shstrtab;
++	size_t shstrtab_sz;
++	size_t nsym;
++};
++
++static int pread_full(int fd, void *buf, size_t len, uint64_t off)
++{
++	size_t done = 0;
++
++	while (done < len) {
++		ssize_t ret = pread(fd, (char *)buf + done, len - done,
++				    (off_t)(off + done));
++
++		if (ret < 0) {
++			if (errno == EINTR)
++				continue;
++			return -errno;
++		}
++		if (ret == 0)
++			return -EIO;
++		done += (size_t)ret;
++	}
++
++	return 0;
++}
++
++static bool file_range_ok(const struct iopipe_elf *elf, uint64_t off,
++			  uint64_t len)
++{
++	return off <= elf->size && len <= elf->size - off;
++}
++
++const char *iopipe_elf_path(const struct iopipe_elf *elf)
++{
++	return elf ? elf->path : "";
++}
++
++uint64_t iopipe_elf_size(const struct iopipe_elf *elf)
++{
++	return elf ? elf->size : 0;
++}
++
++void iopipe_elf_close(struct iopipe_elf *elf)
++{
++	if (!elf)
++		return;
++	if (elf->fd >= 0)
++		close(elf->fd);
++	free(elf->path);
++	free(elf->ph);
++	free(elf->sh);
++	free(elf->strtab);
++	free(elf->shstrtab);
++	free(elf);
++}
++
++static int load_tables(struct iopipe_elf *elf)
++{
++	size_t i;
++	int ret;
++
++	if (elf->eh.e_phoff && elf->eh.e_phnum) {
++		uint64_t bytes = (uint64_t)elf->eh.e_phnum * elf->eh.e_phentsize;
++
++		if (elf->eh.e_phentsize != sizeof(Elf32_Phdr))
++			return -ELIBBAD;
++		if (!file_range_ok(elf, elf->eh.e_phoff, bytes))
++			return -ELIBBAD;
++		elf->ph = calloc(elf->eh.e_phnum, sizeof(*elf->ph));
++		if (!elf->ph)
++			return -ENOMEM;
++		ret = pread_full(elf->fd, elf->ph, (size_t)bytes, elf->eh.e_phoff);
++		if (ret)
++			return ret;
++		elf->nph = elf->eh.e_phnum;
++	}
++
++	if (!elf->eh.e_shoff || !elf->eh.e_shnum)
++		return -ELIBBAD;
++	if (elf->eh.e_shentsize != sizeof(Elf32_Shdr))
++		return -ELIBBAD;
++	if (!file_range_ok(elf, elf->eh.e_shoff,
++			   (uint64_t)elf->eh.e_shnum * elf->eh.e_shentsize))
++		return -ELIBBAD;
++	elf->sh = calloc(elf->eh.e_shnum, sizeof(*elf->sh));
++	if (!elf->sh)
++		return -ENOMEM;
++	ret = pread_full(elf->fd, elf->sh,
++			 (size_t)elf->eh.e_shnum * elf->eh.e_shentsize,
++			 elf->eh.e_shoff);
++	if (ret)
++		return ret;
++	elf->nsh = elf->eh.e_shnum;
++
++	elf->dynsym_idx = SIZE_MAX;
++	for (i = 0; i < elf->nsh; i++) {
++		if (elf->sh[i].sh_type != SHT_DYNSYM)
++			continue;
++		elf->dynsym_idx = i;
++		elf->dynsym = elf->sh[i];
++		break;
++	}
++	if (elf->dynsym_idx == SIZE_MAX)
++		return -ELIBBAD;
++	if (elf->dynsym.sh_entsize != sizeof(Elf32_Sym))
++		return -ELIBBAD;
++	if (!file_range_ok(elf, elf->dynsym.sh_offset, elf->dynsym.sh_size))
++		return -ELIBBAD;
++	if (elf->dynsym.sh_link >= elf->nsh)
++		return -ELIBBAD;
++
++	{
++		const Elf32_Shdr *str = &elf->sh[elf->dynsym.sh_link];
++
++		if (str->sh_type != SHT_STRTAB)
++			return -ELIBBAD;
++		if (!file_range_ok(elf, str->sh_offset, str->sh_size))
++			return -ELIBBAD;
++		if (str->sh_size == 0 || str->sh_size > (16u << 20))
++			return -ELIBBAD;
++		elf->strtab = malloc(str->sh_size);
++		if (!elf->strtab)
++			return -ENOMEM;
++		ret = pread_full(elf->fd, elf->strtab, str->sh_size,
++				 str->sh_offset);
++		if (ret)
++			return ret;
++		elf->strtab_sz = str->sh_size;
++	}
++
++	{
++		const Elf32_Shdr *shstr;
++		size_t idx = elf->eh.e_shstrndx;
++
++		if (idx == SHN_UNDEF || idx >= elf->nsh)
++			return -ELIBBAD;
++		shstr = &elf->sh[idx];
++		if (shstr->sh_type != SHT_STRTAB)
++			return -ELIBBAD;
++		if (!file_range_ok(elf, shstr->sh_offset, shstr->sh_size))
++			return -ELIBBAD;
++		if (!shstr->sh_size || shstr->sh_size > (16u << 20))
++			return -ELIBBAD;
++		elf->shstrtab = malloc(shstr->sh_size);
++		if (!elf->shstrtab)
++			return -ENOMEM;
++		ret = pread_full(elf->fd, elf->shstrtab, shstr->sh_size,
++				 shstr->sh_offset);
++		if (ret)
++			return ret;
++		elf->shstrtab_sz = shstr->sh_size;
++	}
++
++	elf->nsym = elf->dynsym.sh_size / sizeof(Elf32_Sym);
++	return 0;
++}
++
++int iopipe_elf_open(const char *path, struct iopipe_elf **out)
++{
++	struct iopipe_elf *elf;
++	struct stat st;
++	int ret;
++
++	if (!path || !out)
++		return -EINVAL;
++	*out = NULL;
++
++	elf = calloc(1, sizeof(*elf));
++	if (!elf)
++		return -ENOMEM;
++	elf->fd = -1;
++
++	elf->fd = open(path, O_RDONLY | O_CLOEXEC);
++	if (elf->fd < 0) {
++		ret = -errno;
++		free(elf);
++		return ret;
++	}
++	if (fstat(elf->fd, &st) < 0 || !S_ISREG(st.st_mode)) {
++		ret = -ENODATA;
++		goto err;
++	}
++	elf->size = (uint64_t)st.st_size;
++	elf->path = strdup(path);
++	if (!elf->path) {
++		ret = -ENOMEM;
++		goto err;
++	}
++
++	ret = pread_full(elf->fd, &elf->eh, sizeof(elf->eh), 0);
++	if (ret)
++		goto err;
++	if (memcmp(elf->eh.e_ident, ELFMAG, SELFMAG) != 0 ||
++	    elf->eh.e_ident[EI_CLASS] != ELFCLASS32 ||
++	    elf->eh.e_ident[EI_DATA] != ELFDATA2LSB ||
++	    elf->eh.e_ident[EI_VERSION] != EV_CURRENT ||
++	    elf->eh.e_machine != EM_ARM ||
++	    (elf->eh.e_type != ET_DYN && elf->eh.e_type != ET_EXEC)) {
++		ret = -ELIBBAD;
++		goto err;
++	}
++
++	ret = load_tables(elf);
++	if (ret)
++		goto err;
++
++	*out = elf;
++	return 0;
++
++err:
++	iopipe_elf_close(elf);
++	return ret;
++}
++
++size_t iopipe_elf_sym_count(const struct iopipe_elf *elf)
++{
++	return elf ? elf->nsym : 0;
++}
++
++static int sym_name(const struct iopipe_elf *elf, uint32_t name_off,
++		    const char **out)
++{
++	if (name_off == 0) {
++		*out = "";
++		return 0;
++	}
++	if (name_off >= elf->strtab_sz)
++		return -ELIBBAD;
++	if (!memchr(elf->strtab + name_off, '\0',
++		    elf->strtab_sz - name_off))
++		return -ELIBBAD;
++	*out = elf->strtab + name_off;
++	return 0;
++}
++
++int iopipe_elf_sym_at(const struct iopipe_elf *elf, size_t idx,
++		      struct iopipe_sym *out)
++{
++	Elf32_Sym sym;
++	int ret;
++
++	if (!elf || !out)
++		return -EINVAL;
++	if (idx >= elf->nsym)
++		return -EINVAL;
++
++	ret = pread_full(elf->fd, &sym, sizeof(sym),
++			 (uint64_t)elf->dynsym.sh_offset +
++				 idx * sizeof(Elf32_Sym));
++	if (ret)
++		return ret;
++
++	ret = sym_name(elf, sym.st_name, &out->name);
++	if (ret)
++		return ret;
++	out->value = sym.st_value;
++	out->size = sym.st_size;
++	out->entry = sym.st_value & ~1u;
++	out->shndx = sym.st_shndx;
++	out->type = ELF32_ST_TYPE(sym.st_info);
++	out->bind = ELF32_ST_BIND(sym.st_info);
++	return 0;
++}
++
++int iopipe_elf_sym_find(const struct iopipe_elf *elf, const char *want,
++			bool prefix, bool allow_zero_size,
++			struct iopipe_sym *out)
++{
++	size_t i, len;
++
++	if (!elf || !want || !out)
++		return -EINVAL;
++	len = strlen(want);
++
++	for (i = 0; i < elf->nsym; i++) {
++		struct iopipe_sym sym;
++		int ret = iopipe_elf_sym_at(elf, i, &sym);
++
++		if (ret)
++			continue;
++		if (sym.shndx == SHN_UNDEF || !sym.name[0])
++			continue;
++		if (!allow_zero_size && sym.size == 0)
++			continue;
++		if (prefix) {
++			if (strncmp(sym.name, want, len) != 0)
++				continue;
++		} else if (strcmp(sym.name, want) != 0) {
++			continue;
++		}
++		*out = sym;
++		return 0;
++	}
++
++	return -ENOENT;
++}
++
++size_t iopipe_elf_sym_count_matching(const struct iopipe_elf *elf,
++				     const char *want, bool prefix)
++{
++	size_t i, len, n = 0;
++
++	if (!elf || !want)
++		return 0;
++	len = strlen(want);
++
++	for (i = 0; i < elf->nsym; i++) {
++		struct iopipe_sym sym;
++
++		if (iopipe_elf_sym_at(elf, i, &sym))
++			continue;
++		if (sym.shndx == SHN_UNDEF || !sym.name[0])
++			continue;
++		if (prefix ? strncmp(sym.name, want, len) == 0
++			   : strcmp(sym.name, want) == 0)
++			n++;
++	}
++
++	return n;
++}
++
++int iopipe_elf_vaddr_to_off(const struct iopipe_elf *elf, uint32_t vaddr,
++			    uint32_t len, uint64_t *off, size_t *seg_out)
++{
++	size_t i;
++	int rc = -ENOENT;
++	uint64_t end = (uint64_t)vaddr + len;
++
++	if (!elf)
++		return -EINVAL;
++	if (end > 0x100000000ULL)
++		return -ERANGE;
++
++	for (i = 0; i < elf->nph; i++) {
++		const Elf32_Phdr *p = &elf->ph[i];
++		uint64_t seg_end;
++
++		if (p->p_type != PT_LOAD)
++			continue;
++		if (vaddr < p->p_vaddr)
++			continue;
++		if (end > (uint64_t)p->p_vaddr + p->p_memsz)
++			continue;
++		seg_end = (uint64_t)p->p_vaddr + p->p_filesz;
++		if (seg_out)
++			*seg_out = i;
++		if (end > seg_end) {
++			/* Mapped but not backed by file bytes (.bss). */
++			rc = -ENODATA;
++			continue;
++		}
++		if (off)
++			*off = (uint64_t)p->p_offset + (vaddr - p->p_vaddr);
++		return 0;
++	}
++
++	return rc;
++}
++
++bool iopipe_elf_fits(const struct iopipe_elf *elf, uint32_t vaddr,
++		     uint32_t len)
++{
++	return iopipe_elf_vaddr_to_off(elf, vaddr, len, NULL, NULL) == 0;
++}
++
++int iopipe_elf_read_vaddr(const struct iopipe_elf *elf, uint32_t vaddr,
++			  void *buf, uint32_t len)
++{
++	uint64_t off;
++	int ret;
++
++	if (!elf || (!buf && len))
++		return -EINVAL;
++	if (!len)
++		return 0;
++	ret = iopipe_elf_vaddr_to_off(elf, vaddr, len, &off, NULL);
++	if (ret)
++		return ret;
++	return pread_full(elf->fd, buf, len, off);
++}
++
++int iopipe_elf_section_of(const struct iopipe_elf *elf, uint32_t vaddr,
++			  const char **name_out, uint32_t *flags_out)
++{
++	size_t i;
++
++	if (!elf)
++		return -EINVAL;
++	for (i = 1; i < elf->nsh; i++) {
++		const Elf32_Shdr *s = &elf->sh[i];
++		uint64_t end;
++
++		if (!(s->sh_flags & SHF_ALLOC))
++			continue;
++		if (s->sh_type == SHT_NOBITS)
++			continue;
++		if (!s->sh_size)
++			continue;
++		end = (uint64_t)s->sh_addr + s->sh_size;
++		if (vaddr < s->sh_addr || vaddr >= end)
++			continue;
++		if (name_out) {
++			const char *n;
++
++			if (iopipe_elf_section_info(elf, (int)i, &n, NULL, NULL,
++						    NULL))
++				n = "";
++			*name_out = n;
++		}
++		if (flags_out)
++			*flags_out = s->sh_flags;
++		return (int)i;
++	}
++
++	return -ENOENT;
++}
++
++int iopipe_elf_section_by_name(const struct iopipe_elf *elf, const char *name)
++{
++	size_t i;
++	int ret;
++
++	if (!elf || !name)
++		return -EINVAL;
++	for (i = 1; i < elf->nsh; i++) {
++		const char *sname = NULL;
++
++		ret = iopipe_elf_section_info(elf, (int)i, &sname, NULL, NULL,
++					      NULL);
++		if (ret)
++			continue;
++		if (strcmp(sname, name) == 0)
++			return (int)i;
++	}
++	return -ENOENT;
++}
++
++int iopipe_elf_section_info(const struct iopipe_elf *elf, int idx,
++			    const char **name_out, uint32_t *addr_out,
++			    uint32_t *size_out, uint32_t *flags_out)
++{
++	const Elf32_Shdr *s;
++
++	if (!elf)
++		return -EINVAL;
++	if (idx < 0 || (size_t)idx >= elf->nsh)
++		return -EINVAL;
++	s = &elf->sh[idx];
++	if (name_out) {
++		if (s->sh_name >= elf->shstrtab_sz)
++			return -ELIBBAD;
++		if (!memchr(elf->shstrtab + s->sh_name, '\0',
++			    elf->shstrtab_sz - s->sh_name))
++			return -ELIBBAD;
++		*name_out = elf->shstrtab + s->sh_name;
++	}
++	if (addr_out)
++		*addr_out = s->sh_addr;
++	if (size_out)
++		*size_out = s->sh_size;
++	if (flags_out)
++		*flags_out = s->sh_flags;
++	return 0;
++}
++
++int iopipe_elf_str_at(const struct iopipe_elf *elf, uint32_t vaddr,
++		      char *buf, size_t max)
++{
++	size_t i;
++
++	if (!elf || !buf || max < 2)
++		return -EINVAL;
++
++	for (i = 0; i + 1 < max; i++) {
++		int ret = iopipe_elf_read_vaddr(elf, vaddr + (uint32_t)i,
++						buf + i, 1);
++
++		if (ret)
++			return ret;
++		if (buf[i] == '\0')
++			return (int)i;
++	}
++	buf[max - 1] = '\0';
++	return -ENODATA;
++}
++
++/* ---------------------------------------------------------------- */
++/* Library set                                                      */
++/* ---------------------------------------------------------------- */
++
++int iopipe_libset_init(struct iopipe_libset *set, const char *dir)
++{
++	size_t n;
++
++	if (!set || !dir)
++		return -EINVAL;
++	n = strlen(dir);
++	if (n == 0 || n >= sizeof(set->dir))
++		return -ERANGE;
++	memset(set, 0, sizeof(*set));
++	memcpy(set->dir, dir, n + 1);
++	return 0;
++}
++
++void iopipe_libset_free(struct iopipe_libset *set)
++{
++	size_t i;
++
++	if (!set)
++		return;
++	for (i = 0; i < set->n; i++)
++		iopipe_elf_close(set->ent[i].elf);
++	memset(set, 0, sizeof(*set));
++}
++
++const struct iopipe_elf *iopipe_libset_get(struct iopipe_libset *set,
++					   const char *name, int *err)
++{
++	char path[1024];
++	size_t i;
++
++	if (err)
++		*err = 0;
++	if (!set || !name)
++		return NULL;
++	for (i = 0; i < set->n; i++) {
++		if (strcmp(set->ent[i].name, name) == 0)
++			return set->ent[i].elf;
++	}
++	if (set->n >= IOPIPE_LIBSET_MAX) {
++		if (err)
++			*err = -ENOSPC;
++		return NULL;
++	}
++	if (snprintf(path, sizeof(path), "%s/%s", set->dir, name) >=
++	    (int)sizeof(path)) {
++		if (err)
++			*err = -ERANGE;
++		return NULL;
++	}
++	{
++		struct iopipe_elf *elf = NULL;
++		int ret = iopipe_elf_open(path, &elf);
++
++		if (ret) {
++			if (err)
++				*err = ret;
++			return NULL;
++		}
++		snprintf(set->ent[set->n].name, sizeof(set->ent[set->n].name),
++			 "%s", name);
++		set->ent[set->n].elf = elf;
++		set->n++;
++		return elf;
++	}
++}
+diff --git a/tools/mediatek/camera/iopipe/iopipe_elf.h b/tools/mediatek/camera/iopipe/iopipe_elf.h
+new file mode 100644
+index 000000000..d72386fb1
+--- /dev/null
++++ b/tools/mediatek/camera/iopipe/iopipe_elf.h
+@@ -0,0 +1,114 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Read-only ELF32 little-endian ARM reader used by the iopipe tool.
++ *
++ * The vendor camera libraries shipped with the Samsung grandpplte (MT6735)
++ * are ELF32 ARM/Thumb-2 shared objects: stripped, but they keep a full
++ * .dynsym/.dynstr and the section headers.  Everything this tool reports is
++ * read out of those files at run time; nothing is compiled-in.
++ *
++ * Scope: ELF header, program headers (for the PT_LOAD vaddr -> file offset
++ * map), section headers (for names and sh_addr/sh_size), .dynsym/.dynstr.
++ * Every offset is bounds checked against the file size, and every read is
++ * restricted to the file-backed part of a PT_LOAD segment, so a wrong symbol
++ * value can never make the tool read outside the segment it claims.
++ *
++ * No part of the image is loaded or executed: the ARM code is never run.
++ */
++
++#ifndef IOPIPE_ELF_H
++#define IOPIPE_ELF_H
++
++#include <elf.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++/* One dynamic symbol, resolved. */
++struct iopipe_sym {
++	const char *name;	/* points into the ELF's string table */
++	uint32_t value;		/* st_value exactly as stored (Thumb bit kept) */
++	uint32_t size;		/* st_size */
++	uint32_t entry;		/* st_value with the Thumb bit cleared */
++	uint16_t shndx;		/* st_shndx */
++	unsigned char type;	/* ELF32_ST_TYPE(st_info) */
++	unsigned char bind;	/* ELF32_ST_BIND(st_info) */
++};
++
++struct iopipe_elf;
++
++int iopipe_elf_open(const char *path, struct iopipe_elf **out);
++void iopipe_elf_close(struct iopipe_elf *elf);
++const char *iopipe_elf_path(const struct iopipe_elf *elf);
++uint64_t iopipe_elf_size(const struct iopipe_elf *elf);
++
++/* Symbol enumeration over .dynsym.  Indices are stable while elf is open. */
++size_t iopipe_elf_sym_count(const struct iopipe_elf *elf);
++int iopipe_elf_sym_at(const struct iopipe_elf *elf, size_t idx,
++		      struct iopipe_sym *out);
++/* First defined symbol whose name equals want, or (prefix != 0) starts with
++ * want.  Symbols with st_size == 0 are skipped unless allow_zero_size.
++ * Returns 0 or -ENOENT. */
++int iopipe_elf_sym_find(const struct iopipe_elf *elf, const char *want,
++			bool prefix, bool allow_zero_size,
++			struct iopipe_sym *out);
++/* Number of defined symbols matching, used to reject ambiguous prefixes. */
++size_t iopipe_elf_sym_count_matching(const struct iopipe_elf *elf,
++				     const char *want, bool prefix);
++
++/*
++ * Translate [vaddr, vaddr+len) to a file offset through PT_LOAD.  Fails with
++ * -ENOENT when the range is not mapped, -ENODATA when it is mapped but only by
++ * p_memsz (writable .bss: the file holds no bytes for it), -ERANGE when the
++ * range runs past p_filesz of the segment.
++ */
++int iopipe_elf_vaddr_to_off(const struct iopipe_elf *elf, uint32_t vaddr,
++			    uint32_t len, uint64_t *off, size_t *seg_out);
++
++/* Read len bytes from a virtual address; same failure codes as above. */
++int iopipe_elf_read_vaddr(const struct iopipe_elf *elf, uint32_t vaddr,
++			  void *buf, uint32_t len);
++
++/* Section covering vaddr (SHF_ALLOC sections only), by name.  Returns the
++ * section index or -ENOENT; name_out may be NULL. */
++int iopipe_elf_section_of(const struct iopipe_elf *elf, uint32_t vaddr,
++			  const char **name_out, uint32_t *flags_out);
++
++/* Section lookup by name; returns the index or -ENOENT. */
++int iopipe_elf_section_by_name(const struct iopipe_elf *elf, const char *name);
++/* sh_addr/sh_size of a section index; -EINVAL for a bad index. */
++int iopipe_elf_section_info(const struct iopipe_elf *elf, int idx,
++			    const char **name_out, uint32_t *addr_out,
++			    uint32_t *size_out, uint32_t *flags_out);
++
++/* Copy a NUL-terminated string out of the file at vaddr, at most max-1 bytes
++ * plus the terminator.  Returns the length, or -ENODATA when the mapped bytes
++ * do not contain a terminator before max, or the PT_LOAD failure codes. */
++int iopipe_elf_str_at(const struct iopipe_elf *elf, uint32_t vaddr,
++		      char *buf, size_t max);
++
++/* True when every byte of [vaddr, vaddr+len) is file-backed by a PT_LOAD. */
++bool iopipe_elf_fits(const struct iopipe_elf *elf, uint32_t vaddr,
++		     uint32_t len);
++
++/*
++ * Small cache of opened vendor libraries, so a command can address several
++ * of them by basename ("libcam.iopipe.so") without re-opening files.
++ */
++#define IOPIPE_LIBSET_MAX 6
++struct iopipe_libset {
++	char dir[512];
++	size_t n;
++	struct iopipe_libent {
++		char name[64];
++		struct iopipe_elf *elf;
++	} ent[IOPIPE_LIBSET_MAX];
++};
++
++int iopipe_libset_init(struct iopipe_libset *set, const char *dir);
++void iopipe_libset_free(struct iopipe_libset *set);
++/* Opened library, or NULL with *err set to the negative errno. */
++const struct iopipe_elf *iopipe_libset_get(struct iopipe_libset *set,
++					   const char *name, int *err);
++
++#endif /* IOPIPE_ELF_H */
+diff --git a/tools/mediatek/camera/iopipe/iopipe_mgr.c b/tools/mediatek/camera/iopipe/iopipe_mgr.c
+new file mode 100644
+index 000000000..40c378f56
+--- /dev/null
++++ b/tools/mediatek/camera/iopipe/iopipe_mgr.c
+@@ -0,0 +1,415 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * ISP_MGR_* catalogue extraction from libcam.hal3a.v3.so's dynamic symbols.
++ *
++ * Mangled-name grammar actually used by the vendor library (Itanium ABI):
++ *
++ *   _ZN <n> NSIspTuningv3 <n> ISP_MGR_<MOD> <n> <method> <args...>
++ *   _ZZN <n> NSIspTuningv3 <n> ISP_MGR_<MOD>_DEV IL
++ *        N <n> NSIspTuning <n> ESensorDev_T E <v> E
++ *        L N S1_ <n> ESensorTG_T E <v> E  E
++ *        <n> getInstance Ev E 9singleton
++ *
++ * Every component is length prefixed, so a token such as "SL2" (which reads
++ * as "SL" + "2apply" if the length prefix is ignored) is parsed exactly.
++ * The NVRAM parameter type is likewise a length-prefixed component right
++ * after the "I" that opens the template argument list of put()/get().
++ */
++
++#include <errno.h>
++#include <inttypes.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "iopipe_mgr.h"
++
++#define MAX_ROWS 4096
++#define MOD_LEN 32
++#define INST_LEN 24
++#define METH_LEN 32
++#define TYPE_LEN 48
++
++enum row_kind {
++	ROW_INSTANCE,
++	ROW_METHOD,
++};
++
++struct mgr_row {
++	enum row_kind kind;
++	char module[MOD_LEN];
++	char instance[INST_LEN];	/* "dev=4 tg=1", "dev=1 pca=0", "-" */
++	char method[METH_LEN];
++	char nvram[TYPE_LEN];
++	const char *sym;
++	uint32_t vaddr;
++	uint32_t size;
++};
++
++static const char *const kind_names[] = {
++	[ROW_INSTANCE] = "instance",
++	[ROW_METHOD] = "method",
++};
++
++/* Read "<digits><component>" at *p.  Returns the component start and advances
++ * *p past it, or NULL when the input does not start with a length prefix. */
++static const char *read_component(const char **p, size_t *len)
++{
++	const char *s = *p;
++	unsigned long n = 0;
++	const char *start;
++
++	if (*s < '0' || *s > '9')
++		return NULL;
++	while (*s >= '0' && *s <= '9') {
++		n = n * 10 + (unsigned long)(*s - '0');
++		if (n > 512)
++			return NULL;
++		s++;
++	}
++	start = s;
++	if (strlen(start) < n)
++		return NULL;
++	*p = start + n;
++	*len = n;
++	return start;
++}
++
++static void copy_part(char *dst, size_t dstsz, const char *src, size_t len)
++{
++	if (len >= dstsz)
++		len = dstsz - 1;
++	memcpy(dst, src, len);
++	dst[len] = '\0';
++}
++
++/* Value of an enum template argument: after the type name comes 'E' and then
++ * the decimal value terminated by 'E'.  Returns -1 when absent. */
++static long enum_value_after(const char *hay, const char *type_name)
++{
++	const char *p = strstr(hay, type_name);
++	unsigned long v = 0;
++
++	if (!p)
++		return -1;
++	p += strlen(type_name);
++	if (*p != 'E')
++		return -1;
++	p++;
++	if (*p < '0' || *p > '9')
++		return -1;
++	while (*p >= '0' && *p <= '9') {
++		v = v * 10 + (unsigned long)(*p - '0');
++		if (v > 1000)
++			return -1;
++		p++;
++	}
++	if (*p != 'E')
++		return -1;
++	return (long)v;
++}
++
++/* Decode the NVRAM parameter type of a put()/get(): after the method name the
++ * name has 'I' [N] <len> NSIspTuning <len> ISP_NVRAM_<T>_T ... */
++static void nvram_type_of(const char *p, char *dst, size_t dstsz)
++{
++	size_t len;
++	const char *comp;
++
++	dst[0] = '\0';
++	if (*p != 'I')
++		return;
++	p++;
++	if (*p == 'N')
++		p++;
++	comp = read_component(&p, &len);
++	if (!comp)
++		return;
++	if (len < 10 || memcmp(comp, "NSIspTunin", 10) != 0)
++		return;
++	comp = read_component(&p, &len);
++	if (!comp)
++		return;
++	if (len < 10 || memcmp(comp, "ISP_NVRAM_", 10) != 0)
++		return;
++	copy_part(dst, dstsz, comp, len);
++}
++
++static void add_row(struct mgr_row *rows, size_t *n, const struct mgr_row *r)
++{
++	size_t i;
++
++	for (i = 0; i < *n; i++) {
++		if (strcmp(rows[i].sym, r->sym) == 0)
++			return;		/* dynsym may repeat a weak symbol */
++	}
++	if (*n >= MAX_ROWS)
++		return;
++	rows[*n] = *r;
++	(*n)++;
++}
++
++static void parse_symbol(const struct iopipe_sym *sym, struct mgr_row *rows,
++			 size_t *n)
++{
++	const char *p = sym->name;
++	const char *cls;
++	size_t cls_len;
++	struct mgr_row row;
++
++	memset(&row, 0, sizeof(row));
++	row.sym = sym->name;
++	row.vaddr = sym->entry;
++	row.size = sym->size;
++
++	if (strncmp(p, "_ZZN", 4) == 0 || strncmp(p, "_ZGVZN", 6) == 0) {
++		/* Singleton / guard variable of a template instance. */
++		const char *q = strstr(p, "_ZZN");
++		size_t len;
++
++		if (!q)
++			return;
++		q += 4;
++		if (!read_component(&q, &len))	/* namespace */
++			return;
++		cls = read_component(&q, &cls_len);
++		if (!cls || cls_len <= 8 || memcmp(cls, "ISP_MGR_", 8) != 0)
++			return;
++		if (cls_len < 12 ||
++		    memcmp(cls + cls_len - 4, "_DEV", 4) != 0)
++			return;
++		row.kind = ROW_INSTANCE;
++		copy_part(row.module, sizeof(row.module), cls + 8,
++			  cls_len - 12);
++		{
++			long dev = enum_value_after(q, "ESensorDev_T");
++			long tg = enum_value_after(q, "ESensorTG_T");
++			long pca = enum_value_after(q, "EPCAMode_T");
++			char tmp[INST_LEN];
++
++			tmp[0] = '\0';
++			if (dev >= 0)
++				snprintf(tmp + strlen(tmp),
++					 sizeof(tmp) - strlen(tmp), "dev=%ld",
++					 dev);
++			if (tg >= 0)
++				snprintf(tmp + strlen(tmp),
++					 sizeof(tmp) - strlen(tmp), "%stg=%ld",
++					 tmp[0] ? " " : "", tg);
++			if (pca >= 0)
++				snprintf(tmp + strlen(tmp),
++					 sizeof(tmp) - strlen(tmp), "%spca=%ld",
++					 tmp[0] ? " " : "", pca);
++			snprintf(row.instance, sizeof(row.instance), "%s",
++				 tmp[0] ? tmp : "-");
++		}
++		add_row(rows, n, &row);
++		return;
++	}
++
++	if (strncmp(p, "_ZN", 3) == 0) {
++		size_t len;
++		const char *meth;
++
++		p += 3;
++		if (!read_component(&p, &len))
++			return;
++		cls = read_component(&p, &cls_len);
++		if (!cls || cls_len <= 8 || memcmp(cls, "ISP_MGR_", 8) != 0)
++			return;
++		meth = read_component(&p, &len);
++		if (!meth)
++			return;
++
++		row.kind = ROW_METHOD;
++		copy_part(row.module, sizeof(row.module), cls + 8, cls_len - 8);
++		copy_part(row.method, sizeof(row.method), meth, len);
++		nvram_type_of(p, row.nvram, sizeof(row.nvram));
++		snprintf(row.instance, sizeof(row.instance), "-");
++		add_row(rows, n, &row);
++	}
++}
++
++static int cmp_row(const void *a, const void *b)
++{
++	const struct mgr_row *ra = a, *rb = b;
++	int rc;
++
++	rc = strcmp(ra->module, rb->module);
++	if (rc)
++		return rc;
++	if (ra->kind != rb->kind)
++		return (int)ra->kind - (int)rb->kind;
++	rc = strcmp(ra->instance, rb->instance);
++	if (rc)
++		return rc;
++	rc = strcmp(ra->method, rb->method);
++	if (rc)
++		return rc;
++	return strcmp(ra->sym, rb->sym);
++}
++
++static int collect(const struct iopipe_elf *elf, struct mgr_row **out,
++		   size_t *n_out)
++{
++	struct mgr_row *rows;
++	size_t i, n = 0;
++
++	if (!elf || !out || !n_out)
++		return -EINVAL;
++	rows = calloc(MAX_ROWS, sizeof(*rows));
++	if (!rows)
++		return -ENOMEM;
++
++	for (i = 0; i < iopipe_elf_sym_count(elf); i++) {
++		struct iopipe_sym sym;
++
++		if (iopipe_elf_sym_at(elf, i, &sym))
++			continue;
++		if (!sym.name[0] || sym.shndx == SHN_UNDEF)
++			continue;
++		parse_symbol(&sym, rows, &n);
++	}
++
++	qsort(rows, n, sizeof(*rows), cmp_row);
++	*out = rows;
++	*n_out = n;
++	return 0;
++}
++
++unsigned int iopipe_mgr_module_count(const struct iopipe_elf *elf)
++{
++	struct mgr_row *rows = NULL;
++	size_t n = 0, i;
++	unsigned int count = 0;
++
++	if (collect(elf, &rows, &n))
++		return 0;
++	for (i = 0; i < n; i++) {
++		if (i == 0 || strcmp(rows[i].module, rows[i - 1].module) != 0)
++			count++;
++	}
++	free(rows);
++	return count;
++}
++
++static void json_escape(const char *s, char *dst, size_t dstsz)
++{
++	size_t o = 0, i;
++
++	for (i = 0; s[i] && o + 7 < dstsz; i++) {
++		unsigned char c = (unsigned char)s[i];
++
++		if (c == '"' || c == '\\') {
++			dst[o++] = '\\';
++			dst[o++] = (char)c;
++		} else if (c < 0x20) {
++			o += (size_t)snprintf(dst + o, dstsz - o, "\\u%04x", c);
++		} else {
++			dst[o++] = (char)c;
++		}
++	}
++	dst[o] = '\0';
++}
++
++int iopipe_mgr_dump(const struct iopipe_elf *elf, enum iopipe_mgr_fmt fmt,
++		    FILE *out)
++{
++	struct mgr_row *rows = NULL;
++	size_t n = 0, i;
++	const char *last_mod = NULL;
++	int ret;
++
++	if (!elf || !out)
++		return -EINVAL;
++	ret = collect(elf, &rows, &n);
++	if (ret)
++		return ret;
++	if (!n) {
++		free(rows);
++		return -ENODATA;
++	}
++
++	if (fmt == IOPIPE_MGR_CSV) {
++		fprintf(out, "module,kind,instance,method,nvram_type,symbol,vaddr,size\n");
++		for (i = 0; i < n; i++) {
++			fprintf(out, "%s,%s,%s,%s,%s,%s,0x%08x,%u\n",
++				rows[i].module, kind_names[rows[i].kind],
++				rows[i].instance,
++				rows[i].method[0] ? rows[i].method : "-",
++				rows[i].nvram[0] ? rows[i].nvram : "-",
++				rows[i].sym, rows[i].vaddr, rows[i].size);
++		}
++	} else if (fmt == IOPIPE_MGR_JSON) {
++		fprintf(out, "[\n");
++		for (i = 0; i < n; i++) {
++			char sym[512], mod[MOD_LEN * 2], inst[INST_LEN * 2];
++			char meth[METH_LEN * 2], nv[TYPE_LEN * 2];
++
++			json_escape(rows[i].sym, sym, sizeof(sym));
++			json_escape(rows[i].module, mod, sizeof(mod));
++			json_escape(rows[i].instance, inst, sizeof(inst));
++			json_escape(rows[i].method, meth, sizeof(meth));
++			json_escape(rows[i].nvram, nv, sizeof(nv));
++			fprintf(out,
++				"  {\"module\": \"%s\", \"kind\": \"%s\", \"instance\": \"%s\", "
++				"\"method\": \"%s\", \"nvram_type\": \"%s\", \"symbol\": \"%s\", "
++				"\"vaddr\": \"0x%08x\", \"size\": %u}%s\n",
++				mod, kind_names[rows[i].kind], inst, meth, nv, sym,
++				rows[i].vaddr, rows[i].size,
++				i + 1 < n ? "," : "");
++		}
++		fprintf(out, "]\n");
++	} else {
++		fprintf(out, "module                          kind      instance        method            nvram type                 symbol@vaddr\n");
++		for (i = 0; i < n; i++) {
++			if (!last_mod || strcmp(last_mod, rows[i].module) != 0) {
++				if (last_mod)
++					fprintf(out, "\n");
++				last_mod = rows[i].module;
++			}
++			fprintf(out, "%-31s %-9s %-15s %-17s %-26s %s@0x%x\n",
++				rows[i].module, kind_names[rows[i].kind],
++				rows[i].instance,
++				rows[i].method[0] ? rows[i].method : "-",
++				rows[i].nvram[0] ? rows[i].nvram : "-",
++				rows[i].sym, rows[i].vaddr);
++		}
++	}
++
++	free(rows);
++	return 0;
++}
++
++int iopipe_mgr_expect(const struct iopipe_elf *elf, const char *module,
++		      const char *want_nvram)
++{
++	struct mgr_row *rows = NULL;
++	size_t n = 0, i;
++	int ret;
++
++	if (!elf || !module)
++		return -EINVAL;
++	ret = collect(elf, &rows, &n);
++	if (ret)
++		return ret;
++
++	ret = -ENOENT;
++	for (i = 0; i < n; i++) {
++		if (strcmp(rows[i].module, module) != 0)
++			continue;
++		if (!want_nvram) {
++			ret = 0;
++			break;
++		}
++		if (rows[i].kind == ROW_METHOD &&
++		    (strcmp(rows[i].method, "put") == 0 ||
++		     strcmp(rows[i].method, "get") == 0) &&
++		    strcmp(rows[i].nvram, want_nvram) == 0) {
++			ret = 0;
++			break;
++		}
++	}
++
++	free(rows);
++	return ret;
++}
+diff --git a/tools/mediatek/camera/iopipe/iopipe_mgr.h b/tools/mediatek/camera/iopipe/iopipe_mgr.h
+new file mode 100644
+index 000000000..072d6fe14
+--- /dev/null
++++ b/tools/mediatek/camera/iopipe/iopipe_mgr.h
+@@ -0,0 +1,44 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * ISP tuning manager catalogue from libcam.hal3a.v3.so.
++ *
++ * The MT6735 3A library implements one small "manager" class per tuning
++ * module (ISP_MGR_<MOD>) and one singleton per (module, sensor device,
++ * sensor timing generator) combination.  Each manager takes an NVRAM
++ * parameter structure through put() and programs the corresponding ISP
++ * registers in apply().
++ *
++ * The catalogue is built purely from the dynamic symbol table: the class
++ * token, the template instance (ESensorDev_T / ESensorTG_T / EPCAMode_T) and
++ * the ISP_NVRAM_<T>_T argument of put()/get() are decoded from the Itanium
++ * mangled names.  Length prefixes are honoured, so tokens containing digits
++ * (SL2, G3C, MIXER3, CTL_EN_P1_D) are never guessed.
++ */
++
++#ifndef IOPIPE_MGR_H
++#define IOPIPE_MGR_H
++
++#include <stdio.h>
++
++#include "iopipe_elf.h"
++
++enum iopipe_mgr_fmt {
++	IOPIPE_MGR_TEXT,
++	IOPIPE_MGR_CSV,
++	IOPIPE_MGR_JSON,
++};
++
++/* Number of distinct module tokens found (0 on error). */
++unsigned int iopipe_mgr_module_count(const struct iopipe_elf *elf);
++/* Print the catalogue.  Returns 0 or a negative errno. */
++int iopipe_mgr_dump(const struct iopipe_elf *elf, enum iopipe_mgr_fmt fmt,
++		    FILE *out);
++/*
++ * Per-module check used by the selftest: the module must have at least one
++ * manager symbol and, when want_nvram is non-NULL, a put()/get() overload
++ * taking that exact NVRAM type.  Returns 0 or -ENOENT.
++ */
++int iopipe_mgr_expect(const struct iopipe_elf *elf, const char *module,
++		      const char *want_nvram);
++
++#endif /* IOPIPE_MGR_H */
+diff --git a/tools/mediatek/camera/iopipe/iopipe_portmap.c b/tools/mediatek/camera/iopipe/iopipe_portmap.c
+new file mode 100644
+index 000000000..3e8aabfd1
+--- /dev/null
++++ b/tools/mediatek/camera/iopipe/iopipe_portmap.c
+@@ -0,0 +1,496 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Decoder for the six libcam.iopipe.so port/path tables.
++ *
++ * Evidence (libcam.iopipe.so, ELF32 ARM Thumb-2, stripped, dynsym only):
++ *
++ *   llvm-readelf -sW  : the six OBJECT symbols and their st_size
++ *   llvm-readelf -SW  : .data at vaddr 0x30000 / file 0x2f000
++ *   llvm-readelf -rW  : R_ARM_GLOB_DAT slots the code loads them through
++ *                       (mSwHwPathMapping 0x2f8e0, mPortIdxMappingAlltoP2
++ *                       0x2f910, mPortTypeMapping 0x2f914,
++ *                       mTransformMapping 0x2f918, nsTimeoutToWait 0x2f920,
++ *                       mPortIdxMappingP2toAll 0x2f928)
++ *   llvm-objdump -d   : FeatureStream::init @0x11682-0x116a2 (record stride
++ *                       0x14 and the name field at +0x8 used as an argument),
++ *                       HalPipeWrapper::waitDequeVSSBufAgain @0x15d48-0x15d7c
++ *                       (ldrd of nsTimeoutToWait, divide by the 64-bit
++ *                       0x3b9aca00 constant at 0x15d88, timespec for
++ *                       pthread_cond_timedwait_relative_np).
++ *
++ * Every read goes through iopipe_elf_read_vaddr(), i.e. it is confined to the
++ * file-backed part of a PT_LOAD segment.
++ */
++
++#include <errno.h>
++#include <inttypes.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "iopipe_portmap.h"
++
++static const char *const pm_fields_alltop2[] = {
++	"all_port", "p2_port",
++};
++static const char *const pm_fields_p2toall[] = {
++	"p2_port", "all_port",
++};
++static const char *const pm_fields_swhw[] = {
++	"sw_path", "name_ptr", "f2", "f3", "f4",
++};
++static const char *const pm_fields_porttype[] = {
++	"port", "type",
++};
++static const char *const pm_fields_transform[] = {
++	"transform", "f1", "f2",
++};
++static const char *const pm_fields_timeout[] = {
++	"ns_timeout_lo", "ns_timeout_hi",
++};
++
++#define PMT(_sym, _size, _rec, _nf, _fields, _ptr, _ev)			\
++	{								\
++		.sym = (_sym), .size = (_size), .rec_size = (_rec),	\
++		.nfields = (_nf),					\
++		.fields = (_fields),					\
++		.ptr_mask = (_ptr),					\
++		.evidence = (_ev),					\
++	}
++
++const struct iopipe_pm_table iopipe_pm_tables[] = {
++	PMT("mPortIdxMappingAlltoP2", 272, 8, 2, pm_fields_alltop2, 0,
++	    "272 = 34 x 2 u32; field0 is a dense 0..33 index (verified) and "
++	    "mPortIdxMappingP2toAll is its inverse"),
++	PMT("mPortIdxMappingP2toAll", 136, 8, 2, pm_fields_p2toall, 0,
++	    "136 = 17 x 2 u32; field0 is a dense 0..16 index (verified)"),
++	PMT("mSwHwPathMapping", 860, 20, 5, pm_fields_swhw, 1u << 1,
++	    "stride 0x14 at FeatureStream::init @0x11686/@0x11698 "
++	    "(mla with #0x14); field0 dense 0..42"),
++	PMT("mPortTypeMapping", 16, 8, 2, pm_fields_porttype, 0,
++	    "16 = 2 x 2 u32; the two records are each other's inverse "
++	    "(0->1, 1->0) [INFERENCE: pair semantics]"),
++	PMT("mTransformMapping", 96, 12, 3, pm_fields_transform, 0,
++	    "96 = 8 x 3 u32; only this factorisation makes field0 a dense "
++	    "0..7 index (verified)"),
++	PMT("nsTimeoutToWait", 8, 8, 2, pm_fields_timeout, 0,
++	    "8 = 1 u64 ns timeout; read with ldrd @0x15d4c and scaled by the "
++	    "64-bit 1e9 constant at 0x15d88"),
++};
++
++const size_t iopipe_pm_table_count =
++	sizeof(iopipe_pm_tables) / sizeof(iopipe_pm_tables[0]);
++
++const struct iopipe_pm_table *iopipe_pm_by_name(const char *name)
++{
++	size_t i;
++
++	if (!name)
++		return NULL;
++	for (i = 0; i < iopipe_pm_table_count; i++) {
++		if (strcmp(iopipe_pm_tables[i].sym, name) == 0)
++			return &iopipe_pm_tables[i];
++	}
++	return NULL;
++}
++
++static int read_words(const struct iopipe_elf *elf, uint32_t vaddr,
++		      uint32_t size, uint32_t **out)
++{
++	uint32_t *w;
++	int ret;
++
++	if (size % 4)
++		return -ERANGE;
++	w = calloc(size ? size / 4 : 1, sizeof(*w));
++	if (!w)
++		return -ENOMEM;
++	ret = iopipe_elf_read_vaddr(elf, vaddr, w, size);
++	if (ret) {
++		free(w);
++		return ret;
++	}
++	*out = w;
++	return 0;
++}
++
++int iopipe_pm_resolve(const struct iopipe_elf *elf,
++		      const struct iopipe_pm_table *t,
++		      struct iopipe_pm_info *out)
++{
++	struct iopipe_sym sym;
++	const char *sec = "";
++	uint64_t off;
++	size_t seg = 0;
++	int ret;
++
++	if (!elf || !t || !out)
++		return -EINVAL;
++
++	ret = iopipe_elf_sym_find(elf, t->sym, false, false, &sym);
++	if (ret)
++		return ret;
++	if (sym.type != STT_OBJECT)
++		return -EINVAL;
++	if (sym.size != t->size)
++		return -ERANGE;
++	/* Symbols live in .data; the Thumb bit must not be set for an OBJECT. */
++	if (sym.value & 1u)
++		return -EINVAL;
++
++	ret = iopipe_elf_vaddr_to_off(elf, sym.value, sym.size, &off, &seg);
++	if (ret)
++		return ret;
++
++	iopipe_elf_section_of(elf, sym.value, &sec, NULL);
++
++	out->vaddr = sym.value;
++	out->size = sym.size;
++	out->nrec = t->rec_size ? sym.size / t->rec_size : 0;
++	out->seg = seg;
++	out->section = sec;
++	return 0;
++}
++
++/* Content invariant that proves the record width. */
++static int verify_content(const struct iopipe_elf *elf,
++			  const struct iopipe_pm_table *t, const uint32_t *w,
++			  unsigned int nrec, char *err, size_t errsz)
++{
++	unsigned int i, f;
++
++	if (t->rec_size != t->nfields * 4) {
++		snprintf(err, errsz, "rec_size %u != %u fields of 4 bytes",
++			 t->rec_size, t->nfields);
++		return -EINVAL;
++	}
++
++	if (strcmp(t->sym, "mPortIdxMappingAlltoP2") == 0 ||
++	    strcmp(t->sym, "mPortIdxMappingP2toAll") == 0) {
++		for (i = 0; i < nrec; i++) {
++			if (w[i * t->nfields] != i) {
++				snprintf(err, errsz,
++					 "record %u: index field is %u, not %u",
++					 i, w[i * t->nfields], i);
++				return -EINVAL;
++			}
++		}
++		for (i = 0; i < nrec; i++) {
++			uint32_t v = w[i * t->nfields + 1];
++
++			if (strcmp(t->sym, "mPortIdxMappingAlltoP2") == 0) {
++				if (v != 0xffffffffu && v >= 34) {
++					snprintf(err, errsz,
++						 "record %u: p2 port %u out of range",
++						 i, v);
++					return -EINVAL;
++				}
++			} else if (v >= 34) {
++				snprintf(err, errsz,
++					 "record %u: all port %u out of range",
++					 i, v);
++				return -EINVAL;
++			}
++		}
++		return 0;
++	}
++
++	if (strcmp(t->sym, "mSwHwPathMapping") == 0) {
++		for (i = 0; i < nrec; i++) {
++			char name[64];
++			int n;
++
++			if (w[i * t->nfields] != i) {
++				snprintf(err, errsz,
++					 "record %u: sw path field is %u",
++					 i, w[i * t->nfields]);
++				return -EINVAL;
++			}
++			n = iopipe_elf_str_at(elf, w[i * t->nfields + 1],
++					      name, sizeof(name));
++			if (n < 1) {
++				snprintf(err, errsz,
++					 "record %u: name pointer 0x%08x is not a mapped string",
++					 i, w[i * t->nfields + 1]);
++				return -EINVAL;
++			}
++			for (f = 0; f < (unsigned int)n; f++) {
++				if (name[f] < 0x20 || name[f] > 0x7e) {
++					snprintf(err, errsz,
++						 "record %u: name is not printable",
++						 i);
++					return -EINVAL;
++				}
++			}
++		}
++		return 0;
++	}
++
++	if (strcmp(t->sym, "mTransformMapping") == 0) {
++		for (i = 0; i < nrec; i++) {
++			if (w[i * t->nfields] != i) {
++				snprintf(err, errsz,
++					 "record %u: transform field is %u",
++					 i, w[i * t->nfields]);
++				return -EINVAL;
++			}
++		}
++		return 0;
++	}
++
++	if (strcmp(t->sym, "mPortTypeMapping") == 0) {
++		if (nrec != 2) {
++			snprintf(err, errsz, "expected 2 records, got %u", nrec);
++			return -EINVAL;
++		}
++		if (w[0] == w[1] || w[0] != w[3] || w[1] != w[2]) {
++			snprintf(err, errsz,
++				 "pairs (%u,%u) and (%u,%u) are not an involution",
++				 w[0], w[1], w[2], w[3]);
++			return -EINVAL;
++		}
++		return 0;
++	}
++
++	if (strcmp(t->sym, "nsTimeoutToWait") == 0) {
++		uint64_t ns = (uint64_t)w[0] | ((uint64_t)w[1] << 32);
++
++		if (ns != 3000000ull) {
++			snprintf(err, errsz, "timeout is %" PRIu64 " ns, not 3000000",
++				 ns);
++			return -EINVAL;
++		}
++		return 0;
++	}
++
++	snprintf(err, errsz, "no content check for %s", t->sym);
++	return -EINVAL;
++}
++
++int iopipe_pm_verify(const struct iopipe_elf *elf,
++		     const struct iopipe_pm_table *t, char *err, size_t errsz)
++{
++	struct iopipe_pm_info info;
++	uint32_t *w = NULL;
++	int ret;
++
++	if (!elf || !t || !err || !errsz)
++		return -EINVAL;
++	err[0] = '\0';
++
++	ret = iopipe_pm_resolve(elf, t, &info);
++	if (ret) {
++		snprintf(err, errsz, "%s: resolve failed (%s)", t->sym,
++			 ret == -ENOENT ? "symbol not found" :
++			 ret == -ERANGE ? "unexpected st_size" : "invalid");
++		return ret;
++	}
++	if (!t->rec_size || info.size % t->rec_size) {
++		snprintf(err, errsz, "%s: size %u is not a multiple of %u",
++			 t->sym, info.size, t->rec_size);
++		return -EINVAL;
++	}
++
++	ret = read_words(elf, info.vaddr, info.size, &w);
++	if (ret) {
++		snprintf(err, errsz, "%s: read at 0x%08x failed (%d)", t->sym,
++			 info.vaddr, ret);
++		return ret;
++	}
++
++	ret = verify_content(elf, t, w, info.nrec, err, errsz);
++	free(w);
++	return ret;
++}
++
++/* Cross-check: mPortIdxMappingP2toAll is the inverse of
++ * mPortIdxMappingAlltoP2 for every All port that has a P2 port. */
++static int verify_inverse(const struct iopipe_elf *elf, char *err, size_t errsz)
++{
++	const struct iopipe_pm_table *ta = iopipe_pm_by_name("mPortIdxMappingAlltoP2");
++	const struct iopipe_pm_table *tb = iopipe_pm_by_name("mPortIdxMappingP2toAll");
++	struct iopipe_pm_info ia, ib;
++	uint32_t *a = NULL, *b = NULL;
++	unsigned int i;
++	int ret = 0;
++
++	if (!ta || !tb)
++		return -EINVAL;
++	if (iopipe_pm_resolve(elf, ta, &ia) || iopipe_pm_resolve(elf, tb, &ib))
++		return -EINVAL;
++	if (read_words(elf, ia.vaddr, ia.size, &a))
++		return -EINVAL;
++	if (read_words(elf, ib.vaddr, ib.size, &b)) {
++		free(a);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < ia.nrec; i++) {
++		uint32_t all = a[i * 2], p2 = a[i * 2 + 1];
++		unsigned int j;
++
++		if (p2 == 0xffffffffu)
++			continue;
++		if (p2 >= ib.nrec) {
++			snprintf(err, errsz,
++				 "all port %u maps to p2 port %u of %u", all, p2,
++				 ib.nrec);
++			ret = -EINVAL;
++			break;
++		}
++		/* Find the P2->All record for this P2 port and check the back
++		 * reference.  The first field is the dense index, so it is a
++		 * direct lookup. */
++		j = p2;
++		if (b[j * 2] != p2 || b[j * 2 + 1] != all) {
++			snprintf(err, errsz,
++				 "all %u -> p2 %u but p2 %u -> all %u", all, p2,
++				 b[j * 2], b[j * 2 + 1]);
++			ret = -EINVAL;
++			break;
++		}
++	}
++	for (i = 0; i < ib.nrec; i++) {
++		uint32_t p2 = b[i * 2], all = b[i * 2 + 1];
++
++		if (all >= ia.nrec) {
++			snprintf(err, errsz,
++				 "p2 port %u maps to all port %u of %u", p2, all,
++				 ia.nrec);
++			ret = -EINVAL;
++			break;
++		}
++		if (a[all * 2] != all || a[all * 2 + 1] != p2) {
++			snprintf(err, errsz,
++				 "p2 %u -> all %u but all %u -> p2 %u", p2, all,
++				 a[all * 2], a[all * 2 + 1]);
++			ret = -EINVAL;
++			break;
++		}
++	}
++
++	free(a);
++	free(b);
++	return ret;
++}
++
++int iopipe_pm_check_all(const struct iopipe_elf *elf, FILE *out)
++{
++	char err[256];
++	size_t i;
++	int ret = 0;
++
++	if (!elf || !out)
++		return -EINVAL;
++
++	for (i = 0; i < iopipe_pm_table_count; i++) {
++		const struct iopipe_pm_table *t = &iopipe_pm_tables[i];
++		struct iopipe_pm_info info;
++		int rc = iopipe_pm_verify(elf, t, err, sizeof(err));
++
++		if (rc) {
++			fprintf(out, "portmap: FAIL %-24s %s\n", t->sym, err);
++			ret = rc;
++			continue;
++		}
++		if (iopipe_pm_resolve(elf, t, &info)) {
++			fprintf(out, "portmap: FAIL %-24s cannot resolve\n",
++				t->sym);
++			ret = -EINVAL;
++			continue;
++		}
++		fprintf(out,
++			"portmap: ok   %-24s @0x%08x size %u (%u x %u bytes) %s PT_LOAD[%zu] sym.value 0x%08x\n",
++			t->sym, info.vaddr, info.size, info.nrec,
++			t->rec_size, info.section, info.seg, info.vaddr);
++	}
++
++	memset(err, 0, sizeof(err));
++	if (verify_inverse(elf, err, sizeof(err))) {
++		fprintf(out, "portmap: FAIL inverse map check: %s\n", err);
++		ret = -EINVAL;
++	} else {
++		fprintf(out, "portmap: ok   mPortIdxMappingAlltoP2 <-> mPortIdxMappingP2toAll are inverses\n");
++	}
++
++	return ret;
++}
++
++int iopipe_pm_dump(const struct iopipe_elf *elf, const struct iopipe_pm_table *t,
++		   FILE *out)
++{
++	struct iopipe_pm_info info;
++	uint32_t *w = NULL;
++	unsigned int i;
++	int ret;
++
++	if (!elf || !t || !out)
++		return -EINVAL;
++
++	ret = iopipe_pm_resolve(elf, t, &info);
++	if (ret) {
++		fprintf(out, "portmap: %s: %s\n", t->sym,
++			ret == -ENOENT ? "symbol not found" :
++			ret == -ERANGE ? "st_size mismatch" : "invalid symbol");
++		return ret;
++	}
++
++	fprintf(out, "table    %s\n", t->sym);
++	fprintf(out, "vaddr    0x%08x\n", info.vaddr);
++	fprintf(out, "size     %u bytes\n", info.size);
++	fprintf(out, "section  %s\n", info.section);
++	fprintf(out, "segment  PT_LOAD[%zu]\n", info.seg);
++	fprintf(out, "records  %u x %u bytes (%u u32 fields)\n", info.nrec,
++		t->rec_size, t->nfields);
++	fprintf(out, "proved   %s\n", t->evidence);
++
++	ret = read_words(elf, info.vaddr, info.size, &w);
++	if (ret) {
++		fprintf(out, "portmap: read failed (%d)\n", ret);
++		return ret;
++	}
++
++	fprintf(out, "  #");
++	for (i = 0; i < t->nfields; i++)
++		fprintf(out, "  %-14s", t->fields[i]);
++	fprintf(out, "\n");
++	for (i = 0; i < info.nrec; i++) {
++		unsigned int f;
++
++		fprintf(out, "  %-3u", i);
++		for (f = 0; f < t->nfields; f++) {
++			uint32_t v = w[i * t->nfields + f];
++
++			if (v == 0xffffffffu)
++				fprintf(out, "  %-14s", "0xffffffff");
++			else if (t->ptr_mask & (1u << f))
++				fprintf(out, "  0x%08x      ", v);
++			else
++				fprintf(out, "  %-14u", v);
++		}
++		fprintf(out, "\n");
++	}
++
++	/* Field names are the interpretation; raw words are the evidence. */
++	fprintf(out, "raw      ");
++	for (i = 0; i < info.nrec * t->nfields; i++) {
++		fprintf(out, "%08x", w[i]);
++		if (i + 1 < info.nrec * t->nfields)
++			fprintf(out, " ");
++	}
++	fprintf(out, "\n");
++
++	if (strcmp(t->sym, "mSwHwPathMapping") == 0) {
++		fprintf(out, "names   ");
++		for (i = 0; i < info.nrec; i++) {
++			char name[64];
++
++			if (iopipe_elf_str_at(elf, w[i * t->nfields + 1], name,
++					      sizeof(name)) >= 0)
++				fprintf(out, " %s", name);
++		}
++		fprintf(out, "\n");
++	}
++
++	free(w);
++	return 0;
++}
+diff --git a/tools/mediatek/camera/iopipe/iopipe_portmap.h b/tools/mediatek/camera/iopipe/iopipe_portmap.h
+new file mode 100644
+index 000000000..1a7a72d06
+--- /dev/null
++++ b/tools/mediatek/camera/iopipe/iopipe_portmap.h
+@@ -0,0 +1,84 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Port / path / transform maps of libcam.iopipe.so (NSCam::NSIoPipe).
++ *
++ * The MT6735 camera HAL keeps six exported tables in .data of
++ * libcam.iopipe.so that describe how a requested image port maps onto the
++ * two ISP passes and onto the post-processing (P2) pipe.  The tool reads
++ * them out of the shipped ELF; it never embeds their contents.
++ *
++ * Record widths are *proved*, not assumed:
++ *
++ *  - mPortIdxMappingAlltoP2 / mPortIdxMappingP2toAll: first field of every
++ *    record is a dense ascending index (0..n-1), which fixes the record
++ *    count; the two tables are inverses of each other (checked by
++ *    iopipe_pm_check_all()).
++ *  - mSwHwPathMapping: the record stride 0x14 is read straight out of
++ *    libcam.iopipe.so NSCam::NSIoPipe::NSPostProc::FeatureStream::init
++ *    @0x11682-0x116a2 ("movs r2,#0x14" + "mla lr, r2, r3, r7" over the
++ *    GOT slot of mSwHwPathMapping, then "ldr.w r1,[lr,#0x8]").
++ *  - mTransformMapping: only the 8 x 3 u32 factorisation makes the first
++ *    field a dense ascending 0..7 index; verified at run time.
++ *  - mPortTypeMapping / nsTimeoutToWait: size plus content (involution pair /
++ *    the 64-bit 3000000 ns timeout used as a pthread_cond_timedwait_relative
++ *    interval at libcam.iopipe.so @0x15d48-0x15d7c).
++ *
++ * Field *names* are the reverse-engineered interpretation and are marked
++ * [INFERENCE] in the output; the offsets, sizes and raw words are not.
++ */
++
++#ifndef IOPIPE_PORTMAP_H
++#define IOPIPE_PORTMAP_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++
++#include "iopipe_elf.h"
++
++#define IOPIPE_PM_MAX_FIELDS 5
++
++struct iopipe_pm_table {
++	const char *sym;		/* ELF symbol name */
++	uint32_t size;			/* expected st_size */
++	uint32_t rec_size;		/* proved record width in bytes */
++	unsigned int nfields;		/* u32 fields per record */
++	const char *const *fields;	/* nfields names, [INFERENCE] labels */
++	unsigned int ptr_mask;		/* fields holding a pointer (hex) */
++	const char *evidence;		/* how the width was proved */
++};
++
++extern const struct iopipe_pm_table iopipe_pm_tables[];
++extern const size_t iopipe_pm_table_count;
++
++struct iopipe_pm_info {
++	uint32_t vaddr;
++	uint32_t size;
++	unsigned int nrec;
++	size_t seg;
++	const char *section;
++};
++
++int iopipe_pm_resolve(const struct iopipe_elf *elf,
++		      const struct iopipe_pm_table *t,
++		      struct iopipe_pm_info *out);
++
++/* Print one table: symbol, vaddr, size, section, PT_LOAD index, record count
++ * and the decoded fields.  Returns 0 or a negative errno. */
++int iopipe_pm_dump(const struct iopipe_elf *elf, const struct iopipe_pm_table *t,
++		   FILE *out);
++
++/* Structural verification of one table (sizes, segment containment and the
++ * content invariant that proves the record width). 0 or -EINVAL/-ERANGE. */
++int iopipe_pm_verify(const struct iopipe_elf *elf,
++		     const struct iopipe_pm_table *t, char *err, size_t errsz);
++
++/* Verify all six tables plus the AlltoP2 <-> P2toAll inverse property.
++ * Prints one line per check.  Returns 0 when every check passed. */
++int iopipe_pm_check_all(const struct iopipe_elf *elf, FILE *out);
++
++/* Look up a table descriptor by ELF symbol name; NULL when unknown. */
++const struct iopipe_pm_table *iopipe_pm_by_name(const char *name);
++
++#endif /* IOPIPE_PORTMAP_H */
+diff --git a/tools/mediatek/camera/iopipe/iopipe_regmap.c b/tools/mediatek/camera/iopipe/iopipe_regmap.c
+new file mode 100644
+index 000000000..0d03d9ff2
+--- /dev/null
++++ b/tools/mediatek/camera/iopipe/iopipe_regmap.c
+@@ -0,0 +1,575 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Per-module TPIPE/P1/P2 enable-word programming recovered from
++ * libcam.hal3a.v3.so.  Every address/word pair below was produced by
++ * disassembling the library (llvm-objdump -d --triple=thumbv7a-none-eabi) and
++ * is re-read from the shipped ELF by iopipe_regmap_verify().
++ *
++ * Symbol values in .dynsym carry the Thumb bit; the function therefore starts
++ * at st_value & ~1 (e.g. ISP_MGR_BNR::apply is 0x66d4d -> entry 0x66d4c).
++ * libcam.hal3a.v3.so maps vaddr 0x2000 -> file offset 0, so the tool's
++ * PT_LOAD walk finds every word below.
++ *
++ * Nothing here is a guess: the register address is decoded from the MOVW
++ * immediate, the bit position from the BFI/ORR immediate, and the owning
++ * enable manager from the getInstance call site recorded per record.
++ */
++
++#include <errno.h>
++#include <inttypes.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "iopipe_mgr.h"
++#include "iopipe_regmap.h"
++
++#define IOPIPE_CAM_ADDR_MIN 0x4000u
++#define IOPIPE_CAM_ADDR_MAX 0x10000u
++
++/* clang-format off */
++const struct iopipe_regmap_rec iopipe_regmap_recs[] = {
++	{ "OBC",
++	  "_ZN13NSIspTuningv311ISP_MGR_OBC5applyEN11NSIspTuning13EIspProfile_TE",
++	  0x6621a, 0x0904f244u, 0x66264, 0x1204f366u, 4, IOPIPE_RM_BFI,
++	  0x66298, 0xee00f7d4u, "CTL_EN_P1" },
++	{ "OBC",
++	  "_ZN13NSIspTuningv311ISP_MGR_OBC5applyEN11NSIspTuning13EIspProfile_TE",
++	  0x66310, 0x0910f244u, 0x66362, 0x1204f366u, 4, IOPIPE_RM_BFI,
++	  0x66396, 0xed88f7d4u, "CTL_EN_P1_D" },
++	{ "BNR",
++	  "_ZN13NSIspTuningv311ISP_MGR_BNR5applyEN11NSIspTuning13EIspProfile_TE",
++	  0x66dd0, 0x0704f244u, 0x66d9e, 0x1245f36au, 5, IOPIPE_RM_BFI,
++	  0x66d92, 0xe884f7d4u, "CTL_EN_P1" },
++	{ "BNR",
++	  "_ZN13NSIspTuningv311ISP_MGR_BNR5applyEN11NSIspTuning13EIspProfile_TE",
++	  0x66e16, 0x0710f244u, 0x66df4, 0x1245f36au, 5, IOPIPE_RM_BFI,
++	  0x66de8, 0xe85ef7d4u, "CTL_EN_P1_D" },
++	{ "LSC",
++	  "_ZN13NSIspTuningv311ISP_MGR_LSC5applyEN11NSIspTuning13EIspProfile_TE",
++	  0x676da, 0x0904f244u, 0x6771c, 0x1286f361u, 6, IOPIPE_RM_BFI,
++	  0x677ae, 0xeb76f7d3u, "CTL_EN_P1" },
++	{ "LSC",
++	  "_ZN13NSIspTuningv311ISP_MGR_LSC5applyEN11NSIspTuning13EIspProfile_TE",
++	  0x67744, 0x0908f244u, 0x67780, 0x17c7f362u, 7, IOPIPE_RM_BFI,
++	  0x677ae, 0xeb76f7d3u, "CTL_EN_P1" },
++	{ "LSC",
++	  "_ZN13NSIspTuningv311ISP_MGR_LSC5applyEN11NSIspTuning13EIspProfile_TE",
++	  0x677be, 0x0910f244u, 0x677fe, 0x1786f362u, 6, IOPIPE_RM_BFI,
++	  0x67890, 0xeb0af7d3u, "CTL_EN_P1_D" },
++	{ "LSC",
++	  "_ZN13NSIspTuningv311ISP_MGR_LSC5applyEN11NSIspTuning13EIspProfile_TE",
++	  0x67826, 0x0914f244u, 0x67862, 0x17c7f361u, 7, IOPIPE_RM_BFI,
++	  0x67890, 0xeb0af7d3u, "CTL_EN_P1_D" },
++	{ "RPG",
++	  "_ZN13NSIspTuningv311ISP_MGR_RPG5applyEN11NSIspTuning13EIspProfile_TE",
++	  0x6818e, 0x0804f244u, 0x681ce, 0x12c7f361u, 7, IOPIPE_RM_BFI,
++	  0x68200, 0xee4cf7d2u, "CTL_EN_P1" },
++	{ "RPG",
++	  "_ZN13NSIspTuningv311ISP_MGR_RPG5applyEN11NSIspTuning13EIspProfile_TE",
++	  0x6820e, 0x0810f244u, 0x68250, 0x12c7f361u, 7, IOPIPE_RM_BFI,
++	  0x68282, 0xee12f7d2u, "CTL_EN_P1_D" },
++	{ "PGN",
++	  "_ZN13NSIspTuningv311ISP_MGR_PGN5applyEN11NSIspTuning13EIspProfile_TE",
++	  0x68a9c, 0x0818f244u, 0x68ae6, 0x0241f361u, 1, IOPIPE_RM_BFI,
++	  0x68b18, 0xe9d2f7d2u, "CTL_EN_P2" },
++	{ "SL2",
++	  "_ZN13NSIspTuningv311ISP_MGR_SL25applyEN11NSIspTuning13EIspProfile_TE",
++	  0x69042, 0x0518f244u, 0x6908c, 0x0182f369u, 2, IOPIPE_RM_BFI,
++	  0x68fd4, 0xef74f7d1u, "CTL_EN_P2" },
++	{ "CFA",
++	  "_ZN13NSIspTuningv311ISP_MGR_CFA5applyEN11NSIspTuning13EIspProfile_TE",
++	  0x699d6, 0x0418f244u, 0x69a08, 0x0108f040u, 3, IOPIPE_RM_ORR_IMM,
++	  0x69a36, 0xea44f7d1u, "CTL_EN_P2" },
++	{ "CCM",
++	  "_ZN13NSIspTuningv311ISP_MGR_CCM5applyEN11NSIspTuning13EIspProfile_TE",
++	  0x69ed0, 0x0818f244u, 0x69ee6, 0x1c45f362u, 5, IOPIPE_RM_BFI,
++	  0x69ed6, 0xeff4f7d0u, "CTL_EN_P2" },
++	{ "GGM",
++	  "_ZN13NSIspTuningv311ISP_MGR_GGM5applyEN11NSIspTuning13EIspProfile_TE",
++	  0x6a3a2, 0x0518f244u, 0x6a3ec, 0x1286f368u, 6, IOPIPE_RM_BFI,
++	  0x6a41a, 0xed52f7d0u, "CTL_EN_P2" },
++	{ "G2C",
++	  "_ZN13NSIspTuningv311ISP_MGR_G2C5applyEN11NSIspTuning13EIspProfile_TE",
++	  0x6aa7a, 0x0818f244u, 0x6aa8e, 0x0341f366u, 1, IOPIPE_RM_BFI,
++	  0x6aa7e, 0xea20f7d0u, "CTL_EN_P2" },
++	{ "NBC",
++	  "_ZN13NSIspTuningv311ISP_MGR_NBC5applyEN11NSIspTuning13EIspProfile_TE",
++	  0x6b68a, 0x0518f244u, 0x6b682, 0x0800f365u, 0, IOPIPE_RM_BFI,
++	  0x6b69a, 0xec12f7cfu, "CTL_EN_P2" },
++	{ "PCA",
++	  "_ZN13NSIspTuningv311ISP_MGR_PCA5applyEN11NSIspTuning13EIspProfile_TE",
++	  0x6bb06, 0x0818f244u, 0x6bb18, 0x1304f369u, 4, IOPIPE_RM_BFI,
++	  0x6bb0a, 0xe9daf7cfu, "CTL_EN_P2" },
++	{ "SEEE",
++	  "_ZN13NSIspTuningv312ISP_MGR_SEEE5applyEN11NSIspTuning13EIspProfile_TE",
++	  0x6c4b6, 0x0418f244u, 0x6c4ca, 0x1145f369u, 5, IOPIPE_RM_BFI,
++	  0x6c4be, 0xed00f7ceu, "CTL_EN_P2" },
++};
++/* clang-format on */
++
++const size_t iopipe_regmap_rec_count =
++	sizeof(iopipe_regmap_recs) / sizeof(iopipe_regmap_recs[0]);
++
++const char *iopipe_regmap_reg_label(uint32_t reg)
++{
++	switch (reg) {
++	case 0x4004:
++		return "CAM_CTL_EN_P1";
++	case 0x4008:
++		return "CAM_CTL_EN_P1+4";
++	case 0x4010:
++		return "CAM_CTL_EN_P1_D";
++	case 0x4014:
++		return "CAM_CTL_EN_P1_D+4";
++	case 0x4018:
++		return "CAM_CTL_EN_P2";
++	default:
++		return "unknown";
++	}
++}
++
++int iopipe_thumb_movw(uint32_t word, uint32_t *imm16_out)
++{
++	uint16_t hw1 = (uint16_t)(word & 0xffff);
++	uint16_t hw2 = (uint16_t)(word >> 16);
++	uint32_t imm;
++
++	/* MOVW (immediate), T3: 11110 i 10 0100 imm4 | 0 imm3 Rd imm8 */
++	if ((hw1 & 0xfb00) != 0xf200 || (hw1 & 0x0080))
++		return -EINVAL;
++	imm = ((uint32_t)(hw1 & 0xf) << 12) |
++	      ((uint32_t)((hw1 >> 10) & 1) << 11) |
++	      ((uint32_t)((hw2 >> 12) & 7) << 8) | (hw2 & 0xff);
++	if (imm16_out)
++		*imm16_out = imm;
++	return 0;
++}
++
++int iopipe_thumb_bfi(uint32_t word, unsigned int *lsb_out,
++		     unsigned int *width_out)
++{
++	uint16_t hw1 = (uint16_t)(word & 0xffff);
++	uint16_t hw2 = (uint16_t)(word >> 16);
++	unsigned int lsb, msb;
++
++	/* BFI, T1: 1111 0011 0110 Rn | 0 imm3 Rd imm2 0 msb */
++	if ((hw1 & 0xfff0) != 0xf360)
++		return -EINVAL;
++	if (hw2 & 0x8000)
++		return -EINVAL;
++	lsb = (unsigned int)(((hw2 >> 12) & 7) << 2) | ((hw2 >> 6) & 3);
++	msb = hw2 & 0x1f;
++	if (msb < lsb)
++		return -EINVAL;
++	if (lsb_out)
++		*lsb_out = lsb;
++	if (width_out)
++		*width_out = msb - lsb + 1;
++	return 0;
++}
++
++int iopipe_thumb_orr_imm(uint32_t word, uint32_t *imm_out)
++{
++	uint16_t hw1 = (uint16_t)(word & 0xffff);
++	uint16_t hw2 = (uint16_t)(word >> 16);
++	uint32_t imm;
++
++	/* ORR (immediate), T1: 11110 i 0 0010 0 S Rn | 0 imm3 Rd imm8 */
++	if ((hw1 & 0xfbf0) != 0xf040)
++		return -EINVAL;
++	imm = ((uint32_t)((hw1 >> 10) & 1) << 11) |
++	      ((uint32_t)((hw2 >> 12) & 7) << 8) | (hw2 & 0xff);
++	if (imm_out)
++		*imm_out = imm;
++	return 0;
++}
++
++unsigned int iopipe_thumb_insn_len(uint16_t hw1)
++{
++	unsigned int top = hw1 >> 11;
++
++	if (top == 0x1d || top == 0x1e || top == 0x1f)
++		return 4;
++	return 2;
++}
++
++static int read_word(const struct iopipe_elf *elf, uint32_t vaddr,
++		     uint32_t *out)
++{
++	/* Thumb-2 instructions are halfword aligned; the 32-bit forms the
++	 * table records often start at +2 in the function. */
++	if (vaddr & 1u)
++		return -EINVAL;
++	return iopipe_elf_read_vaddr(elf, vaddr, out, sizeof(*out));
++}
++
++/* Verify one record; fills err on failure. */
++static int verify_rec(const struct iopipe_elf *elf,
++		      const struct iopipe_regmap_rec *r, char *err, size_t errsz)
++{
++	struct iopipe_sym sym;
++	uint32_t word = 0, imm = 0;
++	unsigned int lsb = 0, width = 0;
++	uint32_t end;
++	int ret;
++
++	ret = iopipe_elf_sym_find(elf, r->symbol, false, false, &sym);
++	if (ret) {
++		snprintf(err, errsz, "%s: symbol not found", r->module);
++		return ret;
++	}
++	if (sym.type != STT_FUNC) {
++		snprintf(err, errsz, "%s: %s is not a function", r->module,
++			 r->symbol);
++		return -EINVAL;
++	}
++	end = sym.entry + sym.size;
++	if (end < sym.entry) {
++		snprintf(err, errsz, "%s: symbol range overflows", r->module);
++		return -ERANGE;
++	}
++
++	if (r->reg_insn_vaddr < sym.entry || r->reg_insn_vaddr + 4 > end ||
++	    r->bit_insn_vaddr < sym.entry || r->bit_insn_vaddr + 4 > end ||
++	    r->owner_insn_vaddr < sym.entry || r->owner_insn_vaddr + 4 > end) {
++		snprintf(err, errsz,
++			 "%s: recorded instruction addresses fall outside %s [0x%x,0x%x) size %u",
++			 r->module, r->symbol, sym.entry, end, sym.size);
++		return -ERANGE;
++	}
++
++	ret = read_word(elf, r->reg_insn_vaddr, &word);
++	if (ret) {
++		snprintf(err, errsz, "%s: read 0x%x failed (%d)", r->module,
++			 r->reg_insn_vaddr, ret);
++		return ret;
++	}
++	if (word != r->reg_insn_word) {
++		snprintf(err, errsz,
++			 "%s: MOVW word at 0x%x is 0x%08x, table says 0x%08x",
++			 r->module, r->reg_insn_vaddr, word, r->reg_insn_word);
++		return -EINVAL;
++	}
++	if (iopipe_thumb_movw(word, &imm)) {
++		snprintf(err, errsz, "%s: 0x%08x is not MOVW", r->module, word);
++		return -EINVAL;
++	}
++	if (imm < IOPIPE_CAM_ADDR_MIN || imm >= IOPIPE_CAM_ADDR_MAX) {
++		snprintf(err, errsz,
++			 "%s: MOVW immediate 0x%x outside the CAM window [0x%x,0x%x)",
++			 r->module, imm, IOPIPE_CAM_ADDR_MIN,
++			 IOPIPE_CAM_ADDR_MAX);
++		return -ERANGE;
++	}
++
++	ret = read_word(elf, r->bit_insn_vaddr, &word);
++	if (ret) {
++		snprintf(err, errsz, "%s: read 0x%x failed (%d)", r->module,
++			 r->bit_insn_vaddr, ret);
++		return ret;
++	}
++	if (word != r->bit_insn_word) {
++		snprintf(err, errsz,
++			 "%s: bit word at 0x%x is 0x%08x, table says 0x%08x",
++			 r->module, r->bit_insn_vaddr, word, r->bit_insn_word);
++		return -EINVAL;
++	}
++	if (r->form == IOPIPE_RM_BFI) {
++		if (iopipe_thumb_bfi(word, &lsb, &width)) {
++			snprintf(err, errsz, "%s: 0x%08x is not BFI", r->module,
++				 word);
++			return -EINVAL;
++		}
++		if (width != 1 || (int)lsb != r->bit) {
++			snprintf(err, errsz,
++				 "%s: BFI inserts #%u,#%u at 0x%x, table says bit %d",
++				 r->module, lsb, width, r->bit_insn_vaddr,
++				 r->bit);
++			return -EINVAL;
++		}
++	} else {
++		if (iopipe_thumb_orr_imm(word, &imm)) {
++			snprintf(err, errsz, "%s: 0x%08x is not ORR-immediate",
++				 r->module, word);
++			return -EINVAL;
++		}
++		if (imm != (1u << r->bit)) {
++			snprintf(err, errsz,
++				 "%s: ORR sets 0x%x at 0x%x, table says bit %d",
++				 r->module, imm, r->bit_insn_vaddr, r->bit);
++			return -EINVAL;
++		}
++	}
++
++	ret = read_word(elf, r->owner_insn_vaddr, &word);
++	if (ret) {
++		snprintf(err, errsz, "%s: read 0x%x failed (%d)", r->module,
++			 r->owner_insn_vaddr, ret);
++		return ret;
++	}
++	if (word != r->owner_insn_word) {
++		snprintf(err, errsz,
++			 "%s: call word at 0x%x is 0x%08x, table says 0x%08x",
++			 r->module, r->owner_insn_vaddr, word, r->owner_insn_word);
++		return -EINVAL;
++	}
++	/* The BLX at the recorded site must target a PLT stub, i.e. hw1[15:11]
++	 * is 11110 and hw1[14:12] is 111. */
++	if (((word & 0xffff) >> 11) != 0x1e || (((word >> 12) & 7) != 7)) {
++		snprintf(err, errsz, "%s: 0x%08x is not BLX", r->module, word);
++		return -EINVAL;
++	}
++
++	if (iopipe_mgr_expect(elf, r->owner_module, NULL)) {
++		snprintf(err, errsz, "%s: owner manager %s not in catalogue",
++			 r->module, r->owner_module);
++		return -ENOENT;
++	}
++
++	return 0;
++}
++
++int iopipe_regmap_verify(const struct iopipe_elf *elf, FILE *out)
++{
++	char err[256];
++	size_t i;
++	int ret = 0;
++
++	if (!elf || !out)
++		return -EINVAL;
++
++	for (i = 0; i < iopipe_regmap_rec_count; i++) {
++		const struct iopipe_regmap_rec *r = &iopipe_regmap_recs[i];
++		uint32_t reg = 0;
++		int rc;
++
++		err[0] = '\0';
++		rc = verify_rec(elf, r, err, sizeof(err));
++		if (rc) {
++			fprintf(out, "regmap: FAIL %-4s %s\n", r->module, err);
++			ret = rc;
++			continue;
++		}
++		iopipe_thumb_movw(r->reg_insn_word, &reg);
++		fprintf(out,
++			"regmap: ok   %-4s reg 0x%04x (%s) bit %d %-7s "
++			"movw@0x%05x=%08x %s@0x%05x=%08x owner@0x%05x=%08x %s\n",
++			r->module, reg, iopipe_regmap_reg_label(reg), r->bit,
++			r->form == IOPIPE_RM_BFI ? "bfi" : "orr-imm",
++			r->reg_insn_vaddr, r->reg_insn_word,
++			r->form == IOPIPE_RM_BFI ? "bfi" : "orr",
++			r->bit_insn_vaddr, r->bit_insn_word,
++			r->owner_insn_vaddr, r->owner_insn_word,
++			r->owner_module);
++	}
++
++	return ret;
++}
++
++static int rec_has_module(const char *module)
++{
++	size_t i;
++
++	for (i = 0; i < iopipe_regmap_rec_count; i++) {
++		if (strcmp(iopipe_regmap_recs[i].module, module) == 0)
++			return 1;
++	}
++	return 0;
++}
++
++/* True when the function body contains a MOVW whose immediate could be a
++ * CAM-window register address.  Walks the body with Thumb-2 lengths so the
++ * scan cannot decode the second half of a 32-bit instruction as a new one. */
++static int body_has_cam_movw(const struct iopipe_elf *elf,
++			     const struct iopipe_sym *sym)
++{
++	uint8_t buf[4096];
++	uint32_t len = sym->size;
++	uint32_t off = 0;
++	int ret;
++
++	if (len > sizeof(buf))
++		len = sizeof(buf);
++	ret = iopipe_elf_read_vaddr(elf, sym->entry, buf, len);
++	if (ret)
++		return 0;
++
++	while (off + 2 <= len) {
++		uint16_t hw1;
++
++		memcpy(&hw1, buf + off, sizeof(hw1));
++		if (iopipe_thumb_insn_len(hw1) == 4 && off + 4 <= len) {
++			uint32_t w;
++			uint32_t imm;
++
++			memcpy(&w, buf + off, sizeof(w));
++			if (!iopipe_thumb_movw(w, &imm) &&
++			    imm >= IOPIPE_CAM_ADDR_MIN &&
++			    imm < IOPIPE_CAM_ADDR_MAX)
++				return 1;
++			off += 4;
++		} else {
++			off += 2;
++		}
++	}
++	return 0;
++}
++
++/* Collect the apply() overloads per module: the profile-only form and the
++ * profile + isp_reg_t* form.  A module is only "proven" when one of its apply
++ * bodies carries a CAM-window register immediate. */
++#define MAX_UNPROVEN 64
++struct unproven_mod {
++	char module[32];
++	uint32_t entry;
++	uint32_t size;
++	int has_cam_movw;
++	int has_apply_profile;
++};
++
++static struct unproven_mod *find_mod(struct unproven_mod *mods, size_t *n,
++				     const char *module)
++{
++	size_t i;
++
++	for (i = 0; i < *n; i++) {
++		if (strcmp(mods[i].module, module) == 0)
++			return &mods[i];
++	}
++	if (*n >= MAX_UNPROVEN)
++		return NULL;
++	memset(&mods[*n], 0, sizeof(mods[*n]));
++	snprintf(mods[*n].module, sizeof(mods[*n].module), "%s", module);
++	(*n)++;
++	return &mods[*n - 1];
++}
++
++int iopipe_regmap_unproven(const struct iopipe_elf *elf, FILE *out)
++{
++	struct unproven_mod *mods;
++	size_t i, n = 0, seen = 0;
++	int ret = 0;
++
++	if (!elf || !out)
++		return -EINVAL;
++
++	mods = calloc(MAX_UNPROVEN, sizeof(*mods));
++	if (!mods)
++		return -ENOMEM;
++
++	for (i = 0; i < iopipe_elf_sym_count(elf); i++) {
++		struct iopipe_sym sym;
++		const char *cls, *p;
++		size_t cls_len;
++		char module[32];
++		struct unproven_mod *m;
++		int one_arg;
++
++		if (iopipe_elf_sym_at(elf, i, &sym))
++			continue;
++		if (sym.shndx == SHN_UNDEF || sym.type != STT_FUNC || !sym.size)
++			continue;
++		if (strncmp(sym.name, "_ZN13NSIspTuningv3", 18) != 0)
++			continue;
++		if (!strstr(sym.name,
++			    "5applyEN11NSIspTuning13EIspProfile_TE"))
++			continue;
++		/* Only the two apply() overloads; anything else that happens to
++		 * contain the prefix is not a manager entry point. */
++		{
++			size_t tail = strlen("EIspProfile_TE");
++			size_t len = strlen(sym.name);
++
++			one_arg = len >= tail &&
++				  strcmp(sym.name + len - tail,
++					 "EIspProfile_TE") == 0;
++		}
++		p = sym.name + 18;
++		{
++			unsigned long l = 0;
++
++			while (*p >= '0' && *p <= '9')
++				l = l * 10 + (unsigned long)(*p++ - '0');
++			if (l == 0 || l > 31 || strlen(p) < l)
++				continue;
++			cls = p;
++			cls_len = (size_t)l;
++		}
++		if (cls_len <= 8 || memcmp(cls, "ISP_MGR_", 8) != 0)
++			continue;
++		if (cls_len - 8 >= sizeof(module))
++			continue;
++		memcpy(module, cls + 8, cls_len - 8);
++		module[cls_len - 8] = '\0';
++		if (rec_has_module(module))
++			continue;
++
++		seen++;
++		m = find_mod(mods, &n, module);
++		if (!m)
++			continue;
++		if (!m->entry || sym.entry < m->entry) {
++			m->entry = sym.entry;
++			m->size = sym.size;
++		}
++		if (one_arg)
++			m->has_apply_profile = 1;
++		if (body_has_cam_movw(elf, &sym))
++			m->has_cam_movw = 1;
++	}
++
++	if (!seen) {
++		fprintf(out, "regmap: FAIL no ISP_MGR_*::apply(EIspProfile_T) symbols found\n");
++		free(mods);
++		return -ENOENT;
++	}
++
++	for (i = 0; i < n; i++) {
++		if (mods[i].has_cam_movw) {
++			fprintf(out,
++				"regmap: FAIL %-10s apply@0x%x contains a CAM-window MOVW but has no record\n",
++				mods[i].module, mods[i].entry);
++			ret = -EINVAL;
++		} else {
++			fprintf(out,
++				"regmap: none %-10s apply@0x%x size %u: no CAM-window register immediate in the body%s\n",
++				mods[i].module, mods[i].entry, mods[i].size,
++				mods[i].has_apply_profile ?
++					" (values go through apply(profile, isp_reg_t*) "
++					"from runtime (address,value) pairs)" : "");
++		}
++	}
++
++	free(mods);
++	return ret;
++}
++
++int iopipe_regmap_dump(const struct iopipe_elf *elf, FILE *out)
++{
++	size_t i;
++	int ret;
++
++	if (!elf || !out)
++		return -EINVAL;
++
++	ret = iopipe_regmap_verify(elf, out);
++	if (ret)
++		return ret;
++
++	fprintf(out, "\nmodule reg     name             bit form     apply symbol entry\n");
++	for (i = 0; i < iopipe_regmap_rec_count; i++) {
++		const struct iopipe_regmap_rec *r = &iopipe_regmap_recs[i];
++		struct iopipe_sym sym;
++		uint32_t reg = 0;
++
++		iopipe_thumb_movw(r->reg_insn_word, &reg);
++		if (iopipe_elf_sym_find(elf, r->symbol, false, false, &sym))
++			memset(&sym, 0, sizeof(sym));
++		fprintf(out, "%-6s 0x%04x  %-16s %3d %-8s %s@0x%x\n", r->module,
++			reg, iopipe_regmap_reg_label(reg), r->bit,
++			r->form == IOPIPE_RM_BFI ? "bfi" : "orr-imm", r->symbol,
++			sym.entry);
++	}
++
++	return iopipe_regmap_unproven(elf, out);
++}
+diff --git a/tools/mediatek/camera/iopipe/iopipe_regmap.h b/tools/mediatek/camera/iopipe/iopipe_regmap.h
+new file mode 100644
+index 000000000..6d293df50
+--- /dev/null
++++ b/tools/mediatek/camera/iopipe/iopipe_regmap.h
+@@ -0,0 +1,87 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Per-module TPIPE register programming recovered from libcam.hal3a.v3.so.
++ *
++ * The 3A library programs the ISP module-enable words directly: every
++ * ISP_MGR_<MOD>::apply(EIspProfile_T) materialises the CAM-window address of
++ * the enable word with a MOVW, reads the word through TuningMgr, inserts the
++ * module's enable bit (BFI for conditional modules, ORR-immediate for the
++ * always-on ones) and writes it back.  Each table entry below records the
++ * exact instruction addresses and 32-bit instruction words so the selftest
++ * can re-read them from the ELF and re-decode the register address and the
++ * bit position instead of trusting the table.
++ *
++ * A record only exists when all three facts are present in one function:
++ *
++ *   1. MOVW <Rd>, #0x40xx-0x4xxx  (the CAM-window register address, i.e.
++ *      0x15000000 + offset; the offset range matches the userspace ABI range
++ *      documented in drivers/media/platform/mediatek/isp/mtk-isp-regs.h:
++ *      MTK_ISP_CAM_ADDR_MIN/MAX = 0x4000/0x10000),
++ *   2. BFI <Rd>, <Rn>, #bit, #1 or ORR <Rd>, <Rn>, #(1 << bit) in the same
++ *      function, carrying the module enable bit,
++ *   3. a call to ISP_MGR_CTL_EN_P1 / _P1_D / _P2 getInstance, which proves
++ *      which manager owns that word.
++ *
++ * Modules whose apply() contains no such immediate are reported by
++ * iopipe_regmap_unproven(): their values are programmed through
++ * apply(EIspProfile_T, isp_reg_t *) from (address, value) pairs kept in the
++ * manager object at run time (see ISP_MGR_MFB/MIXER3 apply @0x6ce50/0x6d1a4:
++ * "for i in 0..count: isp_reg_t[addr[i]] = value[i]"), so no static register
++ * address exists in the ELF to recover.
++ */
++
++#ifndef IOPIPE_REGMAP_H
++#define IOPIPE_REGMAP_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++
++#include "iopipe_elf.h"
++
++enum iopipe_regmap_form {
++	IOPIPE_RM_BFI,		/* BFI <Rd>, <Rn>, #bit, #1 */
++	IOPIPE_RM_ORR_IMM,	/* ORR <Rd>, <Rn>, #(1 << bit) */
++};
++
++struct iopipe_regmap_rec {
++	const char *module;
++	const char *symbol;		/* mangled apply() the words live in */
++	uint32_t reg_insn_vaddr;	/* MOVW materialising the address */
++	uint32_t reg_insn_word;
++	uint32_t bit_insn_vaddr;	/* BFI/ORR setting the enable bit */
++	uint32_t bit_insn_word;
++	int bit;
++	enum iopipe_regmap_form form;
++	uint32_t owner_insn_vaddr;	/* call to the CTL_EN_* manager */
++	uint32_t owner_insn_word;
++	const char *owner_module;	/* "CTL_EN_P1" / "CTL_EN_P1_D" / "CTL_EN_P2" */
++};
++
++extern const struct iopipe_regmap_rec iopipe_regmap_recs[];
++extern const size_t iopipe_regmap_rec_count;
++
++/* "CAM_CTL_EN_P1", "CAM_CTL_EN_P1_D", "CAM_CTL_EN_P2" or "unknown". */
++const char *iopipe_regmap_reg_label(uint32_t reg);
++
++/* Decoders for the three instruction forms the table uses.  Each returns 0 on
++ * success and -EINVAL when the word is not that instruction. */
++int iopipe_thumb_movw(uint32_t word, uint32_t *imm16_out);
++int iopipe_thumb_bfi(uint32_t word, unsigned int *lsb_out,
++		     unsigned int *width_out);
++int iopipe_thumb_orr_imm(uint32_t word, uint32_t *imm_out);
++/* Thumb-2 instruction length from its first halfword: 2 or 4 bytes. */
++unsigned int iopipe_thumb_insn_len(uint16_t hw1);
++
++/* Human-readable dump of the recovered programming. */
++int iopipe_regmap_dump(const struct iopipe_elf *elf, FILE *out);
++
++/* Re-read and re-decode every record.  Prints one line per record and returns
++ * 0 only when all of them matched and all owners exist in the catalogue. */
++int iopipe_regmap_verify(const struct iopipe_elf *elf, FILE *out);
++
++/* Report every ISP_MGR_*::apply(EIspProfile_T) that has no record, with the
++ * machine-checked reason.  Returns 0 when the accounting is complete. */
++int iopipe_regmap_unproven(const struct iopipe_elf *elf, FILE *out);
++
++#endif /* IOPIPE_REGMAP_H */
+diff --git a/tools/mediatek/camera/iopipe/iopipe_selftest.c b/tools/mediatek/camera/iopipe/iopipe_selftest.c
+new file mode 100644
+index 000000000..59af84a28
+--- /dev/null
++++ b/tools/mediatek/camera/iopipe/iopipe_selftest.c
+@@ -0,0 +1,284 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * iopipe selftest.
++ *
++ * Runs against the real vendor libraries in the library directory and fails
++ * when anything the tool claims stops being true:
++ *
++ *   - every port/path table: symbol type, st_size, PT_LOAD containment,
++ *     record count from the proved divisor, and the content invariant that
++ *     proves that divisor;
++ *   - every ISP_MGR_* record: the MOVW/BFI/ORR words are re-read from the ELF
++ *     and re-decoded (register address, bit position, owner call site);
++ *   - the manager catalogue: a fixed set of (module, NVRAM type) pairs;
++ *   - the CQ0C builder: known-answer tests plus every rejection path;
++ *   - the tuning allow-list: presence, size, section and the .bss/runtime
++ *     distinction;
++ *   - the ELF reader: not-mapped, not-found and no-file-bytes paths.
++ */
++
++#include <errno.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "iopipe_cq.h"
++#include "iopipe_elf.h"
++#include "iopipe_mgr.h"
++#include "iopipe_portmap.h"
++#include "iopipe_regmap.h"
++#include "iopipe_tuning.h"
++
++#define IOPIPE_HAL3A	"libcam.hal3a.v3.so"
++#define IOPIPE_IOPIPE	"libcam.iopipe.so"
++#define IOPIPE_CUSTOM	"libcameracustom.so"
++
++extern int iopipe_selftest(const char *libdir, FILE *out);
++
++static unsigned int failures;
++
++static void check(FILE *out, int cond, const char *what)
++{
++	if (cond) {
++		fprintf(out, "selftest: ok   %s\n", what);
++	} else {
++		fprintf(out, "selftest: FAIL %s\n", what);
++		failures++;
++	}
++}
++
++static int test_elf_basics(struct iopipe_libset *libs, FILE *out)
++{
++	const struct iopipe_elf *iop, *custom;
++	struct iopipe_sym sym;
++	uint32_t buf[4];
++	int err = 0;
++
++	iop = iopipe_libset_get(libs, IOPIPE_IOPIPE, &err);
++	if (!iop) {
++		fprintf(out, "selftest: FAIL %s open (%d)\n", IOPIPE_IOPIPE, err);
++		failures++;
++		return err;
++	}
++	custom = iopipe_libset_get(libs, IOPIPE_CUSTOM, &err);
++	if (!custom) {
++		fprintf(out, "selftest: FAIL %s open (%d)\n", IOPIPE_CUSTOM, err);
++		failures++;
++		return err;
++	}
++
++	check(out, iopipe_elf_sym_find(iop, "mSwHwPathMapping", false, false,
++				      &sym) == 0 &&
++			   sym.type == STT_OBJECT && sym.size == 860,
++	      "ELF: mSwHwPathMapping is an OBJECT of 860 bytes");
++	check(out, iopipe_elf_sym_find(iop, "no.such.symbol", false, false,
++				      &sym) == -ENOENT,
++	      "ELF: unknown symbol reports -ENOENT");
++	check(out, iopipe_elf_read_vaddr(iop, 0x10000000, buf, sizeof(buf)) ==
++			   -ENOENT,
++	      "ELF: unmapped virtual address reports -ENOENT");
++	check(out, iopipe_elf_read_vaddr(iop, 0x30590, buf, sizeof(buf)) ==
++			   -ENODATA,
++	      "ELF: .bss has no file bytes (-ENODATA)");
++
++	/* g_lsc_param lives in .bss of libcameracustom.so. */
++	check(out, iopipe_elf_sym_find(custom, "g_lsc_param", false, false,
++				      &sym) == 0 &&
++			   iopipe_elf_read_vaddr(custom, sym.value, buf,
++						 sizeof(buf)) == -ENODATA,
++	      "ELF: runtime .bss object reports -ENODATA");
++	check(out, iopipe_elf_section_of(iop, 0x3000c, NULL, NULL) > 0,
++	      "ELF: .data virtual address resolves to a section");
++	return 0;
++}
++
++static int run_portmap(struct iopipe_libset *libs, FILE *out)
++{
++	const struct iopipe_elf *elf;
++	int err = 0;
++
++	elf = iopipe_libset_get(libs, IOPIPE_IOPIPE, &err);
++	if (!elf) {
++		fprintf(out, "selftest: FAIL %s open (%d)\n", IOPIPE_IOPIPE, err);
++		failures++;
++		return err;
++	}
++	check(out, iopipe_pm_check_all(elf, out) == 0,
++	      "portmap: all six tables verified");
++	check(out, iopipe_pm_table_count == 6,
++	      "portmap: six tables are catalogued");
++	return 0;
++}
++
++static int run_mgr(struct iopipe_libset *libs, FILE *out)
++{
++	const struct iopipe_elf *elf;
++	unsigned int modules;
++	int err = 0;
++
++	elf = iopipe_libset_get(libs, IOPIPE_HAL3A, &err);
++	if (!elf) {
++		fprintf(out, "selftest: FAIL %s open (%d)\n", IOPIPE_HAL3A, err);
++		failures++;
++		return err;
++	}
++	modules = iopipe_mgr_module_count(elf);
++	check(out, modules >= 15, "mgr: at least 15 module tokens found");
++	check(out, iopipe_mgr_expect(elf, "BNR", "ISP_NVRAM_BPC_T") == 0,
++	      "mgr: BNR::put(ISP_NVRAM_BPC_T)");
++	check(out, iopipe_mgr_expect(elf, "BNR", "ISP_NVRAM_BPC_RMM_T") == 0,
++	      "mgr: BNR::get(ISP_NVRAM_BPC_RMM_T)");
++	check(out, iopipe_mgr_expect(elf, "BNR", "ISP_NVRAM_NR1_T") == 0,
++	      "mgr: BNR::put(ISP_NVRAM_NR1_T)");
++	check(out, iopipe_mgr_expect(elf, "NBC", "ISP_NVRAM_ANR_T") == 0,
++	      "mgr: NBC::put(ISP_NVRAM_ANR_T)");
++	check(out, iopipe_mgr_expect(elf, "NBC", "ISP_NVRAM_CCR_T") == 0,
++	      "mgr: NBC::put(ISP_NVRAM_CCR_T)");
++	check(out, iopipe_mgr_expect(elf, "LSC", "ISP_NVRAM_LSC_T") == 0,
++	      "mgr: LSC::put(ISP_NVRAM_LSC_T)");
++	check(out, iopipe_mgr_expect(elf, "GGM", "ISP_NVRAM_GGM_T") == 0,
++	      "mgr: GGM::put(ISP_NVRAM_GGM_T)");
++	check(out, iopipe_mgr_expect(elf, "MIXER3", "ISP_NVRAM_MIXER3_T") == 0,
++	      "mgr: MIXER3::put(ISP_NVRAM_MIXER3_T)");
++	check(out, iopipe_mgr_expect(elf, "CTL_EN_P1", NULL) == 0,
++	      "mgr: CTL_EN_P1 has manager symbols");
++	check(out, iopipe_mgr_expect(elf, "CTL_EN_P1", "ISP_NVRAM_ANR_T") ==
++			   -ENOENT,
++	      "mgr: wrong NVRAM type is rejected");
++	return 0;
++}
++
++static int run_regmap(struct iopipe_libset *libs, FILE *out)
++{
++	const struct iopipe_elf *elf;
++	const struct iopipe_regmap_rec *r = &iopipe_regmap_recs[0];
++	uint32_t imm = 0;
++	unsigned int lsb = 0, width = 0;
++	int err = 0;
++
++	elf = iopipe_libset_get(libs, IOPIPE_HAL3A, &err);
++	if (!elf) {
++		fprintf(out, "selftest: FAIL %s open (%d)\n", IOPIPE_HAL3A, err);
++		failures++;
++		return err;
++	}
++	check(out, iopipe_regmap_verify(elf, out) == 0,
++	      "regmap: every instruction word re-read and re-decoded");
++	check(out, iopipe_regmap_unproven(elf, out) == 0,
++	      "regmap: no uncatalogued module carries a register immediate");
++	check(out, iopipe_regmap_rec_count >= 19,
++	      "regmap: at least 19 records catalogued");
++
++	/* Decoder KATs on the recorded words. */
++	check(out, iopipe_thumb_movw(r->reg_insn_word, &imm) == 0 && imm == 0x4004,
++	      "regmap: MOVW decoder gives 0x4004 for 0x0904f244");
++	check(out, iopipe_thumb_bfi(0x1245f36au, &lsb, &width) == 0 &&
++			   lsb == 5 && width == 1,
++	      "regmap: BFI decoder gives #5,#1 for 0x1245f36a");
++	check(out, iopipe_thumb_orr_imm(0x0108f040u, &imm) == 0 && imm == 0x8,
++	      "regmap: ORR decoder gives 0x8 for 0x0108f040");
++	check(out, iopipe_thumb_movw(0x1245f36au, &imm) == -EINVAL,
++	      "regmap: MOVW decoder rejects a BFI");
++	check(out, iopipe_thumb_bfi(0x0904f244u, &lsb, &width) == -EINVAL,
++	      "regmap: BFI decoder rejects a MOVW");
++	check(out, iopipe_thumb_insn_len(0xf244) == 4 &&
++			   iopipe_thumb_insn_len(0x2200) == 2,
++	      "regmap: Thumb-2 instruction lengths");
++	return 0;
++}
++
++static int run_cq(FILE *out)
++{
++	struct iopipe_cq_cmd cmd[4];
++	struct iopipe_cq_write w[2];
++	int n;
++
++	fprintf(out, "--- cq0c\n");
++	w[0].reg = IOPIPE_CQ_INST_IMGO_BASE;
++	w[0].operand_pa = 0x12345000u;
++	w[1].reg = IOPIPE_CQ_INST_RRZO_BASE;
++	w[1].operand_pa = 0x12346000u;
++
++	n = iopipe_cq_build(cmd, 4, w, 2);
++	check(out, n == 3, "cq: two writes build three commands (incl. end)");
++	check(out, n == 3 && cmd[0].inst == 0x7300 &&
++			   cmd[0].data_ptr_pa == 0x12345000u,
++	      "cq: IMGO base command matches the libcamdrv encoding");
++	check(out, n == 3 && cmd[1].inst == 0x7320 &&
++			   cmd[1].data_ptr_pa == 0x12346000u,
++	      "cq: RRZO base command matches the libcamdrv encoding");
++	check(out, n == 3 && cmd[2].inst == IOPIPE_CQ_INST_END &&
++			   cmd[2].data_ptr_pa == 0,
++	      "cq: end marker is 0xfc000000/0");
++	check(out, IOPIPE_CQ_INST_IMGO_BASE == 0x7300 &&
++			   IOPIPE_CQ_INST_RRZO_BASE == 0x7320 &&
++			   IOPIPE_CQ_INST_IMGO_D_BASE == 0x74d4 &&
++			   IOPIPE_CQ_INST_RRZO_D_BASE == 0x74f4 &&
++			   IOPIPE_CQ_INST_NEXT_CQ0C == 0x40b4 &&
++			   IOPIPE_CQ_INST_NEXT_CQ0C2 == 0x40cc &&
++			   IOPIPE_CQ_INST_TABLE_END == 0x4184,
++	      "cq: recovered instruction words are unchanged");
++	check(out, iopipe_cq_reg_valid(IOPIPE_CQ_INST_IMGO_BASE) &&
++			   iopipe_cq_reg_valid(IOPIPE_CQ_INST_TABLE_END) &&
++			   !iopipe_cq_reg_valid(IOPIPE_CQ_INST_END) &&
++			   !iopipe_cq_reg_valid(0x3fffu) &&
++			   !iopipe_cq_reg_valid(0x10000u),
++	      "cq: register window is [0x4000,0x10000)");
++	check(out, iopipe_cq_build(cmd, 2, w, 2) == -ENOSPC,
++	      "cq: ENOSPC when the output array cannot hold the end marker");
++	check(out, iopipe_cq_build(cmd, 4, w, 0) == -EINVAL,
++	      "cq: EINVAL for an empty write list");
++	w[0].reg = 0x3fffu;
++	check(out, iopipe_cq_build(cmd, 4, w, 1) == -EINVAL,
++	      "cq: EINVAL for a register below the CAM window");
++	w[0].reg = IOPIPE_CQ_INST_IMGO_BASE;
++	w[0].operand_pa = 0x12345002u;
++	check(out, iopipe_cq_build(cmd, 4, w, 1) == -EINVAL,
++	      "cq: EINVAL for a misaligned operand address");
++	w[0].operand_pa = 0;
++	check(out, iopipe_cq_build(cmd, 4, w, 1) == -EINVAL,
++	      "cq: EINVAL for a null operand address");
++	return 0;
++}
++
++static int run_tuning(struct iopipe_libset *libs, FILE *out)
++{
++	fprintf(out, "--- tuning\n");
++	check(out, iopipe_tuning_verify(libs, out) == 0,
++	      "tuning: allow-list symbols, sizes and sections verified");
++	check(out, iopipe_tuning_accessors(libs, IOPIPE_CUSTOM, out) == 0,
++	      "tuning: per-sensor default generators are functions, not blobs");
++	return 0;
++}
++
++int iopipe_selftest(const char *libdir, FILE *out)
++{
++	struct iopipe_libset libs;
++	int ret;
++
++	if (!libdir || !out)
++		return -EINVAL;
++
++	failures = 0;
++	ret = iopipe_libset_init(&libs, libdir);
++	if (ret) {
++		fprintf(out, "selftest: FAIL libdir: %d\n", ret);
++		return ret;
++	}
++
++	test_elf_basics(&libs, out);
++	run_portmap(&libs, out);
++	run_mgr(&libs, out);
++	run_regmap(&libs, out);
++	run_cq(out);
++	run_tuning(&libs, out);
++
++	iopipe_libset_free(&libs);
++
++	if (failures) {
++		fprintf(out, "selftest: %u check(s) FAILED\n", failures);
++		return -EINVAL;
++	}
++	fprintf(out, "selftest: all checks passed\n");
++	return 0;
++}
+diff --git a/tools/mediatek/camera/iopipe/iopipe_tuning.c b/tools/mediatek/camera/iopipe/iopipe_tuning.c
+new file mode 100644
+index 000000000..724f4f9d2
+--- /dev/null
++++ b/tools/mediatek/camera/iopipe/iopipe_tuning.c
+@@ -0,0 +1,316 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Static tuning/calibration data in libcameracustom.so, lib3a.so and
++ * libcamalgo.so.  Every entry names its citation; nothing is filled in from
++ * "typical MTK" knowledge.
++ *
++ * The lens-shading and 3A table layouts below are the ones documented (with
++ * the libcameracustom.so disassembly addresses) in
++ * $M/logs/rem-camera-otp.md sections 3.3 and 3.4.  Where no layout is cited
++ * the bytes are printed as annotated hex, not decoded.
++ */
++
++#include <errno.h>
++#include <inttypes.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "iopipe_tuning.h"
++
++enum td_kind {
++	TD_RAW,		/* annotated hex only */
++	TD_SHADING_ATN,	/* 21 x 6 s32, word 5 is the 1e6 normaliser */
++	TD_S32_ARRAY,	/* array of s32, index/value listing */
++	TD_U32_ARRAY,	/* array of u32, index/value listing */
++	TD_RUNTIME,	/* .bss: no file bytes, runtime state only */
++};
++
++struct td_entry {
++	const char *lib;
++	const char *sym;
++	uint32_t size;		/* expected st_size */
++	enum td_kind kind;
++	const char *note;
++};
++
++static const struct td_entry td_entries[] = {
++	{ "libcameracustom.so", "ShadingATNTable", 0x1f8, TD_SHADING_ATN,
++	  "rem-camera-otp.md s3.3: 21 x 6 s32, v[0..4]/v[5], v[5] = 1e6" },
++	{ "libcameracustom.so", "LomoFilterG2C", 160, TD_RAW,
++	  "no layout cited; annotated hex" },
++	{ "libcameracustom.so", "LomoFilterG2CDefault", 20, TD_RAW,
++	  "no layout cited; annotated hex" },
++	{ "libcameracustom.so", "LomoFilterGGM", 11520, TD_RAW,
++	  "no layout cited; annotated hex (GGM 12-bit LUT blob)" },
++	{ "libcameracustom.so", "LomoFilterGGMJni", 11520, TD_RAW,
++	  "no layout cited; annotated hex" },
++	{ "libcameracustom.so", "SensorList", 168, TD_RAW,
++	  "no layout cited; annotated hex (sensor descriptor list)" },
++	{ "libcameracustom.so", "channel_lsc_data", 910, TD_RUNTIME,
++	  ".bss: per-sensor LSC NVRAM at run time" },
++	{ "libcameracustom.so", "channel_lsc_data_2800k", 910, TD_RUNTIME,
++	  ".bss: per-sensor LSC NVRAM at run time" },
++	{ "libcameracustom.so", "channel_lsc_data_4100k", 910, TD_RUNTIME,
++	  ".bss: per-sensor LSC NVRAM at run time" },
++	{ "libcameracustom.so", "g_lsc_param", 100, TD_RUNTIME,
++	  ".bss: LSC conversion parameters at run time" },
++	{ "libcameracustom.so", "g_rLSCCaliINIParam", 64, TD_RUNTIME,
++	  ".bss: LSC calibration init parameters at run time" },
++	{ "lib3a.so", "_ZN7AwbAlgo14m_i4AWBLogLUT1E", 1024, TD_S32_ARRAY,
++	  "rem-camera-otp.md s3.4: 256 s32 log2 LUT, entry[255] = 2047" },
++	{ "lib3a.so", "_ZN7AwbAlgo14m_i4AWBLogLUT2E", 8192, TD_S32_ARRAY,
++	  "rem-camera-otp.md s3.4: 2048 s32 log2 LUT, entry[512] = 0" },
++	{ "libcamalgo.so", "_ZN7GmaCore15m_i4DefGmaBase0E", 580, TD_U32_ARRAY,
++	  "rem-camera-otp.md s3.4: 145 packed u32 GMA base" },
++	{ "libcamalgo.so", "g_lsc_param", 104, TD_RUNTIME,
++	  ".bss: runtime LSC parameters" },
++};
++
++static const size_t td_count = sizeof(td_entries) / sizeof(td_entries[0]);
++
++static int read_body(const struct iopipe_elf *elf, uint32_t vaddr,
++		     uint32_t size, uint8_t **out)
++{
++	uint8_t *buf;
++	int ret;
++
++	buf = malloc(size ? size : 1);
++	if (!buf)
++		return -ENOMEM;
++	ret = iopipe_elf_read_vaddr(elf, vaddr, buf, size);
++	if (ret) {
++		free(buf);
++		return ret;
++	}
++	*out = buf;
++	return 0;
++}
++
++static void dump_raw(const uint8_t *buf, uint32_t size, FILE *out)
++{
++	uint32_t i;
++
++	fprintf(out, "  words    %u\n", size / 4);
++	for (i = 0; i + 4 <= size && i < 64; i += 4) {
++		uint32_t w;
++
++		memcpy(&w, buf + i, sizeof(w));
++		fprintf(out, "  [%02u]     0x%08" PRIx32 "\n", i / 4, w);
++	}
++	if (size > 64)
++		fprintf(out, "  ...      %u more bytes (use --dump to slice)\n",
++			size - 64);
++}
++
++static void dump_shading_atn(const uint8_t *buf, uint32_t size, FILE *out)
++{
++	uint32_t n = size / 4;
++	uint32_t r, f;
++
++	fprintf(out, "  layout   21 x 6 s32\n");
++	if (n < 126) {
++		fprintf(out, "  ERROR    size %u holds only %u words\n", size, n);
++		return;
++	}
++	for (r = 0; r < 21; r++) {
++		int32_t v[6];
++		double norm;
++
++		for (f = 0; f < 6; f++)
++			memcpy(&v[f], buf + (r * 6 + f) * 4, sizeof(v[f]));
++		norm = v[5] ? (double)v[5] : 0.0;
++		fprintf(out, "   atn[%2u] %8" PRId32 " %8" PRId32 " %8" PRId32
++			     " %8" PRId32 " %8" PRId32 " %8" PRId32,
++			r, v[0], v[1], v[2], v[3], v[4], v[5]);
++		if (norm != 0.0)
++			fprintf(out, "  ratio %.6f %.6f %.6f %.6f %.6f",
++				v[0] / norm, v[1] / norm, v[2] / norm,
++				v[3] / norm, v[4] / norm);
++		fprintf(out, "\n");
++	}
++}
++
++static void dump_array(const uint8_t *buf, uint32_t size, FILE *out,
++		       int is_signed)
++{
++	uint32_t n = size / 4, i;
++
++	fprintf(out, "  count    %u\n", n);
++	for (i = 0; i < n && i < 8; i++) {
++		if (is_signed) {
++			int32_t v;
++
++			memcpy(&v, buf + i * 4, sizeof(v));
++			fprintf(out, "  [%4u]   %" PRId32 "\n", i, v);
++		} else {
++			uint32_t v;
++
++			memcpy(&v, buf + i * 4, sizeof(v));
++			fprintf(out, "  [%4u]   0x%08" PRIx32 "\n", i, v);
++		}
++	}
++	if (n > 8)
++		fprintf(out, "  ...      %u more entries, monotonic\n", n - 8);
++}
++
++int iopipe_tuning_dump(struct iopipe_libset *libs, FILE *out)
++{
++	size_t i;
++	int ret = 0;
++
++	if (!libs || !out)
++		return -EINVAL;
++
++	for (i = 0; i < td_count; i++) {
++		const struct td_entry *e = &td_entries[i];
++		const struct iopipe_elf *elf;
++		struct iopipe_sym sym;
++		const char *sec = "";
++		uint8_t *buf = NULL;
++		int err = 0, rc;
++
++		elf = iopipe_libset_get(libs, e->lib, &err);
++		if (!elf) {
++			fprintf(out, "%s: %s: cannot open (%d)\n", e->lib, e->sym,
++				err);
++			ret = err;
++			continue;
++		}
++		rc = iopipe_elf_sym_find(elf, e->sym, false, false, &sym);
++		if (rc) {
++			fprintf(out, "%s: %s: symbol not found\n", e->lib, e->sym);
++			ret = rc;
++			continue;
++		}
++		if (sym.size != e->size) {
++			fprintf(out, "%s: %s: st_size %u, expected %u\n", e->lib,
++				e->sym, sym.size, e->size);
++			ret = -ERANGE;
++			continue;
++		}
++		iopipe_elf_section_of(elf, sym.value, &sec, NULL);
++		fprintf(out, "%s:%s\n", e->lib, e->sym);
++		fprintf(out, "  vaddr    0x%08x\n", sym.value);
++		fprintf(out, "  size     %u\n", sym.size);
++		fprintf(out, "  section  %s\n", sec);
++		fprintf(out, "  note     %s\n", e->note);
++
++		rc = read_body(elf, sym.value, sym.size, &buf);
++		if (rc == -ENODATA) {
++			fprintf(out, "  decode   runtime only: no file bytes in %s"
++				     " (allocated by the library)\n", sec);
++			continue;
++		}
++		if (rc) {
++			fprintf(out, "  decode   read failed (%d)\n", rc);
++			ret = rc;
++			continue;
++		}
++		switch (e->kind) {
++		case TD_SHADING_ATN:
++			dump_shading_atn(buf, sym.size, out);
++			break;
++		case TD_S32_ARRAY:
++			dump_array(buf, sym.size, out, 1);
++			break;
++		case TD_U32_ARRAY:
++			dump_array(buf, sym.size, out, 0);
++			break;
++		case TD_RAW:
++		case TD_RUNTIME:
++		default:
++			dump_raw(buf, sym.size, out);
++			break;
++		}
++		free(buf);
++	}
++
++	return ret;
++}
++
++int iopipe_tuning_verify(struct iopipe_libset *libs, FILE *out)
++{
++	size_t i;
++	int ret = 0;
++
++	if (!libs || !out)
++		return -EINVAL;
++
++	for (i = 0; i < td_count; i++) {
++		const struct td_entry *e = &td_entries[i];
++		const struct iopipe_elf *elf;
++		struct iopipe_sym sym;
++		const char *sec = "";
++		int err = 0, rc;
++
++		elf = iopipe_libset_get(libs, e->lib, &err);
++		if (!elf) {
++			fprintf(out, "tuning: FAIL %s:%s: cannot open (%d)\n",
++				e->lib, e->sym, err);
++			ret = err;
++			continue;
++		}
++		rc = iopipe_elf_sym_find(elf, e->sym, false, true, &sym);
++		if (rc) {
++			fprintf(out, "tuning: FAIL %s:%s: symbol not found\n",
++				e->lib, e->sym);
++			ret = rc;
++			continue;
++		}
++		if (sym.size != e->size) {
++			fprintf(out, "tuning: FAIL %s:%s: st_size %u != %u\n",
++				e->lib, e->sym, sym.size, e->size);
++			ret = -ERANGE;
++			continue;
++		}
++		iopipe_elf_section_of(elf, sym.value, &sec, NULL);
++		fprintf(out,
++			"tuning: ok   %s:%-40s @0x%08x size %-6u %-6s %s\n",
++			e->lib, e->sym, sym.value, sym.size, sec,
++			e->kind == TD_RUNTIME ? "runtime (.bss, no bytes)" :
++							"file-backed");
++	}
++
++	return ret;
++}
++
++int iopipe_tuning_accessors(struct iopipe_libset *libs, const char *libname,
++			    FILE *out)
++{
++	const struct iopipe_elf *elf;
++	size_t i, found = 0;
++	int err = 0;
++
++	if (!libs || !libname || !out)
++		return -EINVAL;
++
++	elf = iopipe_libset_get(libs, libname, &err);
++	if (!elf) {
++		fprintf(out, "tuning: %s: cannot open (%d)\n", libname, err);
++		return err;
++	}
++
++	fprintf(out,
++		"per-sensor ISP NVRAM default generators in %s (no static blob):\n",
++		libname);
++	for (i = 0; i < iopipe_elf_sym_count(elf); i++) {
++		struct iopipe_sym sym;
++
++		if (iopipe_elf_sym_at(elf, i, &sym))
++			continue;
++		if (sym.shndx == SHN_UNDEF || sym.type != STT_FUNC || !sym.size)
++			continue;
++		if (!strstr(sym.name, "RAWSensorInfoILj"))
++			continue;
++		if (!strstr(sym.name, "17impGetDefaultData"))
++			continue;
++		fprintf(out, "  %s @0x%x size %u\n", sym.name, sym.entry,
++			sym.size);
++		found++;
++	}
++	if (!found) {
++		fprintf(out, "  none found\n");
++		return -ENOENT;
++	}
++	return 0;
++}
+diff --git a/tools/mediatek/camera/iopipe/iopipe_tuning.h b/tools/mediatek/camera/iopipe/iopipe_tuning.h
+new file mode 100644
+index 000000000..8b0823d70
+--- /dev/null
++++ b/tools/mediatek/camera/iopipe/iopipe_tuning.h
+@@ -0,0 +1,43 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Tuning / calibration data actually carried as static bytes by the MT6735
++ * camera libraries.
++ *
++ * Only symbols on a cited allow-list are read, each with an expected st_size
++ * that is re-checked against the ELF.  The allow-list exists because the same
++ * libraries also export large .bss objects that hold per-sensor NVRAM data at
++ * run time: those have no file bytes at all, and the tool reports them as
++ * runtime-only instead of inventing contents.
++ *
++ * Per-sensor ISP NVRAM defaults are NOT static blobs in libcameracustom.so:
++ * they are produced by per-sensor accessor functions.  The library exports
++ *
++ *   _ZNK9NSFeature13RAWSensorInfoILj537EE17impGetDefaultDataE21CAMERA_DATA_TYPE_ENUMPvj
++ *   _ZNK9NSFeature13RAWSensorInfoILj24112EE17impGetDefaultDataE21CAMERA_DATA_TYPE_ENUMPvj
++ *
++ * each 208 bytes (i.e. a generator, not a 0x28000-byte ISP NVRAM image), and
++ * the earlier lens-shading study found the same shape in GetCameraDefaultPara
++ * ($M/logs/rem-camera-otp.md section 3.3).  iopipe_tuning_accessors() lists
++ * those generator symbols and their sizes so the claim is checkable rather
++ * than asserted.
++ */
++
++#ifndef IOPIPE_TUNING_H
++#define IOPIPE_TUNING_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++
++#include "iopipe_elf.h"
++
++/* Print every allow-listed symbol with its decode.  returns 0 or -errno. */
++int iopipe_tuning_dump(struct iopipe_libset *libs, FILE *out);
++/* Verify symbol presence, size, section and decode preconditions. */
++int iopipe_tuning_verify(struct iopipe_libset *libs, FILE *out);
++/* List the per-sensor default-data generator functions. */
++int iopipe_tuning_accessors(struct iopipe_libset *libs, const char *libname,
++			    FILE *out);
++
++#endif /* IOPIPE_TUNING_H */
+diff --git a/tools/mediatek/camera/iopipe/main.c b/tools/mediatek/camera/iopipe/main.c
+new file mode 100644
+index 000000000..64b821924
+--- /dev/null
++++ b/tools/mediatek/camera/iopipe/main.c
+@@ -0,0 +1,282 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * iopipe - decode MT6735 camera pipe/tuning data out of the vendor libraries.
++ *
++ * Commands:
++ *   portmap   the six NSCam::NSIoPipe port/path tables of libcam.iopipe.so
++ *   modules   the ISP_MGR_* catalogue of libcam.hal3a.v3.so (text/CSV/JSON)
++ *   regmap    the per-module TPIPE/P1/P1_D/P2 enable-word programming
++ *   cq        build CQ0C command words for a caller-supplied write list
++ *   tuning    the static tuning tables of libcameracustom/lib3a/libcamalgo
++ *   selftest  verify everything above against the shipped ELF files
++ *
++ * The library directory comes from --lib-dir, then $IOPIPE_LIBDIR, then the
++ * build-time default (IOPIPE_DEFAULT_LIBDIR, set by the Makefile).
++ *
++ * Exit status: 0 success, 1 failure, 2 usage.
++ */
++
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "iopipe_cq.h"
++#include "iopipe_elf.h"
++#include "iopipe_mgr.h"
++#include "iopipe_portmap.h"
++#include "iopipe_regmap.h"
++#include "iopipe_tuning.h"
++
++#ifndef IOPIPE_DEFAULT_LIBDIR
++#define IOPIPE_DEFAULT_LIBDIR "/usr/share/mtk-camera"
++#endif
++
++#define IOPIPE_HAL3A	"libcam.hal3a.v3.so"
++#define IOPIPE_IOPIPE	"libcam.iopipe.so"
++#define IOPIPE_CUSTOM	"libcameracustom.so"
++
++extern int iopipe_selftest(const char *libdir, FILE *out);
++
++static void usage(FILE *out)
++{
++	fprintf(out,
++		"usage: iopipe <command> [options]\n"
++		"\n"
++		"commands:\n"
++		"  portmap   [--table NAME]        port/path maps of %s\n"
++		"  modules   [--csv|--json]        ISP_MGR_* catalogue of %s\n"
++		"  regmap                          per-module enable-word programming\n"
++		"  cq        --write REG:PA ...    build CQ0C command words\n"
++		"  tuning    [--accessors]         static tuning tables\n"
++		"  selftest                        verify against the ELF files\n"
++		"\n"
++		"options:\n"
++		"  --lib-dir DIR   vendor library directory (else $IOPIPE_LIBDIR,\n"
++		"                  else %s)\n"
++		"  --table NAME    only this port map table\n"
++		"  --write R:P     register address (0x15000000 relative) and the\n"
++		"                  physical address of its 32-bit operand; repeatable\n"
++		"  --accessors     list the per-sensor default-data generators\n"
++		"  -h, --help\n",
++		IOPIPE_IOPIPE, IOPIPE_HAL3A, IOPIPE_DEFAULT_LIBDIR);
++}
++
++static int parse_u32(const char *s, uint32_t *out)
++{
++	char *end = NULL;
++	unsigned long v;
++
++	if (!s || !*s)
++		return -EINVAL;
++	v = strtoul(s, &end, 0);
++	if (!end || *end || v > 0xfffffffful)
++		return -EINVAL;
++	*out = (uint32_t)v;
++	return 0;
++}
++
++static int cmd_portmap(struct iopipe_libset *libs, const char *table, FILE *out)
++{
++	const struct iopipe_elf *elf;
++	size_t i;
++	int err = 0, ret = 0;
++
++	elf = iopipe_libset_get(libs, IOPIPE_IOPIPE, &err);
++	if (!elf) {
++		fprintf(stderr, "iopipe: cannot open %s in %s (%s)\n",
++			IOPIPE_IOPIPE, libs->dir, strerror(-err));
++		return 1;
++	}
++
++	if (table) {
++		const struct iopipe_pm_table *t = iopipe_pm_by_name(table);
++
++		if (!t) {
++			fprintf(stderr, "iopipe: unknown table %s\n", table);
++			return 2;
++		}
++		return iopipe_pm_dump(elf, t, out) ? 1 : 0;
++	}
++
++	for (i = 0; i < iopipe_pm_table_count; i++) {
++		if (i)
++			fprintf(out, "\n");
++		if (iopipe_pm_dump(elf, &iopipe_pm_tables[i], out))
++			ret = 1;
++	}
++	return ret;
++}
++
++static int cmd_modules(struct iopipe_libset *libs, enum iopipe_mgr_fmt fmt,
++		       FILE *out)
++{
++	const struct iopipe_elf *elf;
++	int err = 0, ret;
++
++	elf = iopipe_libset_get(libs, IOPIPE_HAL3A, &err);
++	if (!elf) {
++		fprintf(stderr, "iopipe: cannot open %s in %s (%s)\n",
++			IOPIPE_HAL3A, libs->dir, strerror(-err));
++		return 1;
++	}
++	ret = iopipe_mgr_dump(elf, fmt, out);
++	if (ret) {
++		fprintf(stderr, "iopipe: modules failed (%s)\n", strerror(-ret));
++		return 1;
++	}
++	return 0;
++}
++
++static int cmd_regmap(struct iopipe_libset *libs, FILE *out)
++{
++	const struct iopipe_elf *elf;
++	int err = 0;
++
++	elf = iopipe_libset_get(libs, IOPIPE_HAL3A, &err);
++	if (!elf) {
++		fprintf(stderr, "iopipe: cannot open %s in %s (%s)\n",
++			IOPIPE_HAL3A, libs->dir, strerror(-err));
++		return 1;
++	}
++	return iopipe_regmap_dump(elf, out) ? 1 : 0;
++}
++
++static int cmd_cq(const struct iopipe_cq_write *w, size_t n, FILE *out)
++{
++	struct iopipe_cq_cmd cmd[64];
++	int got;
++
++	if (!n) {
++		fprintf(stderr, "iopipe: cq needs at least one --write REG:PA\n");
++		return 2;
++	}
++	got = iopipe_cq_build(cmd, sizeof(cmd) / sizeof(cmd[0]), w, n);
++	if (got < 0) {
++		fprintf(stderr, "iopipe: cq build failed: %s\n", strerror(-got));
++		return 1;
++	}
++	iopipe_cq_dump(cmd, (size_t)got, out);
++	return 0;
++}
++
++static int cmd_tuning(struct iopipe_libset *libs, bool accessors, FILE *out)
++{
++	if (accessors)
++		return iopipe_tuning_accessors(libs, IOPIPE_CUSTOM, out) ? 1 : 0;
++	return iopipe_tuning_dump(libs, out);
++}
++
++int main(int argc, char **argv)
++{
++	struct iopipe_libset libs;
++	struct iopipe_cq_write writes[64];
++	size_t nwrites = 0;
++	const char *libdir = NULL;
++	const char *cmd = NULL;
++	const char *table = NULL;
++	enum iopipe_mgr_fmt fmt = IOPIPE_MGR_TEXT;
++	bool accessors = false;
++	int i, ret;
++
++	for (i = 1; i < argc; i++) {
++		const char *a = argv[i];
++
++		if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
++			usage(stdout);
++			return 0;
++		} else if (!strcmp(a, "--lib-dir")) {
++			if (++i >= argc) {
++				usage(stderr);
++				return 2;
++			}
++			libdir = argv[i];
++		} else if (!strcmp(a, "--csv")) {
++			fmt = IOPIPE_MGR_CSV;
++		} else if (!strcmp(a, "--json")) {
++			fmt = IOPIPE_MGR_JSON;
++		} else if (!strcmp(a, "--table")) {
++			if (++i >= argc) {
++				usage(stderr);
++				return 2;
++			}
++			table = argv[i];
++		} else if (!strcmp(a, "--accessors")) {
++			accessors = true;
++		} else if (!strcmp(a, "--write")) {
++			const char *spec;
++			char *sep;
++			char reg[64];
++
++			if (++i >= argc) {
++				usage(stderr);
++				return 2;
++			}
++			spec = argv[i];
++			sep = strchr(spec, ':');
++			if (!sep || (size_t)(sep - spec) >= sizeof(reg)) {
++				fprintf(stderr, "iopipe: bad --write %s\n", spec);
++				return 2;
++			}
++			memcpy(reg, spec, (size_t)(sep - spec));
++			reg[sep - spec] = '\0';
++			if (nwrites >= sizeof(writes) / sizeof(writes[0])) {
++				fprintf(stderr, "iopipe: too many --write\n");
++				return 2;
++			}
++			if (parse_u32(reg, &writes[nwrites].reg) ||
++			    parse_u32(sep + 1, &writes[nwrites].operand_pa)) {
++				fprintf(stderr, "iopipe: bad --write %s\n", spec);
++				return 2;
++			}
++			nwrites++;
++		} else if (a[0] == '-') {
++			fprintf(stderr, "iopipe: unknown option %s\n", a);
++			usage(stderr);
++			return 2;
++		} else if (!cmd) {
++			cmd = a;
++		} else {
++			fprintf(stderr, "iopipe: unexpected argument %s\n", a);
++			return 2;
++		}
++	}
++
++	if (!cmd) {
++		usage(stderr);
++		return 2;
++	}
++
++	if (!libdir)
++		libdir = getenv("IOPIPE_LIBDIR");
++	if (!libdir)
++		libdir = IOPIPE_DEFAULT_LIBDIR;
++
++	ret = iopipe_libset_init(&libs, libdir);
++	if (ret) {
++		fprintf(stderr, "iopipe: bad library directory %s (%s)\n", libdir,
++			strerror(-ret));
++		return 2;
++	}
++
++	if (!strcmp(cmd, "portmap"))
++		ret = cmd_portmap(&libs, table, stdout);
++	else if (!strcmp(cmd, "modules"))
++		ret = cmd_modules(&libs, fmt, stdout);
++	else if (!strcmp(cmd, "regmap"))
++		ret = cmd_regmap(&libs, stdout);
++	else if (!strcmp(cmd, "cq"))
++		ret = cmd_cq(writes, nwrites, stdout);
++	else if (!strcmp(cmd, "tuning"))
++		ret = cmd_tuning(&libs, accessors, stdout);
++	else if (!strcmp(cmd, "selftest"))
++		ret = iopipe_selftest(libdir, stdout) ? 1 : 0;
++	else {
++		fprintf(stderr, "iopipe: unknown command %s\n", cmd);
++		usage(stderr);
++		ret = 2;
++	}
++
++	iopipe_libset_free(&libs);
++	return ret;
++}

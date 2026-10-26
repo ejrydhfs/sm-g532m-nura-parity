@@ -1,0 +1,3311 @@
+diff --git a/drivers/media/i2c/s5k5e3yx.c b/drivers/media/i2c/s5k5e3yx.c
+index 6f5ff20af..e9242819b 100644
+--- a/drivers/media/i2c/s5k5e3yx.c
++++ b/drivers/media/i2c/s5k5e3yx.c
+@@ -539,6 +539,9 @@ struct s5k5e3yx {
+ 	struct v4l2_ctrl *hblank;
+ 
+ 	const struct s5k5e3yx_mode *cur_mode;
++
++	/* Serialises the OTP page reads against the streaming sequences. */
++	struct mutex otp_lock;
+ };
+ 
+ static inline struct s5k5e3yx *to_s5k5e3yx(struct v4l2_subdev *sd)
+@@ -891,11 +894,13 @@ static int s5k5e3yx_enable_streams(struct v4l2_subdev *sd,
+ 	if (ret < 0)
+ 		return ret;
+ 
++	mutex_lock(&s->otp_lock);
++
+ 	/* All downstream mode tables start by stopping the stream */
+ 	ret = cci_write(s->regmap, S5K5E3YX_REG_CTRL_MODE,
+ 			S5K5E3YX_MODE_STANDBY, NULL);
+ 	if (ret)
+-		goto err_rpm_put;
++		goto err_unlock_put;
+ 
+ 	/*
+ 	 * The 30 fps capture path waits 40 ms between stream off and the
+@@ -907,20 +912,23 @@ static int s5k5e3yx_enable_streams(struct v4l2_subdev *sd,
+ 	ret = cci_multi_reg_write(s->regmap, s5k5e3yx_init_regs,
+ 				  ARRAY_SIZE(s5k5e3yx_init_regs), NULL);
+ 	if (ret)
+-		goto err_rpm_put;
++		goto err_unlock_put;
+ 
+ 	ret = cci_multi_reg_write(s->regmap, mode->regs, mode->num_regs, NULL);
+ 	if (ret)
+-		goto err_rpm_put;
++		goto err_unlock_put;
+ 
+ 	ret = cci_write(s->regmap, S5K5E3YX_REG_CTRL_MODE,
+ 			S5K5E3YX_MODE_STREAMING, NULL);
+ 	if (ret)
+-		goto err_rpm_put;
++		goto err_unlock_put;
++
++	mutex_unlock(&s->otp_lock);
+ 
+ 	return 0;
+ 
+-err_rpm_put:
++err_unlock_put:
++	mutex_unlock(&s->otp_lock);
+ 	pm_runtime_put_autosuspend(&client->dev);
+ 
+ 	return ret;
+@@ -937,8 +945,10 @@ static int s5k5e3yx_disable_streams(struct v4l2_subdev *sd,
+ 	if (pad != 0)
+ 		return -EINVAL;
+ 
++	mutex_lock(&s->otp_lock);
+ 	ret = cci_write(s->regmap, S5K5E3YX_REG_CTRL_MODE,
+ 			S5K5E3YX_MODE_STANDBY, NULL);
++	mutex_unlock(&s->otp_lock);
+ 	if (ret)
+ 		dev_err(&client->dev, "failed to stop streaming: %d\n", ret);
+ 
+@@ -1079,6 +1089,132 @@ static int s5k5e3yx_power_off(struct device *dev)
+ 	return 0;
+ }
+ 
++/* -------------------------------------------------------------------------
++ * OTP sysfs attribute
++ *
++ * Port of get_otps_data() (s5k5e3yxmipiraw_Sensor.c:392-414).  The sensor's
++ * NVM controller exposes one five-byte page at a time through registers
++ * 0x0a04..0x0a08; the sequence below is the downstream one unchanged:
++ *
++ *   0x0a00 = 0x04   initial state
++ *   0x0a02 = page   0..3
++ *   0x0a00 = 0x01   read mode
++ *   delay 1 ms      "to wait Tmin = 47us" (:400)
++ *   read 0x0a04..0x0a08 as one burst
++ *   0x0a00 = 0x04
++ *   0x0a00 = 0x00
++ *
++ * The attribute is read-only and refuses to run while the sensor streams, so
++ * a calibration read can never disturb a capture.
++ */
++
++#define S5K5E3YX_REG_NVM_CTRL			CCI_REG8(0x0a00)
++#define S5K5E3YX_REG_NVM_PAGE			CCI_REG8(0x0a02)
++#define S5K5E3YX_REG_NVM_DATA			CCI_REG8(0x0a04)
++
++#define S5K5E3YX_NVM_CTRL_RESET			0x04
++#define S5K5E3YX_NVM_CTRL_READ			0x01
++#define S5K5E3YX_NVM_CTRL_OFF			0x00
++
++#define S5K5E3YX_OTP_PAGES			4
++#define S5K5E3YX_OTP_PAGE_BYTES			5
++/* Four lines of "pageN:" plus five "0aXX=VV" pairs fit in 256 bytes. */
++#define S5K5E3YX_OTP_TEXT_MAX			256
++
++static int s5k5e3yx_read_otp_page(struct s5k5e3yx *s, unsigned int page,
++				  u8 *data)
++{
++	int ret;
++
++	/* s5k5e3yxmipiraw_Sensor.c:395-397 */
++	cci_write(s->regmap, S5K5E3YX_REG_NVM_CTRL, S5K5E3YX_NVM_CTRL_RESET,
++		  &ret);
++	cci_write(s->regmap, S5K5E3YX_REG_NVM_PAGE, page, &ret);
++	cci_write(s->regmap, S5K5E3YX_REG_NVM_CTRL, S5K5E3YX_NVM_CTRL_READ,
++		  &ret);
++	if (ret)
++		goto out_idle;
++
++	usleep_range(1000, 1100);
++
++	ret = regmap_bulk_read(s->regmap,
++			       CCI_REG_ADDR(S5K5E3YX_REG_NVM_DATA), data,
++			       S5K5E3YX_OTP_PAGE_BYTES);
++
++out_idle:
++	/*
++	 * s5k5e3yxmipiraw_Sensor.c:408-409: the controller always goes back to
++	 * its initial state, so this runs on the error path as well.
++	 */
++	cci_write(s->regmap, S5K5E3YX_REG_NVM_CTRL, S5K5E3YX_NVM_CTRL_RESET,
++		  NULL);
++	cci_write(s->regmap, S5K5E3YX_REG_NVM_CTRL, S5K5E3YX_NVM_CTRL_OFF,
++		  NULL);
++
++	return ret;
++}
++
++static ssize_t otp_show(struct device *dev, struct device_attribute *attr,
++			char *buf)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct s5k5e3yx *s = to_s5k5e3yx(sd);
++	u8 raw[S5K5E3YX_OTP_PAGES][S5K5E3YX_OTP_PAGE_BYTES];
++	unsigned int page, i;
++	ssize_t len = 0;
++	u64 mode;
++	int ret;
++
++	ret = pm_runtime_resume_and_get(dev);
++	if (ret)
++		return ret;
++
++	mutex_lock(&s->otp_lock);
++
++	ret = cci_read(s->regmap, S5K5E3YX_REG_CTRL_MODE, &mode, NULL);
++	if (ret)
++		goto out_unlock;
++
++	if (mode == S5K5E3YX_MODE_STREAMING) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++
++	for (page = 0; page < S5K5E3YX_OTP_PAGES; page++) {
++		ret = s5k5e3yx_read_otp_page(s, page, raw[page]);
++		if (ret)
++			goto out_unlock;
++	}
++
++	for (page = 0; page < S5K5E3YX_OTP_PAGES; page++) {
++		len += scnprintf(buf + len, S5K5E3YX_OTP_TEXT_MAX - len,
++				 "page%u:", page);
++		for (i = 0; i < S5K5E3YX_OTP_PAGE_BYTES; i++)
++			len += scnprintf(buf + len, S5K5E3YX_OTP_TEXT_MAX - len,
++					 " %04x=%02x",
++					 (unsigned int)CCI_REG_ADDR(
++						S5K5E3YX_REG_NVM_DATA) + i,
++					 raw[page][i]);
++		len += scnprintf(buf + len, S5K5E3YX_OTP_TEXT_MAX - len, "\n");
++	}
++
++	ret = len;
++
++out_unlock:
++	mutex_unlock(&s->otp_lock);
++	pm_runtime_put_autosuspend(dev);
++
++	return ret;
++}
++
++static DEVICE_ATTR_RO(otp);
++
++static struct attribute *s5k5e3yx_attrs[] = {
++	&dev_attr_otp.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(s5k5e3yx);
++
+ /* -------------------------------------------------------------------------
+  * Probe & remove
+  */
+@@ -1205,6 +1341,8 @@ static int s5k5e3yx_probe(struct i2c_client *client)
+ 	if (!s)
+ 		return -ENOMEM;
+ 
++	mutex_init(&s->otp_lock);
++
+ 	v4l2_i2c_subdev_init(&s->sd, client, &s5k5e3yx_subdev_ops);
+ 	s->sd.internal_ops = &s5k5e3yx_internal_ops;
+ 
+@@ -1268,6 +1406,12 @@ static int s5k5e3yx_probe(struct i2c_client *client)
+ 		goto error_media_entity;
+ 	}
+ 
++	ret = device_add_groups(dev, s5k5e3yx_groups);
++	if (ret) {
++		dev_err_probe(dev, ret, "failed to add the otp attribute\n");
++		goto error_subdev_cleanup;
++	}
++
+ 	pm_runtime_set_active(dev);
+ 	pm_runtime_enable(dev);
+ 
+@@ -1284,6 +1428,7 @@ static int s5k5e3yx_probe(struct i2c_client *client)
+ 	return 0;
+ 
+ error_subdev_cleanup:
++	device_remove_groups(dev, s5k5e3yx_groups);
+ 	v4l2_subdev_cleanup(&s->sd);
+ 	pm_runtime_disable(dev);
+ 	pm_runtime_set_suspended(dev);
+@@ -1306,6 +1451,7 @@ static void s5k5e3yx_remove(struct i2c_client *client)
+ 	struct s5k5e3yx *s = to_s5k5e3yx(sd);
+ 
+ 	v4l2_async_unregister_subdev(sd);
++	device_remove_groups(&client->dev, s5k5e3yx_groups);
+ 	v4l2_subdev_cleanup(sd);
+ 	media_entity_cleanup(&sd->entity);
+ 	v4l2_ctrl_handler_free(&s->ctrl_handler);
+diff --git a/tools/mediatek/camera/Makefile b/tools/mediatek/camera/Makefile
+index a27bcfe02..65cea5ba8 100644
+--- a/tools/mediatek/camera/Makefile
++++ b/tools/mediatek/camera/Makefile
+@@ -50,7 +50,7 @@ COMPAT32_FLAGS := $(shell $(CC) -m32 -malign-double -x c -c /dev/null -o /dev/nu
+ 
+ .PHONY: all static shared cli service compat32 check nodev-check clean
+ 
+-all: static shared cli service
++all: static shared cli service ; @$(MAKE) -C otp
+ 
+ static: $(BIN)/libcamdrv.a
+ shared: $(BIN)/libcamdrv.so
+@@ -129,9 +129,11 @@ nodev-check: cli service
+ 
+ ifeq ($(COMPAT32_FLAGS),)
+ check: nodev-check compat32
++	@$(MAKE) -C otp check
+ else
+ check: nodev-check compat32
+ 	@$(BIN)/abi32 >/dev/null
++	@$(MAKE) -C otp check
+ endif
+ 
+ clean:
+diff --git a/tools/mediatek/camera/otp/Makefile b/tools/mediatek/camera/otp/Makefile
+new file mode 100644
+index 000000000..f6edcab1e
+--- /dev/null
++++ b/tools/mediatek/camera/otp/Makefile
+@@ -0,0 +1,72 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# camotp: camera calibration provider for the Samsung grandpplte.
++#
++# Host build with the system compiler; no kernel header and no proprietary
++# blob takes part in the build.  The tool reads the vendor libraries at
++# runtime when it has to extract a documented table.
++#
++#   make          static and shared library, CLI and selftest
++#   make check    run the selftest
++#   make clean
++#
++# Objects live in build/obj, binaries and libraries in build/bin, so no
++# target name can collide with a source file name.
++
++CC ?= gcc
++AR ?= ar
++CFLAGS ?= -O2
++CFLAGS += -Wall -Wextra -std=gnu11 -fPIC
++CPPFLAGS += -I.
++LDFLAGS ?=
++LDLIBS ?=
++
++BUILD := build
++OBJ := $(BUILD)/obj
++BIN := $(BUILD)/bin
++
++LIB_SRCS := camotp_elf.c camotp_io.c camotp_imx219.c camotp_lsc.c \
++	    camotp_s5k5e3yx.c camotp_tables.c
++LIB_OBJS := $(LIB_SRCS:%.c=$(OBJ)/%.o)
++CLI_OBJS := $(OBJ)/camotp.o
++TEST_OBJS := $(OBJ)/camotp_selftest.o
++
++.PHONY: all static shared cli selftest check clean
++
++all: static shared cli selftest
++
++static: $(BIN)/libcamotp.a
++shared: $(BIN)/libcamotp.so
++cli: $(BIN)/camotp
++selftest: $(BIN)/camotp_selftest
++
++$(OBJ)/%.o: %.c camotp.h
++	@mkdir -p $(dir $@)
++	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
++
++$(BIN)/libcamotp.a: $(LIB_OBJS)
++	@mkdir -p $(dir $@)
++	$(AR) rcs $@ $(LIB_OBJS)
++
++$(BIN)/libcamotp.so: $(LIB_OBJS)
++	@mkdir -p $(dir $@)
++	$(CC) $(CFLAGS) -shared -Wl,-soname,libcamotp.so -o $@ $(LIB_OBJS) \
++		$(LDFLAGS) $(LDLIBS)
++
++$(BIN)/camotp: $(CLI_OBJS) $(BIN)/libcamotp.a
++	@mkdir -p $(dir $@)
++	$(CC) $(CFLAGS) -o $@ $(CLI_OBJS) $(BIN)/libcamotp.a $(LDFLAGS) $(LDLIBS)
++
++$(BIN)/camotp_selftest: $(TEST_OBJS) $(BIN)/libcamotp.a
++	@mkdir -p $(dir $@)
++	$(CC) $(CFLAGS) -o $@ $(TEST_OBJS) $(BIN)/libcamotp.a $(LDFLAGS) $(LDLIBS)
++
++check: selftest
++	@$(BIN)/camotp_selftest
++	@$(BIN)/camotp --help >/dev/null
++	@if $(BIN)/camotp imx219 --file /nonexistent >/dev/null 2>&1; then \
++		echo "check: camotp accepted a missing input"; exit 1; \
++	fi
++
++clean:
++	rm -rf $(BUILD)
+diff --git a/tools/mediatek/camera/otp/camotp.c b/tools/mediatek/camera/otp/camotp.c
+new file mode 100644
+index 000000000..7ed44799a
+--- /dev/null
++++ b/tools/mediatek/camera/otp/camotp.c
+@@ -0,0 +1,697 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * camotp - read-only camera calibration dump for the Samsung grandpplte.
++ *
++ * Source selection:
++ *   imx219    /sys/bus/nvmem/devices/imx219-eeprom<n>/nvmem (or --file)
++ *   s5k5e3yx  /sys/bus/i2c/devices/<bus>-00xx/otp        (or --sysfs/--raw)
++ *   lsc       the EEPROM LSC block through either region, plus the
++ *             ShadingATNTable read out of libcameracustom.so
++ *   tables    documented tables read out of the vendor libraries
++ *
++ * Nothing is opened for writing; every output byte is echoed from a read or
++ * from a vendor library symbol whose size is re-checked against the ELF.
++ */
++
++#include <errno.h>
++#include <getopt.h>
++#include <inttypes.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "camotp.h"
++
++#define DEFAULT_LIBDIR "/system/lib"
++
++static const char *opt_nvmem;
++static const char *opt_file;
++static const char *opt_sysfs;
++static const char *opt_raw;
++static const char *opt_block;
++static const char *opt_lib;
++static const char *opt_libdir = DEFAULT_LIBDIR;
++static const char *opt_region = "samsung";
++static const char *opt_dump;
++static const char *opt_prefix;
++static int opt_list;
++static int opt_decode;
++
++static void usage(FILE *out)
++{
++	fprintf(out,
++"usage: camotp <command> [options]\n"
++"\n"
++"commands:\n"
++"  imx219     dump the IMX219 module OTP image (MTK format)\n"
++"  s5k5e3yx   dump the S5K5E3YX OTP pages\n"
++"  lsc        convert the OTP lens-shading block to the ISP gain table\n"
++"  tables     list or dump documented vendor-library tables\n"
++"\n"
++"options:\n"
++"  --nvmem PATH    nvmem sysfs file of the module EEPROM\n"
++"  --file PATH     read the raw OTP image from PATH instead\n"
++"  --sysfs PATH    S5K5E3YX otp sysfs attribute\n"
++"  --raw PATH      read 20 raw OTP bytes (4 pages x 5) from PATH\n"
++"  --block PATH    read a raw 0x38e-byte LSC block from PATH\n"
++"  --region NAME   lsc block source: samsung (0x300) or mtk (0x17)\n"
++"  --lib PATH      vendor library used for table extraction\n"
++"  --libdir DIR    directory with the vendor libraries (%s)\n"
++"  --dump SYMBOL   dump one dynamic symbol of --lib\n"
++"  --prefix STR    list dynamic symbols of --lib starting with STR\n"
++"  --decode        print the documented decode of a registry table\n"
++"  --list          list the documented table registry\n"
++"  --help          this text\n", DEFAULT_LIBDIR);
++}
++
++static const char *errname(int err)
++{
++	static char buf[64];
++
++	snprintf(buf, sizeof(buf), "%s (%d)", strerror(err < 0 ? -err : err),
++		 err);
++	return buf;
++}
++
++static int load_otp_image(uint8_t *buf, size_t len, const char **source)
++{
++	const char *path = opt_file;
++	char found[512];
++	int ret;
++
++	if (!path) {
++		ret = camotp_find_nvmem(found, sizeof(found));
++		if (ret) {
++			fprintf(stderr,
++				"camotp: no imx219-eeprom nvmem node found "
++				"(%s); use --nvmem or --file\n", errname(ret));
++			return ret;
++		}
++		path = found;
++	}
++
++	ret = camotp_read_file(path, 0, buf, len);
++	if (ret) {
++		fprintf(stderr, "camotp: cannot read %s: %s\n", path,
++			errname(ret));
++		return ret;
++	}
++
++	if (source)
++		*source = path;
++
++	return 0;
++}
++
++static void print_awb(const char *label, const struct camotp_awb *awb)
++{
++	printf("%s: R=%u Gr=%u Gb=%u B=%u\n", label,
++	       awb->r, awb->gr, awb->gb, awb->b);
++}
++
++static int cmd_imx219(void)
++{
++	uint8_t image[CAMOTP_OTP_MTK_POPULATED];
++	struct camotp_imx219 otp;
++	const char *source = NULL;
++	int ret;
++
++	ret = load_otp_image(image, sizeof(image), &source);
++	if (ret)
++		return 1;
++
++	ret = camotp_parse_imx219(image, sizeof(image), &otp);
++	if (ret) {
++		fprintf(stderr, "camotp: malformed OTP image: %s\n",
++			errname(ret));
++		return 1;
++	}
++
++	printf("source: %s\n", source);
++	printf("calibration version: 0x%08x%s\n", otp.cali_version,
++	       otp.cali_version_valid ? "" : " (not 0xff000b01)");
++	printf("serial: 0x%04x\n", otp.serial);
++	printf("version: 0x%02x  awb/af info: 0x%02x\n",
++	       otp.version, otp.awb_af_info);
++	print_awb("unit awb", &otp.unit_awb);
++	print_awb("golden awb", &otp.golden_awb);
++	printf("af infinity: %u  af macro: %u\n",
++	       otp.af_infinity, otp.af_macro);
++	printf("lsc payload: %u bytes%s\n", otp.lsc_size,
++	       otp.lsc_valid ? "" : " (absent or blank)");
++	if (otp.module_id_valid)
++		printf("module id: %c%c%c%c%c%02X%02X%02X%02X%02X\n",
++		       otp.module_id[0], otp.module_id[1], otp.module_id[2],
++		       otp.module_id[3], otp.module_id[4], otp.module_id[5],
++		       otp.module_id[6], otp.module_id[7], otp.module_id[8],
++		       otp.module_id[9]);
++	else
++		printf("module id: (blank)\n");
++	if (otp.mfr_info_valid)
++		printf("manufacturer info: \"%s\"\n", otp.mfr_info);
++	else
++		printf("manufacturer info: (blank)\n");
++
++	return 0;
++}
++
++static int cmd_s5k5e3yx(void)
++{
++	struct camotp_s5k_otp otp;
++	const char *source = NULL;
++	unsigned int page;
++	char *text = NULL;
++	int ret;
++
++	if (opt_raw) {
++		uint8_t raw[CAMOTP_S5K_PAGES * CAMOTP_S5K_PAGE_BYTES];
++
++		ret = camotp_read_file(opt_raw, 0, raw, sizeof(raw));
++		if (ret) {
++			fprintf(stderr, "camotp: cannot read %s: %s\n",
++				opt_raw, errname(ret));
++			return 1;
++		}
++		ret = camotp_parse_s5k5e3yx_raw(raw, sizeof(raw), &otp);
++		source = opt_raw;
++	} else {
++		const char *path = opt_sysfs;
++		char found[512];
++		ssize_t got;
++
++		if (!path) {
++			ret = camotp_find_sensor_otp(found, sizeof(found));
++			if (ret) {
++				fprintf(stderr,
++					"camotp: no s5k5e3yx otp attribute "
++					"found (%s); use --sysfs\n",
++					errname(ret));
++				return 1;
++			}
++			path = found;
++		}
++
++		text = malloc(4096);
++		if (!text) {
++			fprintf(stderr, "camotp: out of memory\n");
++			return 1;
++		}
++
++		got = camotp_read_text(path, text, 4096);
++		if (got < 0) {
++			fprintf(stderr, "camotp: cannot read %s: %s\n", path,
++				errname((int)got));
++			free(text);
++			return 1;
++		}
++
++		ret = camotp_parse_s5k5e3yx(text, (size_t)got, &otp);
++		source = path;
++	}
++
++	if (ret) {
++		fprintf(stderr, "camotp: malformed OTP data: %s\n",
++			errname(ret));
++		free(text);
++		return 1;
++	}
++
++	printf("source: %s\n", source);
++	for (page = 0; page < CAMOTP_S5K_PAGES; page++) {
++		const struct camotp_s5k_page *p = &otp.page[page];
++
++		printf("page %u: cal_flag=%u lsc_index=%u R=%u G=%u B=%u\n",
++		       page, p->cal_flag, p->lsc_index, p->r_cal, p->g_cal,
++		       p->b_cal);
++	}
++
++	free(text);
++	return 0;
++}
++
++static int read_lsc_block(uint8_t *block, const char **source)
++{
++	if (opt_block) {
++		int ret = camotp_read_file(opt_block, 0, block,
++					   CAMOTP_LSC_BLOCK_SIZE);
++
++		if (ret) {
++			fprintf(stderr, "camotp: cannot read %s: %s\n",
++				opt_block, errname(ret));
++			return ret;
++		}
++		*source = opt_block;
++		return 0;
++	}
++
++	if (!strcmp(opt_region, "samsung")) {
++		uint8_t lenbuf[2];
++		unsigned int len;
++		char found[512];
++		const char *path = opt_file;
++		int ret;
++
++		if (!path) {
++			ret = camotp_find_nvmem(found, sizeof(found));
++			if (ret) {
++				fprintf(stderr,
++					"camotp: no imx219-eeprom nvmem node "
++					"found (%s)\n", errname(ret));
++				return ret;
++			}
++			path = found;
++		}
++
++		ret = camotp_read_file(path, CAMOTP_EEPROM_LSC_LEN_OFF, lenbuf,
++				       sizeof(lenbuf));
++		if (ret) {
++			fprintf(stderr,
++				"camotp: %s has no LSC block at 0x%03x: %s\n",
++				path, CAMOTP_EEPROM_LSC_LEN_OFF, errname(ret));
++			return ret;
++		}
++
++		len = (unsigned int)lenbuf[0] | ((unsigned int)lenbuf[1] << 8);
++		if (len != CAMOTP_LSC_BLOCK_SIZE) {
++			fprintf(stderr,
++				"camotp: EEPROM LSC length is %u, expected %u\n",
++				len, CAMOTP_LSC_BLOCK_SIZE);
++			return -EINVAL;
++		}
++
++		ret = camotp_read_file(path, CAMOTP_EEPROM_LSC_DATA_OFF, block,
++				       CAMOTP_LSC_BLOCK_SIZE);
++		if (ret)
++			return ret;
++
++		*source = path;
++		return 0;
++	}
++
++	if (!strcmp(opt_region, "mtk")) {
++		uint8_t image[CAMOTP_OTP_MTK_POPULATED];
++		struct camotp_imx219 otp;
++		const char *src = NULL;
++		int ret;
++
++		ret = load_otp_image(image, sizeof(image), &src);
++		if (ret)
++			return ret;
++		ret = camotp_parse_imx219(image, sizeof(image), &otp);
++		if (ret)
++			return ret;
++		if (otp.lsc_size != CAMOTP_LSC_BLOCK_SIZE) {
++			fprintf(stderr,
++				"camotp: MTK OTP LSC payload is %u bytes, "
++				"expected %u\n", otp.lsc_size,
++				CAMOTP_LSC_BLOCK_SIZE);
++			return -EINVAL;
++		}
++		memcpy(block, otp.lsc, CAMOTP_LSC_BLOCK_SIZE);
++		*source = src;
++		return 0;
++	}
++
++	fprintf(stderr, "camotp: unknown --region %s\n", opt_region);
++	return -EINVAL;
++}
++
++static int load_atn(struct camotp_lsc_atn *atn, size_t *natn)
++{
++	struct camotp_elf *elf = NULL;
++	struct camotp_elf_sym sym;
++	uint8_t *raw;
++	size_t i;
++	int ret;
++
++	if (!opt_lib) {
++		fprintf(stderr,
++			"camotp: the block selects the distance polynomial; "
++			"pass --lib /path/to/libcameracustom.so\n");
++		return -EINVAL;
++	}
++
++	ret = camotp_elf_open(opt_lib, &elf);
++	if (ret) {
++		fprintf(stderr, "camotp: cannot open %s: %s\n", opt_lib,
++			errname(ret));
++		return ret;
++	}
++
++	ret = camotp_elf_find(elf, "ShadingATNTable", &sym);
++	if (ret) {
++		fprintf(stderr, "camotp: ShadingATNTable not found in %s\n",
++			opt_lib);
++		goto out;
++	}
++
++	if (sym.size != CAMOTP_LSC_ATN_ENTRIES * CAMOTP_LSC_ATN_COEF * 4u) {
++		fprintf(stderr,
++			"camotp: ShadingATNTable is %u bytes, expected %u\n",
++			sym.size,
++			CAMOTP_LSC_ATN_ENTRIES * CAMOTP_LSC_ATN_COEF * 4u);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	raw = malloc(sym.size);
++	if (!raw) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	ret = camotp_elf_read(elf, sym.addr, raw, sym.size);
++	if (!ret) {
++		for (i = 0; i < CAMOTP_LSC_ATN_ENTRIES; i++) {
++			unsigned int k;
++
++			for (k = 0; k < CAMOTP_LSC_ATN_COEF; k++) {
++				const uint8_t *p = raw + (i * 24 + k * 4);
++
++				atn[i].coef[k] = (int32_t)(
++					(uint32_t)p[0] |
++					((uint32_t)p[1] << 8) |
++					((uint32_t)p[2] << 16) |
++					((uint32_t)p[3] << 24));
++			}
++		}
++		*natn = CAMOTP_LSC_ATN_ENTRIES;
++		printf("atn table: %s ShadingATNTable @0x%x, %u bytes\n",
++		       opt_lib, sym.addr, sym.size);
++	}
++
++	free(raw);
++out:
++	camotp_elf_close(elf);
++	return ret;
++}
++
++static int cmd_lsc(void)
++{
++	uint8_t block[CAMOTP_LSC_BLOCK_SIZE];
++	struct camotp_lsc_atn atn[CAMOTP_LSC_ATN_ENTRIES];
++	struct camotp_lsc_info info;
++	uint16_t table[CAMOTP_LSC_MAX_BLOCKS * CAMOTP_LSC_PLANES];
++	const char *source = NULL;
++	size_t natn = 0;
++	unsigned int row, col, ch;
++	int ret;
++
++	ret = read_lsc_block(block, &source);
++	if (ret) {
++		fprintf(stderr, "camotp: cannot load LSC block: %s\n",
++			errname(ret));
++		return 1;
++	}
++
++	if (block[0x08] <= CAMOTP_LSC_ATN_ENTRIES - 1) {
++		ret = load_atn(atn, &natn);
++		if (ret)
++			return 1;
++	}
++
++	ret = camotp_lsc_convert(block, sizeof(block), atn, natn, table,
++				 &info);
++	if (ret) {
++		fprintf(stderr, "camotp: LSC conversion refused: %s\n",
++			errname(ret));
++		return 1;
++	}
++
++	printf("source: %s\n", source);
++	printf("grid: %ux%u  bayer=%u  width=%u height=%u\n",
++	       info.n_x, info.n_y, info.bayer, info.width, info.height);
++	printf("atn index: %u (%s)  pedestals: %u %u %u %u\n",
++	       info.atn_index, info.poly_enabled ? "polynomial on" : "off",
++	       info.pedestal[0], info.pedestal[1], info.pedestal[2],
++	       info.pedestal[3]);
++	printf("max per channel: %d %d %d %d\n",
++	       info.max_value[0], info.max_value[1], info.max_value[2],
++	       info.max_value[3]);
++	printf("col step: %u  row step: %u  reference distance: %u\n",
++	       info.col_step, info.row_step, info.ref_distance);
++	printf("gain table (unit: 8192 == 1.0, saturated at 65535)\n");
++
++	for (row = 0; row < info.n_y; row++) {
++		for (col = 0; col < info.n_x; col++) {
++			unsigned int idx = row * info.n_x + col;
++
++			printf("  block %3u (col %2u row %2u):", idx, col, row);
++			for (ch = 0; ch < CAMOTP_LSC_PLANES; ch++)
++				printf(" %5u", table[idx * 4 + ch]);
++			printf("\n");
++		}
++	}
++
++	return 0;
++}
++
++static void hexdump(const uint8_t *buf, size_t len, uint32_t base)
++{
++	size_t i, j;
++
++	for (i = 0; i < len; i += 16) {
++		printf("  %08x:", base + (uint32_t)i);
++		for (j = 0; j < 16 && i + j < len; j++)
++			printf(" %02x", buf[i + j]);
++		for (; j < 16; j++)
++			printf("   ");
++		printf("  ");
++		for (j = 0; j < 16 && i + j < len; j++) {
++			unsigned char c = buf[i + j];
++
++			printf("%c", c >= 0x20 && c < 0x7f ? c : '.');
++		}
++		printf("\n");
++	}
++}
++
++static void print_ints(const struct camotp_table *t, const uint8_t *buf,
++		       size_t len)
++{
++	size_t count = len / 4, i;
++
++	printf("  %zu x %s:", count,
++	       t->elem == CAMOTP_ELEM_S32 ? "s32" : "u32");
++	for (i = 0; i < count; i++) {
++		uint32_t v = (uint32_t)buf[i * 4] |
++			     ((uint32_t)buf[i * 4 + 1] << 8) |
++			     ((uint32_t)buf[i * 4 + 2] << 16) |
++			     ((uint32_t)buf[i * 4 + 3] << 24);
++
++		if (i % 8 == 0)
++			printf("\n   ");
++		if (t->elem == CAMOTP_ELEM_S32)
++			printf(" %11" PRId32, (int32_t)v);
++		else
++			printf(" %11" PRIu32, v);
++	}
++	printf("\n");
++}
++
++static int cmd_tables(void)
++{
++	const struct camotp_table *reg = camotp_tables();
++
++	if (opt_list || (!opt_dump && !opt_prefix)) {
++		const struct camotp_table *t;
++
++		printf("documented tables (element sizes checked against the ELF):\n");
++		for (t = reg; t->symbol; t++) {
++			printf("  %-32s %-22s %6u bytes  %s\n",
++			       t->symbol, t->lib, t->size, t->what);
++			if (opt_decode)
++				printf("      decode: %s\n", t->decode);
++		}
++		if (!opt_dump && !opt_prefix)
++			return 0;
++	}
++
++	if (opt_prefix) {
++		struct camotp_elf *elf = NULL;
++		size_t i, n;
++		int ret;
++
++		if (!opt_lib) {
++			fprintf(stderr, "camotp: --prefix needs --lib PATH\n");
++			return 1;
++		}
++		ret = camotp_elf_open(opt_lib, &elf);
++		if (ret) {
++			fprintf(stderr, "camotp: cannot open %s: %s\n", opt_lib,
++				errname(ret));
++			return 1;
++		}
++		n = camotp_elf_sym_count(elf);
++		for (i = 1; i < n; i++) {
++			struct camotp_elf_sym sym;
++
++			if (camotp_elf_sym_get(elf, i, &sym))
++				continue;
++			if (strncmp(sym.name, opt_prefix,
++				    strlen(opt_prefix)) != 0)
++				continue;
++			printf("  0x%08x %6u %s\n", sym.addr, sym.size,
++			       sym.name);
++		}
++		camotp_elf_close(elf);
++		return 0;
++	}
++
++	if (opt_dump) {
++		const struct camotp_table *t = camotp_table_by_symbol(opt_dump);
++		struct camotp_elf *elf = NULL;
++		struct camotp_elf_sym sym;
++		char path[1024];
++		uint8_t *buf;
++		size_t len;
++		int ret;
++
++		if (!opt_lib) {
++			if (!t) {
++				fprintf(stderr,
++					"camotp: %s is not a registry table; "
++					"pass --lib PATH\n", opt_dump);
++				return 1;
++			}
++			snprintf(path, sizeof(path), "%s/%s", opt_libdir,
++				 t->lib);
++			opt_lib = path;
++		}
++
++		ret = camotp_elf_open(opt_lib, &elf);
++		if (ret) {
++			fprintf(stderr, "camotp: cannot open %s: %s\n", opt_lib,
++				errname(ret));
++			return 1;
++		}
++		ret = camotp_elf_find(elf, opt_dump, &sym);
++		if (ret) {
++			fprintf(stderr, "camotp: %s not found in %s\n", opt_dump,
++				opt_lib);
++			camotp_elf_close(elf);
++			return 1;
++		}
++
++		len = sym.size;
++		buf = malloc(len ? len : 1);
++		if (!buf) {
++			camotp_elf_close(elf);
++			return 1;
++		}
++		ret = camotp_elf_read(elf, sym.addr, buf, len);
++		camotp_elf_close(elf);
++		if (ret) {
++			fprintf(stderr, "camotp: cannot read %s: %s\n", opt_dump,
++				errname(ret));
++			free(buf);
++			return 1;
++		}
++
++		printf("symbol: %s\nlibrary: %s\naddress: 0x%08x\n"
++		       "size: %zu bytes\n", opt_dump, opt_lib, sym.addr, len);
++		if (t)
++			printf("what: %s\ndecode: %s\n", t->what, t->decode);
++		hexdump(buf, len, sym.addr);
++		if (t)
++			print_ints(t, buf, len);
++		free(buf);
++		return 0;
++	}
++
++	return 0;
++}
++
++int main(int argc, char **argv)
++{
++	static const struct option longopts[] = {
++		{ "nvmem", required_argument, NULL, 'n' },
++		{ "file", required_argument, NULL, 'f' },
++		{ "sysfs", required_argument, NULL, 's' },
++		{ "raw", required_argument, NULL, 'r' },
++		{ "block", required_argument, NULL, 'b' },
++		{ "region", required_argument, NULL, 'R' },
++		{ "lib", required_argument, NULL, 'l' },
++		{ "libdir", required_argument, NULL, 'L' },
++		{ "dump", required_argument, NULL, 'd' },
++		{ "prefix", required_argument, NULL, 'p' },
++		{ "decode", no_argument, NULL, 'D' },
++		{ "list", no_argument, NULL, 'T' },
++		{ "help", no_argument, NULL, 'h' },
++		{ NULL, 0, NULL, 0 },
++	};
++	const char *cmd;
++	int c;
++
++	while ((c = getopt_long(argc, argv, "h", longopts, NULL)) != -1) {
++		switch (c) {
++		case 'n':
++			opt_nvmem = optarg;
++			break;
++		case 'f':
++			opt_file = optarg;
++			break;
++		case 's':
++			opt_sysfs = optarg;
++			break;
++		case 'r':
++			opt_raw = optarg;
++			break;
++		case 'b':
++			opt_block = optarg;
++			break;
++		case 'R':
++			opt_region = optarg;
++			break;
++		case 'l':
++			opt_lib = optarg;
++			break;
++		case 'L':
++			opt_libdir = optarg;
++			break;
++		case 'd':
++			opt_dump = optarg;
++			break;
++		case 'p':
++			opt_prefix = optarg;
++			break;
++		case 'D':
++			opt_decode = 1;
++			break;
++		case 'T':
++			opt_list = 1;
++			break;
++		case 'h':
++			usage(stdout);
++			return 0;
++		default:
++			usage(stderr);
++			return 2;
++		}
++	}
++
++	if (optind >= argc) {
++		usage(stderr);
++		return 2;
++	}
++	cmd = argv[optind];
++
++	(void)opt_nvmem;	/* --nvmem falls back to opt_file below */
++	if (opt_nvmem) {
++		opt_file = opt_nvmem;
++	}
++
++	if (!strcmp(cmd, "imx219"))
++		return cmd_imx219();
++	if (!strcmp(cmd, "s5k5e3yx"))
++		return cmd_s5k5e3yx();
++	if (!strcmp(cmd, "lsc"))
++		return cmd_lsc();
++	if (!strcmp(cmd, "tables"))
++		return cmd_tables();
++
++	fprintf(stderr, "camotp: unknown command %s\n", cmd);
++	usage(stderr);
++	return 2;
++}
+diff --git a/tools/mediatek/camera/otp/camotp.h b/tools/mediatek/camera/otp/camotp.h
+new file mode 100644
+index 000000000..8b72d5d53
+--- /dev/null
++++ b/tools/mediatek/camera/otp/camotp.h
+@@ -0,0 +1,328 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * camotp - camera calibration provider for the Samsung grandpplte
++ *          (MT6737T, SM-G532M, Nura 7.0.10 arm64).
++ *
++ * The library is a parser/provider only: every byte it reports comes either
++ * from a device read (module EEPROM nvmem, sensor OTP sysfs) or from a
++ * vendor library ELF symbol whose name, file offset and size are documented
++ * below and in the leaf report.  Nothing is synthesised, defaulted or
++ * clamped to a "neutral" value.
++ *
++ * Sources and their evidence:
++ *   imgsensor/src/mt6735/imx219_mipi_raw/imx219_eeprom.c
++ *     read_imx219_eeprom_mtk_fmt()  :174-233   OTP image assembly
++ *     update_sysfs_information()    :362-396   module id / mfr info
++ *     selective_read_region()       :320-345   Samsung LSC block at 0x300
++ *   imgsensor/src/mt6735/s5k5e3yx_mipi_raw/s5k5e3yxmipiraw_Sensor.c
++ *     get_otps_data()               :392-414   four OTP pages, 5 bytes each
++ *   zip/vendor-libs/libcameracustom.so
++ *     ShadingATNTable               0x50af18, 0x1f8 bytes (.data)
++ *     LSC_AVGRAW_to_Gaintable       0xf45a0 (thumb)
++ *     vLSC_AvgRaw_Load              0xf4150 (thumb)
++ *     vLSC_AvgRaw_Process           0xf4020 (thumb)
++ *     vLSC_PARAM_INIT               0xf3e84 (thumb)
++ *     vLSC_Calibration_INIT         0xf3f8c (thumb)
++ *     mrLSC_AvgToGainTbl            0xf4250 (thumb)
++ *     mrLSC_POLY_RatioFloat_Get     0xf3e1a (thumb)
++ *     u4LSC_Integer_SQRT            0xf3d48 (thumb)
++ *
++ * The userspace side never writes to a device node, never mmaps and never
++ * loads the vendor libraries; it only reads from file descriptors.
++ */
++
++#ifndef CAMOTP_H
++#define CAMOTP_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <sys/types.h>
++
++/* ------------------------------------------------------------------ */
++/* IMX219 module EEPROM, MTK OTP image                                 */
++/* ------------------------------------------------------------------ */
++
++/*
++ * The downstream reader fills a 1100-byte union (OTP_MTK_TYPE) but only
++ * populates 955 bytes:
++ *
++ *   page alias 0xa0, 0x01..0xff   255 bytes  (imx219_eeprom.c:192-219)
++ *   page alias 0xa2, 0x00..0xff   256 bytes  (:221-224)
++ *   page alias 0xa4, 0x00..0xff   256 bytes  (:221-224)
++ *   page alias 0xa6, 0x00..0xba   187 bytes  (:225)
++ *
++ * so bytes 0x000..0x3ba are meaningful and 0x3bb.. are never written.
++ */
++#define CAMOTP_OTP_MTK_POPULATED	0x3bb
++
++#define CAMOTP_OTP_OFF_CALI_VER		0x001	/* 4, :192 */
++#define CAMOTP_OTP_OFF_SERIAL		0x005	/* 2, :198 */
++#define CAMOTP_OTP_OFF_VERSION		0x007	/* 1, :201 (first byte) */
++#define CAMOTP_OTP_OFF_AWB_AF_INFO	0x008	/* 1, :201 (second byte) */
++#define CAMOTP_OTP_OFF_UNIT_AWB		0x009	/* 4, :204 */
++#define CAMOTP_OTP_OFF_GOLDEN_AWB	0x00d	/* 4, :204 */
++#define CAMOTP_OTP_OFF_AF_INFINITY	0x011	/* 2, :207 */
++#define CAMOTP_OTP_OFF_AF_MACRO		0x013	/* 2, :207 */
++#define CAMOTP_OTP_OFF_LSC_SIZE		0x015	/* 2, :210 */
++#define CAMOTP_OTP_OFF_LSC_DATA		0x017	/* lsc_size bytes, :219-225 */
++
++#define CAMOTP_OTP_OFF_MFR_INFO		0x020	/* 11, :365,371 */
++#define CAMOTP_OTP_LEN_MFR_INFO		11
++#define CAMOTP_OTP_OFF_MODULE_ID	0x050	/* 10, :369,387 */
++#define CAMOTP_OTP_LEN_MODULE_ID	10
++
++/* read_imx219_eeprom_mtk_fmt() requires the first block read to succeed
++ * with the shipped calibration version (imx219_eeprom.c:192-195). */
++#define CAMOTP_OTP_CALI_VER		0xff000b01u
++
++/* As much of the LSC payload as the image can hold (0x3bb - 0x017). */
++#define CAMOTP_OTP_LSC_CAPACITY		(CAMOTP_OTP_MTK_POPULATED - CAMOTP_OTP_OFF_LSC_DATA)
++
++/* Samsung LSC calibration block, read through selective_read_region():
++ * a little-endian u16 length at 0x300 followed by that many bytes at 0x302
++ * (imx219_eeprom.c:324-332).  The payload is the CAM_CAL_EEPROM_DATA block
++ * consumed by LSC_AVGRAW_to_Gaintable() and is 0x38e bytes long. */
++#define CAMOTP_EEPROM_LSC_LEN_OFF	0x300
++#define CAMOTP_EEPROM_LSC_DATA_OFF	0x302
++
++struct camotp_awb {
++	uint8_t r, gr, gb, b;
++};
++
++struct camotp_imx219 {
++	uint32_t cali_version;		/* little endian */
++	int cali_version_valid;
++	uint16_t serial;
++	uint8_t version;
++	uint8_t awb_af_info;
++	struct camotp_awb unit_awb;
++	struct camotp_awb golden_awb;
++	uint16_t af_infinity;
++	uint16_t af_macro;
++	uint16_t lsc_size;
++	const uint8_t *lsc;		/* points into the caller's image */
++	int lsc_valid;			/* not all-0x00 / all-0xff */
++	uint8_t module_id[CAMOTP_OTP_LEN_MODULE_ID];
++	int module_id_valid;
++	char mfr_info[CAMOTP_OTP_LEN_MFR_INFO + 1];
++	int mfr_info_valid;
++};
++
++/*
++ * camotp_parse_imx219() - decode a raw OTP image without doing I/O.
++ * @image: CAMOTP_OTP_MTK_POPULATED bytes (a longer buffer is fine).
++ * @len:   number of valid bytes at @image.
++ *
++ * Returns 0, -EINVAL if @len is too small or an argument is NULL, or
++ * -ERANGE if the LSC length does not fit inside the populated part of the
++ * image.  A calibration version other than the shipped one is reported
++ * through @cali_version_valid, not as an error: downstream only treats a
++ * failed I2C read as an error (imx219_eeprom.c:192-195).
++ */
++int camotp_parse_imx219(const uint8_t *image, size_t len,
++			struct camotp_imx219 *out);
++
++/* ------------------------------------------------------------------ */
++/* S5K5E3YX OTP pages                                                  */
++/* ------------------------------------------------------------------ */
++
++#define CAMOTP_S5K_PAGES		4
++#define CAMOTP_S5K_PAGE_BYTES		5
++
++/*
++ * Register 0x0a04..0x0a08 of page 0..3
++ * (s5k5e3yxmipiraw_Sensor.c:400-405).  Byte 0 is the calibration flag, 1 the
++ * lens-shading table index, 2..4 the R/G/B calibration values (:409-413).
++ */
++struct camotp_s5k_page {
++	uint8_t cal_flag;
++	uint8_t lsc_index;
++	uint8_t r_cal;
++	uint8_t g_cal;
++	uint8_t b_cal;
++};
++
++struct camotp_s5k_otp {
++	struct camotp_s5k_page page[CAMOTP_S5K_PAGES];
++};
++
++/*
++ * camotp_parse_s5k5e3yx_raw() - decode the 20 raw bytes (4 pages x 5).
++ * camotp_parse_s5k5e3yx() - decode the same data from the sysfs text the
++ *                           sensor driver emits (see s5k5e3yx.c, attribute
++ *                           "otp"): one "pageN:" line per page, each value
++ *                           after the colon is "RRRR=VV" with RRRR the
++ *                           hex register address and VV the value.
++ * Both return 0 on success, -EINVAL on a truncated or malformed input and
++ * -ERANGE on a repeated/missing page.
++ */
++int camotp_parse_s5k5e3yx_raw(const uint8_t *raw, size_t len,
++			      struct camotp_s5k_otp *out);
++int camotp_parse_s5k5e3yx(const char *text, size_t len,
++			  struct camotp_s5k_otp *out);
++
++/* ------------------------------------------------------------------ */
++/* Lens shading: CAM_CAL_EEPROM_DATA -> ISP gain table                 */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Layout proven from libcameracustom.so:
++ *
++ *   +0x00 u8   n_x            (grid columns)   vLSC_PARAM_INIT arg 0
++ *   +0x01 u8   n_y            (grid rows)      vLSC_PARAM_INIT arg 1
++ *   +0x02 u16  bayer order    (0..3)           LSC_AVGRAW_to_Gaintable 0xf45dc
++ *   +0x04 u16  width                          0xf45c2
++ *   +0x06 u16  height                         0xf45c6
++ *   +0x08 u8   ShadingATNTable index (0..20)  0xf45be/0xf45ca
++ *   +0x09 u8   unused
++ *   +0x0a..+0x0d u8 pedestal[4]               0xf4650-0xf4666
++ *   +0x0e       four 224-byte planes           vLSC_AvgRaw_Load 0xf4182/0xf41c0/
++ *                                              0xf41fe/0xf4230 (+0x2ae/+0x1ce/
++ *                                              +0xee/+0x0e)
++ *
++ * The total is 0x0e + 4 * 0xe0 = 0x38e.
++ */
++#define CAMOTP_LSC_BLOCK_SIZE		0x38e
++#define CAMOTP_LSC_PLANES		4
++#define CAMOTP_LSC_PLANE_BYTES		0xe0
++#define CAMOTP_LSC_PLANE_BASE		0x0e
++#define CAMOTP_LSC_MAX_BLOCKS		CAMOTP_LSC_PLANE_BYTES
++#define CAMOTP_LSC_ATN_ENTRIES		21
++#define CAMOTP_LSC_ATN_COEF		6
++
++/* ShadingATNTable: 21 entries x 6 int32, fixed point with 1000000 == 1.0
++ * (libcameracustom.so 0x50af18, size 0x1f8).  The last word of each entry is
++ * the normaliser: LSC_AVGRAW_to_Gaintable divides words 0..4 by it
++ * (0xf4608-0xf4648). */
++struct camotp_lsc_atn {
++	int32_t coef[CAMOTP_LSC_ATN_COEF];
++};
++
++struct camotp_lsc_info {
++	unsigned int n_x, n_y;
++	unsigned int bayer;
++	unsigned int width, height;
++	unsigned int atn_index;
++	int poly_enabled;
++	uint8_t pedestal[4];
++	int32_t max_value[4];		/* per channel, after pedestal */
++	uint32_t ref_distance;		/* u4LSC_Integer_SQRT result */
++	unsigned int col_step, row_step;
++};
++
++/*
++ * camotp_lsc_convert() - convert one CAM_CAL_EEPROM_DATA block to the ISP
++ * gain table.
++ * @block:  CAMOTP_LSC_BLOCK_SIZE bytes.
++ * @len:    number of valid bytes.
++ * @atn:    CAMOTP_LSC_ATN_ENTRIES entries read from the vendor library.
++ * @out16:  at least 4 * n_x * n_y u16: R, Gr, Gb, B per block, each the
++ *          16.16 style gain clamped to 65535 (step 8192 == 1.0), in
++ *          row-major block order.  May be NULL to only fill @info.
++ * @info:   decoded header and derived values; may be NULL.
++ *
++ * Returns 0, -EINVAL for a malformed block (grid too large for the fixed
++ * plane stride, bayer > 3, zero height/width steps, index out of range),
++ * -ENODATA if the plane data is blank, or -ERANGE if the ATN entry is
++ * unusable (zero normaliser).
++ */
++int camotp_lsc_convert(const uint8_t *block, size_t len,
++		       const struct camotp_lsc_atn *atn, size_t natn,
++		       uint16_t *out16, struct camotp_lsc_info *info);
++
++/* The five-point polynomial of mrLSC_POLY_RatioFloat_Get() (0xf3e1a):
++ * 1 + a4*r + a3*r^2 + a2*r^3 + a1*r^4 + a0*r^5 with r = distance/ref. */
++float camotp_lsc_poly(const float coef[6], float r);
++
++/* Floor of the square root, matching u4LSC_Integer_SQRT() (0xf3d48). */
++uint64_t camotp_isqrt(uint64_t v);
++
++/* ------------------------------------------------------------------ */
++/* ELF32 vendor library access                                         */
++/* ------------------------------------------------------------------ */
++
++struct camotp_elf_sym {
++	const char *name;
++	uint32_t addr;
++	uint32_t size;
++	uint8_t type;
++	uint16_t shndx;
++};
++
++struct camotp_elf;
++
++int camotp_elf_open(const char *path, struct camotp_elf **elf);
++void camotp_elf_close(struct camotp_elf *elf);
++size_t camotp_elf_sym_count(const struct camotp_elf *elf);
++int camotp_elf_sym_get(const struct camotp_elf *elf, size_t idx,
++		       struct camotp_elf_sym *sym);
++int camotp_elf_find(const struct camotp_elf *elf, const char *name,
++		    struct camotp_elf_sym *sym);
++int camotp_elf_read(const struct camotp_elf *elf, uint32_t addr, void *buf,
++		    size_t len);
++
++/* ------------------------------------------------------------------ */
++/* Documented vendor tables                                            */
++/* ------------------------------------------------------------------ */
++
++enum camotp_elem {
++	CAMOTP_ELEM_S32,
++	CAMOTP_ELEM_U32,
++};
++
++struct camotp_table {
++	const char *lib;	/* file name as shipped in /system/lib */
++	const char *symbol;	/* dynamic symbol name */
++	const char *what;	/* one-line description */
++	enum camotp_elem elem;
++	uint32_t size;		/* bytes, verified against the ELF symbol */
++	const char *decode;	/* field decode */
++};
++
++/* NULL-terminated registry of tables verified in this ROM. */
++const struct camotp_table *camotp_tables(void);
++const struct camotp_table *camotp_table_by_symbol(const char *symbol);
++
++/*
++ * camotp_table_read() - copy the bytes of a registry table out of its
++ * vendor library.
++ * Returns 0, -EINVAL if the symbol size differs from the documented size or
++ * @buflen is too small, or a negative errno from the ELF reader.
++ */
++int camotp_table_read(const struct camotp_table *table, const char *lib_path,
++		      void *buf, size_t buflen, size_t *out_len);
++
++/* ------------------------------------------------------------------ */
++/* Read-only I/O helpers                                               */
++/* ------------------------------------------------------------------ */
++
++/*
++ * camotp_read_file() - pread @len bytes at @offset from a read-only file.
++ * Returns 0 on success or a negative errno.  Short reads are an error.
++ */
++int camotp_read_file(const char *path, size_t offset, void *buf, size_t len);
++
++/*
++ * camotp_read_text() - read a sysfs attribute into @buf and NUL terminate it.
++ * Returns the number of bytes read (always < @len) or a negative errno.
++ */
++ssize_t camotp_read_text(const char *path, char *buf, size_t len);
++
++/*
++ * camotp_find_nvmem() - resolve the IMX219 module EEPROM nvmem node.
++ * Scans the entries of /sys/bus/nvmem/devices for the device named
++ * "imx219-eeprom" (nvmem_config.name in drivers/media/i2c/imx219-eeprom.c;
++ * with NVMEM_DEVID_NONE the device keeps exactly that name, see
++ * drivers/nvmem/core.c:961-963).  Returns 0 and fills @path, or -ENOENT.
++ */
++int camotp_find_nvmem(char *path, size_t pathlen);
++
++/*
++ * camotp_find_sensor_otp() - resolve the S5K5E3YX "otp" sysfs attribute.
++ * Scans /sys/bus/i2c/devices for the client whose "driver" link points at
++ * s5k5e3yx and that exposes an "otp" attribute.  Returns 0 and fills @path,
++ * or -ENOENT.
++ */
++int camotp_find_sensor_otp(char *path, size_t pathlen);
++
++#endif /* CAMOTP_H */
+diff --git a/tools/mediatek/camera/otp/camotp_elf.c b/tools/mediatek/camera/otp/camotp_elf.c
+new file mode 100644
+index 000000000..2bb71079d
+--- /dev/null
++++ b/tools/mediatek/camera/otp/camotp_elf.c
+@@ -0,0 +1,307 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Minimal read-only ELF32 LSB reader: dynamic symbols and vaddr -> file
++ * offset translation.  Used to read documented tables out of the shipped
++ * vendor libraries (ARM32) without loading or executing them.
++ *
++ * Only what is needed is implemented: the ELF header, the program headers,
++ * the section headers and the DT_SYMTAB-style .dynsym/.dynstr pair.  Every
++ * offset is bounds checked against the file size.
++ */
++
++#include <elf.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "camotp.h"
++
++struct camotp_elf {
++	int fd;
++	uint64_t size;
++	Elf32_Ehdr eh;
++	Elf32_Phdr *ph;
++	size_t nph;
++	Elf32_Shdr *sh;
++	size_t nsh;
++	Elf32_Shdr *dynsym;
++	Elf32_Shdr *dynstr;
++	size_t nsym;
++	char *strtab;
++};
++
++static int pread_full(int fd, void *buf, size_t len, uint64_t off)
++{
++	size_t done = 0;
++
++	while (done < len) {
++		ssize_t ret = pread(fd, (char *)buf + done, len - done,
++				    (off_t)(off + done));
++
++		if (ret < 0) {
++			if (errno == EINTR)
++				continue;
++			return -errno;
++		}
++		if (ret == 0)
++			return -EIO;
++		done += (size_t)ret;
++	}
++
++	return 0;
++}
++
++static int in_file(const struct camotp_elf *elf, uint64_t off, uint64_t len)
++{
++	return off <= elf->size && len <= elf->size - off;
++}
++
++void camotp_elf_close(struct camotp_elf *elf)
++{
++	if (!elf)
++		return;
++	if (elf->fd >= 0)
++		close(elf->fd);
++	free(elf->ph);
++	free(elf->sh);
++	free(elf->strtab);
++	free(elf);
++}
++
++int camotp_elf_open(const char *path, struct camotp_elf **out)
++{
++	struct camotp_elf *elf;
++	struct stat st;
++	uint64_t shoff;
++	size_t i;
++	int ret;
++
++	if (!path || !out)
++		return -EINVAL;
++
++	elf = calloc(1, sizeof(*elf));
++	if (!elf)
++		return -ENOMEM;
++
++	elf->fd = open(path, O_RDONLY | O_CLOEXEC);
++	if (elf->fd < 0) {
++		ret = -errno;
++		goto err;
++	}
++
++	if (fstat(elf->fd, &st)) {
++		ret = -errno;
++		goto err;
++	}
++	if (!S_ISREG(st.st_mode) || st.st_size < (off_t)sizeof(Elf32_Ehdr)) {
++		ret = -EINVAL;
++		goto err;
++	}
++	elf->size = (uint64_t)st.st_size;
++
++	ret = pread_full(elf->fd, &elf->eh, sizeof(elf->eh), 0);
++	if (ret)
++		goto err;
++
++	if (memcmp(elf->eh.e_ident, ELFMAG, SELFMAG) != 0 ||
++	    elf->eh.e_ident[EI_CLASS] != ELFCLASS32 ||
++	    elf->eh.e_ident[EI_DATA] != ELFDATA2LSB ||
++	    elf->eh.e_machine != EM_ARM) {
++		ret = -ENOEXEC;
++		goto err;
++	}
++
++	/* Program headers */
++	elf->nph = elf->eh.e_phnum;
++	if (elf->nph) {
++		uint64_t bytes;
++
++		if (elf->eh.e_phentsize < sizeof(Elf32_Phdr) ||
++		    elf->eh.e_phoff == 0) {
++			ret = -ENOEXEC;
++			goto err;
++		}
++		if (elf->nph > (1u << 16)) {
++			ret = -ENOEXEC;
++			goto err;
++		}
++		bytes = (uint64_t)elf->nph * sizeof(Elf32_Phdr);
++		if (!in_file(elf, elf->eh.e_phoff, bytes)) {
++			ret = -ENOEXEC;
++			goto err;
++		}
++		elf->ph = calloc(elf->nph, sizeof(*elf->ph));
++		if (!elf->ph) {
++			ret = -ENOMEM;
++			goto err;
++		}
++		ret = pread_full(elf->fd, elf->ph, bytes, elf->eh.e_phoff);
++		if (ret)
++			goto err;
++	}
++
++	/* Section headers (extended numbering if e_shnum == 0) */
++	shoff = elf->eh.e_shoff;
++	if (!shoff || elf->eh.e_shentsize < sizeof(Elf32_Shdr) ||
++	    !in_file(elf, shoff, sizeof(Elf32_Shdr))) {
++		ret = -ENOEXEC;
++		goto err;
++	}
++
++	elf->nsh = elf->eh.e_shnum;
++	if (!elf->nsh) {
++		Elf32_Shdr zero;
++
++		ret = pread_full(elf->fd, &zero, sizeof(zero), shoff);
++		if (ret)
++			goto err;
++		elf->nsh = zero.sh_size;
++	}
++	if (!elf->nsh || elf->nsh > (1u << 16) ||
++	    !in_file(elf, shoff, (uint64_t)elf->nsh * sizeof(Elf32_Shdr))) {
++		ret = -ENOEXEC;
++		goto err;
++	}
++
++	elf->sh = calloc(elf->nsh, sizeof(*elf->sh));
++	if (!elf->sh) {
++		ret = -ENOMEM;
++		goto err;
++	}
++	ret = pread_full(elf->fd, elf->sh, (uint64_t)elf->nsh * sizeof(*elf->sh),
++			 shoff);
++	if (ret)
++		goto err;
++
++	for (i = 1; i < elf->nsh; i++) {
++		if (elf->sh[i].sh_type != SHT_DYNSYM)
++			continue;
++		if (elf->sh[i].sh_link >= elf->nsh)
++			continue;
++		if (elf->sh[i].sh_entsize &&
++		    elf->sh[i].sh_entsize != sizeof(Elf32_Sym))
++			continue;
++		elf->dynsym = &elf->sh[i];
++		elf->dynstr = &elf->sh[elf->sh[i].sh_link];
++		break;
++	}
++
++	if (!elf->dynsym || !elf->dynstr) {
++		ret = -ENOENT;
++		goto err;
++	}
++
++	elf->nsym = elf->dynsym->sh_size / sizeof(Elf32_Sym);
++	if (!elf->nsym ||
++	    !in_file(elf, elf->dynsym->sh_offset, elf->dynsym->sh_size) ||
++	    !in_file(elf, elf->dynstr->sh_offset, elf->dynstr->sh_size)) {
++		ret = -ENOEXEC;
++		goto err;
++	}
++
++	elf->strtab = malloc(elf->dynstr->sh_size + 1);
++	if (!elf->strtab) {
++		ret = -ENOMEM;
++		goto err;
++	}
++	ret = pread_full(elf->fd, elf->strtab, elf->dynstr->sh_size,
++			 elf->dynstr->sh_offset);
++	if (ret)
++		goto err;
++	elf->strtab[elf->dynstr->sh_size] = '\0';
++
++	*out = elf;
++	return 0;
++
++err:
++	camotp_elf_close(elf);
++	return ret;
++}
++
++size_t camotp_elf_sym_count(const struct camotp_elf *elf)
++{
++	return elf ? elf->nsym : 0;
++}
++
++int camotp_elf_sym_get(const struct camotp_elf *elf, size_t idx,
++		       struct camotp_elf_sym *sym)
++{
++	Elf32_Sym s;
++	uint64_t off;
++	int ret;
++
++	if (!elf || !sym || idx >= elf->nsym)
++		return -EINVAL;
++
++	off = elf->dynsym->sh_offset + (uint64_t)idx * sizeof(s);
++	ret = pread_full(elf->fd, &s, sizeof(s), off);
++	if (ret)
++		return ret;
++
++	/* st_name is an offset into the string table; the table is held in
++	 * memory and NUL terminated one past its end. */
++	if (s.st_name >= elf->dynstr->sh_size)
++		sym->name = "";
++	else
++		sym->name = elf->strtab + s.st_name;
++
++	sym->addr = s.st_value;
++	sym->size = s.st_size;
++	sym->type = ELF32_ST_TYPE(s.st_info);
++	sym->shndx = s.st_shndx;
++
++	return 0;
++}
++
++int camotp_elf_find(const struct camotp_elf *elf, const char *name,
++		    struct camotp_elf_sym *sym)
++{
++	size_t i;
++
++	if (!elf || !name || !sym)
++		return -EINVAL;
++
++	for (i = 1; i < elf->nsym; i++) {
++		int ret = camotp_elf_sym_get(elf, i, sym);
++
++		if (ret)
++			return ret;
++		if (strcmp(sym->name, name) == 0)
++			return 0;
++	}
++
++	return -ENOENT;
++}
++
++int camotp_elf_read(const struct camotp_elf *elf, uint32_t addr, void *buf,
++		    size_t len)
++{
++	size_t i;
++
++	if (!elf || !buf || !len)
++		return -EINVAL;
++
++	for (i = 0; i < elf->nph; i++) {
++		const Elf32_Phdr *p = &elf->ph[i];
++		uint64_t start = p->p_vaddr;
++		uint64_t end = start + p->p_filesz;
++
++		if (p->p_type != PT_LOAD)
++			continue;
++		if (p->p_filesz == 0)
++			continue;
++		if (addr < start || (uint64_t)addr + len > end)
++			continue;
++		if (!in_file(elf, p->p_offset + (addr - start), len))
++			return -ENOEXEC;
++
++		return pread_full(elf->fd, buf, len,
++				  p->p_offset + (addr - start));
++	}
++
++	return -ENOENT;
++}
+diff --git a/tools/mediatek/camera/otp/camotp_imx219.c b/tools/mediatek/camera/otp/camotp_imx219.c
+new file mode 100644
+index 000000000..503304672
+--- /dev/null
++++ b/tools/mediatek/camera/otp/camotp_imx219.c
+@@ -0,0 +1,110 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * IMX219 module EEPROM MTK OTP image parser.
++ *
++ * The image is the byte-for-byte buffer downstream assembles in
++ * read_imx219_eeprom_mtk_fmt():
++ *
++ *   imgsensor/src/mt6735/imx219_mipi_raw/imx219_eeprom.c
++ *     :192  0xa0 0x01 4 bytes   calibration version
++ *     :198  0xa0 0x05 2 bytes   serial number
++ *     :201  0xa0 0x07 2 bytes   version, AWB/AF info
++ *     :204  0xa0 0x09 8 bytes   unit AWB (4) + golden AWB (4)
++ *     :207  0xa0 0x11 4 bytes   AF infinity (u16), AF macro (u16)
++ *     :210  0xa0 0x15 2 bytes   LSC payload length
++ *     :219  0xa0 0x17 233 bytes LSC payload, continued by
++ *     :221  0xa2/0xa4   256+256 bytes
++ *     :225  0xa6 0x00 187 bytes
++ *
++ * The byte offsets are taken from the reads themselves, not from the C
++ * struct: downstream never dereferences OTP_MTK_TYPE, it only fills the
++ * union byte array, and the struct would place CaliVer at offset 4 through
++ * natural alignment while the image stores it at offset 1.
++ */
++
++#include <errno.h>
++#include <string.h>
++
++#include "camotp.h"
++
++static uint16_t le16(const uint8_t *p)
++{
++	return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
++}
++
++static uint32_t le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static int all_blank(const uint8_t *p, size_t len)
++{
++	size_t i;
++	int zero = 1, ones = 1;
++
++	for (i = 0; i < len; i++) {
++		if (p[i] != 0x00)
++			zero = 0;
++		if (p[i] != 0xff)
++			ones = 0;
++	}
++
++	return zero || ones;
++}
++
++int camotp_parse_imx219(const uint8_t *image, size_t len,
++			struct camotp_imx219 *out)
++{
++	uint16_t lsc_size;
++
++	if (!image || !out)
++		return -EINVAL;
++	if (len < CAMOTP_OTP_MTK_POPULATED)
++		return -EINVAL;
++
++	memset(out, 0, sizeof(*out));
++
++	out->cali_version = le32(image + CAMOTP_OTP_OFF_CALI_VER);
++	out->cali_version_valid = out->cali_version == CAMOTP_OTP_CALI_VER;
++
++	out->serial = le16(image + CAMOTP_OTP_OFF_SERIAL);
++	out->version = image[CAMOTP_OTP_OFF_VERSION];
++	out->awb_af_info = image[CAMOTP_OTP_OFF_AWB_AF_INFO];
++
++	out->unit_awb.r = image[CAMOTP_OTP_OFF_UNIT_AWB + 0];
++	out->unit_awb.gr = image[CAMOTP_OTP_OFF_UNIT_AWB + 1];
++	out->unit_awb.gb = image[CAMOTP_OTP_OFF_UNIT_AWB + 2];
++	out->unit_awb.b = image[CAMOTP_OTP_OFF_UNIT_AWB + 3];
++
++	out->golden_awb.r = image[CAMOTP_OTP_OFF_GOLDEN_AWB + 0];
++	out->golden_awb.gr = image[CAMOTP_OTP_OFF_GOLDEN_AWB + 1];
++	out->golden_awb.gb = image[CAMOTP_OTP_OFF_GOLDEN_AWB + 2];
++	out->golden_awb.b = image[CAMOTP_OTP_OFF_GOLDEN_AWB + 3];
++
++	out->af_infinity = le16(image + CAMOTP_OTP_OFF_AF_INFINITY);
++	out->af_macro = le16(image + CAMOTP_OTP_OFF_AF_MACRO);
++
++	lsc_size = le16(image + CAMOTP_OTP_OFF_LSC_SIZE);
++	if (lsc_size > CAMOTP_OTP_LSC_CAPACITY)
++		return -ERANGE;
++
++	out->lsc_size = lsc_size;
++	out->lsc = image + CAMOTP_OTP_OFF_LSC_DATA;
++	out->lsc_valid = lsc_size != 0 && !all_blank(out->lsc, lsc_size);
++
++	memcpy(out->module_id, image + CAMOTP_OTP_OFF_MODULE_ID,
++	       CAMOTP_OTP_LEN_MODULE_ID);
++	out->module_id_valid =
++		!all_blank(image + CAMOTP_OTP_OFF_MODULE_ID,
++			   CAMOTP_OTP_LEN_MODULE_ID);
++
++	memcpy(out->mfr_info, image + CAMOTP_OTP_OFF_MFR_INFO,
++	       CAMOTP_OTP_LEN_MFR_INFO);
++	out->mfr_info[CAMOTP_OTP_LEN_MFR_INFO] = '\0';
++	out->mfr_info_valid =
++		!all_blank(image + CAMOTP_OTP_OFF_MFR_INFO,
++			   CAMOTP_OTP_LEN_MFR_INFO);
++
++	return 0;
++}
+diff --git a/tools/mediatek/camera/otp/camotp_io.c b/tools/mediatek/camera/otp/camotp_io.c
+new file mode 100644
+index 000000000..b3a268fdf
+--- /dev/null
++++ b/tools/mediatek/camera/otp/camotp_io.c
+@@ -0,0 +1,205 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Read-only I/O helpers: pread on regular files, discovery of the two
++ * calibration sources in sysfs.  Nothing here opens a path for writing.
++ */
++
++#include <dirent.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "camotp.h"
++
++int camotp_read_file(const char *path, size_t offset, void *buf, size_t len)
++{
++	size_t done = 0;
++	int fd;
++
++	if (!path || !buf)
++		return -EINVAL;
++
++	/* O_NONBLOCK keeps a FIFO or a mis-typed path from blocking forever;
++	 * the FSTAT check below rejects anything that is not a regular file
++	 * or a sysfs attribute. */
++	fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
++	if (fd < 0)
++		return -errno;
++
++	while (done < len) {
++		ssize_t ret = pread(fd, (char *)buf + done, len - done,
++				    (off_t)(offset + done));
++
++		if (ret < 0) {
++			int err = -errno;
++
++			if (errno == EINTR)
++				continue;
++			close(fd);
++			return err;
++		}
++		if (ret == 0) {
++			close(fd);
++			return -EIO;
++		}
++		done += (size_t)ret;
++	}
++
++	close(fd);
++	return 0;
++}
++
++ssize_t camotp_read_text(const char *path, char *buf, size_t len)
++{
++	size_t done = 0;
++	int fd;
++
++	if (!path || !buf || len < 2)
++		return -EINVAL;
++
++	fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
++	if (fd < 0)
++		return -errno;
++
++	while (done < len - 1) {
++		ssize_t ret = read(fd, buf + done, len - 1 - done);
++
++		if (ret < 0) {
++			int err = -errno;
++
++			if (errno == EINTR)
++				continue;
++			close(fd);
++			return err;
++		}
++		if (ret == 0)
++			break;
++		done += (size_t)ret;
++	}
++
++	close(fd);
++	buf[done] = '\0';
++
++	return (ssize_t)done;
++}
++
++/*
++ * True when the symbolic link at @path names @want in its last component,
++ * e.g. /sys/bus/i2c/devices/1-0010/driver -> .../drivers/s5k5e3yx.
++ */
++static int link_tail_is(const char *path, const char *want)
++{
++	char buf[PATH_MAX];
++	const char *tail;
++	ssize_t n;
++
++	n = readlink(path, buf, sizeof(buf) - 1);
++	if (n < 0)
++		return 0;
++	buf[n] = '\0';
++
++	tail = strrchr(buf, '/');
++	tail = tail ? tail + 1 : buf;
++
++	return strcmp(tail, want) == 0;
++}
++
++static int join(char *dst, size_t len, const char *dir, const char *leaf)
++{
++	int n = snprintf(dst, len, "%s/%s", dir, leaf);
++
++	if (n < 0 || (size_t)n >= len)
++		return -ENAMETOOLONG;
++
++	return 0;
++}
++
++int camotp_find_nvmem(char *path, size_t pathlen)
++{
++	const char *dirpath = "/sys/bus/nvmem/devices";
++	struct dirent *de;
++	DIR *dir;
++	int ret = -ENOENT;
++
++	if (!path || pathlen < 32)
++		return -EINVAL;
++
++	dir = opendir(dirpath);
++	if (!dir)
++		return -errno;
++
++	while ((de = readdir(dir))) {
++		char dirbuf[PATH_MAX];
++		char full[PATH_MAX];
++
++		if (de->d_name[0] == '.')
++			continue;
++		/*
++		 * nvmem names the device after nvmem_config.name
++		 * (drivers/nvmem/core.c:961-963, NVMEM_DEVID_NONE) and the
++		 * directory under /sys/bus/nvmem/devices carries that name.
++		 */
++		if (strncmp(de->d_name, "imx219-eeprom", 13) != 0)
++			continue;
++		if (join(dirbuf, sizeof(dirbuf), dirpath, de->d_name))
++			continue;
++		if (join(full, sizeof(full), dirbuf, "nvmem"))
++			continue;
++		if (access(full, R_OK))
++			continue;
++		if ((size_t)snprintf(path, pathlen, "%s", full) >= pathlen)
++			continue;
++
++		ret = 0;
++		break;
++	}
++
++	closedir(dir);
++	return ret;
++}
++
++int camotp_find_sensor_otp(char *path, size_t pathlen)
++{
++	const char *dirpath = "/sys/bus/i2c/devices";
++	struct dirent *de;
++	DIR *dir;
++	int ret = -ENOENT;
++
++	if (!path || pathlen < 32)
++		return -EINVAL;
++
++	dir = opendir(dirpath);
++	if (!dir)
++		return -errno;
++
++	while ((de = readdir(dir))) {
++		char dirbuf[PATH_MAX];
++		char full[PATH_MAX];
++
++		if (de->d_name[0] == '.')
++			continue;
++		if (join(dirbuf, sizeof(dirbuf), dirpath, de->d_name))
++			continue;
++		/* Only the device bound to this driver has the attribute. */
++		if (join(full, sizeof(full), dirbuf, "driver"))
++			continue;
++		if (!link_tail_is(full, "s5k5e3yx"))
++			continue;
++		if (join(full, sizeof(full), dirbuf, "otp"))
++			continue;
++		if (access(full, R_OK))
++			continue;
++		if ((size_t)snprintf(path, pathlen, "%s", full) >= pathlen)
++			continue;
++
++		ret = 0;
++		break;
++	}
++
++	closedir(dir);
++	return ret;
++}
+diff --git a/tools/mediatek/camera/otp/camotp_lsc.c b/tools/mediatek/camera/otp/camotp_lsc.c
+new file mode 100644
+index 000000000..14fab94ac
+--- /dev/null
++++ b/tools/mediatek/camera/otp/camotp_lsc.c
+@@ -0,0 +1,299 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Lens-shading conversion: the module OTP block (CAM_CAL_EEPROM_DATA) to the
++ * ISP gain table.
++ *
++ * This is a port of the four functions libcameracustom.so runs on the
++ * calibration block.  Every constant below is taken from the shipped code;
++ * the instruction address that proves it is noted next to it.
++ *
++ *   LSC_AVGRAW_to_Gaintable  @0xf45a0  reads the header, computes the
++ *                                       ShadingATNTable ratios and drives the
++ *                                       rest of the pipeline.
++ *   vLSC_PARAM_INIT          @0xf3e84  derives the grid steps and the
++ *                                       distance normaliser.
++ *   vLSC_Calibration_INIT    @0xf3f8c  builds the per-column / per-row
++ *                                       coordinate tables.
++ *   vLSC_AvgRaw_Load         @0xf4150  four planar 8-bit channel blocks to
++ *                                       floats.
++ *   vLSC_AvgRaw_Process      @0xf4020  bayer permutation and pedestal
++ *                                       subtraction.
++ *   mrLSC_AvgToGainTbl       @0xf4250  per-channel maximum, distance ratio,
++ *                                       gain, 16.16 packing.
++ *   mrLSC_POLY_RatioFloat_Get @0xf3e1a distance polynomial.
++ *   u4LSC_Integer_SQRT       @0xf3d48  integer square root.
++ *
++ * Notes on things the vendor code does not do, but a hardware-less parser
++ * must:
++ *   - the vendor divides by (n_x - 1), (n_y - 1) and the reference distance
++ *     without checking them; those blocks are rejected here instead of
++ *     producing inf/nan;
++ *   - an all-blank plane area is rejected (-ENODATA) instead of producing a
++ *     constant "gain = 4.0" table.
++ */
++
++#include <errno.h>
++#include <string.h>
++
++#include "camotp.h"
++
++/*
++ * Channel permutation selected by the block's bayer order byte
++ * (vLSC_AvgRaw_Process 0xf403e-0xf4084): the output channel order is
++ * (src[perm[0]], src[perm[1]], src[perm[2]], src[perm[3]]).
++ */
++static const uint8_t camotp_lsc_perm[4][4] = {
++	{ 0, 1, 2, 3 },
++	{ 1, 0, 3, 2 },
++	{ 2, 3, 0, 1 },
++	{ 3, 2, 1, 0 },
++};
++
++/* param[0x44] << 13 clamped to 0xffff with param[0x44] = 4
++ * (vLSC_PARAM_INIT 0xf3ec8, mrLSC_AvgToGainTbl 0xf4316-0xf4338). */
++#define CAMOTP_LSC_MAX_GAIN	32768.0f
++
++/* Gain scale and saturation of the packed table: 0xf437c/0xf4476 load
++ * 8192.0f, 0xf44a6-0xf44b6 compare against the double 65535.0. */
++#define CAMOTP_LSC_GAIN_SCALE	8192.0f
++#define CAMOTP_LSC_GAIN_SATURATION 65535.0
++
++uint64_t camotp_isqrt(uint64_t v)
++{
++	uint64_t rem = 0, root = 0;
++	int i;
++
++	/* Bit-by-bit floor square root; the vendor routine (0xf3d48)
++	 * normalises the input to its highest power of four, then walks the
++	 * bits down, which yields the same floor. */
++	for (i = 62; i >= 0; i -= 2) {
++		uint64_t test;
++
++		rem = (rem << 2) | ((v >> i) & 3);
++		test = (root << 2) | 1;
++		if (rem >= test) {
++			rem -= test;
++			root = (root << 1) | 1;
++		} else {
++			root <<= 1;
++		}
++	}
++
++	return root;
++}
++
++float camotp_lsc_poly(const float coef[6], float r)
++{
++	float acc = coef[5];
++	float power = r;
++	int i;
++
++	/* mrLSC_POLY_RatioFloat_Get @0xf3e1a: accumulates c[4]..c[0] with
++	 * successive powers of the ratio; the constant term is coef[5]. */
++	for (i = 4; i >= 0; i--) {
++		acc += coef[i] * power;
++		power *= r;
++	}
++
++	return acc;
++}
++
++static uint16_t le16(const uint8_t *p)
++{
++	return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
++}
++
++static int plane_is_blank(const uint8_t *block, unsigned int blocks)
++{
++	unsigned int plane, i;
++	int zero = 1, ones = 1;
++
++	for (plane = 0; plane < CAMOTP_LSC_PLANES; plane++) {
++		const uint8_t *p = block + CAMOTP_LSC_PLANE_BASE +
++				   plane * CAMOTP_LSC_PLANE_BYTES;
++
++		for (i = 0; i < blocks; i++) {
++			if (p[i] != 0x00)
++				zero = 0;
++			if (p[i] != 0xff)
++				ones = 0;
++		}
++	}
++
++	return zero || ones;
++}
++
++int camotp_lsc_convert(const uint8_t *block, size_t len,
++		       const struct camotp_lsc_atn *atn, size_t natn,
++		       uint16_t *out16, struct camotp_lsc_info *info)
++{
++	float proc[CAMOTP_LSC_MAX_BLOCKS * CAMOTP_LSC_PLANES];
++	float coef[6] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
++	struct camotp_lsc_info li;
++	int32_t maxv[CAMOTP_LSC_PLANES] = { 0, 0, 0, 0 };
++	unsigned int nx, ny, bayer, atn_index, blocks;
++	unsigned int col_step, row_step, col, row, ch, i;
++	uint32_t ref_dist;
++	uint16_t w, h;
++
++	if (!block)
++		return -EINVAL;
++	if (len < CAMOTP_LSC_BLOCK_SIZE)
++		return -EINVAL;
++
++	memset(&li, 0, sizeof(li));
++
++	nx = block[0x00];
++	ny = block[0x01];
++	bayer = le16(block + 0x02);
++	w = le16(block + 0x04);
++	h = le16(block + 0x06);
++	atn_index = block[0x08];
++
++	/* vLSC_PARAM_INIT divides by (n_x - 1) and (n_y - 1) without a check
++	 * (0xf3f2a, 0xf3f30); the plane stride is fixed at 0xe0 bytes, so a
++	 * grid larger than that would walk into the next plane. */
++	if (nx < 2 || ny < 2)
++		return -EINVAL;
++	if (nx * ny > CAMOTP_LSC_MAX_BLOCKS)
++		return -EINVAL;
++	if (bayer > 3)
++		return -EINVAL;
++	if (w < 2 || h < 2)
++		return -EINVAL;
++
++	blocks = nx * ny;
++
++	/*
++	 * ShadingATNTable ratios: param[0x24..0x38] = coef[0..4] / coef[5]
++	 * (LSC_AVGRAW_to_Gaintable 0xf45e4-0xf4648).  An index above 20
++	 * leaves the coefficients at zero, which is what a fresh process sees
++	 * and which disables the polynomial (flag at param[0x60], 0xf3f1e).
++	 */
++	if (atn_index < CAMOTP_LSC_ATN_ENTRIES) {
++		const struct camotp_lsc_atn *entry;
++
++		if (!atn || natn <= atn_index)
++			return -EINVAL;
++		entry = &atn[atn_index];
++		if (entry->coef[5] == 0)
++			return -ERANGE;
++
++		for (i = 0; i < 5; i++)
++			coef[i] = (float)entry->coef[i] /
++				  (float)entry->coef[5];
++		coef[5] = 1.0f;
++	}
++
++	if (plane_is_blank(block, blocks))
++		return -ENODATA;
++
++	/* vLSC_AvgRaw_Process 0xf40a6-0xf4134 */
++	for (i = 0; i < blocks; i++) {
++		for (ch = 0; ch < CAMOTP_LSC_PLANES; ch++) {
++			const uint8_t *plane = block + CAMOTP_LSC_PLANE_BASE +
++					       camotp_lsc_perm[bayer][ch] *
++					       CAMOTP_LSC_PLANE_BYTES;
++			float v = (float)plane[i];
++			float ped = (float)block[0x0a + ch];
++			float d;
++
++			d = v > ped ? v - ped : 0.0f;
++			proc[i * CAMOTP_LSC_PLANES + ch] = d;
++			if ((int32_t)d > maxv[ch])
++				maxv[ch] = (int32_t)d;
++		}
++	}
++
++	/*
++	 * vLSC_PARAM_INIT 0xf3f24-0xf3f3e: param[8] = width >> 1,
++	 * param[0xc] = height >> 1, param[0x24] = param[8] / (n_x - 1),
++	 * param[0x28] = param[0xc] / (n_y - 1).
++	 * mrLSC_AvgToGainTbl 0xf4306-0xf4346: the reference distance is
++	 * sqrt((((w >> 1)^2 + (h >> 1)^2) >> 2) << 12).
++	 */
++	col_step = (w >> 1) / (nx - 1);
++	row_step = (h >> 1) / (ny - 1);
++
++	ref_dist = (uint32_t)camotp_isqrt(
++		(((uint64_t)(w >> 1) * (w >> 1) +
++		  (uint64_t)(h >> 1) * (h >> 1)) >> 2) << 12);
++	if (!ref_dist)
++		return -ERANGE;
++
++	for (row = 0; row < ny; row++) {
++		/* vLSC_Calibration_INIT 0xf3fbe-0xf3ffc */
++		uint32_t y = row == 0 ? 0 :
++			     row == ny - 1 ? (uint32_t)(h >> 1) - 1 :
++			     row * row_step;
++
++		for (col = 0; col < nx; col++) {
++			uint32_t x = col == 0 ? 0 :
++				     col == nx - 1 ? (uint32_t)(w >> 1) - 1 :
++				     col * col_step;
++			uint32_t dist, ratio_ok;
++			float ratio = 1.0f;
++			unsigned int idx = row * nx + col;
++
++			dist = (uint32_t)camotp_isqrt(
++				((uint64_t)x * x + (uint64_t)y * y) << 12);
++			ratio_ok = coef[0] != 0.0f || coef[1] != 0.0f ||
++				   coef[2] != 0.0f || coef[3] != 0.0f ||
++				   coef[4] != 0.0f;
++			if (ratio_ok)
++				ratio = camotp_lsc_poly(coef,
++							(float)dist /
++							(float)ref_dist);
++
++			for (ch = 0; ch < CAMOTP_LSC_PLANES; ch++) {
++				float avg = proc[idx * CAMOTP_LSC_PLANES + ch];
++				float gain, scaled;
++				double rounded;
++				uint32_t fixed;
++
++				if (avg == 0.0f) {
++					gain = CAMOTP_LSC_MAX_GAIN;
++				} else {
++					gain = (float)maxv[ch] * ratio / avg;
++					if (gain > CAMOTP_LSC_MAX_GAIN)
++						gain = CAMOTP_LSC_MAX_GAIN;
++				}
++
++				/* 0xf4462-0xf4546 */
++				scaled = gain * CAMOTP_LSC_GAIN_SCALE;
++				rounded = (double)scaled + 0.5;
++				if (rounded < CAMOTP_LSC_GAIN_SATURATION)
++					scaled = (float)rounded;
++				else
++					scaled = (float)CAMOTP_LSC_GAIN_SATURATION;
++				fixed = (uint32_t)(int32_t)scaled;
++
++				if (out16)
++					out16[idx * CAMOTP_LSC_PLANES + ch] =
++						(uint16_t)fixed;
++			}
++		}
++	}
++
++	li.n_x = nx;
++	li.n_y = ny;
++	li.bayer = bayer;
++	li.width = w;
++	li.height = h;
++	li.atn_index = atn_index;
++	li.poly_enabled = coef[0] != 0.0f || coef[1] != 0.0f ||
++			  coef[2] != 0.0f || coef[3] != 0.0f ||
++			  coef[4] != 0.0f;
++	li.col_step = col_step;
++	li.row_step = row_step;
++	li.ref_distance = ref_dist;
++	for (ch = 0; ch < CAMOTP_LSC_PLANES; ch++) {
++		li.pedestal[ch] = block[0x0a + ch];
++		li.max_value[ch] = maxv[ch];
++	}
++
++	if (info)
++		*info = li;
++
++	return 0;
++}
+diff --git a/tools/mediatek/camera/otp/camotp_s5k5e3yx.c b/tools/mediatek/camera/otp/camotp_s5k5e3yx.c
+new file mode 100644
+index 000000000..2cfa99a13
+--- /dev/null
++++ b/tools/mediatek/camera/otp/camotp_s5k5e3yx.c
+@@ -0,0 +1,188 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * S5K5E3YX OTP page parser.
++ *
++ * Hardware source: imgsensor/src/mt6735/s5k5e3yx_mipi_raw/
++ * s5k5e3yxmipiraw_Sensor.c get_otps_data() :392-414
++ *
++ *   write 0x0a00 = 0x04   NVM controller to initial state
++ *   write 0x0a02 = page   select page 0..3
++ *   write 0x0a00 = 0x01   read mode
++ *   delay 1 ms            Tmin 47 us (:400)
++ *   read  0x0a04..0x0a08  five bytes of the page buffer (:402-406)
++ *   write 0x0a00 = 0x04
++ *   write 0x0a00 = 0x00
++ *
++ * The five bytes are logged as calibration flag, lens-shading table index and
++ * R/G/B calibration values (:409-413); this parser keeps that order.
++ */
++
++#include <errno.h>
++#include <string.h>
++
++#include "camotp.h"
++
++int camotp_parse_s5k5e3yx_raw(const uint8_t *raw, size_t len,
++			      struct camotp_s5k_otp *out)
++{
++	unsigned int page;
++
++	if (!raw || !out)
++		return -EINVAL;
++	if (len < CAMOTP_S5K_PAGES * CAMOTP_S5K_PAGE_BYTES)
++		return -EINVAL;
++
++	for (page = 0; page < CAMOTP_S5K_PAGES; page++) {
++		const uint8_t *p = raw + page * CAMOTP_S5K_PAGE_BYTES;
++
++		out->page[page].cal_flag = p[0];
++		out->page[page].lsc_index = p[1];
++		out->page[page].r_cal = p[2];
++		out->page[page].g_cal = p[3];
++		out->page[page].b_cal = p[4];
++	}
++
++	return 0;
++}
++
++static int hexval(char c)
++{
++	if (c >= '0' && c <= '9')
++		return c - '0';
++	if (c >= 'a' && c <= 'f')
++		return c - 'a' + 10;
++	if (c >= 'A' && c <= 'F')
++		return c - 'A' + 10;
++	return -1;
++}
++
++static int parse_hex(const char *s, size_t n, unsigned int *out)
++{
++	unsigned int v = 0;
++	size_t i;
++
++	if (!n || n > 8)
++		return -EINVAL;
++
++	for (i = 0; i < n; i++) {
++		int d = hexval(s[i]);
++
++		if (d < 0)
++			return -EINVAL;
++		v = (v << 4) | (unsigned int)d;
++	}
++
++	*out = v;
++	return 0;
++}
++
++static int is_space(char c)
++{
++	return c == ' ' || c == '\t' || c == '\r' || c == '\n';
++}
++
++/*
++ * One line is "pageN: 0a04=VV 0a05=VV 0a06=VV 0a07=VV 0a08=VV", exactly what
++ * s5k5e3yx.c emits for its "otp" attribute.
++ */
++static int parse_line(const char *line, size_t len, struct camotp_s5k_otp *out,
++		      unsigned int *seen)
++{
++	unsigned int page, first = 0x0a04, values[CAMOTP_S5K_PAGE_BYTES];
++	size_t i = 0;
++	unsigned int k;
++
++	while (i < len && is_space(line[i]))
++		i++;
++
++	if (len - i < 4 || memcmp(line + i, "page", 4) != 0)
++		return -EINVAL;
++	i += 4;
++
++	if (i >= len || line[i] < '0' || line[i] > ('0' + CAMOTP_S5K_PAGES - 1))
++		return -EINVAL;
++	page = (unsigned int)(line[i] - '0');
++	i++;
++
++	if (i >= len || line[i] != ':')
++		return -EINVAL;
++	i++;
++
++	first = 0x0a04;
++	for (k = 0; k < CAMOTP_S5K_PAGE_BYTES; k++) {
++		size_t start;
++		unsigned int addr, val;
++
++		while (i < len && is_space(line[i]))
++			i++;
++
++		start = i;
++		while (i < len && line[i] != '=')
++			i++;
++		if (i >= len)
++			return -EINVAL;
++		if (parse_hex(line + start, i - start, &addr))
++			return -EINVAL;
++		if (addr != first + k)
++			return -EINVAL;
++		i++;
++
++		start = i;
++		while (i < len && !is_space(line[i]))
++			i++;
++		if (parse_hex(line + start, i - start, &val))
++			return -EINVAL;
++		if (val > 0xff)
++			return -EINVAL;
++
++		values[k] = val;
++	}
++
++	while (i < len) {
++		if (!is_space(line[i]))
++			return -EINVAL;
++		i++;
++	}
++
++	out->page[page].cal_flag = (uint8_t)values[0];
++	out->page[page].lsc_index = (uint8_t)values[1];
++	out->page[page].r_cal = (uint8_t)values[2];
++	out->page[page].g_cal = (uint8_t)values[3];
++	out->page[page].b_cal = (uint8_t)values[4];
++	*seen |= 1u << page;
++
++	return 0;
++}
++
++int camotp_parse_s5k5e3yx(const char *text, size_t len,
++			  struct camotp_s5k_otp *out)
++{
++	unsigned int seen = 0;
++	size_t pos = 0;
++
++	if (!text || !out)
++		return -EINVAL;
++
++	memset(out, 0, sizeof(*out));
++
++	while (pos < len) {
++		size_t start = pos, end;
++
++		while (pos < len && text[pos] != '\n')
++			pos++;
++		end = pos;
++		if (pos < len)
++			pos++;
++
++		if (start == end)
++			continue;
++
++		if (parse_line(text + start, end - start, out, &seen))
++			return -EINVAL;
++	}
++
++	if (seen != (1u << CAMOTP_S5K_PAGES) - 1)
++		return -ERANGE;
++
++	return 0;
++}
+diff --git a/tools/mediatek/camera/otp/camotp_selftest.c b/tools/mediatek/camera/otp/camotp_selftest.c
+new file mode 100644
+index 000000000..297e2fd14
+--- /dev/null
++++ b/tools/mediatek/camera/otp/camotp_selftest.c
+@@ -0,0 +1,633 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * camotp selftest.
++ *
++ * Every fixture below is an *input to the parser*.  None of it is, or can
++ * become, fallback data: the conversion functions only ever receive what the
++ * caller passes in, and the selftest passes hand-written buffers whose
++ * expected outputs are derived from the ported formulas, not from a device.
++ */
++
++#include <elf.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "camotp.h"
++
++static int failures;
++
++#define CHECK(cond) do {						\
++	if (!(cond)) {							\
++		fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__,	\
++			#cond);						\
++		failures++;						\
++	}								\
++} while (0)
++
++#define CHECK_EQ(a, b) do {						\
++	long long _a = (long long)(a), _b = (long long)(b);		\
++	if (_a != _b) {							\
++		fprintf(stderr, "FAIL %s:%d: %s == %lld, expected %lld\n",\
++			__FILE__, __LINE__, #a, _a, _b);		\
++		failures++;						\
++	}								\
++} while (0)
++
++/* ------------------------------------------------------------------ */
++/* Fixtures                                                            */
++/* ------------------------------------------------------------------ */
++
++static void put16(uint8_t *p, unsigned int v)
++{
++	p[0] = (uint8_t)(v & 0xff);
++	p[1] = (uint8_t)((v >> 8) & 0xff);
++}
++
++static void put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)(v & 0xff);
++	p[1] = (uint8_t)((v >> 8) & 0xff);
++	p[2] = (uint8_t)((v >> 16) & 0xff);
++	p[3] = (uint8_t)((v >> 24) & 0xff);
++}
++
++static void fixture_imx219(uint8_t *img)
++{
++	static const uint8_t module_id[10] = { 'S', 'L', 'S', 'I', '8',
++					       0x1a, 0x2b, 0x3c, 0x4d, 0x5e };
++	unsigned int i;
++
++	memset(img, 0, CAMOTP_OTP_MTK_POPULATED);
++
++	put32(img + CAMOTP_OTP_OFF_CALI_VER, CAMOTP_OTP_CALI_VER);
++	put16(img + CAMOTP_OTP_OFF_SERIAL, 0x1234);
++	img[CAMOTP_OTP_OFF_VERSION] = 0x01;
++	img[CAMOTP_OTP_OFF_AWB_AF_INFO] = 0x0f;
++	img[CAMOTP_OTP_OFF_UNIT_AWB + 0] = 0x10;
++	img[CAMOTP_OTP_OFF_UNIT_AWB + 1] = 0x11;
++	img[CAMOTP_OTP_OFF_UNIT_AWB + 2] = 0x12;
++	img[CAMOTP_OTP_OFF_UNIT_AWB + 3] = 0x13;
++	img[CAMOTP_OTP_OFF_GOLDEN_AWB + 0] = 0x20;
++	img[CAMOTP_OTP_OFF_GOLDEN_AWB + 1] = 0x21;
++	img[CAMOTP_OTP_OFF_GOLDEN_AWB + 2] = 0x22;
++	img[CAMOTP_OTP_OFF_GOLDEN_AWB + 3] = 0x23;
++	put16(img + CAMOTP_OTP_OFF_AF_INFINITY, 0x0200);
++	put16(img + CAMOTP_OTP_OFF_AF_MACRO, 0x01a0);
++	put16(img + CAMOTP_OTP_OFF_LSC_SIZE, 32);
++
++	for (i = 0; i < 32; i++)
++		img[CAMOTP_OTP_OFF_LSC_DATA + i] = (uint8_t)(64 + i);
++
++	memcpy(img + CAMOTP_OTP_OFF_MODULE_ID, module_id, sizeof(module_id));
++	memcpy(img + CAMOTP_OTP_OFF_MFR_INFO, "SUNNY  ABCD", 11);
++}
++
++/*
++ * LSC block: 2x2 grid, bayer 0, 4x4 extents, no pedestal, all four planes
++ * carry the same samples so every channel produces the same gain.
++ */
++static void fixture_lsc(uint8_t *block, const uint8_t samples[4])
++{
++	unsigned int plane, i;
++
++	memset(block, 0, CAMOTP_LSC_BLOCK_SIZE);
++	block[0x00] = 2;	/* n_x */
++	block[0x01] = 2;	/* n_y */
++	put16(block + 0x02, 0);	/* bayer */
++	put16(block + 0x04, 4);	/* width */
++	put16(block + 0x06, 4);	/* height */
++	block[0x08] = 0;	/* ShadingATNTable entry 0: all zero */
++
++	for (plane = 0; plane < CAMOTP_LSC_PLANES; plane++)
++		for (i = 0; i < 4; i++)
++			block[CAMOTP_LSC_PLANE_BASE +
++			      plane * CAMOTP_LSC_PLANE_BYTES + i] = samples[i];
++}
++
++/* ------------------------------------------------------------------ */
++/* IMX219                                                              */
++/* ------------------------------------------------------------------ */
++
++static void test_imx219(void)
++{
++	uint8_t img[CAMOTP_OTP_MTK_POPULATED];
++	struct camotp_imx219 otp;
++
++	fixture_imx219(img);
++
++	CHECK_EQ(camotp_parse_imx219(img, sizeof(img), &otp), 0);
++	CHECK_EQ(otp.cali_version, CAMOTP_OTP_CALI_VER);
++	CHECK(otp.cali_version_valid);
++	CHECK_EQ(otp.serial, 0x1234);
++	CHECK_EQ(otp.version, 0x01);
++	CHECK_EQ(otp.awb_af_info, 0x0f);
++	CHECK_EQ(otp.unit_awb.r, 0x10);
++	CHECK_EQ(otp.unit_awb.gr, 0x11);
++	CHECK_EQ(otp.unit_awb.gb, 0x12);
++	CHECK_EQ(otp.unit_awb.b, 0x13);
++	CHECK_EQ(otp.golden_awb.r, 0x20);
++	CHECK_EQ(otp.golden_awb.gr, 0x21);
++	CHECK_EQ(otp.golden_awb.gb, 0x22);
++	CHECK_EQ(otp.golden_awb.b, 0x23);
++	CHECK_EQ(otp.af_infinity, 0x0200);
++	CHECK_EQ(otp.af_macro, 0x01a0);
++	CHECK_EQ(otp.lsc_size, 32);
++	CHECK(otp.lsc_valid);
++	CHECK_EQ(otp.lsc[0], 64);
++	CHECK_EQ(otp.lsc[31], 95);
++	CHECK(otp.module_id_valid);
++	CHECK_EQ(otp.module_id[5], 0x1a);
++	CHECK(otp.mfr_info_valid);
++	CHECK(strcmp(otp.mfr_info, "SUNNY  ABCD") == 0);
++
++	/* Truncated image. */
++	CHECK_EQ(camotp_parse_imx219(img, sizeof(img) - 1, &otp), -EINVAL);
++	CHECK_EQ(camotp_parse_imx219(NULL, sizeof(img), &otp), -EINVAL);
++	CHECK_EQ(camotp_parse_imx219(img, sizeof(img), NULL), -EINVAL);
++
++	/* LSC length beyond the populated image. */
++	fixture_imx219(img);
++	put16(img + CAMOTP_OTP_OFF_LSC_SIZE, CAMOTP_OTP_LSC_CAPACITY + 1);
++	CHECK_EQ(camotp_parse_imx219(img, sizeof(img), &otp), -ERANGE);
++
++	/* A blank module still parses, but reports the block as absent. */
++	fixture_imx219(img);
++	memset(img + CAMOTP_OTP_OFF_LSC_DATA, 0xff, 32);
++	memset(img + CAMOTP_OTP_OFF_MODULE_ID, 0x00, 10);
++	CHECK_EQ(camotp_parse_imx219(img, sizeof(img), &otp), 0);
++	CHECK(!otp.lsc_valid);
++	CHECK(!otp.module_id_valid);
++}
++
++/* ------------------------------------------------------------------ */
++/* S5K5E3YX                                                            */
++/* ------------------------------------------------------------------ */
++
++static void test_s5k5e3yx(void)
++{
++	static const char good[] =
++		"page0: 0a04=01 0a05=02 0a06=03 0a07=04 0a08=05\n"
++		"page1: 0a04=11 0a05=12 0a06=13 0a07=14 0a08=15\n"
++		"page2: 0a04=21 0a05=22 0a06=23 0a07=24 0a08=25\n"
++		"page3: 0a04=31 0a05=32 0a06=33 0a07=34 0a08=35\n";
++	uint8_t raw[CAMOTP_S5K_PAGES * CAMOTP_S5K_PAGE_BYTES];
++	struct camotp_s5k_otp otp;
++	unsigned int page;
++
++	CHECK_EQ(camotp_parse_s5k5e3yx(good, sizeof(good) - 1, &otp), 0);
++	for (page = 0; page < CAMOTP_S5K_PAGES; page++) {
++		CHECK_EQ(otp.page[page].cal_flag, 1 + 0x10 * page);
++		CHECK_EQ(otp.page[page].lsc_index, 2 + 0x10 * page);
++		CHECK_EQ(otp.page[page].r_cal, 3 + 0x10 * page);
++		CHECK_EQ(otp.page[page].g_cal, 4 + 0x10 * page);
++		CHECK_EQ(otp.page[page].b_cal, 5 + 0x10 * page);
++	}
++
++	/* Missing page. */
++	/* Three complete lines: the fourth page is missing. */
++	CHECK_EQ(camotp_parse_s5k5e3yx(good, strlen(good) - 48, &otp),
++		 -ERANGE);
++
++	/* Wrong register order in a line. */
++	{
++		static const char bad[] = "page0: 0a05=01 0a04=02 0a06=03 "
++					  "0a07=04 0a08=05\n";
++		CHECK_EQ(camotp_parse_s5k5e3yx(bad, sizeof(bad) - 1, &otp),
++			 -EINVAL);
++	}
++
++	/* Out-of-range page digit. */
++	{
++		static const char bad[] = "page4: 0a04=01 0a05=02 0a06=03 "
++					  "0a07=04 0a08=05\n";
++		CHECK_EQ(camotp_parse_s5k5e3yx(bad, sizeof(bad) - 1, &otp),
++			 -EINVAL);
++	}
++
++	/* Value wider than a byte. */
++	{
++		static const char bad[] = "page0: 0a04=101 0a05=02 0a06=03 "
++					  "0a07=04 0a08=05\n";
++		CHECK_EQ(camotp_parse_s5k5e3yx(bad, sizeof(bad) - 1, &otp),
++			 -EINVAL);
++	}
++
++	CHECK_EQ(camotp_parse_s5k5e3yx(good, 0, &otp), -ERANGE);
++
++	/* Raw path. */
++	for (page = 0; page < sizeof(raw); page++)
++		raw[page] = (uint8_t)page;
++	CHECK_EQ(camotp_parse_s5k5e3yx_raw(raw, sizeof(raw), &otp), 0);
++	CHECK_EQ(otp.page[1].cal_flag, 5);
++	CHECK_EQ(otp.page[3].b_cal, 19);
++	CHECK_EQ(camotp_parse_s5k5e3yx_raw(raw, sizeof(raw) - 1, &otp),
++		 -EINVAL);
++	CHECK_EQ(camotp_parse_s5k5e3yx_raw(NULL, sizeof(raw), &otp), -EINVAL);
++}
++
++/* ------------------------------------------------------------------ */
++/* Lens shading                                                        */
++/* ------------------------------------------------------------------ */
++
++static void test_isqrt(void)
++{
++	CHECK_EQ(camotp_isqrt(0), 0);
++	CHECK_EQ(camotp_isqrt(1), 1);
++	CHECK_EQ(camotp_isqrt(3), 1);
++	CHECK_EQ(camotp_isqrt(4), 2);
++	CHECK_EQ(camotp_isqrt(8192), 90);
++	CHECK_EQ(camotp_isqrt((uint64_t)65535 * 65535), 65535);
++	CHECK_EQ(camotp_isqrt(UINT64_MAX), 0xffffffffull);
++}
++
++static void test_poly(void)
++{
++	/* coef[5] is the constant term; the rest are applied to r^1..r^5. */
++	const float ones[6] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f };
++	const float ramp[6] = { 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f };
++
++	CHECK(camotp_lsc_poly(ones, 0.0f) == 1.0f);
++	CHECK(camotp_lsc_poly(ones, 1.0f) == 1.0f);
++	CHECK(camotp_lsc_poly(ramp, 1.0f) == 2.0f);
++	CHECK(camotp_lsc_poly(ramp, 0.5f) == 1.03125f);
++}
++
++static void test_lsc(void)
++{
++	struct camotp_lsc_atn atn[CAMOTP_LSC_ATN_ENTRIES];
++	struct camotp_lsc_info info;
++	uint8_t block[CAMOTP_LSC_BLOCK_SIZE];
++	uint16_t table[CAMOTP_LSC_MAX_BLOCKS * CAMOTP_LSC_PLANES];
++	static const uint8_t samples[4] = { 100, 50, 25, 12 };
++	unsigned int i, ch;
++
++	/*
++	 * The shipped table normalises every entry with 1000000 in word 5;
++	 * entry 0 has zero coefficients, which disables the polynomial.
++	 */
++	memset(atn, 0, sizeof(atn));
++	for (i = 0; i < CAMOTP_LSC_ATN_ENTRIES; i++)
++		atn[i].coef[5] = 1000000;
++
++	/* Entry 0 is all zero in the shipped table: polynomial off. */
++	fixture_lsc(block, samples);
++	CHECK_EQ(camotp_lsc_convert(block, sizeof(block), atn,
++				    CAMOTP_LSC_ATN_ENTRIES, table, &info), 0);
++	CHECK_EQ(info.n_x, 2);
++	CHECK_EQ(info.n_y, 2);
++	CHECK_EQ(info.bayer, 0);
++	CHECK_EQ(info.poly_enabled, 0);
++	CHECK_EQ(info.ref_distance, 90);
++	CHECK_EQ(info.col_step, 2);
++	CHECK_EQ(info.row_step, 2);
++	CHECK_EQ(info.max_value[0], 100);
++	CHECK_EQ(info.max_value[3], 100);
++
++	/* max/avg for 100, 50, 25, 12 -> 1, 2, 4, 8.333 -> 8192, 16384,
++	 * 32768 and a saturated 65535 (gain * 8192 + 0.5 >= 65535). */
++	{
++		static const uint16_t expect[4] = { 8192, 16384, 32768, 65535 };
++		unsigned int b;
++
++		for (b = 0; b < 4; b++)
++			for (ch = 0; ch < CAMOTP_LSC_PLANES; ch++)
++				CHECK_EQ(table[b * 4 + ch], expect[b]);
++	}
++
++	/* Pedestal subtraction: 10 off every channel turns 100,50,25,12 into
++	 * 90,40,15,2.  The maximum is taken after subtraction, so the gains
++	 * are 90/90, 90/40, 90/15 and 90/2. */
++	block[0x0a] = block[0x0b] = block[0x0c] = block[0x0d] = 10;
++	CHECK_EQ(camotp_lsc_convert(block, sizeof(block), atn,
++				    CAMOTP_LSC_ATN_ENTRIES, table, &info), 0);
++	CHECK_EQ(info.max_value[0], 90);
++	{
++		static const uint16_t expect[4] = {
++			8192,	/* 1       * 8192 */
++			18432,	/* 2.25    * 8192 */
++			49152,	/* 6       * 8192 */
++			65535,	/* 45      * 8192 saturated */
++		};
++		unsigned int b;
++
++		for (b = 0; b < 4; b++)
++			for (ch = 0; ch < CAMOTP_LSC_PLANES; ch++)
++				CHECK_EQ(table[b * 4 + ch], expect[b]);
++	}
++
++	/* Distance polynomial: entry 1 = {1, 0, 0, 0, 0, 1} gives
++	 * 1 + r^5, so the corner block (r == 1) doubles its gain. */
++	atn[1].coef[0] = 1000000;
++	{
++		static const uint8_t flat[4] = { 100, 100, 100, 100 };
++
++		fixture_lsc(block, flat);
++		block[0x08] = 1;
++		CHECK_EQ(camotp_lsc_convert(block, sizeof(block), atn,
++					    CAMOTP_LSC_ATN_ENTRIES, table,
++					    &info), 0);
++		CHECK(info.poly_enabled);
++		CHECK_EQ(table[0], 8192);	/* r = 0, poly = 1 */
++		CHECK_EQ(table[3 * 4], 16384);	/* r = 1, poly = 2 */
++	}
++
++	/* Bayer permutation.  Each plane has its own max/average pattern, so
++	 * the output channel order is visible in the gains. */
++	{
++		static const uint8_t plane_samples[4][2] = {
++			{ 10, 20 },	/* max 20: gains 2, 1 */
++			{ 20, 20 },	/* max 20: gains 1, 1 */
++			{ 30, 10 },	/* max 30: gains 1, 3 */
++			{ 40, 40 },	/* max 40: gains 1, 1 */
++		};
++		unsigned int plane;
++
++		memset(block, 0, sizeof(block));
++		block[0x00] = 2;
++		block[0x01] = 2;
++		put16(block + 0x04, 4);
++		put16(block + 0x06, 4);
++		for (plane = 0; plane < CAMOTP_LSC_PLANES; plane++)
++			memcpy(block + CAMOTP_LSC_PLANE_BASE +
++			       plane * CAMOTP_LSC_PLANE_BYTES,
++			       plane_samples[plane], 2);
++
++		/* bayer 0: channels come from planes 0, 1, 2, 3.  Block 0
++		 * gains are 2, 1, 1, 1; block 1 gains are 1, 1, 3, 1. */
++		CHECK_EQ(camotp_lsc_convert(block, sizeof(block), atn,
++					    CAMOTP_LSC_ATN_ENTRIES, table,
++					    &info), 0);
++		CHECK_EQ(table[0], 16384);
++		CHECK_EQ(table[1], 8192);
++		CHECK_EQ(table[2], 8192);
++		CHECK_EQ(table[3], 8192);
++		CHECK_EQ(table[4], 8192);
++		CHECK_EQ(table[5], 8192);
++		CHECK_EQ(table[6], 24576);
++		CHECK_EQ(table[7], 8192);
++
++		/* bayer 1: channels come from planes 1, 0, 3, 2.  Block 0
++		 * gains are 1, 2, 1, 1; block 1 gains are 1, 1, 1, 3. */
++		put16(block + 0x02, 1);
++		CHECK_EQ(camotp_lsc_convert(block, sizeof(block), atn,
++					    CAMOTP_LSC_ATN_ENTRIES, table,
++					    &info), 0);
++		CHECK_EQ(table[0], 8192);
++		CHECK_EQ(table[1], 16384);
++		CHECK_EQ(table[2], 8192);
++		CHECK_EQ(table[3], 8192);
++		CHECK_EQ(table[4], 8192);
++		CHECK_EQ(table[5], 8192);
++		CHECK_EQ(table[6], 8192);
++		CHECK_EQ(table[7], 24576);
++	}
++
++	/* Rejections. */
++	fixture_lsc(block, samples);
++	CHECK_EQ(camotp_lsc_convert(NULL, sizeof(block), atn,
++				    CAMOTP_LSC_ATN_ENTRIES, table, &info),
++		 -EINVAL);
++	CHECK_EQ(camotp_lsc_convert(block, sizeof(block) - 1, atn,
++				    CAMOTP_LSC_ATN_ENTRIES, table, &info),
++		 -EINVAL);
++
++	fixture_lsc(block, samples);
++	{
++		unsigned int plane;
++
++		for (plane = 0; plane < CAMOTP_LSC_PLANES; plane++)
++			memset(block + CAMOTP_LSC_PLANE_BASE +
++			       plane * CAMOTP_LSC_PLANE_BYTES, 0x00, 4);
++	}
++	CHECK_EQ(camotp_lsc_convert(block, sizeof(block), atn,
++				    CAMOTP_LSC_ATN_ENTRIES, table, &info),
++		 -ENODATA);
++
++	fixture_lsc(block, samples);
++	block[0x00] = 200;	/* 200 * 2 > 224 blocks */
++	CHECK_EQ(camotp_lsc_convert(block, sizeof(block), atn,
++				    CAMOTP_LSC_ATN_ENTRIES, table, &info),
++		 -EINVAL);
++
++	fixture_lsc(block, samples);
++	block[0x02] = 4;	/* bayer out of range */
++	CHECK_EQ(camotp_lsc_convert(block, sizeof(block), atn,
++				    CAMOTP_LSC_ATN_ENTRIES, table, &info),
++		 -EINVAL);
++
++	fixture_lsc(block, samples);
++	block[0x00] = 1;	/* division by (n_x - 1) */
++	CHECK_EQ(camotp_lsc_convert(block, sizeof(block), atn,
++				    CAMOTP_LSC_ATN_ENTRIES, table, &info),
++		 -EINVAL);
++
++	fixture_lsc(block, samples);
++	block[0x04] = 1;	/* width >> 1 == 0 */
++	CHECK_EQ(camotp_lsc_convert(block, sizeof(block), atn,
++				    CAMOTP_LSC_ATN_ENTRIES, table, &info),
++		 -EINVAL);
++
++	/* Entry with a zero normaliser. */
++	fixture_lsc(block, samples);
++	block[0x08] = 2;
++	atn[2].coef[5] = 0;
++	CHECK_EQ(camotp_lsc_convert(block, sizeof(block), atn,
++				    CAMOTP_LSC_ATN_ENTRIES, table, &info),
++		 -ERANGE);
++	CHECK_EQ(camotp_lsc_convert(block, sizeof(block), NULL, 0, table,
++				    &info), -EINVAL);
++
++	/* Index above the table: polynomial off, no table needed. */
++	block[0x08] = 21;
++	CHECK_EQ(camotp_lsc_convert(block, sizeof(block), NULL, 0, table,
++				    &info), 0);
++	CHECK_EQ(info.poly_enabled, 0);
++
++	for (ch = 0; ch < CAMOTP_LSC_PLANES; ch++)
++		CHECK_EQ(info.pedestal[ch], 0);
++}
++
++/* ------------------------------------------------------------------ */
++/* Minimal ELF32 fixture                                               */
++/* ------------------------------------------------------------------ */
++
++struct elf_fixture {
++	Elf32_Ehdr eh;
++	Elf32_Phdr ph;
++	Elf32_Sym sym[2];
++	char strtab[9];
++	uint8_t pad[4];
++	Elf32_Shdr sh[4];
++	uint8_t data[4];
++};
++
++static const char *write_fixture(const char *dir, const char *name,
++				 const void *buf, size_t len)
++{
++	static char path[512];
++	int fd;
++
++	snprintf(path, sizeof(path), "%s/%s", dir, name);
++	fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
++	if (fd < 0)
++		return NULL;
++	if (write(fd, buf, len) != (ssize_t)len) {
++		close(fd);
++		return NULL;
++	}
++	close(fd);
++
++	return path;
++}
++
++static void test_elf(void)
++{
++	struct elf_fixture f;
++	const char *path;
++	const char *dir;
++	char dirbuf[256];
++	const char *tmpdir = getenv("TMPDIR");
++	struct camotp_elf *elf = NULL;
++	struct camotp_elf_sym sym;
++	uint8_t data[4];
++	uint32_t symoff, stroff, shoff, dataoff;
++
++	memset(&f, 0, sizeof(f));
++
++	symoff = offsetof(struct elf_fixture, sym);
++	stroff = offsetof(struct elf_fixture, strtab);
++	shoff = offsetof(struct elf_fixture, sh);
++	dataoff = offsetof(struct elf_fixture, data);
++
++	memcpy(f.eh.e_ident, ELFMAG, SELFMAG);
++	f.eh.e_ident[EI_CLASS] = ELFCLASS32;
++	f.eh.e_ident[EI_DATA] = ELFDATA2LSB;
++	f.eh.e_ident[EI_VERSION] = EV_CURRENT;
++	f.eh.e_type = ET_DYN;
++	f.eh.e_machine = EM_ARM;
++	f.eh.e_version = EV_CURRENT;
++	f.eh.e_ehsize = sizeof(Elf32_Ehdr);
++	f.eh.e_phoff = offsetof(struct elf_fixture, ph);
++	f.eh.e_phentsize = sizeof(Elf32_Phdr);
++	f.eh.e_phnum = 1;
++	f.eh.e_shoff = shoff;
++	f.eh.e_shentsize = sizeof(Elf32_Shdr);
++	f.eh.e_shnum = 4;
++
++	f.ph.p_type = PT_LOAD;
++	f.ph.p_offset = dataoff;
++	f.ph.p_vaddr = 0x2000;
++	f.ph.p_filesz = sizeof(f.data);
++	f.ph.p_memsz = sizeof(f.data);
++	f.ph.p_flags = PF_R | PF_X;
++
++	f.sym[0].st_info = STB_LOCAL << 4;
++	f.sym[1].st_name = 1;		/* "testsym" */
++	f.sym[1].st_value = 0x2000;
++	f.sym[1].st_size = sizeof(f.data);
++	f.sym[1].st_info = (STB_GLOBAL << 4) | STT_OBJECT;
++	f.sym[1].st_shndx = 3;
++
++	memcpy(f.strtab, "\0testsym", sizeof(f.strtab));
++
++	f.sh[1].sh_type = SHT_DYNSYM;
++	f.sh[1].sh_offset = symoff;
++	f.sh[1].sh_size = sizeof(f.sym);
++	f.sh[1].sh_entsize = sizeof(Elf32_Sym);
++	f.sh[1].sh_link = 2;
++
++	f.sh[2].sh_type = SHT_STRTAB;
++	f.sh[2].sh_offset = stroff;
++	f.sh[2].sh_size = sizeof(f.strtab);
++
++	f.sh[3].sh_type = SHT_PROGBITS;
++	f.sh[3].sh_offset = dataoff;
++	f.sh[3].sh_addr = 0x2000;
++	f.sh[3].sh_size = sizeof(f.data);
++	f.sh[3].sh_flags = SHF_ALLOC | SHF_EXECINSTR;
++
++	f.data[0] = 0x11;
++	f.data[1] = 0x22;
++	f.data[2] = 0x33;
++	f.data[3] = 0x44;
++
++	snprintf(dirbuf, sizeof(dirbuf), "%s/camotp-selftest-XXXXXX",
++		 tmpdir && *tmpdir ? tmpdir : "/tmp");
++	dir = mkdtemp(dirbuf);
++	CHECK(dir != NULL);
++	if (!dir)
++		return;
++
++	path = write_fixture(dir, "fixture.so", &f, sizeof(f));
++	CHECK(path != NULL);
++	if (!path)
++		return;
++
++	CHECK_EQ(camotp_elf_open(path, &elf), 0);
++	if (elf) {
++		CHECK_EQ(camotp_elf_sym_count(elf), 2);
++		CHECK_EQ(camotp_elf_find(elf, "testsym", &sym), 0);
++		CHECK_EQ(sym.addr, 0x2000);
++		CHECK_EQ(sym.size, 4);
++		CHECK_EQ(sym.type, STT_OBJECT);
++		CHECK_EQ(camotp_elf_read(elf, sym.addr, data, sizeof(data)), 0);
++		CHECK_EQ(data[0], 0x11);
++		CHECK_EQ(data[3], 0x44);
++		/* Out of segment. */
++		CHECK_EQ(camotp_elf_read(elf, 0x3000, data, sizeof(data)),
++			 -ENOENT);
++		CHECK_EQ(camotp_elf_find(elf, "nosuch", &sym), -ENOENT);
++		camotp_elf_close(elf);
++	}
++
++	/* Truncated file: smaller than an ELF header. */
++	path = write_fixture(dir, "short.so", "abc", 3);
++	CHECK(path != NULL);
++	if (path) {
++		CHECK_EQ(camotp_elf_open(path, &elf), -EINVAL);
++		unlink(path);
++	}
++
++	/* Wrong machine. */
++	f.eh.e_machine = EM_X86_64;
++	path = write_fixture(dir, "x86.so", &f, sizeof(f));
++	CHECK(path != NULL);
++	if (path) {
++		CHECK_EQ(camotp_elf_open(path, &elf), -ENOEXEC);
++		unlink(path);
++	}
++
++	{
++		char buf[512];
++
++		snprintf(buf, sizeof(buf), "%s/fixture.so", dir);
++		unlink(buf);
++	}
++	rmdir(dir);
++}
++
++int main(void)
++{
++	printf("camotp selftest\n");
++
++	test_imx219();
++	test_s5k5e3yx();
++	test_isqrt();
++	test_poly();
++	test_lsc();
++	test_elf();
++
++	if (failures) {
++		printf("FAILED: %d check(s)\n", failures);
++		return 1;
++	}
++
++	printf("PASS\n");
++	return 0;
++}
+diff --git a/tools/mediatek/camera/otp/camotp_tables.c b/tools/mediatek/camera/otp/camotp_tables.c
+new file mode 100644
+index 000000000..dac8ccb8c
+--- /dev/null
++++ b/tools/mediatek/camera/otp/camotp_tables.c
+@@ -0,0 +1,148 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Registry of the static tuning tables that are provably present in the
++ * shipped vendor libraries, with the decode that was verified against the
++ * binary.  Sizes are the dynamic symbol sizes and are re-checked when the
++ * table is read, so a different library build fails loudly instead of
++ * producing bytes from the wrong place.
++ *
++ * Everything that lives in .bss (g_lsc_cali_info, g_lsc_param, g_lsc_result,
++ * g_rLSCCaliINIParam, channel_lsc_data*, and the lib3a/libcam.hal3a.v3
++ * singletons) is deliberately absent: at load time those bytes are zero and
++ * only the runtime NVRAM image can fill them.
++ */
++
++#include <errno.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "camotp.h"
++
++static const struct camotp_table camotp_table_list[] = {
++	{
++		.lib = "libcameracustom.so",
++		.symbol = "ShadingATNTable",
++		.what = "lens-shading distance-polynomial coefficient table",
++		.elem = CAMOTP_ELEM_S32,
++		.size = 0x1f8,
++		.decode = "21 entries x 6 s32; words 0..4 are divided by word 5 "
++			  "(1000000 == 1.0) to give the polynomial "
++			  "1 + a4*r + a3*r^2 + a2*r^3 + a1*r^4 + a0*r^5; "
++			  "entry 0 is all zero (no distance correction)",
++	},
++	{
++		.lib = "lib3a.so",
++		.symbol = "_ZN7AwbAlgo14m_i4AWBLogLUT1E",
++		.what = "AWB log2 lookup, Q8 over 0..255",
++		.elem = CAMOTP_ELEM_S32,
++		.size = 0x400,
++		.decode = "256 entries; entry[i] ~= 256*log2(i), entries 0 and 1 "
++			  "are 0, entry 255 is 2047 (fixed-point log2, not "
++			  "bit-identical to the float formula)",
++	},
++	{
++		.lib = "lib3a.so",
++		.symbol = "_ZN7AwbAlgo14m_i4AWBLogLUT2E",
++		.what = "AWB log2 lookup, wide range",
++		.elem = CAMOTP_ELEM_S32,
++		.size = 0x2000,
++		.decode = "2048 entries; monotonic, entry[512] == 0, "
++			  "entry[1024] == 4932, entry[2047] == 9861 "
++			  "(about 4932*(log2(i) - 9))",
++	},
++	{
++		.lib = "lib3a.so",
++		.symbol = "LumLog2x1000",
++		.what = "luminance log2 lookup scaled by 1000",
++		.elem = CAMOTP_ELEM_S32,
++		.size = 0x804,
++		.decode = "513 entries; entry[i] ~= 1000*log2(i), entries 0 and "
++			  "1 are 0, entry 512 is 9000",
++	},
++	{
++		.lib = "lib3a.so",
++		.symbol = "g_i4PLweight",
++		.what = "path-length weight table",
++		.elem = CAMOTP_ELEM_U32,
++		.size = 0x80,
++		.decode = "32 entries, monotonically increasing, used as a "
++			  "position-weight ramp",
++	},
++	{
++		.lib = "libcamalgo.so",
++		.symbol = "_ZN7GmaCore15m_i4DefGmaBase0E",
++		.what = "default ISP gamma base table",
++		.elem = CAMOTP_ELEM_U32,
++		.size = 0x244,
++		.decode = "145 entries, packed GMA base values (bit fields per "
++			  "ISP GMA register layout)",
++	},
++	{
++		.lib = "libcamalgo.so",
++		.symbol = "_ZN7GmaCore14m_i4GmaSectionE",
++		.what = "ISP gamma section table",
++		.elem = CAMOTP_ELEM_U32,
++		.size = 0x244,
++		.decode = "145 entries, packed GMA section values",
++	},
++	{ /* sentinel */ }
++};
++
++const struct camotp_table *camotp_tables(void)
++{
++	return camotp_table_list;
++}
++
++int camotp_table_read(const struct camotp_table *table, const char *lib_path,
++		      void *buf, size_t buflen, size_t *out_len)
++{
++	struct camotp_elf *elf = NULL;
++	struct camotp_elf_sym sym;
++	int ret;
++
++	if (!table || !lib_path || !buf)
++		return -EINVAL;
++	if (buflen < table->size)
++		return -EINVAL;
++
++	ret = camotp_elf_open(lib_path, &elf);
++	if (ret)
++		return ret;
++
++	ret = camotp_elf_find(elf, table->symbol, &sym);
++	if (ret)
++		goto out;
++
++	if (sym.size != table->size) {
++		/* A different library build: report instead of reading the
++		 * wrong number of bytes from the wrong place. */
++		ret = -EINVAL;
++		goto out;
++	}
++
++	ret = camotp_elf_read(elf, sym.addr, buf, table->size);
++	if (ret)
++		goto out;
++
++	if (out_len)
++		*out_len = table->size;
++
++out:
++	camotp_elf_close(elf);
++	return ret;
++}
++
++const struct camotp_table *camotp_table_by_symbol(const char *symbol)
++{
++	const struct camotp_table *t;
++
++	if (!symbol)
++		return NULL;
++
++	for (t = camotp_table_list; t->symbol; t++) {
++		if (strcmp(t->symbol, symbol) == 0)
++			return t;
++	}
++
++	return NULL;
++}

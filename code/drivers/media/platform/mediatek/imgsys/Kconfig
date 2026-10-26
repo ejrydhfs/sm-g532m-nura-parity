@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config VIDEO_MTK_IMGSYS
+	tristate "MediaTek MT6735 IMGSYS/ISP platform driver"
+	depends on MEDIA_SUPPORT
+	depends on VIDEO_DEV
+	depends on COMMON_CLK
+	depends on OF
+	depends on PM
+	help
+	  Platform, clock, power and reset driver for the MediaTek MT6735 /
+	  MT6737T image signal processor (IMGSYS) block.
+
+	  The driver owns the ISP core register windows, the six IMGSYS clock
+	  gates and the ISP power domain, performs the documented Pass 1,
+	  Pass 2, CAMSV and CAMSV2 soft resets on probe, and exposes the
+	  mapped register windows through debugfs for diagnostics.
+
+	  The ISP capture pipeline itself is not implemented: running the
+	  Pass 1 / Pass 2 / CAM_SV / DSP pipelines and the on-demand
+	  ISP_RESET_* ioctls requires the proprietary MTK camera userspace ABI
+	  (libcamdrv) plus the ISP firmware images, neither of which is
+	  available.  That part, including the deterministic reset sequences,
+	  is implemented by the separate "camera-isp" character driver
+	  (CONFIG_VIDEO_MTK_ISP), which maps the same windows itself.  This
+	  driver therefore provides no V4L2 entity and no video node.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called mtk-imgsys.

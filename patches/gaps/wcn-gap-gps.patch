@@ -1,0 +1,992 @@
+diff --git a/drivers/misc/mediatek/connectivity/gps/Kconfig b/drivers/misc/mediatek/connectivity/gps/Kconfig
+index 78d08b452..f4f643c63 100644
+--- a/drivers/misc/mediatek/connectivity/gps/Kconfig
++++ b/drivers/misc/mediatek/connectivity/gps/Kconfig
+@@ -5,12 +5,16 @@
+ config MTK_WCN_GPS
+ 	tristate "MediaTek WCN GPS driver"
+ 	depends on MTK_WCN_WMT
+-	depends on GNSS
+ 	depends on ARCH_MEDIATEK || COMPILE_TEST
+ 	select RFKILL
+ 	help
+-	  GNSS driver for the MediaTek connectivity subsystem.  The GPS
+-	  function is powered through WMT and exchanges NMEA/MTK binary
++	  Driver for the MediaTek connectivity subsystem GPS function.  The
++	  GPS function is powered through WMT and exchanges NMEA/MTK binary
+ 	  frames with the connectivity SoC over the STP GPS channel.
+ 
++	  Two mutually exclusive userspace interfaces are provided: the
++	  standard GNSS character device (when CONFIG_GNSS is enabled) and
++	  the vendor /dev/stpgps character device used by the Android GPS
++	  HAL of the SM-G532M ROM.
++
+ 	  The module is called mtk_wcn_gps.
+diff --git a/drivers/misc/mediatek/connectivity/gps/Makefile b/drivers/misc/mediatek/connectivity/gps/Makefile
+index 95bc7830a..2e61ba6bd 100644
+--- a/drivers/misc/mediatek/connectivity/gps/Makefile
++++ b/drivers/misc/mediatek/connectivity/gps/Makefile
+@@ -4,5 +4,5 @@
+ #
+ ccflags-y += -I$(srctree)/drivers/misc/mediatek/connectivity/include
+ 
+-mtk_wcn_gps-y := gps.o
++mtk_wcn_gps-y := gps.o stp_chrdev_gps.o
+ obj-$(CONFIG_MTK_WCN_GPS) += mtk_wcn_gps.o
+diff --git a/drivers/misc/mediatek/connectivity/gps/gps.c b/drivers/misc/mediatek/connectivity/gps/gps.c
+index 1bffdfd7f..c9b6e3b1d 100644
+--- a/drivers/misc/mediatek/connectivity/gps/gps.c
++++ b/drivers/misc/mediatek/connectivity/gps/gps.c
+@@ -4,6 +4,10 @@
+  * channel, with the GPS function of the connectivity SoC powered through
+  * WMT.
+  *
++ * The same STP channel is also exposed through the vendor /dev/stpgps
++ * character device (stp_chrdev_gps.c).  Both faces share the channel
++ * state machine in this file; only one of them may be open at a time.
++ *
+  * Port from Samsung/MTK downstream connectivity/gps (stp_chrdev_gps.c and
+  * gps.c) of the SM-G532M Android 6.0.1 kernel.
+  *
+@@ -20,10 +24,10 @@
+  */
+ 
+ #include <linux/device.h>
+-#include <linux/gnss.h>
+ #include <linux/kstrtox.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/nvmem-consumer.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm.h>
+@@ -33,6 +37,7 @@
+ #include <linux/sysfs.h>
+ #include <linux/types.h>
+ 
++#include "gps.h"
+ #include "mtk_wcn_stp.h"
+ #include "mtk_wcn_wmt.h"
+ 
+@@ -50,42 +55,24 @@
+ /* Bound a single drain to the STP per-channel queue size. */
+ #define MTK_GPS_RX_CHUNKS		(MTKSTP_BUFFER_SIZE / MTK_GPS_RX_CHUNK)
+ 
+-/**
+- * struct mtk_gps - GPS driver state
+- * @dev: platform device
+- * @gdev: GNSS character device
+- * @rfkill: GPS radio switch
+- * @lock: serialises open/close, rfkill and power management transitions
+- * @rx_lock: protects @rx_enabled and @rx_buf against the STP callback
+- * @rx_enabled: the STP callback may feed the GNSS FIFO
+- * @rx_buf: receive scratch buffer
+- * @opened: the GNSS device is open
+- * @channel_on: the WMT GPS function and the STP channel are up
+- * @resetting: the connectivity SoC is being reset
+- * @suspended: system suspend notification state
+- */
+-struct mtk_gps {
+-	struct device *dev;
+-	struct gnss_device *gdev;
+-	struct rfkill *rfkill;
+-
+-	struct mutex lock;	/* open/close, rfkill and PM transitions */
+-	spinlock_t rx_lock;	/* rx_enabled and rx_buf, taken in STP context */
+-	bool rx_enabled;
+-	u8 *rx_buf;
+-
+-	bool opened;
+-	bool channel_on;
+-	bool resetting;
+-	bool suspended;
+-};
+-
+ /*
+  * The STP event callback takes no argument (mtk_wcn_stp_event_cb), so the
+  * single GPS channel of the connectivity SoC is reached through this pointer.
+  */
+ static struct mtk_gps *mtk_gps_singleton;
+ 
++/*
++ * Wake a /dev/stpgps reader blocked in read().
++ *
++ * Called from the STP receive path and the reset path, both of which may run
++ * in atomic context.
++ */
++static void mtk_gps_wake_reader(struct mtk_gps *gps)
++{
++	wake_up_interruptible(&gps->rx_wait);
++}
++
++#if IS_ENABLED(CONFIG_GNSS)
+ static void mtk_gps_set_suspend(struct mtk_gps *gps, bool suspended)
+ {
+ 	if (gps->suspended == suspended)
+@@ -96,6 +83,12 @@ static void mtk_gps_set_suspend(struct mtk_gps *gps, bool suspended)
+ 	/* Downstream wakes the positioning daemon the same way, see gps.c:264-283. */
+ 	sysfs_notify(&gps->gdev->dev.kobj, NULL, "suspend");
+ }
++#else
++static void mtk_gps_set_suspend(struct mtk_gps *gps, bool suspended)
++{
++	gps->suspended = suspended;
++}
++#endif
+ 
+ /*
+  * Drain the STP GPS channel into the GNSS read FIFO.
+@@ -107,16 +100,25 @@ static void mtk_gps_rx_cb(void)
+ {
+ 	struct mtk_gps *gps = READ_ONCE(mtk_gps_singleton);
+ 	unsigned long flags;
++#if IS_ENABLED(CONFIG_GNSS)
+ 	unsigned int dropped = 0;
+ 	int i, n, copied;
++#endif
+ 
+ 	if (!gps)
+ 		return;
+ 
+ 	spin_lock_irqsave(&gps->rx_lock, flags);
+-	if (!gps->rx_enabled)
++	gps->rx_seq++;
++#if IS_ENABLED(CONFIG_GNSS)
++	if (!gps->rx_enabled || READ_ONCE(gps->owner) != MTK_GPS_OWNER_GNSS)
+ 		goto out;
+ 
++	/*
++	 * The vendor character device reads the STP queue itself, exactly as
++	 * downstream stp_chrdev_gps.c:182-247 does; it only needs the wakeup
++	 * below.
++	 */
+ 	for (i = 0; i < MTK_GPS_RX_CHUNKS; i++) {
+ 		n = mtk_wcn_stp_receive_data(gps->rx_buf, MTK_GPS_RX_CHUNK,
+ 					     GPS_TASK_INDX);
+@@ -129,12 +131,17 @@ static void mtk_gps_rx_cb(void)
+ 	}
+ 
+ out:
++#endif
+ 	spin_unlock_irqrestore(&gps->rx_lock, flags);
+ 
++	mtk_gps_wake_reader(gps);
++
++#if IS_ENABLED(CONFIG_GNSS)
+ 	if (dropped)
+ 		dev_warn_ratelimited(gps->dev,
+ 				     "read FIFO full, dropped %u bytes\n",
+ 				     dropped);
++#endif
+ }
+ 
+ /* Reset notifications, see downstream gps_cdev_rst_cb() stp_chrdev_gps.c:354-387. */
+@@ -166,6 +173,8 @@ static void mtk_gps_wmt_cb(enum mtk_wcn_wmt_drv src, enum mtk_wcn_wmt_drv dst,
+ 	default:
+ 		break;
+ 	}
++
++	mtk_gps_wake_reader(gps);
+ }
+ 
+ /*
+@@ -174,8 +183,10 @@ static void mtk_gps_wmt_cb(enum mtk_wcn_wmt_drv src, enum mtk_wcn_wmt_drv dst,
+  * The order matches downstream GPS_open() (stp_chrdev_gps.c:402-420): the
+  * function is turned on first because the WMT handshake is what brings STP
+  * up, then STP readiness is checked and the event callback registered.
++ *
++ * Caller holds gps->lock.
+  */
+-static int mtk_gps_channel_on(struct mtk_gps *gps)
++int mtk_gps_channel_on(struct mtk_gps *gps)
+ {
+ 	unsigned long flags;
+ 	int ret;
+@@ -230,8 +241,13 @@ static int mtk_gps_channel_on(struct mtk_gps *gps)
+ 	return ret;
+ }
+ 
+-/* Release the STP channel and the WMT GPS function, see GPS_close(). */
+-static void mtk_gps_channel_off(struct mtk_gps *gps)
++/*
++ * Release the STP channel and the WMT GPS function, see GPS_close()
++ * (stp_chrdev_gps.c:459-487).
++ *
++ * Caller holds gps->lock.
++ */
++void mtk_gps_channel_off(struct mtk_gps *gps)
+ {
+ 	unsigned long flags;
+ 
+@@ -250,25 +266,63 @@ static void mtk_gps_channel_off(struct mtk_gps *gps)
+ 		dev_warn(gps->dev, "WMT failed to turn the GPS function off\n");
+ 
+ 	gps->channel_on = false;
++
++	/* Blocked readers observe channel_on and retry/report -ENODEV. */
++	mtk_gps_wake_reader(gps);
+ }
+ 
+-static int mtk_gps_open(struct gnss_device *gdev)
++/*
++ * Claim the single GPS link for @owner and power the function up.
++ *
++ * The two faces of the link (GNSS and the vendor chardev) are mutually
++ * exclusive: opening one while the other is open returns -EBUSY.
++ *
++ * Caller holds gps->lock.
++ */
++int mtk_gps_claim(struct mtk_gps *gps, enum mtk_gps_owner owner)
+ {
+-	struct mtk_gps *gps = gnss_get_drvdata(gdev);
+ 	int ret;
+ 
+-	mutex_lock(&gps->lock);
+-
+-	if (rfkill_blocked(gps->rfkill)) {
+-		ret = -ERFKILL;
+-		goto out_unlock;
++	if (gps->owner != MTK_GPS_OWNER_NONE) {
++		dev_dbg(gps->dev, "GPS link already owned by %d\n",
++			gps->owner);
++		return -EBUSY;
+ 	}
+ 
++	if (rfkill_blocked(gps->rfkill))
++		return -ERFKILL;
++
+ 	ret = mtk_gps_channel_on(gps);
+-	if (!ret)
+-		gps->opened = true;
++	if (ret)
++		return ret;
++
++	gps->owner = owner;
+ 
+-out_unlock:
++	return 0;
++}
++
++/*
++ * Release the link if @owner still holds it, powering the GPS function down.
++ *
++ * Caller holds gps->lock.
++ */
++void mtk_gps_release(struct mtk_gps *gps, enum mtk_gps_owner owner)
++{
++	if (gps->owner != owner)
++		return;
++
++	mtk_gps_channel_off(gps);
++	gps->owner = MTK_GPS_OWNER_NONE;
++}
++
++#if IS_ENABLED(CONFIG_GNSS)
++static int mtk_gps_open(struct gnss_device *gdev)
++{
++	struct mtk_gps *gps = gnss_get_drvdata(gdev);
++	int ret;
++
++	mutex_lock(&gps->lock);
++	ret = mtk_gps_claim(gps, MTK_GPS_OWNER_GNSS);
+ 	mutex_unlock(&gps->lock);
+ 
+ 	return ret;
+@@ -279,8 +333,7 @@ static void mtk_gps_close(struct gnss_device *gdev)
+ 	struct mtk_gps *gps = gnss_get_drvdata(gdev);
+ 
+ 	mutex_lock(&gps->lock);
+-	mtk_gps_channel_off(gps);
+-	gps->opened = false;
++	mtk_gps_release(gps, MTK_GPS_OWNER_GNSS);
+ 	mutex_unlock(&gps->lock);
+ }
+ 
+@@ -290,6 +343,10 @@ static int mtk_gps_write_raw(struct gnss_device *gdev, const unsigned char *buf,
+ 	struct mtk_gps *gps = gnss_get_drvdata(gdev);
+ 	int written;
+ 
++	/* A whole-chip reset invalidates the outstanding STP transfer. */
++	if (READ_ONCE(gps->resetting))
++		return -EIO;
++
+ 	/* The STP channel is torn down while the radio is rfkill blocked. */
+ 	if (!READ_ONCE(gps->channel_on))
+ 		return -ENETDOWN;
+@@ -313,6 +370,7 @@ static const struct gnss_operations mtk_gps_gnss_ops = {
+ 	.close = mtk_gps_close,
+ 	.write_raw = mtk_gps_write_raw,
+ };
++#endif /* IS_ENABLED(CONFIG_GNSS) */
+ 
+ static int mtk_gps_rfkill_set_block(void *data, bool blocked)
+ {
+@@ -321,10 +379,11 @@ static int mtk_gps_rfkill_set_block(void *data, bool blocked)
+ 
+ 	mutex_lock(&gps->lock);
+ 
+-	if (blocked)
++	if (blocked) {
+ 		mtk_gps_channel_off(gps);
+-	else if (gps->opened)
++	} else if (gps->owner != MTK_GPS_OWNER_NONE) {
+ 		ret = mtk_gps_channel_on(gps);
++	}
+ 
+ 	mutex_unlock(&gps->lock);
+ 
+@@ -335,6 +394,7 @@ static const struct rfkill_ops mtk_gps_rfkill_ops = {
+ 	.set_block = mtk_gps_rfkill_set_block,
+ };
+ 
++#if IS_ENABLED(CONFIG_GNSS)
+ static ssize_t suspend_show(struct device *dev, struct device_attribute *attr,
+ 			    char *buf)
+ {
+@@ -362,6 +422,7 @@ static ssize_t suspend_store(struct device *dev, struct device_attribute *attr,
+ }
+ 
+ static DEVICE_ATTR_RW(suspend);
++#endif
+ 
+ static int mtk_gps_pm_suspend(struct device *dev)
+ {
+@@ -404,20 +465,31 @@ static int mtk_gps_probe(struct platform_device *pdev)
+ 
+ 	gps->dev = dev;
+ 	mutex_init(&gps->lock);
++	mutex_init(&gps->rd_mtx);
++	mutex_init(&gps->wr_mtx);
+ 	spin_lock_init(&gps->rx_lock);
++	init_waitqueue_head(&gps->rx_wait);
+ 	platform_set_drvdata(pdev, gps);
+ 
+ 	gps->rx_buf = devm_kmalloc(dev, MTK_GPS_RX_CHUNK, GFP_KERNEL);
+-	if (!gps->rx_buf)
++	gps->rd_buf = devm_kmalloc(dev, MTKSTP_BUFFER_SIZE, GFP_KERNEL);
++	gps->wr_buf = devm_kmalloc(dev, MTKSTP_BUFFER_SIZE, GFP_KERNEL);
++	if (!gps->rx_buf || !gps->rd_buf || !gps->wr_buf)
+ 		return -ENOMEM;
+ 
+-	gps->gdev = gnss_allocate_device(dev);
+-	if (!gps->gdev)
+-		return -ENOMEM;
+-
+-	gps->gdev->type = GNSS_TYPE_MTK;
+-	gps->gdev->ops = &mtk_gps_gnss_ops;
+-	gnss_set_drvdata(gps->gdev, gps);
++	gps->efuse_cell = devm_nvmem_cell_get(dev, "gps-efuse");
++	if (IS_ERR(gps->efuse_cell)) {
++		ret = PTR_ERR(gps->efuse_cell);
++		gps->efuse_cell = NULL;
++		if (ret == -EPROBE_DEFER)
++			return ret;
++		/*
++		 * -ENOENT means the board does not describe the efuse word;
++		 * COMBO_IOC_D1_EFUSE_GET then reports -EOPNOTSUPP.
++		 */
++		if (ret != -ENOENT && ret != -ENODEV && ret != -EOPNOTSUPP)
++			dev_warn(dev, "no gps-efuse nvmem cell: %d\n", ret);
++	}
+ 
+ 	WRITE_ONCE(mtk_gps_singleton, gps);
+ 
+@@ -430,29 +502,51 @@ static int mtk_gps_probe(struct platform_device *pdev)
+ 
+ 	ret = rfkill_register(gps->rfkill);
+ 	if (ret)
+-		goto err_rfkill;
++		goto err_rfkill_registered;
++
++#if IS_ENABLED(CONFIG_GNSS)
++	gps->gdev = gnss_allocate_device(dev);
++	if (!gps->gdev) {
++		ret = -ENOMEM;
++		goto err_rfkill_registered;
++	}
++
++	gps->gdev->type = GNSS_TYPE_MTK;
++	gps->gdev->ops = &mtk_gps_gnss_ops;
++	gnss_set_drvdata(gps->gdev, gps);
+ 
+ 	ret = gnss_register_device(gps->gdev);
+ 	if (ret)
+-		goto err_rfkill_registered;
++		goto err_gnss_put;
+ 
+ 	ret = device_create_file(&gps->gdev->dev, &dev_attr_suspend);
+ 	if (ret)
+-		goto err_gnss;
++		goto err_gnss_dereg;
++#endif
++
++	ret = mtk_gps_vendor_init(gps);
++	if (ret)
++		goto err_suspend_file;
+ 
+ 	dev_info(dev, "MediaTek WCN GPS on STP channel %d\n", GPS_TASK_INDX);
+ 
+ 	return 0;
+ 
+-err_gnss:
++err_suspend_file:
++#if IS_ENABLED(CONFIG_GNSS)
++	device_remove_file(&gps->gdev->dev, &dev_attr_suspend);
++err_gnss_dereg:
+ 	gnss_deregister_device(gps->gdev);
++err_gnss_put:
++	gnss_put_device(gps->gdev);
++#endif
+ err_rfkill_registered:
++#if IS_ENABLED(CONFIG_GNSS)
+ 	rfkill_unregister(gps->rfkill);
+-err_rfkill:
++#endif
+ 	rfkill_destroy(gps->rfkill);
+ err_singleton:
+ 	WRITE_ONCE(mtk_gps_singleton, NULL);
+-	gnss_put_device(gps->gdev);
+ 
+ 	return ret;
+ }
+@@ -462,10 +556,14 @@ static void mtk_gps_remove(struct platform_device *pdev)
+ 	struct mtk_gps *gps = platform_get_drvdata(pdev);
+ 	unsigned long flags;
+ 
++	mtk_gps_vendor_exit(gps);
++
++#if IS_ENABLED(CONFIG_GNSS)
+ 	device_remove_file(&gps->gdev->dev, &dev_attr_suspend);
+ 
+ 	/* Closing an open device releases the STP channel and WMT function. */
+ 	gnss_deregister_device(gps->gdev);
++#endif
+ 
+ 	/* Wait for an STP callback which is already running. */
+ 	spin_lock_irqsave(&gps->rx_lock, flags);
+@@ -476,7 +574,9 @@ static void mtk_gps_remove(struct platform_device *pdev)
+ 
+ 	rfkill_unregister(gps->rfkill);
+ 	rfkill_destroy(gps->rfkill);
++#if IS_ENABLED(CONFIG_GNSS)
+ 	gnss_put_device(gps->gdev);
++#endif
+ }
+ 
+ static const struct of_device_id mtk_gps_of_match[] = {
+diff --git a/drivers/misc/mediatek/connectivity/gps/gps.h b/drivers/misc/mediatek/connectivity/gps/gps.h
+new file mode 100644
+index 000000000..bec00b960
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/gps/gps.h
+@@ -0,0 +1,97 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * MediaTek WCN GPS driver: internal interface shared by the GNSS device and
++ * the vendor /dev/stpgps character device.
++ *
++ * Port from Samsung/MTK downstream connectivity/gps (stp_chrdev_gps.c and
++ * gps.c) of the SM-G532M Android 6.0.1 kernel.
++ *
++ * Copyright (C) 2011-2014 MediaTek Inc.
++ */
++
++#ifndef _MTK_WCN_GPS_H_
++#define _MTK_WCN_GPS_H_
++
++#include <linux/device.h>
++#include <linux/kconfig.h>
++#include <linux/mutex.h>
++#include <linux/rfkill.h>
++#include <linux/spinlock.h>
++#include <linux/types.h>
++#include <linux/wait.h>
++
++#if IS_ENABLED(CONFIG_GNSS)
++#include <linux/gnss.h>
++#endif
++
++struct nvmem_cell;
++
++/*
++ * Owner of the single STP GPS channel.  The GNSS device and the vendor
++ * /dev/stpgps node are two faces of the same link, so only one of them may
++ * be open at a time (the other open fails with -EBUSY).
++ */
++enum mtk_gps_owner {
++	MTK_GPS_OWNER_NONE = 0,
++	MTK_GPS_OWNER_GNSS,
++	MTK_GPS_OWNER_VENDOR,
++};
++
++/**
++ * struct mtk_gps - GPS driver state
++ * @dev: platform device (parent of the GNSS and vendor devices)
++ * @gdev: GNSS character device, NULL when CONFIG_GNSS is disabled
++ * @rfkill: GPS radio switch
++ * @efuse_cell: optional "gps-efuse" nvmem cell, see stpgps_ioctl()
++ * @lock: serialises open/close, ioctl power transitions, rfkill and PM
++ * @rx_lock: protects @rx_enabled, @rx_seq and @rx_buf against the STP callback
++ * @rx_enabled: the STP callback may feed the GNSS receive FIFO
++ * @rx_seq: incremented for every STP receive event, wakes blocking readers
++ * @rx_buf: GNSS RX drain scratch buffer
++ * @rx_wait: /dev/stpgps blocking read wait queue
++ * @rd_mtx: serialises /dev/stpgps read() (downstream rd_mtx semaphore)
++ * @wr_mtx: serialises /dev/stpgps write() (downstream wr_mtx semaphore)
++ * @rd_buf: /dev/stpgps read() staging buffer
++ * @wr_buf: /dev/stpgps write() staging buffer
++ * @owner: which face of the link is currently open
++ * @channel_on: the WMT GPS function and the STP channel are up
++ * @resetting: the connectivity SoC is being reset
++ * @suspended: system suspend notification state
++ */
++struct mtk_gps {
++	struct device *dev;
++#if IS_ENABLED(CONFIG_GNSS)
++	struct gnss_device *gdev;
++#endif
++	struct rfkill *rfkill;
++	struct nvmem_cell *efuse_cell;
++
++	struct mutex lock;	/* open/close, rfkill and PM transitions */
++	spinlock_t rx_lock;	/* STP callback state */
++	bool rx_enabled;
++	u32 rx_seq;
++	u8 *rx_buf;
++
++	wait_queue_head_t rx_wait;
++	struct mutex rd_mtx;
++	struct mutex wr_mtx;
++	u8 *rd_buf;
++	u8 *wr_buf;
++
++	enum mtk_gps_owner owner;
++	bool channel_on;
++	bool resetting;
++	bool suspended;
++};
++
++/* Channel/power state machine (gps.c). */
++int mtk_gps_channel_on(struct mtk_gps *gps);
++void mtk_gps_channel_off(struct mtk_gps *gps);
++int mtk_gps_claim(struct mtk_gps *gps, enum mtk_gps_owner owner);
++void mtk_gps_release(struct mtk_gps *gps, enum mtk_gps_owner owner);
++
++/* Vendor character device (stp_chrdev_gps.c). */
++int mtk_gps_vendor_init(struct mtk_gps *gps);
++void mtk_gps_vendor_exit(struct mtk_gps *gps);
++
++#endif /* _MTK_WCN_GPS_H_ */
+diff --git a/drivers/misc/mediatek/connectivity/gps/stp_chrdev_gps.c b/drivers/misc/mediatek/connectivity/gps/stp_chrdev_gps.c
+new file mode 100644
+index 000000000..0350d79e1
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/gps/stp_chrdev_gps.c
+@@ -0,0 +1,407 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WCN GPS vendor character device (/dev/stpgps).
++ *
++ * This is the UAPI face used by the Android GPS HAL of the SM-G532M ROM.
++ * It talks to the same STP GPS channel as the standard GNSS device in
++ * gps.c; both faces are mutually exclusive (see mtk_gps_claim()).
++ *
++ * Port from Samsung/MTK downstream connectivity/gps/stp_chrdev_gps.c of the
++ * SM-G532M Android 6.0.1 kernel.
++ *
++ * Copyright (C) 2011-2014 MediaTek Inc.
++ */
++
++#include <linux/cdev.h>
++#include <linux/compat.h>
++#include <linux/device.h>
++#include <linux/errno.h>
++#include <linux/fs.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/nvmem-consumer.h>
++#include <linux/slab.h>
++#include <linux/types.h>
++#include <linux/uaccess.h>
++
++#include "gps.h"
++#include "mtk_wcn_stp.h"
++#include "mtk_wcn_wmt.h"
++
++/*
++ * Downstream on-stack ioctl numbering (stp_chrdev_gps.c:31-37).  The
++ * commands are plain integers, not _IO() encoded, because the ROM HAL
++ * passes them verbatim.
++ */
++#define COMBO_IOC_GPS_HWVER		6
++#define COMBO_IOC_GPS_IC_HW_VERSION	7
++#define COMBO_IOC_GPS_IC_FW_VERSION	8
++#define COMBO_IOC_D1_EFUSE_GET		9
++#define COMBO_IOC_RTC_FLAG		10
++#define COMBO_IOC_CO_CLOCK_FLAG		11
++
++#define STPGPS_DRIVER_NAME	"stpgps"
++
++/*
++ * Downstream has a module parameter GPS_major defaulting to 191 ("never
++ * used number", stp_chrdev_gps.c:24).  Keep the knob but default to 0 so the
++ * major is allocated dynamically, as required for a modern kernel.
++ */
++static int stpgps_major;
++module_param(stpgps_major, int, 0444);
++MODULE_PARM_DESC(stpgps_major, "Fixed major for /dev/stpgps (0 = dynamic)");
++
++static struct mtk_gps *stpgps_core;
++static dev_t stpgps_devt;
++static struct cdev stpgps_cdev;
++static struct class *stpgps_class;
++static struct device *stpgps_device;
++
++static int stpgps_open(struct inode *inode, struct file *file)
++{
++	struct mtk_gps *gps = READ_ONCE(stpgps_core);
++	int ret;
++
++	if (!gps)
++		return -ENODEV;
++
++	/*
++	 * Downstream GPS_open() rejects opens while a whole-chip reset is in
++	 * progress (stp_chrdev_gps.c:397-400).
++	 */
++	mutex_lock(&gps->lock);
++	ret = mtk_gps_claim(gps, MTK_GPS_OWNER_VENDOR);
++	if (!ret)
++		file->private_data = gps;
++	mutex_unlock(&gps->lock);
++
++	return ret;
++}
++
++static int stpgps_release(struct inode *inode, struct file *file)
++{
++	struct mtk_gps *gps = file->private_data;
++
++	if (!gps)
++		return 0;
++
++	mutex_lock(&gps->lock);
++	mtk_gps_release(gps, MTK_GPS_OWNER_VENDOR);
++	mutex_unlock(&gps->lock);
++
++	file->private_data = NULL;
++
++	return 0;
++}
++
++/*
++ * Blocking read of the raw GNSS byte stream, exactly like downstream
++ * GPS_read() (stp_chrdev_gps.c:177-250): the bytes are dequeued from the
++ * STP GPS channel, and the reader sleeps on the channel event callback.
++ * The sequence counter removes the lost-wakeup window of the downstream
++ * "flag" variable while keeping the same observable semantics.
++ */
++static ssize_t stpgps_read(struct file *file, char __user *buf, size_t count,
++			   loff_t *ppos)
++{
++	struct mtk_gps *gps = file->private_data;
++	u32 seq;
++	int ret;
++
++	if (!count)
++		return 0;
++
++	if (!gps)
++		return -ENODEV;
++
++	if (count > MTKSTP_BUFFER_SIZE)
++		count = MTKSTP_BUFFER_SIZE;
++
++	if (mutex_lock_interruptible(&gps->rd_mtx))
++		return -ERESTARTSYS;
++
++	for (;;) {
++		/* A whole-chip reset invalidates pending transfers. */
++		if (READ_ONCE(gps->resetting)) {
++			ret = -EIO;
++			break;
++		}
++
++		if (!READ_ONCE(gps->channel_on)) {
++			ret = -ENODEV;
++			break;
++		}
++
++		seq = READ_ONCE(gps->rx_seq);
++		ret = mtk_wcn_stp_receive_data(gps->rd_buf, count,
++					       GPS_TASK_INDX);
++		if (ret)
++			break;
++
++		if (wait_event_interruptible(gps->rx_wait,
++					     READ_ONCE(gps->rx_seq) != seq ||
++					     READ_ONCE(gps->resetting) ||
++					     !READ_ONCE(gps->channel_on))) {
++			ret = -ERESTARTSYS;
++			break;
++		}
++	}
++
++	mutex_unlock(&gps->rd_mtx);
++
++	if (ret > 0 && copy_to_user(buf, gps->rd_buf, ret))
++		return -EFAULT;
++
++	return ret;
++}
++
++/*
++ * Write the raw GNSS byte stream into the STP GPS channel, like downstream
++ * GPS_write() (stp_chrdev_gps.c:103-175).  A short transfer is reported as
++ * the number of bytes accepted by STP; a full STP window is -ENOSPC.
++ */
++static ssize_t stpgps_write(struct file *file, const char __user *buf,
++			    size_t count, loff_t *ppos)
++{
++	struct mtk_gps *gps = file->private_data;
++	int ret;
++
++	if (!gps)
++		return -ENODEV;
++
++	/* Downstream rejects a zero-length write with -EFAULT. */
++	if (!count)
++		return -EFAULT;
++
++	if (count > MTKSTP_BUFFER_SIZE)
++		count = MTKSTP_BUFFER_SIZE;
++
++	if (mutex_lock_interruptible(&gps->wr_mtx))
++		return -ERESTARTSYS;
++
++	if (READ_ONCE(gps->resetting)) {
++		ret = -EIO;
++		goto out;
++	}
++
++	if (!READ_ONCE(gps->channel_on)) {
++		ret = -ENODEV;
++		goto out;
++	}
++
++	if (copy_from_user(gps->wr_buf, buf, count)) {
++		ret = -EFAULT;
++		goto out;
++	}
++
++	ret = mtk_wcn_stp_send_data(gps->wr_buf, count, GPS_TASK_INDX);
++	if (ret <= 0)
++		ret = -ENOSPC;
++
++out:
++	mutex_unlock(&gps->wr_mtx);
++
++	return ret;
++}
++
++/*
++ * COMBO_IOC_D1_EFUSE_GET: downstream ioremaps 0x10206198 and returns the
++ * 32-bit efuse word as the ioctl result (stp_chrdev_gps.c:330-343), it does
++ * not copy it to userspace.  In this tree the word is only reachable through
++ * an nvmem cell; there is no MT6735 efuse provider, so a board may supply
++ * "gps-efuse" and otherwise the ioctl reports -EOPNOTSUPP instead of
++ * inventing a value.
++ */
++static long stpgps_efuse_get(struct mtk_gps *gps)
++{
++	void *cell_data;
++	size_t len = 0;
++	u32 val;
++
++	if (!gps->efuse_cell)
++		return -EOPNOTSUPP;
++
++	cell_data = nvmem_cell_read(gps->efuse_cell, &len);
++	if (IS_ERR(cell_data))
++		return PTR_ERR(cell_data);
++
++	if (len < sizeof(val)) {
++		kfree(cell_data);
++		return -ENODATA;
++	}
++
++	memcpy(&val, cell_data, sizeof(val));
++	kfree(cell_data);
++
++	/* Downstream returns an int, so keep the same sign extension. */
++	return (long)(s32)val;
++}
++
++static long stpgps_ioctl(struct file *file, unsigned int cmd,
++			 unsigned long arg)
++{
++	struct mtk_gps *gps = file->private_data;
++	enum mtk_wcn_wmt_hwver hw_ver;
++	u32 version;
++
++	if (!gps)
++		return -ENODEV;
++
++	switch (cmd) {
++	case 0:
++		/*
++		 * Downstream refuses to let the GPS device control STP
++		 * directly: the STP state is owned by WMT only
++		 * (stp_chrdev_gps.c:257-266).  Return -EINVAL, as it does.
++		 */
++		return -EINVAL;
++
++	case 1:
++		/* Raw-data mode is likewise disabled downstream (:268-271). */
++		return -EINVAL;
++
++	case COMBO_IOC_GPS_HWVER:
++		/* stp_chrdev_gps.c:273-283: native enum, 4 bytes. */
++		hw_ver = mtk_wcn_wmt_hwver_get();
++		if (copy_to_user((void __user *)arg, &hw_ver, sizeof(hw_ver)))
++			return -EFAULT;
++		return 0;
++
++	case COMBO_IOC_GPS_IC_HW_VERSION:
++		version = mtk_wcn_wmt_ic_info_get(WMT_ICINFO_HWVER);
++		if (copy_to_user((void __user *)arg, &version, sizeof(version)))
++			return -EFAULT;
++		return 0;
++
++	case COMBO_IOC_GPS_IC_FW_VERSION:
++		version = mtk_wcn_wmt_ic_info_get(WMT_ICINFO_FWVER);
++		if (copy_to_user((void __user *)arg, &version, sizeof(version)))
++			return -EFAULT;
++		return 0;
++
++	case COMBO_IOC_D1_EFUSE_GET:
++		return stpgps_efuse_get(gps);
++
++	case COMBO_IOC_RTC_FLAG:
++		/*
++		 * Downstream rtc_GPS_low_power_detected()
++		 * (stp_chrdev_gps.c:88-99) has a first-query branch and a
++		 * second branch that both yield 0 while the RTC call is
++		 * commented out.  Reproduce the documented result.
++		 */
++		return 0;
++
++	case COMBO_IOC_CO_CLOCK_FLAG:
++		/*
++		 * Downstream compiles this to 0 with SOC_CO_CLOCK_FLAG
++		 * disabled (:321-326); the WMT core does carry the flag, so
++		 * report it live.
++		 */
++		return mtk_wcn_wmt_co_clock_flag_get() ? 1 : 0;
++
++	default:
++		/* Downstream returns -EFAULT for unknown commands (:345-348). */
++		return -EFAULT;
++	}
++}
++
++#ifdef CONFIG_COMPAT
++static long stpgps_compat_ioctl(struct file *file, unsigned int cmd,
++				unsigned long arg)
++{
++	return stpgps_ioctl(file, cmd, (unsigned long)compat_ptr(arg));
++}
++#endif
++
++static const struct file_operations stpgps_fops = {
++	.owner = THIS_MODULE,
++	.open = stpgps_open,
++	.release = stpgps_release,
++	.read = stpgps_read,
++	.write = stpgps_write,
++	.unlocked_ioctl = stpgps_ioctl,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl = stpgps_compat_ioctl,
++#endif
++};
++
++/*
++ * Register /dev/stpgps for @gps.  The device node is created and destroyed
++ * with the GPS platform device; it does not depend on CONFIG_GNSS.
++ */
++int mtk_gps_vendor_init(struct mtk_gps *gps)
++{
++	int ret;
++
++	if (stpgps_major) {
++		stpgps_devt = MKDEV(stpgps_major, 0);
++		ret = register_chrdev_region(stpgps_devt, 1, STPGPS_DRIVER_NAME);
++	} else {
++		ret = alloc_chrdev_region(&stpgps_devt, 0, 1,
++					  STPGPS_DRIVER_NAME);
++	}
++	if (ret) {
++		dev_err(gps->dev, "failed to reserve stpgps major: %d\n", ret);
++		return ret;
++	}
++
++	cdev_init(&stpgps_cdev, &stpgps_fops);
++	stpgps_cdev.owner = THIS_MODULE;
++
++	ret = cdev_add(&stpgps_cdev, stpgps_devt, 1);
++	if (ret) {
++		dev_err(gps->dev, "failed to add stpgps cdev: %d\n", ret);
++		goto err_region;
++	}
++
++	stpgps_class = class_create(STPGPS_DRIVER_NAME);
++	if (IS_ERR(stpgps_class)) {
++		ret = PTR_ERR(stpgps_class);
++		stpgps_class = NULL;
++		goto err_cdev;
++	}
++
++	WRITE_ONCE(stpgps_core, gps);
++
++	stpgps_device = device_create(stpgps_class, gps->dev, stpgps_devt,
++				      NULL, STPGPS_DRIVER_NAME);
++	if (IS_ERR(stpgps_device)) {
++		ret = PTR_ERR(stpgps_device);
++		stpgps_device = NULL;
++		WRITE_ONCE(stpgps_core, NULL);
++		goto err_class;
++	}
++
++	dev_info(gps->dev, "/dev/%s registered (major %d)\n",
++		 STPGPS_DRIVER_NAME, MAJOR(stpgps_devt));
++
++	return 0;
++
++err_class:
++	class_destroy(stpgps_class);
++	stpgps_class = NULL;
++err_cdev:
++	cdev_del(&stpgps_cdev);
++err_region:
++	unregister_chrdev_region(stpgps_devt, 1);
++
++	return ret;
++}
++
++void mtk_gps_vendor_exit(struct mtk_gps *gps)
++{
++	WRITE_ONCE(stpgps_core, NULL);
++
++	if (stpgps_device) {
++		device_destroy(stpgps_class, stpgps_devt);
++		stpgps_device = NULL;
++	}
++
++	if (stpgps_class) {
++		class_destroy(stpgps_class);
++		stpgps_class = NULL;
++	}
++
++	cdev_del(&stpgps_cdev);
++	unregister_chrdev_region(stpgps_devt, 1);
++}

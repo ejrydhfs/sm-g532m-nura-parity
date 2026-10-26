@@ -1,0 +1,1959 @@
+diff --git a/drivers/mfd/mt6397-core.c b/drivers/mfd/mt6397-core.c
+index 3e58d0764..830b77703 100644
+--- a/drivers/mfd/mt6397-core.c
++++ b/drivers/mfd/mt6397-core.c
+@@ -157,6 +157,9 @@ static const struct mfd_cell mt6328_devs[] = {
+ 		.num_resources = ARRAY_SIZE(mt6328_keys_resources),
+ 		.resources = mt6328_keys_resources,
+ 		.of_compatible = "mediatek,mt6328-keys"
++	}, {
++		.name = "mt6328-codec",
++		.of_compatible = "mediatek,mt6328-codec"
+ 	},
+ };
+ 
+diff --git a/sound/soc/codecs/Kconfig b/sound/soc/codecs/Kconfig
+index adb3fb923..8ef41db60 100644
+--- a/sound/soc/codecs/Kconfig
++++ b/sound/soc/codecs/Kconfig
+@@ -2756,6 +2756,15 @@ config SND_SOC_ML26124
+ 	tristate
+ 	depends on I2C
+ 
++config SND_SOC_MT6331
++	tristate "MediaTek MT6328 PMIC Codec (vendor name MT6331)"
++	depends on MFD_MT6397
++	help
++	  Enable support for the audio codec block of the MT6328 PMIC as
++	  found on MT6735/MT6737 SoCs.  The vendor driver for this block is
++	  named mt6331, but the silicon is an MT6328 and only the MT6328
++	  audio register map is implemented.
++
+ config SND_SOC_MT6351
+ 	tristate "MediaTek MT6351 Codec"
+ 
+diff --git a/sound/soc/codecs/Makefile b/sound/soc/codecs/Makefile
+index 3ddee5298..4f69ca5bf 100644
+--- a/sound/soc/codecs/Makefile
++++ b/sound/soc/codecs/Makefile
+@@ -187,6 +187,7 @@ snd-soc-mc13783-y := mc13783.o
+ snd-soc-ml26124-y := ml26124.o
+ snd-soc-msm8916-analog-y := msm8916-wcd-analog.o
+ snd-soc-msm8916-digital-y := msm8916-wcd-digital.o
++snd-soc-mt6331-y := mt6331.o
+ snd-soc-mt6351-y := mt6351.o
+ snd-soc-mt6357-y := mt6357.o
+ snd-soc-mt6358-y := mt6358.o
+@@ -618,6 +619,7 @@ obj-$(CONFIG_SND_SOC_MC13783)	+= snd-soc-mc13783.o
+ obj-$(CONFIG_SND_SOC_ML26124)	+= snd-soc-ml26124.o
+ obj-$(CONFIG_SND_SOC_MSM8916_WCD_ANALOG) +=snd-soc-msm8916-analog.o
+ obj-$(CONFIG_SND_SOC_MSM8916_WCD_DIGITAL) +=snd-soc-msm8916-digital.o
++obj-$(CONFIG_SND_SOC_MT6331)	+= snd-soc-mt6331.o
+ obj-$(CONFIG_SND_SOC_MT6351)	+= snd-soc-mt6351.o
+ obj-$(CONFIG_SND_SOC_MT6357)	+= snd-soc-mt6357.o
+ obj-$(CONFIG_SND_SOC_MT6358)	+= snd-soc-mt6358.o
+diff --git a/sound/soc/codecs/mt6331.c b/sound/soc/codecs/mt6331.c
+new file mode 100644
+index 000000000..825b2fb60
+--- /dev/null
++++ b/sound/soc/codecs/mt6331.c
+@@ -0,0 +1,1714 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MT6328 PMIC audio codec driver (MT6735 / MT6737)
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ * Copyright (c) 2024 The Nura project
++ *
++ * Port from Samsung/MTK downstream:
++ *   sound/soc/mediatek/mt_soc_audio_v3/mt_soc_codec_63xx.c
++ *   sound/soc/mediatek/mt_soc_audio_v3/mt_soc_codec_speaker_63xx.c
++ *   sound/soc/mediatek/mt_soc_audio_v3/AudDrv_Ana.{c,h}
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * The vendor driver is named "mt6331" (ROM symbols mt6331_codec_probe,
++ * mt6331_read, mt6331_write) but the PMIC on MT6737T/grandpplte is an MT6328
++ * and only the MT6328 audio register map is programmed here.  In the vendor
++ * kernel every one of these registers is a PMIC register reached over pwrap
++ * (AudDrv_Ana.c:67-104 Ana_Set_Reg/Ana_Get_Reg), therefore the driver is a
++ * plain regmap client of the parent PMIC and never touches the SoC AFE MMIO.
++ *
++ * Sequence/source citations use the form "vendor:LINE" for
++ * sound/soc/mediatek/mt_soc_audio_v3/mt_soc_codec_63xx.c, "spk:LINE" for
++ * mt_soc_codec_speaker_63xx.c and "upmu:LINE" for
++ * drivers/misc/mediatek/include/mt-plat/mt6735/include/mach/upmu_hw.h.
++ */
++
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/mfd/mt6397/core.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <sound/jack.h>
++#include <sound/pcm.h>
++#include <sound/soc.h>
++#include <sound/soc-dapm.h>
++#include <sound/tlv.h>
++
++#include "mt6331.h"
++
++/* Vendor names (AudDrv_Def.h:273-295) */
++#define MT6331_CODEC_NAME		"mt-soc-codec"
++#define MT6331_TXDAI_NAME		"mt-soc-codec-tx-dai"
++#define MT6331_TXDAI2_NAME		"mt-soc-codec-tx-dai2"
++#define MT6331_RXDAI_NAME		"mt-soc-codec-rx-dai"
++#define MT6331_DL1_STREAM_NAME		"MultiMedia1_PLayback"
++#define MT6331_DL2_STREAM_NAME		"MultiMedia2_PLayback"
++#define MT6331_UL1_STREAM_NAME		"MultiMedia1_Capture"
++
++/* Vendor trim indexes (mt_soc_pcm_common.h:204-206) */
++#define MT6331_HP_TRIM_INDEX		8	/* 0 dB */
++#define MT6331_SPK_TRIM_INDEX		4	/* 6 dB */
++
++/* Vendor microphone bias reference, always programmed when a bias is enabled
++ * (vendor:3280 "MISBIAS0 = 1P9V", vendor:3287).
++ */
++#define MT6331_MICBIAS_VREF_DEFAULT	7
++
++/* Analog/digital block states, used to mirror the vendor driver's
++ * mAudio_Ana_DevicePower[] bookkeeping and to gate the shared "last user"
++ * power-down paths (vendor:203 GetDLStatus, vendor:3210 GetAdcStatus).
++ */
++#define MT6331_ST_DAC			BIT(0)
++#define MT6331_ST_ADC_SUPPLY		BIT(1)
++#define MT6331_ST_PGA_L			BIT(2)
++#define MT6331_ST_PGA_R			BIT(3)
++#define MT6331_ST_MICBIAS1		BIT(4)
++#define MT6331_ST_MICBIAS2		BIT(5)
++#define MT6331_ST_ADC			BIT(6)
++#define MT6331_ST_HP			BIT(7)
++#define MT6331_ST_EARPIECE		BIT(8)
++#define MT6331_ST_SPEAKER		BIT(9)
++
++#define MT6331_ST_OUTPUTS		(MT6331_ST_HP | MT6331_ST_EARPIECE | \
++					 MT6331_ST_SPEAKER)
++
++struct mt6331_priv {
++	struct device *dev;
++	struct regmap *regmap;
++	struct gpio_desc *hp_depop;
++
++	/* Serializes the analog sequences (vendor Ana_Ctrl_Mutex). */
++	struct mutex ana_lock;
++	/* Vendor ClsqCount / TopCkCount / NvRegCount counters. */
++	struct mutex clk_lock;		/* vendor Ana_Clk_Mutex (TopCk + NvReg) */
++	struct mutex clksq_lock;	/* vendor AudAna_lock (ClsqEnable) */
++	unsigned int clksq_users;
++	unsigned int topck_users;
++	unsigned int audglb_users;
++
++	unsigned int state;		/* MT6331_ST_* */
++	unsigned int suspend_state;	/* saved on suspend */
++
++	unsigned int dl_rate;		/* vendor mBlockSampleRate[OUT_DAC] */
++	unsigned int ul_rate;		/* vendor mBlockSampleRate[IN_ADC] */
++
++	unsigned int micbias_ref;	/* vendor MicbiasRef */
++	bool micbias_ref_saved;		/* vendor GetMicbias */
++	bool headset_mic;		/* jack reports a headset microphone */
++	unsigned int mic_gain;		/* vendor mAudio_Ana_Volume[MICAMPx] */
++
++	struct snd_soc_jack *jack;
++	struct notifier_block jack_nb;
++};
++
++static int mt6331_ana_write(struct mt6331_priv *priv, unsigned int reg,
++			    unsigned int val, unsigned int mask)
++{
++	/* Identical to the vendor Ana_Set_Reg() read-modify-write. */
++	return regmap_update_bits(priv->regmap, reg, mask, val);
++}
++
++/* ------------------------------------------------------------------ */
++/* Reference counted PMIC clocks / global block (vendor:276-381)      */
++/* ------------------------------------------------------------------ */
++
++static int mt6331_clksq_enable(struct mt6331_priv *priv, bool enable)
++{
++	int ret = 0;
++
++	mutex_lock(&priv->clksq_lock);
++	if (enable) {
++		if (priv->clksq_users == 0) {
++			/* vendor:318 ClsqEnable: enable CLKSQ 26MHz and its
++			 * source clock.
++			 */
++			ret = mt6331_ana_write(priv, MT6328_TOP_CLKSQ,
++					       RG_CLKSQ_EN_AUD,
++					       RG_CLKSQ_EN_AUD);
++			if (!ret)
++				ret = mt6331_ana_write(priv,
++						       MT6328_TOP_CLKSQ_SET,
++						       RG_CLKSQ_EN_AUD,
++						       RG_CLKSQ_EN_AUD);
++		}
++		priv->clksq_users++;
++	} else {
++		if (priv->clksq_users)
++			priv->clksq_users--;
++		if (priv->clksq_users == 0) {
++			/* vendor:322-324 */
++			ret = mt6331_ana_write(priv, MT6328_TOP_CLKSQ_CLR,
++					       RG_CLKSQ_EN_AUD,
++					       RG_CLKSQ_EN_AUD);
++			if (!ret)
++				ret = mt6331_ana_write(priv, MT6328_TOP_CLKSQ,
++						       0, RG_CLKSQ_EN_AUD);
++		}
++	}
++	mutex_unlock(&priv->clksq_lock);
++
++	return ret;
++}
++
++static int mt6331_topck_enable(struct mt6331_priv *priv, bool enable)
++{
++	int ret = 0;
++
++	mutex_lock(&priv->clk_lock);
++	if (enable) {
++		if (priv->topck_users == 0) {
++			/* vendor:283: AUDNCP clock divider engine clock +
++			 * AUD 26M clock.
++			 */
++			ret = mt6331_ana_write(priv, MT6328_TOP_CKPDN_CON0_CLR,
++					       RG_AUD_CLK_GRP_VENDOR,
++					       RG_AUD_CLK_GRP_VENDOR);
++		}
++		priv->topck_users++;
++	} else {
++		if (priv->topck_users)
++			priv->topck_users--;
++		if (priv->topck_users == 0)
++			/* vendor:288 */
++			ret = mt6331_ana_write(priv, MT6328_TOP_CKPDN_CON0_SET,
++					       RG_AUD_CLK_GRP_VENDOR,
++					       RG_AUD_CLK_GRP_VENDOR);
++	}
++	mutex_unlock(&priv->clk_lock);
++
++	return ret;
++}
++
++static int mt6331_audglb_enable(struct mt6331_priv *priv, bool enable)
++{
++	int ret = 0;
++
++	mutex_lock(&priv->clk_lock);
++	if (enable) {
++		if (priv->audglb_users == 0)
++			/* vendor:369 NvregEnable: clear AUDGLB power down */
++			ret = mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON8, 0,
++					       RG_AUDGLB_PWRDN_VA28);
++		priv->audglb_users++;
++	} else {
++		if (priv->audglb_users)
++			priv->audglb_users--;
++		if (priv->audglb_users == 0)
++			/* vendor:373 */
++			ret = mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON8,
++					       RG_AUDGLB_PWRDN_VA28,
++					       RG_AUDGLB_PWRDN_VA28);
++	}
++	mutex_unlock(&priv->clk_lock);
++
++	return ret;
++}
++
++/* ------------------------------------------------------------------ */
++/* Downlink interface rate (vendor:1581 GetDLNewIFFrequency)          */
++/* ------------------------------------------------------------------ */
++static unsigned int mt6331_dl_if_freq(unsigned int rate)
++{
++	switch (rate) {
++	case 8000:
++		return 0;
++	case 11025:
++		return 1;
++	case 12000:
++		return 2;
++	case 16000:
++		return 3;
++	case 22050:
++		return 4;
++	case 24000:
++		return 5;
++	case 32000:
++		return 6;
++	case 44100:
++		return 7;
++	case 48000:
++	default:
++		return 8;
++	}
++}
++
++/* Uplink sample rate field (vendor:1290 ULSampleRateTransform) */
++static unsigned int mt6331_ul_rate_sel(unsigned int rate)
++{
++	switch (rate) {
++	case 16000:
++		return 1;
++	case 32000:
++		return 2;
++	case 48000:
++		return 3;
++	case 8000:
++	default:
++		return 0;
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* Downlink digital path (vendor:1618 TurnOnDacPower)                 */
++/* ------------------------------------------------------------------ */
++static int mt6331_dl_power_up(struct mt6331_priv *priv)
++{
++	int ret;
++
++	ret = mt6331_clksq_enable(priv, true);
++	if (ret)
++		return ret;
++	ret = mt6331_topck_enable(priv, true);
++	if (ret)
++		return ret;
++	udelay(250);
++	ret = mt6331_audglb_enable(priv, true);
++	if (ret)
++		return ret;
++
++	/* vendor:1628-1631 */
++	mt6331_ana_write(priv, MT6328_AFE_AUDIO_TOP_CON0,
++			 (priv->state & MT6331_ST_ADC) ? 0x0000 : 0x003a,
++			 0xffff);
++	/* vendor:1634-1637 */
++	mt6331_ana_write(priv, MT6328_AFUNC_AUD_CON2, 0x0006, 0xffff);
++	mt6331_ana_write(priv, MT6328_AFUNC_AUD_CON0, 0xc3a1, 0xffff);
++	mt6331_ana_write(priv, MT6328_AFUNC_AUD_CON2, 0x0003, 0xffff);
++	mt6331_ana_write(priv, MT6328_AFUNC_AUD_CON2, 0x000b, 0xffff);
++	/* vendor:1638-1640 */
++	mt6331_ana_write(priv, MT6328_AFE_DL_SDM_CON1, 0x001e, 0xffff);
++	mt6331_ana_write(priv, MT6328_AFE_UL_DL_CON0, 0x0001, 0xffff);
++	/* vendor:1641-1646 */
++	mt6331_ana_write(priv, MT6328_AFE_PMIC_NEWIF_CFG0,
++			 (mt6331_dl_if_freq(priv->dl_rate) <<
++			  RG_DL_IF_FREQ_SHIFT) | 0x0330, 0xffff);
++	mt6331_ana_write(priv, MT6328_AFE_DL_SRC2_CON0_H,
++			 (mt6331_dl_if_freq(priv->dl_rate) <<
++			  RG_DL_IF_FREQ_SHIFT) | 0x0300, 0xffff);
++	mt6331_ana_write(priv, MT6328_AFE_DL_SRC2_CON0_L, 0x0001, 0xffff);
++	/* vendor:1648 */
++	mt6331_ana_write(priv, MT6328_PMIC_AFE_TOP_CON0, 0x0000, 0xffff);
++
++	priv->state |= MT6331_ST_DAC;
++
++	return 0;
++}
++
++static int mt6331_dl_power_down(struct mt6331_priv *priv)
++{
++	priv->state &= ~MT6331_ST_DAC;
++
++	/* vendor:1654-1664 TurnOffDacPower */
++	mt6331_ana_write(priv, MT6328_AFE_DL_SRC2_CON0_L, 0x0000, 0xffff);
++	if (!(priv->state & MT6331_ST_ADC))
++		mt6331_ana_write(priv, MT6328_AFE_UL_DL_CON0, 0x0000, 0xffff);
++
++	udelay(250);
++
++	mt6331_ana_write(priv, MT6328_AFE_AUDIO_TOP_CON0, 0x0040, 0x0040);
++	mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON0, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON1, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON3, 0x0001, 0xffff);
++
++	mt6331_audglb_enable(priv, false);
++	mt6331_clksq_enable(priv, false);
++	mt6331_topck_enable(priv, false);
++
++	return 0;
++}
++
++/*
++ * Shared analog part of the downlink amplifiers: NCP clock generation, the
++ * cap-less LDOs and the negative voltage regulator (vendor:1749-1778 for the
++ * headphone/speaker values, vendor:1934-1963 for the earpiece values, which
++ * use 0x0A40/0x2AC0 and ZCD_CON0 = 0 instead).
++ */
++static int mt6331_dl_analog_up(struct mt6331_priv *priv, bool va33refgen,
++			       unsigned int zcd_con0)
++{
++	/* vendor:1749-1756 */
++	mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON1, 0x0001, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON2, 0x002b, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON0, 0x0001, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON4, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDNCP_CLKDIV_CON3, 0x0000, 0xffff);
++	/* vendor:1757-1778: cap-less HC/LC LDO (1.5V) + NV regulator (-1.5V) */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6,
++			 va33refgen ? 0x0a41 : 0x0a40,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6,
++			 va33refgen ? 0x2ac1 : 0x2ac0,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON7, 0x8000,
++			 RG_NVREG_EN_VAUDP15);
++	mt6331_ana_write(priv, MT6328_ZCD_CON0, zcd_con0, 0xffff);
++
++	return 0;
++}
++
++/* vendor:1834-1849 (headphone), vendor:1965-1976 (earpiece),
++ * vendor:2104-2119 (speaker): the shared teardown when the last
++ * downlink output powers down.
++ */
++static int mt6331_dl_analog_down(struct mt6331_priv *priv)
++{
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON4, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac0,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON7, 0x0000,
++			 RG_NVREG_EN_VAUDP15);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x0001,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++
++	return 0;
++}
++
++/* vendor:1673-1703 HeadsetVoloumeRestore / vendor:1705-1732
++ * HeadsetVoloumeSet: the vendor ramps the zero-cross-detect gain one step at
++ * a time.  It keeps a single volume for both channels; here the left and
++ * right targets are ramped independently in the same step sequence.
++ */
++static void mt6331_hp_volume_ramp(struct mt6331_priv *priv, unsigned int l,
++				  unsigned int r)
++{
++	unsigned int val, cl, cr;
++
++	if (regmap_read(priv->regmap, MT6328_ZCD_CON2, &val))
++		return;
++	cl = val & RG_AUDHPLGAIN_MASK;
++	cr = (val >> RG_AUDHPRGAIN_SHIFT) & RG_AUDHPRGAIN_MASK;
++
++	while (cl != l || cr != r) {
++		if (cl < l)
++			cl++;
++		else if (cl > l)
++			cl--;
++		if (cr < r)
++			cr++;
++		else if (cr > r)
++			cr--;
++		mt6331_ana_write(priv, MT6328_ZCD_CON2,
++				 (cr << RG_AUDHPRGAIN_SHIFT) | cl, 0xf9f);
++		udelay(200);
++	}
++}
++
++/* Headphone depop pin: vendor:383 HP_Ana_Switch_to_On() drives the
++ * "hpdepop" pinctrl output low while the amplifier settles, and
++ * vendor:409 HP_Ana_Switch_to_Release() drives it high afterwards.
++ */
++static void mt6331_hp_depop(struct mt6331_priv *priv, bool switch_to_ground)
++{
++	if (!priv->hp_depop)
++		return;
++
++	gpiod_set_value_cansleep(priv->hp_depop, switch_to_ground ? 0 : 1);
++	usleep_range(10000, 11000);	/* vendor:404 / vendor:414 */
++}
++
++/* vendor:1734-1826 Audio_Amp_Change(..., true) */
++static int mt6331_hp_power_up(struct mt6331_priv *priv)
++{
++	unsigned int val, hp_l, hp_r;
++
++	/* The de-pop sequence drives both HP gains to the minimum; keep the
++	 * user volume (vendor mAudio_Ana_Volume[HPOUTL/R]) and restore it.
++	 */
++	if (regmap_read(priv->regmap, MT6328_ZCD_CON2, &val))
++		return -EIO;
++	hp_l = val & RG_AUDHPLGAIN_MASK;
++	hp_r = (val >> RG_AUDHPRGAIN_SHIFT) & RG_AUDHPRGAIN_MASK;
++
++	mt6331_hp_depop(priv, true);
++	mt6331_dl_analog_up(priv, true, 0x0400);
++	/* vendor:1786-1790 */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe080, 0xffff);
++	/* vendor:1792 IBIST */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac0,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++	/* vendor:1794-1796 HP & HS driver bias circuit */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON4, 0x0700, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON5, 0x5490, 0xffff);
++	udelay(50);
++	/* vendor:1798-1812 */
++	mt6331_ana_write(priv, MT6328_ZCD_CON2, 0x0f9f, 0xffff);
++	mt6331_ana_write(priv, MT6328_ZCD_CON3, 0x001f, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON1, 0x0480, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON1, 0x1480, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe090, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON1, 0x14a0, 0xffff);
++	udelay(50);
++	/* vendor:1813-1816 */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac2,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe09f, 0xffff);
++
++	/* vendor:1818-1824: DAC gain, HP mux to the audio DAC, drivers on */
++	mt6331_hp_volume_ramp(priv, MT6331_HP_TRIM_INDEX,
++			      MT6331_HP_TRIM_INDEX);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xf49f, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xf4ff, 0xffff);
++	udelay(50);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON1, 0x1480, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON1, 0x0480, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xf46f, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON4, 0x0300, 0xffff);
++
++	/* vendor:1820-1822 restore the user volume, then release the switch */
++	mt6331_hp_volume_ramp(priv, hp_l, hp_r);
++	mt6331_hp_depop(priv, false);
++
++	priv->state |= MT6331_ST_HP;
++
++	return 0;
++}
++
++/* vendor:1828-1862 Audio_Amp_Change(..., false) */
++static int mt6331_hp_power_down(struct mt6331_priv *priv)
++{
++	priv->state &= ~MT6331_ST_HP;
++
++	mt6331_hp_depop(priv, true);
++	mt6331_hp_volume_ramp(priv, MT6331_HP_TRIM_INDEX,
++			      MT6331_HP_TRIM_INDEX);
++	/* vendor:1837 disable HPR/HPL */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xf40f, 0xffff);
++
++	if (!(priv->state & MT6331_ST_OUTPUTS))
++		mt6331_dl_analog_down(priv);
++
++	return 0;
++}
++
++/* vendor:1925-1999 Voice_Amp_Change (earpiece) */
++static int mt6331_earpiece_power_up(struct mt6331_priv *priv)
++{
++	unsigned int val, hs_gain;
++
++	/* The voice power sequence below drives the handset gain to the
++	 * minimum and then to +8 dB (vendor:1988-1997), which would discard
++	 * the user setting of the "Earpiece Volume" control; keep it and
++	 * apply it again once the driver is up.
++	 */
++	if (regmap_read(priv->regmap, MT6328_ZCD_CON3, &val))
++		return -EIO;
++	hs_gain = val & RG_AUDHSGAIN_MASK;
++
++	mt6331_dl_analog_up(priv, false, 0x0000);
++	/* vendor:1965-1976 */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe080, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac0,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON4, 0x0400, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON5, 0x5490, 0xffff);
++	udelay(50);
++	mt6331_ana_write(priv, MT6328_ZCD_CON3, 0x001f, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON1, 0x1000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac2,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe089, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe109, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe119, 0xffff);
++	udelay(50);
++	/* vendor:1997 HS gain (+8 dB) after the driver is up */
++	mt6331_ana_write(priv, MT6328_ZCD_CON3, 0x0000, 0xffff);
++	/* restore the user volume */
++	mt6331_ana_write(priv, MT6328_ZCD_CON3, hs_gain, RG_AUDHSGAIN_MASK);
++
++	priv->state |= MT6331_ST_EARPIECE;
++
++	return 0;
++}
++
++static int mt6331_earpiece_power_down(struct mt6331_priv *priv)
++{
++	priv->state &= ~MT6331_ST_EARPIECE;
++
++	/* vendor:2003 disable the voice driver */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe109, 0xffff);
++
++	if (!(priv->state & MT6331_ST_OUTPUTS))
++		mt6331_dl_analog_down(priv);
++
++	return 0;
++}
++
++/* vendor:569-604 Apply_Speaker_Gain: ramp the internal speaker PGA */
++static void mt6331_speaker_gain_apply(struct mt6331_priv *priv,
++				      unsigned int target)
++{
++	unsigned int val, cur;
++
++	if (regmap_read(priv->regmap, MT6328_SPK_ANA_CON0, &val))
++		return;
++	cur = (val & (RG_SPKPGA_GAIN_MASK << RG_SPKPGA_GAIN_SHIFT)) >>
++		RG_SPKPGA_GAIN_SHIFT;
++
++	while (cur != target) {
++		usleep_range(200, 300);
++		if (target > cur)
++			cur++;
++		else
++			cur--;
++		mt6331_ana_write(priv, MT6328_SPK_ANA_CON0,
++				 cur << RG_SPKPGA_GAIN_SHIFT,
++				 RG_SPKPGA_GAIN_MASK << RG_SPKPGA_GAIN_SHIFT);
++	}
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON0,
++			 target << RG_SPKPGA_GAIN_SHIFT,
++			 RG_SPKPGA_GAIN_MASK << RG_SPKPGA_GAIN_SHIFT);
++}
++
++/* spk:75-117 Speaker_ClassD_Open */
++static int mt6331_speaker_classd_up(struct mt6331_priv *priv)
++{
++	unsigned int val;
++
++	/* spk:81-86 speaker offset trim + class D mode */
++	mt6331_ana_write(priv, MT6328_SPK_CON7, 0x4531, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x3008, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON13, 0x1800, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON2, 0x04a4, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON0,
++			 MT6331_SPK_TRIM_INDEX << RG_SPKPGA_GAIN_SHIFT,
++			 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON9, 0x2000, 0xffff);
++	/* spk:91 turn the speaker on, spk:93 Vcm high-PSRR mode */
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x3009, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON9, 0x0a00, 0xffff);
++
++	msleep(10);		/* spk:95-96 trim settling time */
++
++	/* spk:101 trim off, spk:103 clock back to triangular wave */
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x3001, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON13, 0x0000, 0xffff);
++
++	/* spk:105-110 the vendor only logs the trim result */
++	if (!regmap_read(priv->regmap, MT6328_SPK_CON1, &val))
++		dev_dbg(priv->dev, "speaker trim raw 0x%04x%s\n", val,
++			(val & 0x8000) ? "" : " (trim failed)");
++
++	/* spk:112-117 0 dB amplifier gain, trim disabled */
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x3001, 0xffff);
++
++	return 0;
++}
++
++/* spk:119-130 Speaker_ClassD_close */
++static int mt6331_speaker_classd_down(struct mt6331_priv *priv)
++{
++	mt6331_ana_write(priv, MT6328_SPK_CON9, 0x2a00, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON0,
++			 MT6331_SPK_TRIM_INDEX << RG_SPKPGA_GAIN_SHIFT,
++			 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x3001, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x3000, 0xffff);
++
++	return 0;
++}
++
++/* vendor:2030-2126 Speaker_Amp_Change (internal class-D speaker) */
++static int mt6331_speaker_power_up(struct mt6331_priv *priv)
++{
++	unsigned int val, gain;
++
++	/* Keep the user speaker gain: Speaker_ClassD_Open() below rewrites
++	 * SPK_ANA_CON0 with the trim level (spk:85).
++	 */
++	if (regmap_read(priv->regmap, MT6328_SPK_ANA_CON0, &val))
++		return -EIO;
++	gain = (val & (RG_SPKPGA_GAIN_MASK << RG_SPKPGA_GAIN_SHIFT)) >>
++		RG_SPKPGA_GAIN_SHIFT;
++	if (!gain)
++		gain = MT6331_SPK_TRIM_INDEX;
++
++	mt6331_dl_analog_up(priv, true, 0x0000);
++	/* vendor:2085-2100 */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac0,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x2ac2,
++			 RG_AUDDEC_ANA_CON6_SPK_MASK);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0x0009, 0x0009);
++	mt6331_ana_write(priv, MT6328_ZCD_CON0, 0x0400, 0xffff);
++	mt6331_ana_write(priv, MT6328_ZCD_CON4, 0x0505, 0xffff);
++	/* vendor:2101-2104 IV buffer mux + enable */
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON3, 0x0100, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON3, 0x0110, 0xffff);
++	/* vendor:2106 class-AB/D clock */
++	mt6331_ana_write(priv, MT6328_TOP_CKPDN_CON2_CLR, RG_SPK_CK_GRP,
++			 RG_SPK_CK_GRP);
++
++	mt6331_speaker_classd_up(priv);
++	mt6331_speaker_gain_apply(priv, gain);
++
++	priv->state |= MT6331_ST_SPEAKER;
++
++	return 0;
++}
++
++static int mt6331_speaker_power_down(struct mt6331_priv *priv)
++{
++	priv->state &= ~MT6331_ST_SPEAKER;
++
++	/* vendor:2128-2136: the vendor grounds the de-pop switch first */
++	mt6331_hp_depop(priv, true);
++	mt6331_speaker_classd_down(priv);
++
++	mt6331_ana_write(priv, MT6328_TOP_CKPDN_CON2_SET, RG_SPK_CK_GRP,
++			 RG_SPK_CK_GRP);
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON3, 0x0100, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON3, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_ZCD_CON4, 0x0505, 0xffff);
++	usleep_range(1000, 2000);	/* vendor:2140 */
++
++	if (!(priv->state & MT6331_ST_OUTPUTS))
++		mt6331_dl_analog_down(priv);
++
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* Uplink (capture) paths                                             */
++/* ------------------------------------------------------------------ */
++
++/* vendor:3256-3271: shared analog supply of both ADC channels */
++static int mt6331_adc_supply_up(struct mt6331_priv *priv)
++{
++	int ret;
++
++	mt6331_ana_write(priv, MT6328_LDO_CON2, 0x8102, 0xffff);
++
++	ret = mt6331_audglb_enable(priv, true);
++	if (ret)
++		return ret;
++	ret = mt6331_clksq_enable(priv, true);
++	if (ret)
++		return ret;
++
++	/* vendor:3262-3264 audio ADC clock generator */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x0004, 0x0004);
++	/* vendor:3265 ADC clock from the 13 MHz clock generator */
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON3, 0x0000, 0xffff);
++	/* vendor:3267-3268 LCLDO_ENC 1.8V + remote sense */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x0104, 0x0104);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON7, 0x0006, 0x0006);
++	/* vendor:3270-3271 encoder bias defaults */
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON6, 0x0555, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON4, 0x0800, 0xffff);
++
++	priv->state |= MT6331_ST_ADC_SUPPLY;
++
++	return 0;
++}
++
++static int mt6331_adc_supply_down(struct mt6331_priv *priv)
++{
++	priv->state &= ~MT6331_ST_ADC_SUPPLY;
++
++	/* vendor:3469-3480 */
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON7, 0x0000, 0x0006);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x0004, 0x0104);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON3, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON6, 0x0000, 0x0104);
++
++	/* vendor:3481-3483: clocks last */
++	mt6331_topck_enable(priv, false);
++	mt6331_clksq_enable(priv, false);
++	mt6331_audglb_enable(priv, false);
++
++	return 0;
++}
++
++/* vendor:3359-3391: uplink digital part of TurnOnADcPowerACC */
++static int mt6331_adc_power_up(struct mt6331_priv *priv)
++{
++	int ret;
++
++	ret = mt6331_topck_enable(priv, true);
++	if (ret)
++		return ret;
++
++	/* vendor:3365-3369 */
++	mt6331_ana_write(priv, MT6328_AFE_AUDIO_TOP_CON0,
++			 (priv->state & MT6331_ST_DAC) ? 0x0000 : 0x005a,
++			 0xffff);
++	mt6331_ana_write(priv, MT6328_PMIC_AFE_TOP_CON0, 0x0000, 0xffff);
++	/* vendor:3373 AFE enable */
++	mt6331_ana_write(priv, MT6328_AFE_UL_DL_CON0, 0x0001, 0xffff);
++	/* vendor:3386-3391 UL sample rate + UL turn on */
++	mt6331_ana_write(priv, MT6328_AFE_UL_SRC0_CON0_H,
++			 (mt6331_ul_rate_sel(priv->ul_rate) << 3) |
++			 (mt6331_ul_rate_sel(priv->ul_rate) << 1),
++			 RG_UL_RATE_MASK);
++	mt6331_ana_write(priv, MT6328_AFE_UL_SRC0_CON0_L, 0x0001, 0xffff);
++
++	priv->state |= MT6331_ST_ADC;
++
++	return 0;
++}
++
++static int mt6331_adc_power_down(struct mt6331_priv *priv)
++{
++	priv->state &= ~MT6331_ST_ADC;
++
++	/* vendor:3395-3397 */
++	mt6331_ana_write(priv, MT6328_AFE_UL_SRC0_CON0_L, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AFE_AUDIO_TOP_CON0, 0x0020, 0x0020);
++
++	if (!(priv->state & MT6331_ST_DAC)) {
++		/* vendor:3477-3480 */
++		mt6331_ana_write(priv, MT6328_AFE_UL_DL_CON0, 0x0000, 0xffff);
++		mt6331_ana_write(priv, MT6328_AFE_AUDIO_TOP_CON0, 0x0084,
++				 0x0084);
++	}
++
++	return 0;
++}
++
++/*
++ * Microphone bias.  AUDENC_ANA_CON9 bit 0 enables bias 0, bit 4 enables
++ * bias 1 and bits 8-10 select the shared reference (upmu:7091-7123).
++ * The vendor driver saves the reference programmed by the accessory
++ * detection before it takes the block over (vendor:3234-3239) and restores
++ * it when the last ADC goes away (vendor:3433-3439).
++ */
++static int mt6331_micbias_set(struct mt6331_priv *priv, bool second, bool on)
++{
++	unsigned int bit = second ? RG_AUDPWDBMICBIAS1 : RG_AUDPWDBMICBIAS0;
++	unsigned int vref;
++	int ret;
++
++	if (on) {
++		if (!priv->micbias_ref_saved) {
++			ret = regmap_read(priv->regmap, MT6328_AUDENC_ANA_CON9,
++					  &priv->micbias_ref);
++			if (ret)
++				return ret;
++			priv->micbias_ref &= RG_AUDMICBIASVREF_MASK;
++			priv->micbias_ref_saved = true;
++			vref = priv->micbias_ref;
++			/* The vendor always programs its own reference
++			 * (vendor:3280/3287); keep one already set by
++			 * the accessory detection otherwise.
++			 */
++			if (!vref)
++				vref = MT6331_MICBIAS_VREF_DEFAULT <<
++					RG_AUDMICBIASVREF_SHIFT;
++			ret = mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON9,
++					       vref, RG_AUDMICBIASVREF_MASK);
++			if (ret)
++				return ret;
++		}
++		ret = mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON9, bit,
++				       bit);
++		if (ret)
++			return ret;
++		priv->state |= second ? MT6331_ST_MICBIAS2 :
++					MT6331_ST_MICBIAS1;
++	} else {
++		ret = mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON9, 0, bit);
++		if (ret)
++			return ret;
++		priv->state &= ~(second ? MT6331_ST_MICBIAS2 :
++				 MT6331_ST_MICBIAS1);
++
++		if (!(priv->state & (MT6331_ST_MICBIAS1 |
++				     MT6331_ST_MICBIAS2)) &&
++		    priv->micbias_ref_saved) {
++			ret = mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON9,
++					       priv->micbias_ref,
++					       RG_AUDMICBIASVREF_MASK);
++			if (ret)
++				return ret;
++			priv->micbias_ref_saved = false;
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * The vendor driver re-applies mAudio_Ana_Volume[MICAMP1/2] on every ADC
++ * power-up (mt_soc_codec_63xx.c:3183-3194 SetMicPGAGain) because the power
++ * down path resets RG_AUDPREAMPL/PRGAIN.  Keep the user setting here.
++ */
++static unsigned int mt6331_mic_gain_save(struct mt6331_priv *priv)
++{
++	unsigned int val;
++
++	if (!regmap_read(priv->regmap, MT6328_AUDENC_ANA_CON10, &val))
++		priv->mic_gain = val & (RG_AUDPREAMPLGAIN_MASK |
++					RG_AUDPREAMPRGAIN_MASK);
++
++	return priv->mic_gain;
++}
++
++static void mt6331_mic_gain_restore(struct mt6331_priv *priv)
++{
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON10, priv->mic_gain,
++			 RG_AUDPREAMPLGAIN_MASK | RG_AUDPREAMPRGAIN_MASK);
++}
++
++/* vendor:3273-3341 (left / main or headset mic), 3295-3354 (right / ref mic) */
++static int mt6331_pga_l_power_up(struct mt6331_priv *priv)
++{
++	/* vendor:3276 DC coupling mode of bias 0 (ACC/DCC: no ECM mode) */
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON9, 0x0000,
++			 RG_AUDMICBIAS0DCC_MASK);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON9, 0x0000,
++			 RG_AUDMICBIAS1DCC_MASK);
++
++	/* vendor:3325/3343 preamplifier input select + ADC input select */
++	if (priv->headset_mic) {
++		/* vendor:3335-3337 headset microphone on AIN1 */
++		mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0, 0x0500, 0xffff);
++		mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0, 0x0581, 0xffff);
++	} else {
++		/* vendor:3329-3331 main microphone on AIN0 */
++		mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0, 0x0041, 0x00c1);
++		mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0, 0x0541, 0xffff);
++	}
++
++	mt6331_mic_gain_restore(priv);
++
++	priv->state |= MT6331_ST_PGA_L;
++
++	return 0;
++}
++
++static int mt6331_pga_l_power_down(struct mt6331_priv *priv)
++{
++	priv->state &= ~MT6331_ST_PGA_L;
++
++	mt6331_mic_gain_save(priv);
++
++	/* vendor:3404-3429 */
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0, 0x0041, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON3, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON10, 0x0000,
++			 RG_AUDPREAMPLGAIN_MASK);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON4, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON6, 0x2020, 0xffff);
++
++	return 0;
++}
++
++static int mt6331_pga_r_power_up(struct mt6331_priv *priv)
++{
++	/* vendor:3295-3305 reference microphone on AIN2, bias 0 */
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON9, 0x0000,
++			 RG_AUDMICBIAS0DCC_MASK);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON10, 0x0033, 0x00ff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON3, 0x0800, 0xf900);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON1, 0x00c1, 0x00c1);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON1, 0x05c1, 0xffff);
++
++	mt6331_mic_gain_restore(priv);
++
++	priv->state |= MT6331_ST_PGA_R;
++
++	return 0;
++}
++
++static int mt6331_pga_r_power_down(struct mt6331_priv *priv)
++{
++	priv->state &= ~MT6331_ST_PGA_R;
++
++	mt6331_mic_gain_save(priv);
++
++	/* vendor:3444-3467 */
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON1, 0x00c1, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON3, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON10, 0x0000,
++			 RG_AUDPREAMPRGAIN_MASK);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON1, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON4, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON6, 0x2020, 0xffff);
++
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* DAPM events                                                        */
++/* ------------------------------------------------------------------ */
++static int mt6331_dac_event(struct snd_soc_dapm_widget *w,
++			    struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_dl_power_up(priv);
++		break;
++	case SND_SOC_DAPM_POST_PMD:
++		ret = mt6331_dl_power_down(priv);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++static int mt6331_hp_event(struct snd_soc_dapm_widget *w,
++			   struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_hp_power_up(priv);
++		break;
++	case SND_SOC_DAPM_PRE_PMD:
++		ret = mt6331_hp_power_down(priv);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++static int mt6331_earpiece_event(struct snd_soc_dapm_widget *w,
++				 struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_earpiece_power_up(priv);
++		break;
++	case SND_SOC_DAPM_PRE_PMD:
++		ret = mt6331_earpiece_power_down(priv);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++static int mt6331_speaker_event(struct snd_soc_dapm_widget *w,
++				struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_speaker_power_up(priv);
++		break;
++	case SND_SOC_DAPM_PRE_PMD:
++		ret = mt6331_speaker_power_down(priv);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++static int mt6331_adc_supply_event(struct snd_soc_dapm_widget *w,
++				   struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_adc_supply_up(priv);
++		break;
++	case SND_SOC_DAPM_POST_PMD:
++		ret = mt6331_adc_supply_down(priv);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++static int mt6331_adc_event(struct snd_soc_dapm_widget *w,
++			    struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_adc_power_up(priv);
++		break;
++	case SND_SOC_DAPM_POST_PMD:
++		ret = mt6331_adc_power_down(priv);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++static int mt6331_pga_l_event(struct snd_soc_dapm_widget *w,
++			      struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_pga_l_power_up(priv);
++		break;
++	case SND_SOC_DAPM_POST_PMD:
++		ret = mt6331_pga_l_power_down(priv);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++static int mt6331_pga_r_event(struct snd_soc_dapm_widget *w,
++			      struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_pga_r_power_up(priv);
++		break;
++	case SND_SOC_DAPM_POST_PMD:
++		ret = mt6331_pga_r_power_down(priv);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++static int mt6331_micbias1_event(struct snd_soc_dapm_widget *w,
++				 struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_micbias_set(priv, false, true);
++		break;
++	case SND_SOC_DAPM_POST_PMD:
++		ret = mt6331_micbias_set(priv, false, false);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++static int mt6331_micbias2_event(struct snd_soc_dapm_widget *w,
++				 struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = mt6331_micbias_set(priv, true, true);
++		break;
++	case SND_SOC_DAPM_POST_PMD:
++		ret = mt6331_micbias_set(priv, true, false);
++		break;
++	}
++	mutex_unlock(&priv->ana_lock);
++
++	return ret;
++}
++
++/* ------------------------------------------------------------------ */
++/* Controls                                                           */
++/* ------------------------------------------------------------------ */
++/*
++ * Headphone / earpiece gain: vendor DAC_DL_PGA_Headset_GAIN[]
++ * (vendor:2846-2849), 0 = +8 dB down to 18 = -10 dB in 1 dB steps;
++ * 0x1f is the -40 dB hard mute used internally by the power sequences.
++ * Microphone preamp: vendor ADC_UL_PGA_GAIN[] (vendor:3927), 6 dB steps.
++ */
++static const DECLARE_TLV_DB_SCALE(mt6331_hp_vol_tlv, 800, -100, 0);
++static const DECLARE_TLV_DB_SCALE(mt6331_mic_amp_tlv, 0, 600, 0);
++
++/* vendor:2635-2636 speaker_PGA_function[] */
++static const char *const mt6331_spk_pga_texts[] = {
++	"MUTE", "0Db", "4Db", "5Db", "6Db", "7Db", "8Db",
++	"9Db", "10Db", "11Db", "12Db", "13Db", "14Db", "15Db", "16Db", "17Db",
++};
++static SOC_ENUM_SINGLE_DECL(mt6331_spk_pga_enum, MT6328_SPK_ANA_CON0,
++			    RG_SPKPGA_GAIN_SHIFT, mt6331_spk_pga_texts);
++
++/* vendor:1234-1267 SetDCcoupleNP + vendor:3930-3931 mode names */
++static const char *const mt6331_micbias_mode_texts[] = {
++	"ACC/DCC", "DCC ECM Single", "DCC ECM Diff",
++};
++static const unsigned int mt6331_micbias_mode_values[] = { 0, 2, 3 };
++
++static SOC_VALUE_ENUM_SINGLE_DECL(mt6331_micbias1_mode_enum,
++				  MT6328_AUDENC_ANA_CON9, 1, 0x3,
++				  mt6331_micbias_mode_texts,
++				  mt6331_micbias_mode_values);
++static SOC_VALUE_ENUM_SINGLE_DECL(mt6331_micbias2_mode_enum,
++				  MT6328_AUDENC_ANA_CON9, 5, 0x3,
++				  mt6331_micbias_mode_texts,
++				  mt6331_micbias_mode_values);
++
++static const struct snd_kcontrol_new mt6331_snd_controls[] = {
++	SOC_DOUBLE_TLV("Headset Volume", MT6328_ZCD_CON2,
++		       RG_AUDHPLGAIN_SHIFT, RG_AUDHPRGAIN_SHIFT, 18, 0,
++		       mt6331_hp_vol_tlv),
++	SOC_SINGLE_TLV("Earpiece Volume", MT6328_ZCD_CON3,
++		       RG_AUDHSGAIN_SHIFT, 18, 0, mt6331_hp_vol_tlv),
++	SOC_ENUM("Speaker PGA Gain", mt6331_spk_pga_enum),
++	SOC_SINGLE_TLV("Mic Amp 1 Volume", MT6328_AUDENC_ANA_CON10,
++		       RG_AUDPREAMPLGAIN_SHIFT, 5, 0, mt6331_mic_amp_tlv),
++	SOC_SINGLE_TLV("Mic Amp 2 Volume", MT6328_AUDENC_ANA_CON10,
++		       RG_AUDPREAMPRGAIN_SHIFT, 5, 0, mt6331_mic_amp_tlv),
++	/* Shared microphone bias reference (upmu:7115-7117); the vendor
++	 * always uses 7 (vendor:3280), no voltage table exists.
++	 */
++	SOC_SINGLE("Mic Bias Voltage", MT6328_AUDENC_ANA_CON9,
++		   RG_AUDMICBIASVREF_SHIFT, 7, 0),
++	SOC_ENUM("MICBIAS1 Mode", mt6331_micbias1_mode_enum),
++	SOC_ENUM("MICBIAS2 Mode", mt6331_micbias2_mode_enum),
++};
++
++/* ------------------------------------------------------------------ */
++/* DAPM                                                               */
++/* ------------------------------------------------------------------ */
++static const struct snd_soc_dapm_widget mt6331_dapm_widgets[] = {
++	/* Downlink */
++	SND_SOC_DAPM_AIF_IN("AIF_RX", MT6331_DL1_STREAM_NAME, 0,
++			    SND_SOC_NOPM, 0, 0),
++	SND_SOC_DAPM_AIF_IN("AIF_RX2", MT6331_DL2_STREAM_NAME, 0,
++			    SND_SOC_NOPM, 0, 0),
++	SND_SOC_DAPM_DAC_E("DAC", NULL, SND_SOC_NOPM, 0, 0,
++			   mt6331_dac_event,
++			   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++	SND_SOC_DAPM_OUT_DRV_E("Headphone Amp", SND_SOC_NOPM, 0, 0, NULL, 0,
++			       mt6331_hp_event,
++			       SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_PRE_PMD),
++	SND_SOC_DAPM_OUT_DRV_E("Earpiece Amp", SND_SOC_NOPM, 0, 0, NULL, 0,
++			       mt6331_earpiece_event,
++			       SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_PRE_PMD),
++	SND_SOC_DAPM_OUT_DRV_E("Speaker Amp", SND_SOC_NOPM, 0, 0, NULL, 0,
++			       mt6331_speaker_event,
++			       SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_PRE_PMD),
++	SND_SOC_DAPM_OUTPUT("EARPIECE"),
++	SND_SOC_DAPM_OUTPUT("HEADSET"),
++	SND_SOC_DAPM_OUTPUT("SPEAKER"),
++
++	/* Uplink */
++	SND_SOC_DAPM_INPUT("MIC1"),
++	SND_SOC_DAPM_INPUT("MIC2"),
++	SND_SOC_DAPM_INPUT("Headset Mic"),
++	SND_SOC_DAPM_SUPPLY("MICBIAS1", SND_SOC_NOPM, 0, 0,
++			      mt6331_micbias1_event,
++			      SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++	SND_SOC_DAPM_SUPPLY("MICBIAS2", SND_SOC_NOPM, 0, 0,
++			      mt6331_micbias2_event,
++			      SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++	SND_SOC_DAPM_PGA_E("PGA L", SND_SOC_NOPM, 0, 0, NULL, 0,
++			   mt6331_pga_l_event,
++			   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++	SND_SOC_DAPM_PGA_E("PGA R", SND_SOC_NOPM, 0, 0, NULL, 0,
++			   mt6331_pga_r_event,
++			   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++	SND_SOC_DAPM_SUPPLY("ADC Supply", SND_SOC_NOPM, 0, 0,
++			      mt6331_adc_supply_event,
++			      SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++	SND_SOC_DAPM_ADC_E("ADC", NULL, SND_SOC_NOPM, 0, 0,
++			   mt6331_adc_event,
++			   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++	SND_SOC_DAPM_AIF_OUT("AIF1TX", MT6331_UL1_STREAM_NAME, 0,
++			     SND_SOC_NOPM, 0, 0),
++};
++
++static const struct snd_soc_dapm_route mt6331_dapm_routes[] = {
++	/* Downlink: DAC -> headphone / earpiece / speaker */
++	{ "DAC", NULL, "AIF_RX" },
++	{ "DAC", NULL, "AIF_RX2" },
++	{ "Headphone Amp", NULL, "DAC" },
++	{ "Earpiece Amp", NULL, "DAC" },
++	{ "Speaker Amp", NULL, "DAC" },
++	{ "HEADSET", NULL, "Headphone Amp" },
++	{ "EARPIECE", NULL, "Earpiece Amp" },
++	{ "SPEAKER", NULL, "Speaker Amp" },
++
++	/* Uplink: MICBIAS -> MIC -> PGA -> ADC */
++	{ "MIC1", NULL, "MICBIAS1" },
++	{ "MIC2", NULL, "MICBIAS1" },
++	{ "Headset Mic", NULL, "MICBIAS2" },
++	{ "PGA L", NULL, "MIC1" },
++	{ "PGA L", NULL, "Headset Mic" },
++	{ "PGA R", NULL, "MIC2" },
++	{ "PGA L", NULL, "ADC Supply" },
++	{ "PGA R", NULL, "ADC Supply" },
++	{ "ADC", NULL, "ADC Supply" },
++	{ "ADC", NULL, "PGA L" },
++	{ "ADC", NULL, "PGA R" },
++	{ "AIF1TX", NULL, "ADC" },
++};
++
++/* ------------------------------------------------------------------ */
++/* Jack                                                               */
++/* ------------------------------------------------------------------ */
++/*
++ * The vendor driver selects the headset microphone path (AIN1 plus the
++ * second microphone bias) from the accessory detection result, through the
++ * Audio_MicSource1_Setting control and TurnOnADcPowerACC()'s headset
++ * branches (vendor:3285-3288, vendor:3335-3337).  Here the accessory
++ * detection driver reports jack status and the codec follows it.
++ */
++static void mt6331_headset_mic_set(struct mt6331_priv *priv, bool on)
++{
++	bool pga_on;
++
++	priv->headset_mic = on;
++
++	mutex_lock(&priv->ana_lock);
++	pga_on = priv->state & MT6331_ST_PGA_L;
++
++	if (on) {
++		/* second microphone bias on, vendor:3287 */
++		mt6331_micbias_set(priv, true, true);
++		if (pga_on) {
++			/* vendor:3335-3337 headset microphone path */
++			mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0,
++					 0x0500, 0xffff);
++			mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0,
++					 0x0581, 0xffff);
++		} else {
++			mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0,
++					 RG_AUDPREAMPLINPUTSEL_AIN1,
++					 RG_AUDPREAMPLINPUTSEL_MASK);
++		}
++	} else {
++		mt6331_micbias_set(priv, true, false);
++		if (pga_on) {
++			/* vendor:3329-3331 main microphone path */
++			mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0,
++					 0x0041, 0x00c1);
++			mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0,
++					 0x0541, 0xffff);
++		} else {
++			mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON0,
++					 RG_AUDPREAMPLINPUTSEL_AIN0,
++					 RG_AUDPREAMPLINPUTSEL_MASK);
++		}
++	}
++	mutex_unlock(&priv->ana_lock);
++}
++
++static int mt6331_jack_notify(struct notifier_block *nb, unsigned long status,
++			      void *data)
++{
++	struct mt6331_priv *priv = container_of(nb, struct mt6331_priv,
++						jack_nb);
++	bool mic = status & SND_JACK_MICROPHONE;
++
++	if (mic != priv->headset_mic)
++		mt6331_headset_mic_set(priv, mic);
++
++	return NOTIFY_OK;
++}
++
++static int mt6331_set_jack(struct snd_soc_component *cmpnt,
++			   struct snd_soc_jack *jack, void *data)
++{
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++
++	if (priv->jack) {
++		snd_soc_jack_notifier_unregister(priv->jack, &priv->jack_nb);
++		priv->jack = NULL;
++	}
++
++	if (!jack) {
++		if (priv->headset_mic)
++			mt6331_headset_mic_set(priv, false);
++		return 0;
++	}
++
++	priv->jack = jack;
++	snd_soc_jack_notifier_register(jack, &priv->jack_nb);
++	mt6331_headset_mic_set(priv, jack->status & SND_JACK_MICROPHONE);
++
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* DAI                                                                */
++/* ------------------------------------------------------------------ */
++static int mt6331_dai_hw_params(struct snd_pcm_substream *substream,
++				struct snd_pcm_hw_params *params,
++				struct snd_soc_dai *dai)
++{
++	struct snd_soc_component *cmpnt = dai->component;
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	unsigned int rate = params_rate(params);
++
++	switch (rate) {
++	case 8000:
++	case 11025:
++	case 12000:
++	case 16000:
++	case 22050:
++	case 24000:
++	case 32000:
++	case 44100:
++	case 48000:
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	mutex_lock(&priv->ana_lock);
++
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
++		priv->dl_rate = rate;
++		/* vendor:1641-1646: downlink interface / SDM rate */
++		mt6331_ana_write(priv, MT6328_AFE_PMIC_NEWIF_CFG0,
++				 (mt6331_dl_if_freq(rate) <<
++				  RG_DL_IF_FREQ_SHIFT) | 0x0330, 0xffff);
++		mt6331_ana_write(priv, MT6328_AFE_DL_SRC2_CON0_H,
++				 (mt6331_dl_if_freq(rate) <<
++				  RG_DL_IF_FREQ_SHIFT) | 0x0300, 0xffff);
++	} else {
++		priv->ul_rate = rate;
++		/* vendor:3386-3389: uplink sample rate and mode */
++		mt6331_ana_write(priv, MT6328_AFE_UL_SRC0_CON0_H,
++				 (mt6331_ul_rate_sel(rate) << 3) |
++				 (mt6331_ul_rate_sel(rate) << 1),
++				 RG_UL_RATE_MASK);
++	}
++
++	mutex_unlock(&priv->ana_lock);
++
++	return 0;
++}
++
++static const struct snd_soc_dai_ops mt6331_dai_ops = {
++	.hw_params = mt6331_dai_hw_params,
++};
++
++static struct snd_soc_dai_driver mt6331_dai_driver[] = {
++	{
++		.name = MT6331_TXDAI_NAME,
++		.playback = {
++			.stream_name = MT6331_DL1_STREAM_NAME,
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = SNDRV_PCM_RATE_8000_48000,
++			.formats = SNDRV_PCM_FMTBIT_S16_LE |
++				   SNDRV_PCM_FMTBIT_S24_LE,
++		},
++		.ops = &mt6331_dai_ops,
++	}, {
++		/*
++		 * Second downlink DAI: the ROM machine driver binds the
++		 * MultiMedia_DL2 link to MT_SOC_CODEC_TXDAI2_NAME
++		 * (AudDrv_Def.h:274, stream "MultiMedia2_PLayback").  It is
++		 * an independent DAI object so that ASoC does not serialise
++		 * the two playback streams, but the vendor driver programs
++		 * the very same PMIC downlink voice for both
++		 * (mt_soc_codec_63xx.c:1361-1580: the TXDAI2 entry has no
++		 * per-DAI register programming of its own).
++		 */
++		.name = MT6331_TXDAI2_NAME,
++		.playback = {
++			.stream_name = MT6331_DL2_STREAM_NAME,
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = SNDRV_PCM_RATE_8000_48000,
++			.formats = SNDRV_PCM_FMTBIT_S16_LE |
++				   SNDRV_PCM_FMTBIT_S24_LE,
++		},
++		.ops = &mt6331_dai_ops,
++	}, {
++		.name = MT6331_RXDAI_NAME,
++		.capture = {
++			.stream_name = MT6331_UL1_STREAM_NAME,
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = SNDRV_PCM_RATE_8000_48000,
++			.formats = SNDRV_PCM_FMTBIT_S16_LE |
++				   SNDRV_PCM_FMTBIT_S24_LE,
++		},
++		.ops = &mt6331_dai_ops,
++	},
++};
++
++/* ------------------------------------------------------------------ */
++/* Component                                                          */
++/* ------------------------------------------------------------------ */
++/* vendor:4970-4982 mt6331_codec_init_reg(); the ROM probe function
++ * (mt6331_codec_probe @ 0xc0864460-0xc08644bc) issues exactly these six
++ * read-modify-writes before calling InitCodecDefault @ 0xc08642d4.
++ */
++static int mt6331_codec_init_reg(struct mt6331_priv *priv)
++{
++	int ret;
++
++	/* Disable the CLKSQ 26 MHz clock. */
++	ret = mt6331_ana_write(priv, MT6328_TOP_CLKSQ, 0x0000,
++			       RG_CLKSQ_EN_AUD);
++	if (ret)
++		return ret;
++	/* Power down AUDGLB. */
++	ret = mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON8,
++			       RG_AUDGLB_PWRDN_VA28, RG_AUDGLB_PWRDN_VA28);
++	if (ret)
++		return ret;
++	/* Turn off the AUDNCP clock divider engine clock and AUD 26M. */
++	ret = mt6331_ana_write(priv, MT6328_TOP_CKPDN_CON0_SET,
++			       RG_AUD_CLK_GRP_INIT, RG_AUD_CLK_GRP_INIT);
++	if (ret)
++		return ret;
++	/* Disable headphone/voice short-circuit protection. */
++	ret = mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xe000, 0xe000);
++	if (ret)
++		return ret;
++	/* Power off microphone bias 1. */
++	ret = mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON9, 0x0000,
++			       RG_AUDPWDBMICBIAS1);
++	if (ret)
++		return ret;
++	/* Reverse the PMIC clock. */
++	return mt6331_ana_write(priv, MT6328_AFE_PMIC_NEWIF_CFG2, 0x8000,
++				0x8000);
++}
++
++/* vendor:4975-4996 InitCodecDefault(): default volumes are MICAMP = 3
++ * (18 dB) and HPOUT = 8 (0 dB).
++ */
++static int mt6331_codec_defaults(struct mt6331_priv *priv)
++{
++	int ret;
++
++	priv->mic_gain = (3 << RG_AUDPREAMPRGAIN_SHIFT) | 3;
++
++	ret = mt6331_ana_write(priv, MT6328_AUDENC_ANA_CON10,
++			       priv->mic_gain,
++			       RG_AUDPREAMPLGAIN_MASK |
++			       RG_AUDPREAMPRGAIN_MASK);
++	if (ret)
++		return ret;
++
++	return mt6331_ana_write(priv, MT6328_ZCD_CON2,
++				(MT6331_HP_TRIM_INDEX <<
++				 RG_AUDHPRGAIN_SHIFT) | MT6331_HP_TRIM_INDEX,
++				0xf9f);
++}
++
++static int mt6331_codec_probe(struct snd_soc_component *cmpnt)
++{
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int ret;
++
++	snd_soc_component_init_regmap(cmpnt, priv->regmap);
++
++	ret = mt6331_codec_init_reg(priv);
++	if (ret) {
++		dev_err(priv->dev, "codec init sequence failed: %d\n", ret);
++		return ret;
++	}
++
++	ret = mt6331_codec_defaults(priv);
++	if (ret) {
++		dev_err(priv->dev, "codec defaults failed: %d\n", ret);
++		return ret;
++	}
++
++	dev_info(priv->dev, "MT6328 audio codec ready\n");
++
++	return 0;
++}
++
++static int mt6331_codec_suspend(struct snd_soc_component *cmpnt)
++{
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++
++	mutex_lock(&priv->ana_lock);
++
++	/* vendor:215-262 SetAnalogSuspend(true): remember every powered
++	 * block, then power the analog and digital paths down.
++	 */
++	priv->suspend_state = priv->state;
++
++	if (priv->state & MT6331_ST_ADC)
++		mt6331_adc_power_down(priv);
++	if (priv->state & MT6331_ST_PGA_R)
++		mt6331_pga_r_power_down(priv);
++	if (priv->state & MT6331_ST_PGA_L)
++		mt6331_pga_l_power_down(priv);
++	if (priv->state & MT6331_ST_MICBIAS2)
++		mt6331_micbias_set(priv, true, false);
++	if (priv->state & MT6331_ST_MICBIAS1)
++		mt6331_micbias_set(priv, false, false);
++	if (priv->state & MT6331_ST_ADC_SUPPLY)
++		mt6331_adc_supply_down(priv);
++	if (priv->state & MT6331_ST_SPEAKER)
++		mt6331_speaker_power_down(priv);
++	if (priv->state & MT6331_ST_EARPIECE)
++		mt6331_earpiece_power_down(priv);
++	if (priv->state & MT6331_ST_HP)
++		mt6331_hp_power_down(priv);
++	if (priv->state & MT6331_ST_DAC)
++		mt6331_dl_power_down(priv);
++
++	mutex_unlock(&priv->ana_lock);
++
++	return 0;
++}
++
++static int mt6331_codec_resume(struct snd_soc_component *cmpnt)
++{
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	unsigned int saved = priv->suspend_state;
++	int ret = 0;
++
++	mutex_lock(&priv->ana_lock);
++
++	/* vendor:242-262 SetAnalogSuspend(false): restore what was on. */
++	if (saved & MT6331_ST_DAC)
++		ret = mt6331_dl_power_up(priv);
++	if (!ret && (saved & MT6331_ST_HP))
++		ret = mt6331_hp_power_up(priv);
++	if (!ret && (saved & MT6331_ST_EARPIECE))
++		ret = mt6331_earpiece_power_up(priv);
++	if (!ret && (saved & MT6331_ST_SPEAKER))
++		ret = mt6331_speaker_power_up(priv);
++	if (!ret && (saved & MT6331_ST_ADC_SUPPLY))
++		ret = mt6331_adc_supply_up(priv);
++	if (!ret && (saved & MT6331_ST_MICBIAS1))
++		ret = mt6331_micbias_set(priv, false, true);
++	if (!ret && (saved & MT6331_ST_MICBIAS2))
++		ret = mt6331_micbias_set(priv, true, true);
++	if (!ret && (saved & MT6331_ST_PGA_L))
++		ret = mt6331_pga_l_power_up(priv);
++	if (!ret && (saved & MT6331_ST_PGA_R))
++		ret = mt6331_pga_r_power_up(priv);
++	if (!ret && (saved & MT6331_ST_ADC))
++		ret = mt6331_adc_power_up(priv);
++
++	mutex_unlock(&priv->ana_lock);
++
++	if (ret)
++		dev_err(priv->dev, "resume restore failed: %d\n", ret);
++
++	return ret;
++}
++
++static const struct snd_soc_component_driver mt6331_soc_component_driver = {
++	.name = MT6331_CODEC_NAME,
++	.probe = mt6331_codec_probe,
++	.suspend = mt6331_codec_suspend,
++	.resume = mt6331_codec_resume,
++	.set_jack = mt6331_set_jack,
++	.controls = mt6331_snd_controls,
++	.num_controls = ARRAY_SIZE(mt6331_snd_controls),
++	.dapm_widgets = mt6331_dapm_widgets,
++	.num_dapm_widgets = ARRAY_SIZE(mt6331_dapm_widgets),
++	.dapm_routes = mt6331_dapm_routes,
++	.num_dapm_routes = ARRAY_SIZE(mt6331_dapm_routes),
++};
++
++/* ------------------------------------------------------------------ */
++/* Platform driver                                                    */
++/* ------------------------------------------------------------------ */
++static int mt6331_platform_probe(struct platform_device *pdev)
++{
++	struct mt6397_chip *pmic = dev_get_drvdata(pdev->dev.parent);
++	struct mt6331_priv *priv;
++	int ret;
++
++	if (!pmic || !pmic->regmap)
++		return -EPROBE_DEFER;
++
++	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->dev = &pdev->dev;
++	priv->regmap = pmic->regmap;
++	priv->dl_rate = 48000;	/* vendor:118 mBlockSampleRate[] */
++	priv->ul_rate = 48000;
++
++	mutex_init(&priv->ana_lock);
++	mutex_init(&priv->clk_lock);
++	mutex_init(&priv->clksq_lock);
++	priv->jack_nb.notifier_call = mt6331_jack_notify;
++
++	/* Optional de-pop switch, driven low while the headphone amplifier
++	 * settles (vendor:383-440).  Only present on boards that route it.
++	 */
++	priv->hp_depop = devm_gpiod_get_optional(&pdev->dev, "hp-depop",
++						 GPIOD_OUT_HIGH);
++	if (IS_ERR(priv->hp_depop))
++		return dev_err_probe(&pdev->dev, PTR_ERR(priv->hp_depop),
++				     "failed to get the headphone de-pop GPIO\n");
++
++	dev_set_drvdata(&pdev->dev, priv);
++
++	dev_info(priv->dev, "MT6328 PMIC codec (MT6331 register map naming)\n");
++
++	ret = devm_snd_soc_register_component(&pdev->dev,
++					      &mt6331_soc_component_driver,
++					      mt6331_dai_driver,
++					      ARRAY_SIZE(mt6331_dai_driver));
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static const struct of_device_id mt6331_of_match[] = {
++	{ .compatible = "mediatek,mt6328-codec" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mt6331_of_match);
++
++static struct platform_driver mt6331_platform_driver = {
++	.driver = {
++		.name = "mt6328-codec",
++		.of_match_table = mt6331_of_match,
++	},
++	.probe = mt6331_platform_probe,
++};
++module_platform_driver(mt6331_platform_driver);
++
++MODULE_DESCRIPTION("MT6328 PMIC audio codec (vendor name: mt6331)");
++MODULE_AUTHOR("MediaTek Inc.");
++MODULE_LICENSE("GPL v2");
+diff --git a/sound/soc/codecs/mt6331.h b/sound/soc/codecs/mt6331.h
+new file mode 100644
+index 000000000..e786f9770
+--- /dev/null
++++ b/sound/soc/codecs/mt6331.h
+@@ -0,0 +1,179 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * MT6328 PMIC audio codec (MT6735 / MT6737)
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * Port from Samsung/MTK downstream:
++ *   sound/soc/mediatek/mt_soc_audio_v3/mt_soc_codec_63xx.c
++ *   sound/soc/mediatek/mt_soc_audio_v3/mt_soc_codec_speaker_63xx.c
++ *   sound/soc/mediatek/mt_soc_audio_v3/AudDrv_Ana.{c,h}
++ *
++ * Register addresses and bit fields are the MT6328 audio register map from
++ *   drivers/misc/mediatek/include/mt-plat/mt6735/include/mach/upmu_hw.h
++ * (line numbers cited per register), and the PMIC "AFE" digital block that the
++ * vendor codec driver programs through pwrap (AudDrv_Ana.h:70-101).
++ *
++ * NAMING: the vendor driver that owns these registers is called "mt6331"
++ * (ROM symbols mt6331_codec_probe, mt6331_read, mt6331_write; the
++ * of_compatible in 3.18 was "mediatek,mt_soc_codec_63xx"), but the PMIC
++ * populated on MT6737T/grandpplte is an MT6328 and it is the MT6328 audio
++ * register map that the driver programs.  No MT6331 register map exists in
++ * this driver and none must be added.
++ */
++#ifndef __SND_SOC_MT6331_H
++#define __SND_SOC_MT6331_H
++
++/* ------------------------------------------------------------------ */
++/* PMIC top level clock registers (upmu_hw.h:83-127)                  */
++/* ------------------------------------------------------------------ */
++#define MT6328_TOP_CKPDN_CON0_SET	0x023e	/* upmu_hw.h:84 */
++#define MT6328_TOP_CKPDN_CON0_CLR	0x0240	/* upmu_hw.h:85 */
++#define MT6328_TOP_CKPDN_CON2_SET	0x024a	/* upmu_hw.h:90 */
++#define MT6328_TOP_CKPDN_CON2_CLR	0x024c	/* upmu_hw.h:91 */
++#define MT6328_TOP_CLKSQ		0x028a	/* upmu_hw.h:122 */
++#define MT6328_TOP_CLKSQ_SET		0x028c	/* upmu_hw.h:123 */
++#define MT6328_TOP_CLKSQ_CLR		0x028e	/* upmu_hw.h:124 */
++
++/* AUDNCP / AUDIF / AUD 26M engine clocks (upmu_hw.h:1784-1793) */
++#define RG_AUDNCP_CK_PDN		BIT(12)
++#define RG_AUDIF_CK_PDN			BIT(13)
++#define RG_AUD_CK_PDN			BIT(14)
++/*
++ * The three audio engine clocks switched by the vendor driver
++ * (mt_soc_codec_63xx.c:283 TOP_CKPDN_CON0_CLR 0x7000).  The probe-time
++ * sequence uses a different group including the AUXADC 26M clock
++ * (mt_soc_codec_63xx.c:4981 TOP_CKPDN_CON0_SET 0x3800).
++ */
++#define RG_AUD_CLK_GRP_VENDOR		(RG_AUDNCP_CK_PDN | RG_AUDIF_CK_PDN | \
++					 RG_AUD_CK_PDN)
++#define RG_AUD_CLK_GRP_INIT		(BIT(11) | RG_AUDNCP_CK_PDN | \
++					 RG_AUDIF_CK_PDN)
++
++/* TOP_CLKSQ bit 0: 26MHz clock squarer for the audio block (upmu_hw.h:2267) */
++#define RG_CLKSQ_EN_AUD			BIT(0)
++
++/* TOP_CKPDN_CON2 bits 0/1: internal speaker class-D / PWM clock (upmu_hw.h:1844) */
++#define RG_SPK_CK_GRP			(BIT(0) | BIT(1))
++
++/* ------------------------------------------------------------------ */
++/* Impedance / zero-cross detect block (upmu_hw.h:370-375)            */
++/* ------------------------------------------------------------------ */
++#define MT6328_ZCD_CON0			0x0800
++#define MT6328_ZCD_CON2			0x0804
++#define MT6328_ZCD_CON3			0x0806
++#define MT6328_ZCD_CON4			0x0808
++
++/* upmu_hw.h:4361-4369 */
++#define RG_AUDHPLGAIN_MASK		0x1f
++#define RG_AUDHPLGAIN_SHIFT		0
++#define RG_AUDHPRGAIN_MASK		0x1f
++#define RG_AUDHPRGAIN_SHIFT		7
++#define RG_AUDHSGAIN_MASK		0x1f
++#define RG_AUDHSGAIN_SHIFT		0
++
++/* ------------------------------------------------------------------ */
++/* Speaker amplifier (upmu_hw.h:464-483)                              */
++/* ------------------------------------------------------------------ */
++#define MT6328_SPK_CON0			0x0a90
++#define MT6328_SPK_CON1			0x0a92
++#define MT6328_SPK_CON2			0x0a94
++#define MT6328_SPK_CON7			0x0a9e
++#define MT6328_SPK_CON9			0x0aa2
++#define MT6328_SPK_CON13			0x0aaa
++#define MT6328_SPK_ANA_CON0		0x0ab2
++#define MT6328_SPK_ANA_CON3		0x0ab6
++
++/* upmu_hw.h:6155-6157 */
++#define RG_SPKPGA_GAIN_MASK		0xf
++#define RG_SPKPGA_GAIN_SHIFT		11
++
++/* ------------------------------------------------------------------ */
++/* Audio LDO (upmu_hw.h has no symbolic name; AudDrv_Ana.h:383)       */
++/* ------------------------------------------------------------------ */
++#define MT6328_LDO_CON2			0x0a04
++
++/* ------------------------------------------------------------------ */
++/* Decoder analog block (upmu_hw.h:594-602)                           */
++/* ------------------------------------------------------------------ */
++#define MT6328_AUDDEC_ANA_CON0		0x0cdc
++#define MT6328_AUDDEC_ANA_CON1		0x0cde
++#define MT6328_AUDDEC_ANA_CON4		0x0ce4
++#define MT6328_AUDDEC_ANA_CON5		0x0ce6
++#define MT6328_AUDDEC_ANA_CON6		0x0ce8
++#define MT6328_AUDDEC_ANA_CON7		0x0cea
++#define MT6328_AUDDEC_ANA_CON8		0x0cec
++
++/* upmu_hw.h:6893: 1 = audio global block powered down */
++#define RG_AUDGLB_PWRDN_VA28		BIT(1)
++/* upmu_hw.h:6884-6887: NV regulator (-1.5V) enable */
++#define RG_NVREG_EN_VAUDP15		BIT(15)
++/*
++ * Vendor mask for the shared LDO/clock register: bits 2/4/8 belong to the
++ * encoder path and are never rewritten by the decoder sequences
++ * (mt_soc_codec_63xx.c:1757 "AUDDEC_ANA_CON6 0x0A41 mask 0xfeeb").
++ */
++#define RG_AUDDEC_ANA_CON6_SPK_MASK	0xfeeb
++
++/* ------------------------------------------------------------------ */
++/* Encoder analog block (upmu_hw.h:603-613)                           */
++/* ------------------------------------------------------------------ */
++#define MT6328_AUDENC_ANA_CON0		0x0cee
++#define MT6328_AUDENC_ANA_CON1		0x0cf0
++#define MT6328_AUDENC_ANA_CON3		0x0cf4
++#define MT6328_AUDENC_ANA_CON4		0x0cf6
++#define MT6328_AUDENC_ANA_CON6		0x0cfa
++#define MT6328_AUDENC_ANA_CON9		0x0d00
++#define MT6328_AUDENC_ANA_CON10		0x0d02
++
++/* upmu_hw.h:7005 / 7016: preamplifier input select on the left channel */
++#define RG_AUDPREAMPLINPUTSEL_MASK	(0x3 << 6)
++#define RG_AUDPREAMPLINPUTSEL_AIN0	(0x1 << 6)	/* main mic */
++#define RG_AUDPREAMPLINPUTSEL_AIN1	(0x2 << 6)	/* headset mic */
++
++/* upmu_hw.h:7091-7123: microphone bias control (AUDENC_ANA_CON9) */
++#define RG_AUDPWDBMICBIAS0		BIT(0)
++#define RG_AUDMICBIAS0DCC_MASK		(0x3 << 1)
++#define RG_AUDPWDBMICBIAS1		BIT(4)
++#define RG_AUDMICBIAS1DCC_MASK		(0x3 << 5)
++#define RG_AUDMICBIASVREF_MASK		(0x7 << 8)
++#define RG_AUDMICBIASVREF_SHIFT		8
++
++/* upmu_hw.h:7124-7129: microphone preamplifier gain (AUDENC_ANA_CON10) */
++#define RG_AUDPREAMPLGAIN_MASK		0x7
++#define RG_AUDPREAMPLGAIN_SHIFT		0
++#define RG_AUDPREAMPRGAIN_MASK		0x7
++#define RG_AUDPREAMPRGAIN_SHIFT		4
++
++/* ------------------------------------------------------------------ */
++/* NCP clock divider (upmu_hw.h:614-618)                              */
++/* ------------------------------------------------------------------ */
++#define MT6328_AUDNCP_CLKDIV_CON0	0x0d04
++#define MT6328_AUDNCP_CLKDIV_CON1	0x0d06
++#define MT6328_AUDNCP_CLKDIV_CON2	0x0d08
++#define MT6328_AUDNCP_CLKDIV_CON3	0x0d0a
++#define MT6328_AUDNCP_CLKDIV_CON4	0x0d0c
++
++/* ------------------------------------------------------------------ */
++/* PMIC AFE digital block (AudDrv_Ana.h:70-101, base 0x2000)          */
++/* These are PMIC registers reached over pwrap, not SoC MMIO.         */
++/* ------------------------------------------------------------------ */
++#define MT6328_AFE_UL_DL_CON0		0x2000	/* AudDrv_Ana.h:70 */
++#define MT6328_AFE_DL_SRC2_CON0_H	0x2002	/* AudDrv_Ana.h:71 */
++#define MT6328_AFE_DL_SRC2_CON0_L	0x2004	/* AudDrv_Ana.h:72 */
++#define MT6328_AFE_DL_SDM_CON1		0x2008	/* AudDrv_Ana.h:74 */
++#define MT6328_AFE_UL_SRC0_CON0_H	0x200a	/* AudDrv_Ana.h:75 */
++#define MT6328_AFE_UL_SRC0_CON0_L	0x200c	/* AudDrv_Ana.h:76 */
++#define MT6328_PMIC_AFE_TOP_CON0	0x2012	/* AudDrv_Ana.h:79 */
++#define MT6328_AFE_AUDIO_TOP_CON0	0x2014	/* AudDrv_Ana.h:80 */
++#define MT6328_AFUNC_AUD_CON0		0x201c	/* AudDrv_Ana.h:84 */
++#define MT6328_AFUNC_AUD_CON2		0x2020	/* AudDrv_Ana.h:86 */
++#define MT6328_AFE_PMIC_NEWIF_CFG0	0x2038	/* AudDrv_Ana.h:98 */
++#define MT6328_AFE_PMIC_NEWIF_CFG2	0x203c	/* AudDrv_Ana.h:100 */
++
++/* Downlink interface rate field, bits 12-15 (mt_soc_codec_63xx.c:1641) */
++#define RG_DL_IF_FREQ_SHIFT		12
++/* Uplink rate / mode field, bits 0-4 (mt_soc_codec_63xx.c:3386) */
++#define RG_UL_RATE_MASK			0x1f
++
++#endif /* __SND_SOC_MT6331_H */

@@ -1,0 +1,2253 @@
+diff --git a/tools/mediatek/wcn/fm_rds/Makefile b/tools/mediatek/wcn/fm_rds/Makefile
+new file mode 100644
+index 000000000..6f3180367
+--- /dev/null
++++ b/tools/mediatek/wcn/fm_rds/Makefile
+@@ -0,0 +1,32 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# Userspace decoder for the MediaTek WCN FM raw RDS record stream.
++# Host build: plain libc only.
++
++CC	?= cc
++CFLAGS	?= -O2
++CFLAGS	+= -Wall -Wextra -Werror -std=c11 -D_POSIX_C_SOURCE=200809L
++LDFLAGS	?=
++
++PROG	= fm_rds_decode
++OBJS	= fm_rds_decode.o rds_decode.o selftest.o
++
++all: $(PROG)
++
++$(PROG): $(OBJS)
++	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS)
++
++%.o: %.c
++	$(CC) $(CFLAGS) -c -o $@ $<
++
++fm_rds_decode.o: fm_rds_decode.c rds_decode.h
++rds_decode.o: rds_decode.c rds_decode.h
++selftest.o: selftest.c rds_decode.h
++
++check: $(PROG)
++	./$(PROG) --selftest
++
++clean:
++	rm -f $(PROG) $(OBJS)
++
++.PHONY: all check clean
+diff --git a/tools/mediatek/wcn/fm_rds/fm_rds_decode.c b/tools/mediatek/wcn/fm_rds/fm_rds_decode.c
+new file mode 100644
+index 000000000..3f2f45e16
+--- /dev/null
++++ b/tools/mediatek/wcn/fm_rds/fm_rds_decode.c
+@@ -0,0 +1,741 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * fm_rds_decode - decode the raw RDS record stream of the MediaTek WCN FM
++ * driver.
++ *
++ * Reads raw 148-byte records either from the V4L2 radio device (/dev/radio0,
++ * RDS enabled through V4L2_CID_RDS_RECEPTION) or from a file produced by
++ * capturing read() output, and prints the decoded RDS groups.
++ *
++ * The raw record layout is defined by include/uapi/linux/mtk_fm_rds.h.
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ * Port from Samsung/MTK downstream fm_rds_parser.c (userspace decoder).
++ */
++
++#include <errno.h>
++#include <fcntl.h>
++#include <getopt.h>
++#include <poll.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++#include <linux/videodev2.h>
++
++#include "rds_decode.h"
++
++#define DEFAULT_POLL_MS 2000
++
++int rds_selftest(void);
++
++struct options {
++	const char *device;
++	const char *file;
++	bool json;
++	bool raw;
++	bool enable_rds;
++	unsigned long records;
++};
++
++static void usage(FILE *out)
++{
++	fprintf(out,
++		"usage: fm_rds_decode --device PATH [options]\n"
++		"       fm_rds_decode --file PATH [options]\n"
++		"       fm_rds_decode --selftest\n"
++		"\n"
++		"  -d, --device PATH   read raw RDS records from a V4L2 radio device\n"
++		"  -f, --file PATH     read raw RDS records from a capture file\n"
++		"  -j, --json          emit one JSON object per group (NDJSON)\n"
++		"  -r, --raw           include the raw blocks in text output\n"
++		"      --no-ctl        do not enable V4L2_CID_RDS_RECEPTION\n"
++		"  -n, --records N     stop after N records (0: unlimited)\n"
++		"      --selftest      run the built-in decoder tests\n"
++		"  -h, --help          show this help\n"
++		"\n"
++		"Records are %d bytes (%d groups of %d bytes).\n",
++		RDS_RECORD_SIZE, RDS_GROUPS_PER_RECORD, RDS_GROUP_SIZE);
++}
++
++static void json_string(const char *s)
++{
++	const unsigned char *p = (const unsigned char *)s;
++
++	putchar('"');
++	for (; *p; p++) {
++		switch (*p) {
++		case '"':
++			fputs("\\\"", stdout);
++			break;
++		case '\\':
++			fputs("\\\\", stdout);
++			break;
++		default:
++			if (*p < 0x20 || *p >= 0x7f)
++				printf("\\u%04x", *p);
++			else
++				putchar(*p);
++			break;
++		}
++	}
++	putchar('"');
++}
++
++static void text_freq(int khz)
++{
++	printf("%d.%d", khz / 1000, (khz % 1000) / 100);
++}
++
++static void json_freq(int khz)
++{
++	printf("\"%d.%d\"", khz / 1000, (khz % 1000) / 100);
++}
++
++static const char *good_string(unsigned good, char buf[5])
++{
++	unsigned i;
++
++	for (i = 0; i < 4; i++)
++		buf[i] = (good & (RDS_BLOCK_A_OK >> i)) ? (char)('A' + i) : '-';
++	buf[4] = '\0';
++	return buf;
++}
++
++static void print_eon_text(const struct rds_eon_info *eon)
++{
++	if (eon->have_pi)
++		printf(" EON_PI=0x%04x", eon->pi_on);
++	if (eon->have_tp)
++		printf(" EON_TP=%u", eon->tp_on);
++	if (eon->have_variant)
++		printf(" EON_VARIANT=%u", eon->variant);
++	if (eon->have_ps) {
++		printf(" EON_PS_SEG=%u EON_PS_CHARS=\"%c%c\"",
++		       eon->ps_segment, eon->ps_chars[0], eon->ps_chars[1]);
++	}
++	if (eon->ps_complete)
++		printf(" EON_PS=\"%s\"", eon->ps);
++	if (eon->have_af)
++		printf(" EON_AF=%02x,%02x", eon->af_code[0], eon->af_code[1]);
++	if (eon->have_mapped) {
++		printf(" EON_TUNING=%02x EON_MAPPED=%02x(%s)",
++		       eon->tuning_code, eon->mapped_code,
++		       eon->mapped_is_am ? "am" : "fm");
++	}
++	if (eon->have_linkage)
++		printf(" EON_LA=%u EON_LSN=%u", eon->linkage_la,
++		       eon->linkage_set);
++	if (eon->have_pty)
++		printf(" EON_PTY=%u", eon->pty);
++	if (eon->have_ta)
++		printf(" EON_TA=%u", eon->ta);
++	if (eon->have_pin)
++		printf(" EON_PIN=%u/%02u:%02u", eon->pin_day, eon->pin_hour,
++		       eon->pin_minute);
++	if (eon->have_broadcaster)
++		printf(" EON_BROADCASTER=0x%04x", eon->broadcaster_data);
++}
++
++static void print_group_text(unsigned slot, const struct rds_group_result *r,
++			     bool raw)
++{
++	char name[5];
++	char good[5];
++
++	if (!r->present)
++		return;
++
++	if (!r->b_valid) {
++		printf("slot=%u BAD blocked-b crc=0x%04x A=0x%04x B=0x%04x "
++		       "C=0x%04x D=0x%04x\n",
++		       slot, r->crc, r->block[0], r->block[1], r->block[2],
++		       r->block[3]);
++		return;
++	}
++
++	printf("%s", rds_group_name(r->type, r->version_b, name));
++	printf(" slot=%u", slot);
++	if (r->pi_valid)
++		printf(" PI=0x%04x", r->pi);
++	printf(" PTY=%u TP=%u", r->pty, r->tp);
++	if (r->good != 0x0f)
++		printf(" GOOD=%s", good_string(r->good, good));
++
++	switch (r->type) {
++	case 0:
++		printf(" TA=%u MS=%u DI=%u/%u", r->ta, r->ms, r->di,
++		       r->di_segment);
++		if (r->af_group_valid)
++			printf(" AF_CODE=%u,%u", r->af_code[0],
++			       r->af_code[1]);
++		break;
++	case 1:
++		if (r->slc_valid)
++			printf(" SLC_VARIANT=%u SLC_DATA=0x%03x",
++			       r->slc_variant, r->slc_data);
++		if (r->ecc_valid)
++			printf(" ECC=0x%02x", r->ecc);
++		if (r->language_valid)
++			printf(" LANGUAGE=%u", r->language);
++		break;
++	case 2:
++		printf(" RT_SEG=%u AB=%u", r->segment, r->rt_ab);
++		if (r->rt_dropped_cbc)
++			printf(" RT_DROPPED cbc=0x%04x", r->cbc);
++		break;
++	case 3:
++		if (r->oda_valid) {
++			printf(" ODA_GROUP=%u%c ODA_MSG=0x%04x AID=0x%04x",
++			       r->oda_group, r->oda_group_b ? 'B' : 'A',
++			       r->oda_message, r->aid);
++		}
++		break;
++	case 4:
++		if (r->ct_valid) {
++			int off = r->ct.offset_minutes;
++
++			printf(" CT=%04u-%02u-%02uT%02u:%02uZ "
++			       "OFFSET=%c%02d:%02d",
++			       r->ct.year, r->ct.month, r->ct.day, r->ct.hour,
++			       r->ct.minute, off < 0 ? '-' : '+',
++			       abs(off) / 60, abs(off) % 60);
++		}
++		break;
++	case 5:
++		if (r->tdc_valid) {
++			unsigned i;
++
++			printf(" TDC_ADDR=%u", r->tdc_address);
++			if (r->tdc_len) {
++				printf(" TDC=");
++				for (i = 0; i < r->tdc_len; i++)
++					printf("%02x", r->tdc_data[i]);
++			}
++		}
++		break;
++	case 13:
++		if (r->paging_valid) {
++			printf(" STY=%u", r->sty);
++			if (r->paging_bits_valid)
++				printf(" NOTIFY=0x%07x FIRST_BIT=%u",
++				       r->paging_bits, r->paging_first_bit);
++		}
++		break;
++	case 14:
++		if (r->eon_valid)
++			print_eon_text(&r->eon);
++		break;
++	case 15:
++		if (r->version_b) {
++			printf(" FAST_B TA=%u MS=%u DI=%u/%u TP=%u PTY=%u",
++			       r->fast_b.ta, r->fast_b.ms, r->fast_b.di,
++			       r->fast_b.di_segment, r->fast_b.tp,
++			       r->fast_b.pty);
++			if (r->fast_d.valid)
++				printf(" FAST_D TA=%u MS=%u DI=%u/%u TP=%u PTY=%u",
++				       r->fast_d.ta, r->fast_d.ms,
++				       r->fast_d.di, r->fast_d.di_segment,
++				       r->fast_d.tp, r->fast_d.pty);
++		} else {
++			printf(" 15A_UNDEFINED");
++		}
++		break;
++	default:
++		break;
++	}
++
++	if (r->ps_valid)
++		printf(" PS=\"%s\"", r->ps);
++	if (r->rt_valid)
++		printf(" RT=\"%s\"", r->rt);
++	if (r->af_valid) {
++		unsigned i;
++
++		printf(" AF=");
++		for (i = 0; i < r->af_count; i++) {
++			if (i)
++				putchar(',');
++			text_freq(r->af_khz[i]);
++		}
++	}
++	if (r->pin_valid)
++		printf(" PIN=%u/%02u:%02u", r->pin_day, r->pin_hour,
++		       r->pin_minute);
++
++	if (raw) {
++		printf(" A=0x%04x B=0x%04x C=0x%04x D=0x%04x cbc=0x%04x "
++		       "crc=0x%04x",
++		       r->block[0], r->block[1], r->block[2], r->block[3],
++		       r->cbc, r->crc);
++	}
++	putchar('\n');
++}
++
++static void print_group_json(unsigned slot, const struct rds_group_result *r)
++{
++	char name[5];
++	char good[5];
++
++	if (!r->present)
++		return;
++
++	printf("{\"slot\":%u", slot);
++	if (!r->b_valid) {
++		printf(",\"valid\":false,\"reason\":\"block-b\",");
++		printf("\"crc\":%u,\"blocks\":[\"0x%04x\",\"0x%04x\","
++		       "\"0x%04x\",\"0x%04x\"]}\n",
++		       r->crc, r->block[0], r->block[1], r->block[2],
++		       r->block[3]);
++		return;
++	}
++
++	printf(",\"valid\":true,\"type\":\"%s\",\"version\":\"%c\"",
++	       rds_group_name(r->type, r->version_b, name),
++	       r->version_b ? 'B' : 'A');
++	if (r->pi_valid)
++		printf(",\"pi\":\"0x%04x\"", r->pi);
++	printf(",\"pty\":%u,\"tp\":%s", r->pty, r->tp ? "true" : "false");
++	printf(",\"good\":\"%s\"", good_string(r->good, good));
++	printf(",\"blocks\":[\"0x%04x\",\"0x%04x\",\"0x%04x\",\"0x%04x\"]",
++	       r->block[0], r->block[1], r->block[2], r->block[3]);
++
++	switch (r->type) {
++	case 0:
++		printf(",\"ta\":%s,\"ms\":%s,\"di\":%s,\"di_segment\":%u",
++		       r->ta ? "true" : "false", r->ms ? "true" : "false",
++		       r->di ? "true" : "false", r->di_segment);
++		if (r->af_group_valid)
++			printf(",\"af_codes\":[%u,%u]", r->af_code[0],
++			       r->af_code[1]);
++		break;
++	case 1:
++		if (r->slc_valid)
++			printf(",\"slc_variant\":%u,\"slc_data\":%u",
++			       r->slc_variant, r->slc_data);
++		if (r->ecc_valid)
++			printf(",\"ecc\":%u", r->ecc);
++		if (r->language_valid)
++			printf(",\"language\":%u", r->language);
++		break;
++	case 2:
++		printf(",\"rt_segment\":%u,\"rt_ab\":%u", r->segment, r->rt_ab);
++		if (r->rt_dropped_cbc)
++			printf(",\"rt_dropped_cbc\":%u", r->cbc);
++		break;
++	case 3:
++		if (r->oda_valid)
++			printf(",\"oda_group\":\"%u%c\",\"oda_message\":%u,"
++			       "\"aid\":\"0x%04x\"",
++			       r->oda_group, r->oda_group_b ? 'B' : 'A',
++			       r->oda_message, r->aid);
++		break;
++	case 4:
++		if (r->ct_valid)
++			printf(",\"ct\":\"%04u-%02u-%02uT%02u:%02uZ\","
++			       "\"offset_minutes\":%d",
++			       r->ct.year, r->ct.month, r->ct.day, r->ct.hour,
++			       r->ct.minute, r->ct.offset_minutes);
++		break;
++	case 5:
++		if (r->tdc_valid) {
++			unsigned i;
++
++			printf(",\"tdc_address\":%u,\"tdc_data\":\"",
++			       r->tdc_address);
++			for (i = 0; i < r->tdc_len; i++)
++				printf("%02x", r->tdc_data[i]);
++			putchar('"');
++		}
++		break;
++	case 13:
++		if (r->paging_valid) {
++			printf(",\"sty\":%u", r->sty);
++			if (r->paging_bits_valid)
++				printf(",\"notification\":%u,"
++				       "\"notification_first_bit\":%u",
++				       r->paging_bits,
++				       r->paging_first_bit);
++		}
++		break;
++	case 14: {
++		const struct rds_eon_info *eon = &r->eon;
++		const char *sep = "";
++
++		if (!r->eon_valid)
++			break;
++		printf(",\"eon\":{");
++		if (eon->have_pi) {
++			printf("\"pi\":\"0x%04x\"", eon->pi_on);
++			sep = ",";
++		}
++		if (eon->have_tp) {
++			printf("%s\"tp\":%s", sep,
++			       eon->tp_on ? "true" : "false");
++			sep = ",";
++		}
++		if (eon->have_variant) {
++			printf("%s\"variant\":%u", sep, eon->variant);
++			sep = ",";
++		}
++		if (eon->have_ps) {
++			printf("%s\"ps_segment\":%u,\"ps_chars\":\"%c%c\"",
++			       sep, eon->ps_segment, eon->ps_chars[0],
++			       eon->ps_chars[1]);
++			sep = ",";
++		}
++		if (eon->ps_complete) {
++			printf("%s\"ps\":", sep);
++			json_string(eon->ps);
++			sep = ",";
++		}
++		if (eon->have_af) {
++			printf("%s\"af_codes\":[%u,%u]", sep, eon->af_code[0],
++			       eon->af_code[1]);
++			sep = ",";
++		}
++		if (eon->have_mapped) {
++			printf("%s\"tuning_code\":%u,\"mapped_code\":%u,"
++			       "\"mapped_band\":\"%s\"",
++			       sep, eon->tuning_code, eon->mapped_code,
++			       eon->mapped_is_am ? "am" : "fm");
++			sep = ",";
++		}
++		if (eon->have_linkage) {
++			printf("%s\"linkage_la\":%s,\"linkage_set\":%u", sep,
++			       eon->linkage_la ? "true" : "false",
++			       eon->linkage_set);
++			sep = ",";
++		}
++		if (eon->have_pty) {
++			printf("%s\"pty\":%u", sep, eon->pty);
++			sep = ",";
++		}
++		if (eon->have_ta) {
++			printf("%s\"ta\":%s", sep,
++			       eon->ta ? "true" : "false");
++			sep = ",";
++		}
++		if (eon->have_pin) {
++			printf("%s\"pin\":\"%u/%02u:%02u\"", sep,
++			       eon->pin_day, eon->pin_hour, eon->pin_minute);
++			sep = ",";
++		}
++		if (eon->have_broadcaster) {
++			printf("%s\"broadcaster\":%u", sep,
++			       eon->broadcaster_data);
++		}
++		printf("}");
++		break;
++	}
++	case 15:
++		if (r->version_b) {
++			printf(",\"fast_b\":{\"ta\":%s,\"ms\":%s,\"di\":%s,"
++			       "\"di_segment\":%u,\"tp\":%s,\"pty\":%u}",
++			       r->fast_b.ta ? "true" : "false",
++			       r->fast_b.ms ? "true" : "false",
++			       r->fast_b.di ? "true" : "false",
++			       r->fast_b.di_segment,
++			       r->fast_b.tp ? "true" : "false", r->fast_b.pty);
++			if (r->fast_d.valid)
++				printf(",\"fast_d\":{\"ta\":%s,\"ms\":%s,"
++				       "\"di\":%s,\"di_segment\":%u,"
++				       "\"tp\":%s,\"pty\":%u}",
++				       r->fast_d.ta ? "true" : "false",
++				       r->fast_d.ms ? "true" : "false",
++				       r->fast_d.di ? "true" : "false",
++				       r->fast_d.di_segment,
++				       r->fast_d.tp ? "true" : "false",
++				       r->fast_d.pty);
++		}
++		break;
++	default:
++		break;
++	}
++
++	if (r->ps_valid) {
++		printf(",\"ps\":");
++		json_string(r->ps);
++	}
++	if (r->rt_valid) {
++		printf(",\"rt\":");
++		json_string(r->rt);
++	}
++	if (r->af_valid) {
++		unsigned i;
++
++		printf(",\"af\":[");
++		for (i = 0; i < r->af_count; i++) {
++			if (i)
++				putchar(',');
++			json_freq(r->af_khz[i]);
++		}
++		putchar(']');
++	}
++	if (r->pin_valid)
++		printf(",\"pin\":\"%u/%02u:%02u\"", r->pin_day, r->pin_hour,
++		       r->pin_minute);
++	printf("}\n");
++}
++
++static void print_record(const struct options *opts, struct rds_decoder *dec,
++			 const uint8_t *record, unsigned long *record_no)
++{
++	struct rds_group_result groups[RDS_GROUPS_PER_RECORD];
++	size_t i;
++
++	rds_decode_record(dec, record, groups);
++	for (i = 0; i < RDS_GROUPS_PER_RECORD; i++) {
++		if (!groups[i].present)
++			continue;
++		if (opts->json)
++			print_group_json((unsigned)i, &groups[i]);
++		else
++			print_group_text((unsigned)i, &groups[i], opts->raw);
++	}
++	(*record_no)++;
++}
++
++static int run_file(const struct options *opts)
++{
++	struct rds_decoder dec;
++	uint8_t record[RDS_RECORD_SIZE];
++	unsigned long record_no = 0;
++	size_t used = 0;
++	FILE *fp;
++	int ret = 0;
++
++	fp = fopen(opts->file, "rb");
++	if (!fp) {
++		fprintf(stderr, "fm_rds_decode: cannot open %s: %s\n",
++			opts->file, strerror(errno));
++		return 2;
++	}
++
++	rds_decoder_init(&dec);
++	for (;;) {
++		size_t n;
++
++		if (opts->records && record_no >= opts->records)
++			break;
++
++		n = fread(record + used, 1, sizeof(record) - used, fp);
++		used += n;
++		if (used < sizeof(record)) {
++			if (ferror(fp)) {
++				fprintf(stderr,
++					"fm_rds_decode: read error on %s: %s\n",
++					opts->file, strerror(errno));
++				ret = 2;
++			} else if (used != 0) {
++				fprintf(stderr,
++					"fm_rds_decode: %s ends with a partial "
++					"record (%zu of %d bytes)\n",
++					opts->file, used, RDS_RECORD_SIZE);
++				ret = 2;
++			}
++			break;
++		}
++
++		print_record(opts, &dec, record, &record_no);
++		used = 0;
++	}
++
++	fclose(fp);
++	return ret;
++}
++
++static int enable_rds(int fd)
++{
++	struct v4l2_control ctl = {
++		.id = V4L2_CID_RDS_RECEPTION,
++		.value = 1,
++	};
++
++	if (ioctl(fd, VIDIOC_S_CTRL, &ctl) < 0) {
++		fprintf(stderr,
++			"fm_rds_decode: cannot enable RDS reception: %s\n",
++			strerror(errno));
++		return -1;
++	}
++	return 0;
++}
++
++static int run_device(const struct options *opts)
++{
++	struct rds_decoder dec;
++	struct v4l2_capability cap;
++	uint8_t record[RDS_RECORD_SIZE];
++	unsigned long record_no = 0;
++	struct pollfd pfd;
++	int fd;
++	int ret = 0;
++
++	fd = open(opts->device, O_RDWR | O_CLOEXEC);
++	if (fd < 0) {
++		fprintf(stderr, "fm_rds_decode: cannot open %s: %s\n",
++			opts->device, strerror(errno));
++		return 2;
++	}
++
++	if (ioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
++		fprintf(stderr, "fm_rds_decode: %s is not a V4L2 device: %s\n",
++			opts->device, strerror(errno));
++		close(fd);
++		return 2;
++	}
++
++	if (!(cap.capabilities & V4L2_CAP_RADIO) ||
++	    !(cap.capabilities & V4L2_CAP_READWRITE)) {
++		fprintf(stderr,
++			"fm_rds_decode: %s does not support radio read()\n",
++			opts->device);
++		close(fd);
++		return 2;
++	}
++	if (!(cap.capabilities & V4L2_CAP_RDS_CAPTURE))
++		fprintf(stderr,
++			"fm_rds_decode: warning: %s does not advertise RDS "
++			"capture\n", opts->device);
++
++	if (opts->enable_rds && enable_rds(fd) < 0) {
++		close(fd);
++		return 2;
++	}
++
++	rds_decoder_init(&dec);
++	pfd.fd = fd;
++	pfd.events = POLLIN;
++
++	for (;;) {
++		ssize_t n;
++		int ready;
++
++		if (opts->records && record_no >= opts->records)
++			break;
++
++		ready = poll(&pfd, 1, DEFAULT_POLL_MS);
++		if (ready < 0) {
++			if (errno == EINTR)
++				continue;
++			fprintf(stderr, "fm_rds_decode: poll failed: %s\n",
++				strerror(errno));
++			ret = 2;
++			break;
++		}
++		if (!ready)
++			continue;	/* no data yet, keep waiting */
++
++		n = read(fd, record, sizeof(record));
++		if (n < 0) {
++			if (errno == EINTR || errno == EAGAIN ||
++			    errno == EWOULDBLOCK)
++				continue;
++			if (errno == EIO) {
++				fprintf(stderr,
++					"fm_rds_decode: radio powered down\n");
++				ret = 1;
++			} else {
++				fprintf(stderr,
++					"fm_rds_decode: read failed: %s\n",
++					strerror(errno));
++				ret = 1;
++			}
++			break;
++		}
++		if (n != RDS_RECORD_SIZE) {
++			fprintf(stderr,
++				"fm_rds_decode: short record (%zd of %d bytes)\n",
++				n, RDS_RECORD_SIZE);
++			ret = 2;
++			break;
++		}
++
++		print_record(opts, &dec, record, &record_no);
++	}
++
++	close(fd);
++	return ret;
++}
++
++int main(int argc, char **argv)
++{
++	struct options opts = {
++		.device = NULL,
++		.file = NULL,
++		.json = false,
++		.raw = false,
++		.enable_rds = true,
++		.records = 0,
++	};
++	static const struct option long_options[] = {
++		{ "device", required_argument, NULL, 'd' },
++		{ "file", required_argument, NULL, 'f' },
++		{ "json", no_argument, NULL, 'j' },
++		{ "raw", no_argument, NULL, 'r' },
++		{ "no-ctl", no_argument, NULL, 'C' },
++		{ "records", required_argument, NULL, 'n' },
++		{ "selftest", no_argument, NULL, 't' },
++		{ "help", no_argument, NULL, 'h' },
++		{ NULL, 0, NULL, 0 },
++	};
++	int opt;
++
++	while ((opt = getopt_long(argc, argv, "d:f:jrn:h", long_options,
++				  NULL)) != -1) {
++		switch (opt) {
++		case 'd':
++			opts.device = optarg;
++			break;
++		case 'f':
++			opts.file = optarg;
++			break;
++		case 'j':
++			opts.json = true;
++			break;
++		case 'r':
++			opts.raw = true;
++			break;
++		case 'C':
++			opts.enable_rds = false;
++			break;
++		case 'n': {
++			char *end = NULL;
++
++			opts.records = strtoul(optarg, &end, 0);
++			if (!end || *end || *optarg == '-') {
++				fprintf(stderr,
++					"fm_rds_decode: invalid record count "
++					"'%s'\n", optarg);
++				return 2;
++			}
++			break;
++		}
++		case 't':
++			return rds_selftest();
++		case 'h':
++			usage(stdout);
++			return 0;
++		default:
++			usage(stderr);
++			return 2;
++		}
++	}
++
++	if (opts.device && opts.file) {
++		fprintf(stderr,
++			"fm_rds_decode: --device and --file are mutually "
++			"exclusive\n");
++		return 2;
++	}
++
++	if (opts.file)
++		return run_file(&opts);
++	if (opts.device)
++		return run_device(&opts);
++
++	usage(stderr);
++	return 2;
++}
+diff --git a/tools/mediatek/wcn/fm_rds/rds_decode.c b/tools/mediatek/wcn/fm_rds/rds_decode.c
+new file mode 100644
+index 000000000..5eab71c9b
+--- /dev/null
++++ b/tools/mediatek/wcn/fm_rds/rds_decode.c
+@@ -0,0 +1,696 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Decoder for the raw RDS record stream of the MediaTek WCN FM driver.
++ *
++ * Port from Samsung/MTK downstream drivers/misc/mediatek/fmradio/core/
++ * fm_rds_parser.c (block masks, group assembly, PS/RT/AF/CT/EON rules).
++ * Groups the downstream parser does not decode (5A/5B transparent data,
++ * 13A enhanced radio paging, 15B fast switching) are implemented from
++ * EN 50067:1998 and the corresponding figures are cited inline.
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ */
++
++#include <stdio.h>
++#include <string.h>
++
++#include "rds_decode.h"
++
++static uint16_t le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | (p[1] << 8));
++}
++
++static unsigned get_bits(uint16_t value, unsigned hi, unsigned lo)
++{
++	unsigned width = hi - lo + 1;
++
++	return (value >> lo) & ((1u << width) - 1);
++}
++
++char rds_printable(uint8_t c)
++{
++	/* EN 50067 Annex E is an 8-bit extension of ISO 646; the printable
++	 * ASCII subset is passed through, everything else is shown as '.'.
++	 * A full Annex E table is deliberately not replicated here.
++	 */
++	if (c >= 0x20 && c <= 0x7e)
++		return (char)c;
++	return '.';
++}
++
++void rds_text_to_string(const char *src, size_t len, char *dst, size_t dst_size)
++{
++	size_t i, out = 0;
++
++	if (!dst_size)
++		return;
++
++	for (i = 0; i < len && out + 1 < dst_size; i++) {
++		if ((uint8_t)src[i] == 0x0d)	/* CR terminates RDS text */
++			break;
++		dst[out++] = rds_printable((uint8_t)src[i]);
++	}
++	while (out > 0 && dst[out - 1] == ' ')
++		out--;
++	dst[out] = '\0';
++}
++
++const char *rds_group_name(unsigned type, bool version_b, char buf[5])
++{
++	snprintf(buf, 5, "%u%c", type % 16, version_b ? 'B' : 'A');
++	return buf;
++}
++
++void rds_decoder_init(struct rds_decoder *dec)
++{
++	memset(dec, 0, sizeof(*dec));
++}
++
++void rds_decoder_reset(struct rds_decoder *dec)
++{
++	memset(dec, 0, sizeof(*dec));
++}
++
++static void ps_feed(struct rds_decoder *dec, unsigned segment, uint8_t hi,
++		    uint8_t lo, struct rds_group_result *res)
++{
++	if (segment > 3)
++		return;
++
++	dec->ps_chars[segment * 2] = (char)hi;
++	dec->ps_chars[segment * 2 + 1] = (char)lo;
++	dec->ps_seen |= 3u << (segment * 2);
++
++	if (dec->ps_seen != 0xff)
++		return;
++
++	rds_text_to_string(dec->ps_chars, RDS_PS_LEN, res->ps, sizeof(res->ps));
++	dec->ps_seen = 0;
++	if (dec->ps_have_last && strcmp(dec->ps_last, res->ps) == 0) {
++		res->ps_valid = false;
++		return;
++	}
++	strcpy(dec->ps_last, res->ps);
++	dec->ps_have_last = true;
++	res->ps_valid = true;
++	res->events |= RDS_EV_PS;
++}
++
++static bool rt_emit(struct rds_decoder *dec, struct rds_group_result *res)
++{
++	size_t limit = dec->rt_is_version_b ? 32 : RDS_RT_MAX;
++	size_t i, text_len;
++	bool complete = false;
++
++	/* EN 50067 3.1.5.3: the string ends at 0x0D, otherwise it fills the
++	 * whole 64 (2A) or 32 (2B) character field.  A terminator is only
++	 * trusted once every character up to it has been received.
++	 */
++	for (i = 0; i < limit; i++) {
++		uint64_t mask;
++
++		if ((uint8_t)dec->rt_chars[i] != 0x0d)
++			continue;
++		mask = (i == 63) ? ~0ULL : ((1ULL << (i + 1)) - 1);
++		if ((dec->rt_seen & mask) == mask) {
++			text_len = i;
++			complete = true;
++		}
++		break;
++	}
++
++	if (!complete) {
++		uint64_t full = (limit == 64) ? ~0ULL : ((1ULL << limit) - 1);
++
++		if ((dec->rt_seen & full) == full) {
++			text_len = limit;
++			complete = true;
++		}
++	}
++
++	if (!complete)
++		return false;
++
++	rds_text_to_string(dec->rt_chars, text_len, res->rt, sizeof(res->rt));
++	if (dec->rt_have_last && strcmp(dec->rt_last, res->rt) == 0)
++		return false;
++	strcpy(dec->rt_last, res->rt);
++	dec->rt_have_last = true;
++	res->rt_valid = true;
++	res->events |= RDS_EV_RT;
++	return true;
++}
++
++static void rt_feed(struct rds_decoder *dec, unsigned segment, bool version_b,
++		    uint8_t c_hi, uint8_t c_lo, uint8_t d_hi, uint8_t d_lo,
++		    struct rds_group_result *res)
++{
++	unsigned pos, width = version_b ? 2 : 4;
++	uint8_t bytes[4];
++	unsigned i;
++
++	if (version_b != dec->rt_is_version_b) {
++		/* A message is transmitted with one version only; do not mix
++		 * 2A and 2B segments in one buffer.
++		 */
++		memset(dec->rt_chars, 0, sizeof(dec->rt_chars));
++		dec->rt_seen = 0;
++		dec->rt_is_version_b = version_b;
++	}
++
++	pos = segment * width;
++	if (pos + width > RDS_RT_MAX)
++		return;
++
++	if (version_b) {
++		bytes[0] = d_hi;
++		bytes[1] = d_lo;
++	} else {
++		bytes[0] = c_hi;
++		bytes[1] = c_lo;
++		bytes[2] = d_hi;
++		bytes[3] = d_lo;
++	}
++
++	for (i = 0; i < width; i++) {
++		dec->rt_chars[pos + i] = (char)bytes[i];
++		dec->rt_seen |= 1ULL << (pos + i);
++	}
++
++	rt_emit(dec, res);
++}
++
++static bool af_add(struct rds_decoder *dec, unsigned code)
++{
++	unsigned i;
++	int khz;
++
++	if (code == 250) {
++		/* LF/MF frequency follows in the next code (EN 50067 3.2.1.6.1,
++		 * table 12).  LF/MF tuning is outside this decoder.
++		 */
++		return false;
++	}
++	if (code == 0 || code == 205 || code >= 251)
++		return false;
++	if (code >= 224 && code <= 249) {
++		/* Number-of-frequencies marker starts a new AF list.  224 means
++		 * that no AF exists (EN 50067 table 11).
++		 */
++		dec->af_number = code - 224;
++		dec->af_active = dec->af_number > 0;
++		dec->af_count = 0;
++		dec->af_codes_received = 0;
++		return false;
++	}
++	if (!dec->af_active || dec->af_codes_received >= dec->af_number)
++		return false;
++
++	dec->af_codes_received++;
++	khz = 87500 + (int)code * 100;
++	for (i = 0; i < dec->af_count; i++) {
++		if (dec->af_list[i] == khz)
++			break;
++	}
++	if (i == dec->af_count && dec->af_count < RDS_AF_MAX)
++		dec->af_list[dec->af_count++] = khz;
++
++	if (dec->af_codes_received < dec->af_number)
++		return false;
++
++	dec->af_active = false;	/* list complete */
++	return true;
++}
++
++static void decode_ct(struct rds_group_result *res)
++{
++	uint16_t block_b = res->block[1], block_c = res->block[2],
++		 block_d = res->block[3];
++	unsigned mjd, year, month, k = 0, d1, d2, hour, minute, half;
++	int sign;
++
++	mjd = ((unsigned)(block_b & 0x0003) << 15) |
++	      ((unsigned)block_c >> 1);
++
++	/* EN 50067 3.1.5.5 clock-time conversion. */
++	year = (mjd * 100 - 1507820) / 36525;
++	month = (mjd * 10000 - 149561000 - 3652500 * year) / 306001;
++	if (month == 14 || month == 15)
++		k = 1;
++
++	d1 = (36525 * year) / 100;
++	d2 = (306001 * month) / 10000;
++
++	hour = ((block_c & 0x0001) << 4) | (block_d >> 12);
++	minute = get_bits(block_d, 11, 6);
++	sign = (block_d & 0x0020) ? -1 : 1;
++	half = block_d & 0x001f;
++
++	memset(&res->ct, 0, sizeof(res->ct));
++	res->ct.year = 1900 + year + k;
++	res->ct.month = month - 1 - k * 12;
++	res->ct.day = mjd - 14956 - d1 - d2;
++	res->ct.hour = hour;
++	res->ct.minute = minute;
++	res->ct.offset_minutes = sign * (int)half * 30;
++
++	if (mjd < 15079 || res->ct.month < 1 || res->ct.month > 12 ||
++	    res->ct.day < 1 || res->ct.day > 31 || hour > 23 || minute > 59)
++		return;
++
++	res->ct_valid = true;
++	res->events |= RDS_EV_CT;
++}
++
++static void decode_group0(struct rds_decoder *dec,
++			  struct rds_group_result *res)
++{
++	uint16_t block_b = res->block[1];
++
++	res->ta_valid = true;
++	res->ta = get_bits(block_b, 4, 4);
++	res->ms_valid = true;
++	res->ms = get_bits(block_b, 3, 3);
++	res->di_valid = true;
++	res->di = get_bits(block_b, 2, 2);
++	res->di_segment = block_b & 0x03;
++	res->segment = block_b & 0x03;
++
++	/* Downstream rds_retrieve_g0_af() only looks at block C for 0A. */
++	if (!res->version_b && (res->good & RDS_BLOCK_C_OK)) {
++		uint8_t hi = res->block[2] >> 8, lo = res->block[2] & 0xff;
++		bool complete;
++
++		res->af_group_valid = true;
++		res->af_code[0] = hi;
++		res->af_code[1] = lo;
++
++		complete = af_add(dec, hi);
++		complete |= af_add(dec, lo);
++		if (complete) {
++			memcpy(res->af_khz, dec->af_list,
++			       sizeof(int) * dec->af_count);
++			res->af_count = dec->af_count;
++			res->af_valid = true;
++			res->events |= RDS_EV_AF;
++		}
++	}
++
++	if (res->good & RDS_BLOCK_D_OK)
++		ps_feed(dec, res->segment, res->block[3] >> 8,
++			res->block[3] & 0xff, res);
++}
++
++static void decode_group1(struct rds_group_result *res)
++{
++	uint16_t block_c = res->block[2], block_d = res->block[3];
++	unsigned day, hour, minute;
++
++	/* Programme item number: block D in both versions
++	 * (EN 50067 3.1.5.2, figure 14/15).
++	 */
++	if (res->good & RDS_BLOCK_D_OK) {
++		day = get_bits(block_d, 15, 11);
++		hour = get_bits(block_d, 10, 6);
++		minute = get_bits(block_d, 5, 0);
++		if (day >= 1 && day <= 31 && hour <= 23 && minute <= 59) {
++			res->pin_valid = true;
++			res->pin_day = day;
++			res->pin_hour = hour;
++			res->pin_minute = minute;
++			res->events |= RDS_EV_PIN;
++		}
++	}
++
++	if (res->version_b)
++		return;		/* 1B has no slow labelling codes */
++
++	if (!(res->good & RDS_BLOCK_C_OK))
++		return;
++
++	/* Slow labelling codes: block C bit 15 is the linkage actuator,
++	 * bits 14..12 the variant code and bits 11..0 the data
++	 * (downstream rds_retrieve_g1(), EN 50067 figure 14).
++	 */
++	res->slc_valid = true;
++	res->slc_variant = get_bits(block_c, 14, 12);
++	res->slc_data = block_c & 0x0fff;
++	res->events |= RDS_EV_SLC;
++
++	switch (res->slc_variant) {
++	case 0:
++		res->ecc_valid = true;
++		res->ecc = block_c & 0xff;	/* EN 50067 annex D */
++		break;
++	case 3:
++		res->language_valid = true;
++		res->language = block_c & 0xff;	/* EN 50067 annex J */
++		break;
++	default:
++		break;
++	}
++}
++
++static void eon_ps_feed(struct rds_decoder *dec, uint16_t pi_on,
++			struct rds_group_result *res)
++{
++	uint16_t block_c = res->block[2];
++	unsigned variant = res->eon.variant;
++
++	if (variant > 3)
++		return;
++
++	if (!dec->eon_have_pi || dec->eon_pi != pi_on) {
++		memset(dec->eon_ps_chars, 0, sizeof(dec->eon_ps_chars));
++		dec->eon_ps_seen = 0;
++		dec->eon_have_pi = true;
++		dec->eon_pi = pi_on;
++	}
++
++	dec->eon_ps_chars[variant * 2] = (char)(block_c >> 8);
++	dec->eon_ps_chars[variant * 2 + 1] = (char)(block_c & 0xff);
++	dec->eon_ps_seen |= 3u << (variant * 2);
++
++	res->eon.have_ps = true;
++	res->eon.ps_segment = variant;
++	res->eon.ps_chars[0] = (char)(block_c >> 8);
++	res->eon.ps_chars[1] = (char)(block_c & 0xff);
++
++	if (dec->eon_ps_seen != 0xff)
++		return;
++
++	res->eon.ps_complete = true;
++	rds_text_to_string(dec->eon_ps_chars, RDS_PS_LEN, res->eon.ps,
++			   sizeof(res->eon.ps));
++	res->events |= RDS_EV_EON_PS;
++	dec->eon_ps_seen = 0;
++}
++
++static void decode_group14(struct rds_decoder *dec,
++			   struct rds_group_result *res)
++{
++	uint16_t block_b = res->block[1], block_c = res->block[2],
++		 block_d = res->block[3];
++	struct rds_eon_info *eon = &res->eon;
++
++	res->eon_valid = true;
++
++	if (res->good & RDS_BLOCK_D_OK) {
++		eon->have_pi = true;
++		eon->pi_on = block_d;
++	}
++
++	/* TP(ON) is block B bit 4, TA(ON) bit 3 (EN 50067 figures 37/38,
++	 * downstream rds_retrieve_g14() uses 0x0010/0x0008).
++	 */
++	eon->have_tp = true;
++	eon->tp_on = get_bits(block_b, 4, 4);
++
++	if (res->version_b) {
++		/* 14B carries TA(ON) in block B bit 3. */
++		eon->have_ta = true;
++		eon->ta = get_bits(block_b, 3, 3);
++		res->events |= RDS_EV_EON;
++		return;
++	}
++
++	eon->have_variant = true;
++	eon->variant = block_b & 0x0f;
++
++	if (!(res->good & RDS_BLOCK_C_OK))
++		return;
++
++	switch (eon->variant) {
++	case 0:
++	case 1:
++	case 2:
++	case 3:
++		if (eon->have_pi)
++			eon_ps_feed(dec, eon->pi_on, res);
++		break;
++	case 4:
++		eon->have_af = true;
++		eon->af_code[0] = block_c >> 8;
++		eon->af_code[1] = block_c & 0xff;
++		break;
++	case 5:
++	case 6:
++	case 7:
++	case 8:
++	case 9:
++		eon->have_mapped = true;
++		eon->tuning_code = block_c >> 8;
++		eon->mapped_code = block_c & 0xff;
++		eon->mapped_is_am = eon->variant == 9;
++		break;
++	case 12:
++		eon->have_linkage = true;
++		eon->linkage_la = get_bits(block_c, 15, 15);
++		eon->linkage_set = block_c & 0x0fff;
++		break;
++	case 13:
++		eon->have_pty = true;
++		eon->pty = get_bits(block_c, 15, 11);
++		eon->have_ta = true;
++		eon->ta = block_c & 0x0001;
++		break;
++	case 14: {
++		unsigned day = get_bits(block_c, 15, 11);
++		unsigned hour = get_bits(block_c, 10, 6);
++		unsigned minute = get_bits(block_c, 5, 0);
++
++		if (day >= 1 && day <= 31 && hour <= 23 && minute <= 59) {
++			eon->have_pin = true;
++			eon->pin_day = day;
++			eon->pin_hour = hour;
++			eon->pin_minute = minute;
++		}
++		break;
++	}
++	case 15:
++		eon->have_broadcaster = true;
++		eon->broadcaster_data = block_c;
++		break;
++	default:
++		break;
++	}
++
++	res->events |= RDS_EV_EON;
++}
++
++static void decode_group13(struct rds_group_result *res)
++{
++	uint16_t block_b = res->block[1], block_c = res->block[2],
++		 block_d = res->block[3];
++
++	/* EN 50067 3.1.5.17 / annex M figure M.11a/b: the STY field is block
++	 * B bits 2..0 and carries 25 address notification bits in block C
++	 * bits 8..0 (the high nine) and block D (the low sixteen).
++	 */
++	res->paging_valid = true;
++	res->sty = block_b & 0x07;
++
++	if ((res->good & (RDS_BLOCK_C_OK | RDS_BLOCK_D_OK)) !=
++	    (RDS_BLOCK_C_OK | RDS_BLOCK_D_OK))
++		return;
++
++	res->paging_bits_valid = true;
++	res->paging_bits = ((uint32_t)(block_c & 0x01ff) << 16) | block_d;
++	res->paging_first_bit = (res->sty == 1) ? 25 : 0;
++	res->events |= RDS_EV_PAGING;
++}
++
++static void decode_fast_flags(uint16_t block, struct rds_fast_info *fast)
++{
++	fast->valid = true;
++	fast->tp = get_bits(block, 10, 10);
++	fast->pty = get_bits(block, 9, 5);
++	fast->ta = get_bits(block, 4, 4);
++	fast->ms = get_bits(block, 3, 3);
++	fast->di = get_bits(block, 2, 2);
++	fast->di_segment = block & 0x03;
++}
++
++static void decode_group15b(struct rds_group_result *res)
++{
++	uint16_t block_b = res->block[1], block_d = res->block[3];
++
++	/* EN 50067 3.1.5.21, figure 39: group 15B repeats the basic tuning
++	 * flags; TA is bit 4, M/S bit 3, DI bit 2 and the DI segment address
++	 * bits 1..0 of each half.  Block B is the first half, block D the
++	 * second half and block C' carries the PI again.
++	 */
++	decode_fast_flags(block_b, &res->fast_b);
++	if ((res->good & RDS_BLOCK_D_OK) &&
++	    ((block_d >> 11) & 0x1f) == 0x1f /* group type 15B */)
++		decode_fast_flags(block_d, &res->fast_d);
++	res->events |= RDS_EV_FAST;
++}
++
++void rds_decode_group(struct rds_decoder *dec,
++		      const uint8_t raw[RDS_GROUP_SIZE],
++		      struct rds_group_result *res)
++{
++	uint16_t block_b;
++	unsigned type;
++
++	memset(res, 0, sizeof(*res));
++
++	res->block[0] = le16(raw + 0);
++	res->block[1] = le16(raw + 2);
++	res->block[2] = le16(raw + 4);
++	res->block[3] = le16(raw + 6);
++	res->cbc = le16(raw + 8);
++	res->crc = le16(raw + 10);
++	res->good = res->crc & 0x000f;
++
++	res->present = res->block[0] || res->block[1] || res->block[2] ||
++		       res->block[3] || res->cbc || res->crc;
++	if (!res->present)
++		return;
++
++	/* A group type is only trustworthy when block B passed the checkword
++	 * check (downstream rds_grp_type_get(), fm_rds_parser.c:209-243).
++	 */
++	res->b_valid = (res->good & RDS_BLOCK_B_OK) != 0;
++	if (!res->b_valid)
++		return;
++
++	block_b = res->block[1];
++	type = block_b >> 12;
++	res->type = type;
++	res->version_b = (block_b >> 11) & 0x01;
++
++	if (res->good & RDS_BLOCK_A_OK) {
++		res->pi_valid = true;
++		res->pi = res->block[0];
++	}
++
++	res->pty = get_bits(block_b, 9, 5);
++	res->tp = get_bits(block_b, 10, 10);
++
++	switch (type) {
++	case 0:
++		decode_group0(dec, res);
++		break;
++	case 1:
++		decode_group1(res);
++		break;
++	case 2:
++		res->segment = block_b & 0x0f;
++		res->rt_ab = get_bits(block_b, 4, 4);
++		/* Downstream rds_retrieve_g2() drops groups whose correct-bit
++		 * count is non-zero.  Keep that conservative rule and expose
++		 * the raw group regardless.
++		 */
++		if (res->cbc != 0) {
++			res->rt_dropped_cbc = true;
++			break;
++		}
++		if (res->good & RDS_BLOCK_D_OK) {
++			/* A/B flag (block B bit 4) starts a new message. */
++			bool ab = res->rt_ab;
++
++			if (dec->rt_have_ab && ab != dec->rt_ab) {
++				memset(dec->rt_chars, 0,
++				       sizeof(dec->rt_chars));
++				dec->rt_seen = 0;
++				dec->rt_have_last = false;
++			}
++			dec->rt_have_ab = true;
++			dec->rt_ab = ab;
++
++			if (res->version_b ||
++			    (res->good & RDS_BLOCK_C_OK)) {
++				rt_feed(dec, res->segment, res->version_b,
++					res->block[2] >> 8,
++					res->block[2] & 0xff,
++					res->block[3] >> 8,
++					res->block[3] & 0xff, res);
++			}
++		}
++		break;
++	case 3:
++		/* 3A ODA identification: block B bits 4..0 select the group,
++		 * block C carries the message, block D the AID.
++		 */
++		if (res->version_b)
++			break;
++		if ((res->good & RDS_BLOCK_C_OK) &&
++		    (res->good & RDS_BLOCK_D_OK)) {
++			unsigned group_code = block_b & 0x1f;
++
++			res->oda_valid = true;
++			res->oda_group = group_code >> 1;
++			res->oda_group_b = (group_code & 1) != 0;
++			res->oda_message = res->block[2];
++			res->aid = res->block[3];
++			res->events |= RDS_EV_ODA;
++		}
++		break;
++	case 4:
++		if (res->version_b)
++			break;
++		if ((res->good & RDS_BLOCK_C_OK) &&
++		    (res->good & RDS_BLOCK_D_OK))
++			decode_ct(res);
++		break;
++	case 5: {
++		unsigned address = block_b & 0x1f;
++
++		res->tdc_valid = true;
++		res->tdc_address = address;
++		if (res->version_b) {
++			if (res->good & RDS_BLOCK_D_OK) {
++				res->tdc_data[0] = res->block[3] >> 8;
++				res->tdc_data[1] = res->block[3] & 0xff;
++				res->tdc_len = 2;
++			}
++		} else if ((res->good & RDS_BLOCK_C_OK) &&
++			   (res->good & RDS_BLOCK_D_OK)) {
++			res->tdc_data[0] = res->block[2] >> 8;
++			res->tdc_data[1] = res->block[2] & 0xff;
++			res->tdc_data[2] = res->block[3] >> 8;
++			res->tdc_data[3] = res->block[3] & 0xff;
++			res->tdc_len = 4;
++		}
++		if (res->tdc_len)
++			res->events |= RDS_EV_TDC;
++		break;
++	}
++	case 13:
++		if (!res->version_b)
++			decode_group13(res);
++		break;
++	case 14:
++		decode_group14(dec, res);
++		break;
++	case 15:
++		if (res->version_b)
++			decode_group15b(res);
++		/* 15A is not specified by EN 50067:1998 (3.1.5.20); there is
++		 * nothing portable to decode here.
++		 */
++		break;
++	default:
++		/* Groups 6..12 are in-house or ODA: report the blocks as-is. */
++		break;
++	}
++}
++
++size_t rds_decode_record(struct rds_decoder *dec,
++			 const uint8_t record[RDS_RECORD_SIZE],
++			 struct rds_group_result out[RDS_GROUPS_PER_RECORD])
++{
++	size_t i, usable = 0;
++
++	/* The two leading words are demodulator samples, not RDS data. */
++	for (i = 0; i < RDS_GROUPS_PER_RECORD; i++) {
++		rds_decode_group(dec, record + 4 + i * RDS_GROUP_SIZE, &out[i]);
++		if (out[i].b_valid)
++			usable++;
++	}
++
++	return usable;
++}
+diff --git a/tools/mediatek/wcn/fm_rds/rds_decode.h b/tools/mediatek/wcn/fm_rds/rds_decode.h
+new file mode 100644
+index 000000000..1ef4daf30
+--- /dev/null
++++ b/tools/mediatek/wcn/fm_rds/rds_decode.h
+@@ -0,0 +1,259 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Reusable decoder for the raw RDS record stream of the MediaTek WCN FM
++ * driver (/dev/radio0).
++ *
++ * The raw record layout is defined by include/uapi/linux/mtk_fm_rds.h.  One
++ * record holds two demodulator samples followed by twelve RDS groups; every
++ * group carries the four RDS blocks plus the firmware's good-block bitmap
++ * (crc) and corrected-bit count (cbc).
++ *
++ * The group decoding rules follow Samsung/MTK downstream
++ * drivers/misc/mediatek/fmradio/core/fm_rds_parser.c and, where the
++ * downstream parser has no implementation, EN 50067:1998 (the RDS
++ * specification).  Each rule is marked in rds_decode.c.
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ * Port from Samsung/MTK downstream fm_rds_parser.c.
++ */
++
++#ifndef FM_RDS_DECODE_H
++#define FM_RDS_DECODE_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++/* Raw record ABI, mirroring include/uapi/linux/mtk_fm_rds.h. */
++#define RDS_RECORD_SIZE		148
++#define RDS_GROUPS_PER_RECORD	12
++#define RDS_GROUP_SIZE		12
++#define RDS_BLOCK_A_OK		0x0008	/* good-block bits in the crc word */
++#define RDS_BLOCK_B_OK		0x0004
++#define RDS_BLOCK_C_OK		0x0002
++#define RDS_BLOCK_D_OK		0x0001
++
++#define RDS_PS_LEN		8
++#define RDS_RT_MAX		64
++#define RDS_AF_MAX		25
++
++/* Events produced by a group, so callers can render only real changes. */
++enum rds_event {
++	RDS_EV_PS	= 1u << 0,	/* complete PS name assembled */
++	RDS_EV_RT	= 1u << 1,	/* complete RadioText assembled */
++	RDS_EV_CT	= 1u << 2,	/* clock-time decoded */
++	RDS_EV_AF	= 1u << 3,	/* complete AF list assembled */
++	RDS_EV_ODA	= 1u << 4,	/* 3A ODA identification */
++	RDS_EV_EON_PS	= 1u << 5,	/* complete EON PS name assembled */
++	RDS_EV_SLC	= 1u << 6,	/* slow labelling code decoded */
++	RDS_EV_PIN	= 1u << 7,	/* programme item number decoded */
++	RDS_EV_TDC	= 1u << 8,	/* transparent data channel group */
++	RDS_EV_EON	= 1u << 9,	/* EON information other than PS */
++	RDS_EV_PAGING	= 1u << 10,	/* 13A enhanced radio paging */
++	RDS_EV_FAST	= 1u << 11,	/* 15B fast switching information */
++};
++
++struct rds_clock_time {
++	unsigned year;
++	unsigned month;
++	unsigned day;
++	unsigned hour;
++	unsigned minute;
++	int offset_minutes;	/* local time offset from UTC */
++};
++
++struct rds_eon_info {
++	bool have_pi;		/* block D carried PI(ON) */
++	uint16_t pi_on;
++	bool have_tp;		/* block B bit 10 (TP of other network) */
++	bool tp_on;
++	bool have_variant;
++	unsigned variant;
++	bool have_ps;		/* two PS(ON) characters in this group */
++	char ps_chars[2];
++	unsigned ps_segment;	/* 0..3 */
++	bool ps_complete;	/* decoder has all eight characters */
++	char ps[RDS_PS_LEN + 1];
++	bool have_af;
++	unsigned af_code[2];
++	bool have_mapped;	/* variant 5..9: tuning / mapped frequency */
++	unsigned tuning_code;
++	unsigned mapped_code;
++	bool mapped_is_am;
++	bool have_linkage;
++	bool linkage_la;
++	unsigned linkage_set;
++	bool have_pty;
++	unsigned pty;
++	bool have_ta;
++	bool ta;
++	bool have_pin;
++	unsigned pin_day, pin_hour, pin_minute;
++	bool have_broadcaster;
++	uint16_t broadcaster_data;
++};
++
++/* Group 15B basic tuning flags. */
++struct rds_fast_info {
++	bool valid;
++	bool tp;
++	unsigned pty;
++	bool ta;
++	bool ms;
++	bool di;
++	unsigned di_segment;
++};
++
++/* Decoded view of one 12-byte group slot. */
++struct rds_group_result {
++	bool present;		/* slot is not a zero-filled unused slot */
++	bool b_valid;		/* crc says block B is good: group type usable */
++	unsigned type;		/* 0..15, only valid when b_valid */
++	bool version_b;
++	unsigned good;		/* RDS_BLOCK_*_OK bits from crc */
++	uint16_t block[4];	/* A, B, C, D as delivered */
++	uint16_t cbc;
++	uint16_t crc;
++
++	/* Common block B fields (valid when b_valid). */
++	bool pi_valid;		/* block A good */
++	uint16_t pi;
++	unsigned pty;
++	bool tp;
++
++	/* Group 0. */
++	bool ta_valid, ta;
++	bool ms_valid, ms;
++	bool di_valid, di;
++	unsigned di_segment;
++	unsigned segment;	/* PS/RT/TDC/15B segment address */
++
++	/* Group 0A alternative frequencies: codes from this group. */
++	bool af_group_valid;
++	unsigned af_code[2];
++
++	/* Group 4A. */
++	bool ct_valid;
++	struct rds_clock_time ct;
++
++	/* Group 1A/1B. */
++	bool slc_valid;
++	unsigned slc_variant;
++	uint16_t slc_data;
++	bool ecc_valid;
++	unsigned ecc;
++	bool language_valid;
++	unsigned language;
++	bool pin_valid;
++	unsigned pin_day, pin_hour, pin_minute;
++
++	/* Group 3A. */
++	bool oda_valid;
++	unsigned oda_group;	/* 0..15 */
++	bool oda_group_b;
++	uint16_t oda_message;
++	uint16_t aid;
++
++	/* Group 2. */
++	bool rt_ab;
++	bool rt_dropped_cbc;	/* downstream skips groups with cbc != 0 */
++
++	/* Group 5A/5B transparent data. */
++	bool tdc_valid;
++	unsigned tdc_address;
++	unsigned tdc_len;
++	uint8_t tdc_data[4];
++
++	/* Group 13A enhanced radio paging. */
++	bool paging_valid;
++	unsigned sty;
++	bool paging_bits_valid;
++	uint32_t paging_bits;	/* 25 notification bits (0..24 or 25..49) */
++	unsigned paging_first_bit;
++
++	/* Group 14A/14B EON. */
++	bool eon_valid;
++	struct rds_eon_info eon;
++
++	/* Group 15B fast switching information: block B and block D each
++	 * carry one copy of the flags (EN 50067 figure 39).
++	 */
++	struct rds_fast_info fast_b;
++	struct rds_fast_info fast_d;
++
++	/* Text assembled by the decoder, emitted when complete. */
++	bool ps_valid;
++	char ps[RDS_PS_LEN + 1];
++	bool rt_valid;
++	char rt[RDS_RT_MAX + 1];
++
++	/* Complete AF list for the current programme. */
++	bool af_valid;
++	unsigned af_count;
++	int af_khz[RDS_AF_MAX];
++
++	unsigned events;	/* enum rds_event bits */
++};
++
++struct rds_decoder {
++	/* PS name assembly (group 0). */
++	char ps_chars[RDS_PS_LEN];
++	unsigned ps_seen;	/* one bit per character */
++	char ps_last[RDS_PS_LEN + 1];
++	bool ps_have_last;
++
++	/* RadioText assembly (group 2). */
++	char rt_chars[RDS_RT_MAX];
++	uint64_t rt_seen;	/* one bit per character */
++	bool rt_have_ab;
++	bool rt_ab;
++	bool rt_is_version_b;
++	char rt_last[RDS_RT_MAX + 1];
++	bool rt_have_last;
++
++	/* Alternative frequency list (group 0A). */
++	bool af_active;
++	unsigned af_number;
++	unsigned af_count;	/* unique frequencies stored */
++	unsigned af_codes_received;
++	int af_list[RDS_AF_MAX];
++
++	/* EON programme service name of the last PI(ON) seen. */
++	bool eon_have_pi;
++	uint16_t eon_pi;
++	char eon_ps_chars[RDS_PS_LEN];
++	unsigned eon_ps_seen;
++};
++
++void rds_decoder_init(struct rds_decoder *dec);
++/* Forget all assembled state but keep the decoder usable. */
++void rds_decoder_reset(struct rds_decoder *dec);
++
++/*
++ * Decode one group slot (RDS_GROUP_SIZE bytes, little endian as delivered by
++ * the kernel).  Always fills @res; an unused all-zero slot yields
++ * res->present == false.
++ */
++void rds_decode_group(struct rds_decoder *dec, const uint8_t raw[RDS_GROUP_SIZE],
++		      struct rds_group_result *res);
++
++/*
++ * Decode one record (RDS_RECORD_SIZE bytes).  Fills up to
++ * RDS_GROUPS_PER_RECORD entries in @out and returns the number of slots that
++ * decoded into a usable group (b_valid).  Unused slots are also reported in
++ * @out with present == false so callers can keep the index mapping.
++ */
++size_t rds_decode_record(struct rds_decoder *dec,
++			 const uint8_t record[RDS_RECORD_SIZE],
++			 struct rds_group_result out[RDS_GROUPS_PER_RECORD]);
++
++/* "0A", "14B", ... in a caller supplied buffer of at least 5 bytes. */
++const char *rds_group_name(unsigned type, bool version_b, char buf[5]);
++
++/* Printable form of an ANSI/EN 50067 8-bit text character. */
++char rds_printable(uint8_t c);
++
++/* Sanitise @len bytes of RDS text into @dst (NUL terminated). */
++void rds_text_to_string(const char *src, size_t len, char *dst, size_t dst_size);
++
++#endif /* FM_RDS_DECODE_H */
+diff --git a/tools/mediatek/wcn/fm_rds/selftest.c b/tools/mediatek/wcn/fm_rds/selftest.c
+new file mode 100644
+index 000000000..fe273cd06
+--- /dev/null
++++ b/tools/mediatek/wcn/fm_rds/selftest.c
+@@ -0,0 +1,495 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Built-in self-tests for the RDS record decoder.  Synthetic records are
++ * generated in code; no binary fixtures are used.
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ */
++
++#include <stdio.h>
++#include <string.h>
++
++#include "rds_decode.h"
++
++static int failures;
++
++#define CHECK(cond, msg)                                                \
++	do {                                                            \
++		if (!(cond)) {                                          \
++			fprintf(stderr, "selftest FAIL: %s (%s:%d)\n",   \
++				msg, __FILE__, __LINE__);               \
++			failures++;                                     \
++		}                                                       \
++	} while (0)
++
++struct record_builder {
++	uint8_t data[RDS_RECORD_SIZE];
++	unsigned count;
++};
++
++static void rb_init(struct record_builder *rb)
++{
++	memset(rb, 0, sizeof(*rb));
++}
++
++static void put16(uint8_t *p, uint16_t v)
++{
++	p[0] = v & 0xff;
++	p[1] = v >> 8;
++}
++
++static void rb_add_crc(struct record_builder *rb, uint16_t a, uint16_t b,
++		       uint16_t c, uint16_t d, uint16_t cbc, uint16_t crc)
++{
++	uint8_t *p;
++
++	if (rb->count >= RDS_GROUPS_PER_RECORD)
++		return;
++
++	p = rb->data + 4 + rb->count * RDS_GROUP_SIZE;
++	put16(p + 0, a);
++	put16(p + 2, b);
++	put16(p + 4, c);
++	put16(p + 6, d);
++	put16(p + 8, cbc);
++	put16(p + 10, crc);
++	rb->count++;
++}
++
++static void rb_add(struct record_builder *rb, uint16_t a, uint16_t b,
++		   uint16_t c, uint16_t d)
++{
++	rb_add_crc(rb, a, b, c, d, 0, 0x000f);
++}
++
++/* Block B for group 0 and 2 style groups. */
++static uint16_t group_b(unsigned type, bool version_b, unsigned pty, bool tp,
++			unsigned low5)
++{
++	return (uint16_t)((type << 12) | ((version_b ? 1u : 0u) << 11) |
++			  ((tp ? 1u : 0u) << 10) | ((pty & 0x1f) << 5) |
++			  (low5 & 0x1f));
++}
++
++static uint16_t g0_low5(bool ta, bool ms, bool di, unsigned segment)
++{
++	return (uint16_t)(((ta ? 1u : 0u) << 4) | ((ms ? 1u : 0u) << 3) |
++			  ((di ? 1u : 0u) << 2) | (segment & 0x3));
++}
++
++static uint16_t g2_low5(bool ab, unsigned segment)
++{
++	return (uint16_t)(((ab ? 1u : 0u) << 4) | (segment & 0x0f));
++}
++
++/* Julian day number to modified Julian date, for building CT groups. */
++static unsigned mjd_from_ymd(unsigned year, unsigned month, unsigned day)
++{
++	unsigned a = (14 - month) / 12;
++	unsigned y = year + 4800 - a;
++	unsigned m = month + 12 * a - 3;
++	unsigned jdn = day + (153 * m + 2) / 5 + 365 * y + y / 4 - y / 100 +
++		       y / 400 - 32045;
++
++	return jdn - 2400001;
++}
++
++static void test_group0_ps_af(void)
++{
++	static const char *segments[] = { "RA", "DI", "O1", "23" };
++	struct rds_group_result res[RDS_GROUPS_PER_RECORD];
++	struct rds_decoder dec;
++	struct record_builder rb;
++	unsigned i;
++
++	rb_init(&rb);
++	/* Segment 0 also starts the AF list: 2 frequencies, first 89.5 MHz
++	 * (AF code 20); segment 1 carries 102.3 MHz (AF code 148).
++	 */
++	for (i = 0; i < 4; i++) {
++		uint16_t af = 0;
++		uint16_t d = (uint16_t)((uint8_t)segments[i][0] << 8 |
++					(uint8_t)segments[i][1]);
++
++		if (i == 0)
++			af = (226 << 8) | 20;
++		else if (i == 1)
++			af = (148 << 8) | 0;
++
++		rb_add(&rb, 0x1234,
++		       group_b(0, false, 10, true,
++			       g0_low5(false, true, false, i)),
++		       af, d);
++	}
++
++	rds_decoder_init(&dec);
++	rds_decode_record(&dec, rb.data, res);
++
++	CHECK(res[0].present && res[0].b_valid, "0A group is usable");
++	CHECK(res[0].pi_valid && res[0].pi == 0x1234, "0A PI");
++	CHECK(res[0].pty == 10 && res[0].tp, "0A PTY/TP");
++	CHECK(res[0].ms_valid && res[0].ms, "0A M/S flag");
++	CHECK(res[0].di_valid && !res[0].di && res[0].di_segment == 0,
++	      "0A DI segment 0");
++	CHECK(res[0].segment == 0 && res[1].segment == 1, "0A PS addresses");
++	CHECK(res[0].af_group_valid && res[0].af_code[0] == 226,
++	      "0A AF number marker");
++	CHECK(res[1].af_valid, "0A AF list complete");
++	CHECK(res[1].af_count == 2, "0A AF list length");
++	CHECK(res[1].af_khz[0] == 89500, "0A AF 89.5 MHz");
++	CHECK(res[1].af_khz[1] == 102300, "0A AF 102.3 MHz");
++	CHECK(!res[2].ps_valid, "0A PS not complete early");
++	CHECK(res[3].ps_valid, "0A PS complete");
++	CHECK(strcmp(res[3].ps, "RADIO123") == 0, "0A PS text");
++	CHECK(res[3].events & RDS_EV_PS, "0A PS event");
++}
++
++static void test_group0_version_b(void)
++{
++	static const char *segments[] = { "AB", "CD", "EF", "GH" };
++	struct rds_group_result res[RDS_GROUPS_PER_RECORD];
++	struct rds_decoder dec;
++	struct record_builder rb;
++	unsigned i;
++
++	rb_init(&rb);
++	for (i = 0; i < 4; i++)
++		rb_add(&rb, 0x4321,
++		       group_b(0, true, 3, false, g0_low5(false, false, true, i)),
++		       0x4321,	/* block C repeats the PI in 0B */
++		       (uint16_t)((uint8_t)segments[i][0] << 8 |
++				  (uint8_t)segments[i][1]));
++
++	rds_decoder_init(&dec);
++	rds_decode_record(&dec, rb.data, res);
++
++	CHECK(res[0].version_b, "0B version flag");
++	CHECK(!res[0].af_group_valid, "0B carries no AF");
++	CHECK(res[3].ps_valid && strcmp(res[3].ps, "ABCDEFGH") == 0,
++	      "0B PS text");
++}
++
++static void test_radiotext_2a(void)
++{
++	struct rds_group_result res[RDS_GROUPS_PER_RECORD];
++	struct rds_decoder dec;
++	struct record_builder rb;
++
++	rb_init(&rb);
++	rb_add(&rb, 0x1234, group_b(2, false, 4, false, g2_low5(false, 0)),
++	       ('H' << 8) | 'e', ('l' << 8) | 'l');
++	rb_add(&rb, 0x1234, group_b(2, false, 4, false, g2_low5(false, 1)),
++	       ('o' << 8) | ' ', ('R' << 8) | 'D');
++	rb_add(&rb, 0x1234, group_b(2, false, 4, false, g2_low5(false, 2)),
++	       ('S' << 8) | 0x0d, (' ' << 8) | ' ');
++
++	rds_decoder_init(&dec);
++	rds_decode_record(&dec, rb.data, res);
++
++	CHECK(!res[0].rt_valid, "2A RT not complete at first segment");
++	CHECK(res[2].rt_valid, "2A RT complete");
++	CHECK(strcmp(res[2].rt, "Hello RDS") == 0, "2A RT text");
++	CHECK(res[2].rt_ab == 0, "2A RT A/B flag");
++
++	/* A/B flag change starts a new message. */
++	rb_init(&rb);
++	rb_add(&rb, 0x1234, group_b(2, false, 4, false, g2_low5(true, 0)),
++	       ('N' << 8) | 'e', ('w' << 8) | ' ');
++	rb_add(&rb, 0x1234, group_b(2, false, 4, false, g2_low5(true, 1)),
++	       ('T' << 8) | 'e', ('x' << 8) | 't');
++	rb_add(&rb, 0x1234, group_b(2, false, 4, false, g2_low5(true, 2)),
++	       (0x0d << 8) | ' ', (' ' << 8) | ' ');
++
++	rds_decode_record(&dec, rb.data, res);
++	CHECK(res[2].rt_valid, "2A new RT complete");
++	CHECK(strcmp(res[2].rt, "New Text") == 0, "2A new RT text");
++}
++
++static void test_radiotext_2b(void)
++{
++	struct rds_group_result res[RDS_GROUPS_PER_RECORD];
++	struct rds_decoder dec;
++	struct record_builder rb;
++
++	rb_init(&rb);
++	rb_add(&rb, 0x2222, group_b(2, true, 7, true, g2_low5(false, 0)),
++	       0x2222, ('A' << 8) | 'B');
++	rb_add(&rb, 0x2222, group_b(2, true, 7, true, g2_low5(false, 1)),
++	       0x2222, (0x0d << 8) | ' ');
++
++	rds_decoder_init(&dec);
++	rds_decode_record(&dec, rb.data, res);
++
++	CHECK(res[0].version_b, "2B version flag");
++	CHECK(res[1].rt_valid && strcmp(res[1].rt, "AB") == 0, "2B RT text");
++}
++
++static void test_radiotext_cbc(void)
++{
++	struct rds_group_result res[RDS_GROUPS_PER_RECORD];
++	struct rds_decoder dec;
++	struct record_builder rb;
++
++	rb_init(&rb);
++	rb_add_crc(&rb, 0x1234,
++		   group_b(2, false, 4, false, g2_low5(false, 0)),
++		   ('H' << 8) | 'e', ('l' << 8) | 'l', 2, 0x000f);
++
++	rds_decoder_init(&dec);
++	rds_decode_record(&dec, rb.data, res);
++
++	CHECK(res[0].rt_dropped_cbc, "2A group with corrected bits dropped");
++	CHECK(!res[0].rt_valid, "2A dropped group produces no RT");
++}
++
++static void test_group1(void)
++{
++	struct rds_group_result res[RDS_GROUPS_PER_RECORD];
++	struct rds_decoder dec;
++	struct record_builder rb;
++	uint16_t pin = (24 << 11) | (19 << 6) | 57;
++
++	rb_init(&rb);
++	/* 1A variant 0: ECC 0xE1 in block C, PIN in block D. */
++	rb_add(&rb, 0x1234, group_b(1, false, 9, true, 0), 0x00e1, pin);
++	/* 1A variant 3: language code 0x07. */
++	rb_add(&rb, 0x1234, group_b(1, false, 9, true, 0), 0x3007, pin);
++	/* 1B: block C' is the PI, block D still carries the PIN. */
++	rb_add(&rb, 0x1234, group_b(1, true, 9, true, 0), 0x1234, pin);
++
++	rds_decoder_init(&dec);
++	rds_decode_record(&dec, rb.data, res);
++
++	CHECK(res[0].ecc_valid && res[0].ecc == 0xe1, "1A ECC");
++	CHECK(res[0].slc_variant == 0, "1A SLC variant 0");
++	CHECK(res[0].pin_valid && res[0].pin_day == 24 &&
++	      res[0].pin_hour == 19 && res[0].pin_minute == 57,
++	      "1A programme item number");
++	CHECK(res[1].language_valid && res[1].language == 7, "1A language");
++	CHECK(res[2].pin_valid && !res[2].slc_valid, "1B PIN without SLC");
++}
++
++static void test_group3a(void)
++{
++	struct rds_group_result res[RDS_GROUPS_PER_RECORD];
++	struct rds_decoder dec;
++	struct record_builder rb;
++
++	rb_init(&rb);
++	/* ODA group code 16 = 8A, message 0x1234, AID 0x4BD7 (RT+). */
++	rb_add(&rb, 0x1234, group_b(3, false, 10, false, 16), 0x1234, 0x4bd7);
++
++	rds_decoder_init(&dec);
++	rds_decode_record(&dec, rb.data, res);
++
++	CHECK(res[0].oda_valid, "3A ODA present");
++	CHECK(res[0].oda_group == 8 && !res[0].oda_group_b, "3A ODA group 8A");
++	CHECK(res[0].oda_message == 0x1234, "3A ODA message");
++	CHECK(res[0].aid == 0x4bd7, "3A AID");
++}
++
++static void test_clock_time(void)
++{
++	struct rds_group_result res[RDS_GROUPS_PER_RECORD];
++	struct rds_decoder dec;
++	struct record_builder rb;
++	unsigned mjd = mjd_from_ymd(2026, 10, 24);
++	unsigned hour = 19, minute = 57, half = 4;
++	uint16_t block_b, block_c, block_d;
++
++	block_b = group_b(4, false, 0, false, 0) |
++		  (uint16_t)((mjd >> 15) & 0x3);
++	block_c = (uint16_t)(((mjd & 0x7fff) << 1) | (hour >> 4));
++	block_d = (uint16_t)(((hour & 0x0f) << 12) | (minute << 6) |
++			     (half & 0x1f));
++
++	rb_init(&rb);
++	rb_add(&rb, 0x1234, block_b, block_c, block_d);
++
++	rds_decoder_init(&dec);
++	rds_decode_record(&dec, rb.data, res);
++
++	CHECK(res[0].ct_valid, "4A CT present");
++	CHECK(res[0].ct.year == 2026 && res[0].ct.month == 10 &&
++	      res[0].ct.day == 24, "4A CT date");
++	CHECK(res[0].ct.hour == 19 && res[0].ct.minute == 57, "4A CT time");
++	CHECK(res[0].ct.offset_minutes == 120, "4A CT +02:00 offset");
++}
++
++static void test_transparent_data(void)
++{
++	struct rds_group_result res[RDS_GROUPS_PER_RECORD];
++	struct rds_decoder dec;
++	struct record_builder rb;
++
++	rb_init(&rb);
++	rb_add(&rb, 0x1234, group_b(5, false, 0, false, 3), 0x4142, 0x4344);
++	rb_add(&rb, 0x1234, group_b(5, true, 0, false, 7), 0x1234, 0x4142);
++
++	rds_decoder_init(&dec);
++	rds_decode_record(&dec, rb.data, res);
++
++	CHECK(res[0].tdc_valid && res[0].tdc_address == 3, "5A address");
++	CHECK(res[0].tdc_len == 4 && res[0].tdc_data[0] == 0x41 &&
++	      res[0].tdc_data[1] == 0x42 && res[0].tdc_data[2] == 0x43 &&
++	      res[0].tdc_data[3] == 0x44, "5A data");
++	CHECK(res[1].tdc_address == 7 && res[1].tdc_len == 2 &&
++	      res[1].tdc_data[0] == 0x41 && res[1].tdc_data[1] == 0x42,
++	      "5B data");
++}
++
++static void test_paging(void)
++{
++	struct rds_group_result res[RDS_GROUPS_PER_RECORD];
++	struct rds_decoder dec;
++	struct record_builder rb;
++	uint32_t bits = (1u << 1) | (1u << 17);
++
++	rb_init(&rb);
++	/* STY 0: 25 notification bits, block C bits 8..0 + block D. */
++	rb_add(&rb, 0x1234, group_b(13, false, 0, false, 0),
++	       (uint16_t)(bits >> 16), (uint16_t)(bits & 0xffff));
++	/* STY 1: notification bits 49..25, same bit layout. */
++	rb_add(&rb, 0x1234, group_b(13, false, 0, false, 1),
++	       (uint16_t)(bits >> 16), (uint16_t)(bits & 0xffff));
++
++	rds_decoder_init(&dec);
++	rds_decode_record(&dec, rb.data, res);
++
++	CHECK(res[0].paging_valid && res[0].sty == 0, "13A STY 0");
++	CHECK(res[0].paging_bits_valid && res[0].paging_bits == bits &&
++	      res[0].paging_first_bit == 0, "13A notification bits 0..24");
++	CHECK(res[1].sty == 1 && res[1].paging_first_bit == 25,
++	      "13A STY 1 notification bits 25..49");
++}
++
++static void test_eon(void)
++{
++	static const char *segments[] = { "EO", "NF", "M ", "  " };
++	struct rds_group_result res[RDS_GROUPS_PER_RECORD];
++	struct rds_decoder dec;
++	struct record_builder rb;
++	unsigned i;
++
++	rb_init(&rb);
++	for (i = 0; i < 4; i++)
++		rb_add(&rb, 0x1234, group_b(14, false, 2, true, 0x10 | i),
++		       (uint16_t)((uint8_t)segments[i][0] << 8 |
++				  (uint8_t)segments[i][1]),
++		       0x5678);
++	/* Variant 4: AF(ON) codes 20 and 148. */
++	rb_add(&rb, 0x1234, group_b(14, false, 2, true, 0x14),
++	       (20 << 8) | 148, 0x5678);
++	/* Variant 13: PTY(ON) 5, TA(ON) 1. */
++	rb_add(&rb, 0x1234, group_b(14, false, 2, true, 0x1d),
++	       (5 << 11) | 1, 0x5678);
++	/* 14B: TA(ON) in block B bit 3. */
++	rb_add(&rb, 0x1234, group_b(14, true, 2, true, 0x18), 0x1234, 0x5678);
++
++	rds_decoder_init(&dec);
++	rds_decode_record(&dec, rb.data, res);
++
++	CHECK(res[0].eon_valid && res[0].eon.have_pi &&
++	      res[0].eon.pi_on == 0x5678, "14A EON PI(ON)");
++	CHECK(res[0].eon.have_tp && res[0].eon.tp_on, "14A EON TP(ON)");
++	CHECK(res[3].eon.ps_complete && strcmp(res[3].eon.ps, "EONFM") == 0,
++	      "14A EON PS");
++	CHECK(res[4].eon.have_af && res[4].eon.af_code[0] == 20 &&
++	      res[4].eon.af_code[1] == 148, "14A EON AF");
++	CHECK(res[5].eon.have_pty && res[5].eon.pty == 5 &&
++	      res[5].eon.have_ta && res[5].eon.ta, "14A EON PTY/TA");
++	CHECK(res[6].eon.have_ta && res[6].eon.ta, "14B EON TA(ON)");
++}
++
++static void test_fast_switching(void)
++{
++	struct rds_group_result res[RDS_GROUPS_PER_RECORD];
++	struct rds_decoder dec;
++	struct record_builder rb;
++	uint16_t b = (uint16_t)((15 << 12) | (1 << 11) | (1 << 10) |
++				(5 << 5) | (1 << 4) | (0 << 3) | (1 << 2) | 2);
++	uint16_t d = (uint16_t)((15 << 12) | (1 << 11) | (0 << 10) |
++				(3 << 5) | (0 << 4) | (1 << 3) | (0 << 2) | 3);
++
++	rb_init(&rb);
++	rb_add(&rb, 0x1234, b, 0x1234, d);
++
++	rds_decoder_init(&dec);
++	rds_decode_record(&dec, rb.data, res);
++
++	CHECK(res[0].version_b, "15B version flag");
++	CHECK(res[0].fast_b.valid && res[0].fast_b.ta &&
++	      !res[0].fast_b.ms && res[0].fast_b.di &&
++	      res[0].fast_b.di_segment == 2, "15B block B flags");
++	CHECK(res[0].fast_b.tp && res[0].fast_b.pty == 5,
++	      "15B block B TP/PTY");
++	CHECK(res[0].fast_d.valid && !res[0].fast_d.ta &&
++	      res[0].fast_d.ms && !res[0].fast_d.di &&
++	      res[0].fast_d.di_segment == 3, "15B block D flags");
++}
++
++static void test_invalid_and_padding(void)
++{
++	struct rds_group_result res[RDS_GROUPS_PER_RECORD];
++	struct rds_decoder dec;
++	struct record_builder rb;
++	size_t usable;
++
++	rb_init(&rb);
++	/* Block B not marked good: no group type may be derived. */
++	rb_add_crc(&rb, 0x1234, 0xffff, 0x1111, 0x2222, 0, RDS_BLOCK_A_OK |
++						       RDS_BLOCK_C_OK |
++						       RDS_BLOCK_D_OK);
++	/* One valid group followed by zero-filled unused slots. */
++	rb_add(&rb, 0x1234, group_b(0, false, 1, false,
++				    g0_low5(false, false, false, 0)),
++	       0, ('A' << 8) | 'B');
++
++	rds_decoder_init(&dec);
++	usable = rds_decode_record(&dec, rb.data, res);
++
++	CHECK(res[0].present && !res[0].b_valid, "bad block B detected");
++	CHECK(res[1].present && res[1].b_valid, "valid group after bad one");
++	CHECK(!res[2].present, "zero-filled slot is not a group");
++	CHECK(usable == 1, "usable group count");
++}
++
++static void test_text_helpers(void)
++{
++	char buf[16];
++
++	rds_text_to_string("Hi\x01\x0drest", 8, buf, sizeof(buf));
++	CHECK(strcmp(buf, "Hi.") == 0, "text sanitising stops at CR");
++	rds_text_to_string("AB   ", 5, buf, sizeof(buf));
++	CHECK(strcmp(buf, "AB") == 0, "trailing spaces trimmed");
++	CHECK(rds_printable('A') == 'A' && rds_printable(0x01) == '.',
++	      "printable mapping");
++}
++
++int rds_selftest(void)
++{
++	failures = 0;
++
++	test_group0_ps_af();
++	test_group0_version_b();
++	test_radiotext_2a();
++	test_radiotext_2b();
++	test_radiotext_cbc();
++	test_group1();
++	test_group3a();
++	test_clock_time();
++	test_transparent_data();
++	test_paging();
++	test_eon();
++	test_fast_switching();
++	test_invalid_and_padding();
++	test_text_helpers();
++
++	if (failures) {
++		fprintf(stderr, "selftest: %d check(s) failed\n", failures);
++		return 1;
++	}
++
++	printf("selftest: all checks passed\n");
++	return 0;
++}

@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config VIDEO_MTK_SENINF
+	tristate "MediaTek MT6735 SENINF driver"
+	depends on MEDIA_SUPPORT && VIDEO_DEV && MEDIA_CONTROLLER && VIDEO_V4L2_SUBDEV_API && OF && COMMON_CLK
+	select V4L2_ASYNC
+	select V4L2_FWNODE
+	help
+	  Say Y or M here to enable the MediaTek MT6735 SENINF (sensor
+	  interface) driver.  The driver owns the camera subsystem media
+	  device, binds the sensor subdevices described in the device tree
+	  through the V4L2 async framework, and provides the per-camera MCLK
+	  output clocks.  The MIPI CSI-2 lane, D-PHY and timing programming is
+	  done by the proprietary MTK camera userspace and is not implemented.
+
+	  To compile this driver as a module, choose M here: the module will be
+	  called mtk-seninf.

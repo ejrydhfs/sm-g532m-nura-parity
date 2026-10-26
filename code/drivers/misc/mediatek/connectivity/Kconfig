@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# MediaTek connectivity subsystem (WMT/CONSYS, WLAN, BT, GPS, FM).
+#
+# Ported from Samsung/MTK downstream drivers/misc/mediatek/connectivity.
+
+source "drivers/misc/mediatek/connectivity/wmt/Kconfig"
+source "drivers/misc/mediatek/connectivity/wlan/Kconfig"
+source "drivers/misc/mediatek/connectivity/bt/Kconfig"
+source "drivers/misc/mediatek/connectivity/gps/Kconfig"
+source "drivers/misc/mediatek/connectivity/fm/Kconfig"

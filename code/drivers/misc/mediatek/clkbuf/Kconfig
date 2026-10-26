@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config MTK_CLKBUF
+	bool "MT6735 RF clock buffer control"
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	depends on PM
+	depends on MFD_SYSCON
+	help
+	  Control of the four RF clock buffers (BB/MD, CONN, NFC, AUDIO) of
+	  the MT6735/MT6737T.  The buffers are driven either through the SPM
+	  MD BSI control register while the modem is powered, or through the
+	  AP BSI command-word generator, exactly as the vendor SPM driver
+	  does.
+
+	  The driver implements clk_buf_ctrl()/clk_buf_get_swctrl_status()
+	  for the CCCI RPC service (IPC_RPC_GET_RF_CLK_BUF_OP) and the WMT
+	  CONSYS co-clock power sequence, and exports the sysfs knob
+	  /sys/power/clk_buf/clk_buf_ctrl.
+
+	  This option must be built in (=y), not modular: it registers a
+	  group below power_kobj, which the kernel does not export to
+	  modules.

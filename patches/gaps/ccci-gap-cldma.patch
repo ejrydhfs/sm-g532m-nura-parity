@@ -1,0 +1,550 @@
+diff --git a/drivers/misc/mediatek/ccci/ccci_core.c b/drivers/misc/mediatek/ccci/ccci_core.c
+index c2c4194a5..8e5e35bd5 100644
+--- a/drivers/misc/mediatek/ccci/ccci_core.c
++++ b/drivers/misc/mediatek/ccci/ccci_core.c
+@@ -115,6 +115,40 @@ int ccci_md_set_state(struct ccci_md *md, enum ccci_md_state state)
+ 	md->state = state;
+ 	spin_unlock_irqrestore(&md->lock, flags);
+ 
++	/*
++	 * CCCI gap closure (CLDMA leaf): select the CLDMA ring set.
++	 *
++	 * Downstream decides per queue in cldma_queue_switch_ring(), keyed on
++	 * md->ex_stage != EX_INIT_DONE (modem_cldma.c:1102,1116), and only
++	 * ever re-points rings when the engine is initialised or re-armed by
++	 * cldma_start() (modem_cldma.c:1569-1617); the exception handshake
++	 * sets EX_INIT_DONE immediately before that restart at
++	 * HIF_EX_ALLQ_RESET (modem_cldma.c:2021-2024).  The frozen API has no
++	 * stage-aware setter and md->ex_stage is not updated by Nura's
++	 * exception handshake, so the state machine is the trigger here: the
++	 * engine is switched to the exception map on entering EXCEPTION and
++	 * back to the net map on BOOTING/READY (and STOPPED, which always
++	 * precedes a new boot).  ccci_cldma_set_exception_mode() only latches
++	 * the map while the engine runs and ccci_cldma_start() applies it
++	 * before arming, i.e. at exactly the downstream restart point.
++	 * Entering EXCEPTION can therefore only change the rings at the
++	 * ALLQ_RESET restart, never on a live ring.
++	 */
++	if (md->cldma) {
++		switch (state) {
++		case CCCI_MD_EXCEPTION:
++			ccci_cldma_set_exception_mode(md->cldma, true);
++			break;
++		case CCCI_MD_BOOTING:
++		case CCCI_MD_READY:
++		case CCCI_MD_STOPPED:
++			ccci_cldma_set_exception_mode(md->cldma, false);
++			break;
++		default:
++			break;
++		}
++	}
++
+ 	if (old == state)
+ 		return 0;
+ 
+@@ -589,6 +623,15 @@ int ccci_md_start(struct ccci_md *md)
+ 		ccci_ccif_reset_rings(md);
+ 	}
+ 	if (md->cldma) {
++		/*
++		 * CCCI gap closure (CLDMA leaf): a cold boot always arms the
++		 * normal ring set. Downstream's cldma_queue_switch_ring()
++		 * picks the net rings whenever ex_stage != EX_INIT_DONE
++		 * (modem_cldma.c:1102,1116) and a boot never has EX_INIT_DONE,
++		 * so clear a stale latch left by an exception that has not
++		 * gone through ccci_md_stop()/ccci_md_reset().
++		 */
++		ccci_cldma_set_exception_mode(md->cldma, false);
+ 		err = ccci_cldma_start(md->cldma);
+ 		if (err) {
+ 			ccci_md_err(md, "cldma start failed: %d\n", err);
+diff --git a/drivers/misc/mediatek/ccci/ccci_platform.c b/drivers/misc/mediatek/ccci/ccci_platform.c
+index 25b93d293..b3e7f75b8 100644
+--- a/drivers/misc/mediatek/ccci/ccci_platform.c
++++ b/drivers/misc/mediatek/ccci/ccci_platform.c
+@@ -251,6 +251,8 @@ static int ccci_mdcldma_probe(struct platform_device *pdev)
+ 			goto err_ccif;
+ 		}
+ 		ccci_cldma_set_rx_cb(pl->cldma, ccci_md_rx_cb, pl->md);
++		/* Gap closure: INFRA_AO window for the RGU CLDMA reset. */
++		ccci_cldma_set_infra_ao(pl->cldma, pl->md->infra_ao);
+ 		ccci_md_attach_cldma(pl->md, pl->cldma);
+ 	}
+ 
+diff --git a/drivers/misc/mediatek/ccci_cldma/ccci_cldma.c b/drivers/misc/mediatek/ccci_cldma/ccci_cldma.c
+index e1a12bbeb..dcfba72fc 100644
+--- a/drivers/misc/mediatek/ccci_cldma/ccci_cldma.c
++++ b/drivers/misc/mediatek/ccci_cldma/ccci_cldma.c
+@@ -889,9 +889,13 @@ static int cldma_tx_ring_init(struct ccci_cldma *cd, struct cldma_ring *ring)
+ }
+ 
+ /*
+- * modem_cldma.c:1094-1133. The exception-mode branch of downstream (queues
+- * 3/4/5 switching to the 4K normal rings once the core reaches EX_INIT_DONE)
+- * cannot be driven through the frozen ccci_cldma API; see the report.
++ * modem_cldma.c:1094-1133. Network queues (3/4/5) use their 1.5K net ring in
++ * normal mode. In exception mode a network queue moves to the 4K normal ring
++ * only when CLDMA_NORMAL_QUEUE_MASK has its bit: queue 3 does (it carries the
++ * exception-mode MD logger control traffic), queues 4/5 have no normal ring
++ * (normal_{tx,rx}_queue2ring[4/5] == -1) and keep the net ring, mirroring the
++ * downstream "else if" branch that has no else. The non-network queues always
++ * use the normal ring.
+  */
+ static void cldma_queue_switch_ring(struct ccci_cldma *cd,
+ 				    struct cldma_queue *queue)
+@@ -901,12 +905,33 @@ static void cldma_queue_switch_ring(struct ccci_cldma *cd,
+ 	int mapped;
+ 
+ 	if (BIT(queue->index) & CLDMA_NET_QUEUE_MASK) {
+-		if (queue->tx) {
+-			mapped = cldma_net_tx_queue2ring[queue->index];
+-			ring = &cd->net_tx_ring[mapped];
++		if (!cd->exception_mode) {
++			if (queue->tx) {
++				mapped = cldma_net_tx_queue2ring[queue->index];
++				ring = &cd->net_tx_ring[mapped];
++			} else {
++				mapped = cldma_net_rx_queue2ring[queue->index];
++				ring = &cd->net_rx_ring[mapped];
++			}
++		} else if (BIT(queue->index) & CLDMA_NORMAL_QUEUE_MASK) {
++			if (queue->tx) {
++				mapped = cldma_normal_tx_queue2ring[queue->index];
++				ring = &cd->normal_tx_ring[mapped];
++			} else {
++				mapped = cldma_normal_rx_queue2ring[queue->index];
++				ring = &cd->normal_rx_ring[mapped];
++			}
+ 		} else {
+-			mapped = cldma_net_rx_queue2ring[queue->index];
+-			ring = &cd->net_rx_ring[mapped];
++			/* Queues 4/5: no exception ring, keep the net ring. */
++			ring = queue->tr_ring;
++			if (!ring) {
++				if (queue->tx)
++					ring = &cd->net_tx_ring[
++						cldma_net_tx_queue2ring[queue->index]];
++				else
++					ring = &cd->net_rx_ring[
++						cldma_net_rx_queue2ring[queue->index]];
++			}
+ 		}
+ 	} else {
+ 		if (queue->tx) {
+@@ -930,6 +955,28 @@ static void cldma_queue_switch_ring(struct ccci_cldma *cd,
+ 		queue->index, queue->tx ? "tx" : "rx", ring->length);
+ }
+ 
++/*
++ * Re-point every queue at the ring selected by cd->exception_mode and reset
++ * its cursors. Only valid while the engine is idle: downstream does the same
++ * from cldma_queue_switch_ring() when a queue is initialised or when
++ * cldma_start() arms the rings (modem_cldma.c:1135-1180,1569-1617).
++ */
++static void cldma_apply_ring_map(struct ccci_cldma *cd)
++{
++	int i;
++
++	for (i = 0; i < CLDMA_TXQ_NUM; i++) {
++		spin_lock(&cd->txq[i].ring_lock);
++		cldma_queue_switch_ring(cd, &cd->txq[i]);
++		spin_unlock(&cd->txq[i].ring_lock);
++	}
++	for (i = 0; i < CLDMA_RXQ_NUM; i++) {
++		spin_lock(&cd->rxq[i].ring_lock);
++		cldma_queue_switch_ring(cd, &cd->rxq[i]);
++		spin_unlock(&cd->rxq[i].ring_lock);
++	}
++}
++
+ /*
+  * modem_cldma.c:308-330 timer and 1135-1180 queue setup. Each CLDMA queue
+  * gets its own ordered workqueue so that work for one queue never runs
+@@ -1171,22 +1218,32 @@ static void cldma_hw_config(struct ccci_cldma *cd)
+ /* modem_cldma.c:1569-1617 */
+ static void cldma_hw_start(struct ccci_cldma *cd)
+ {
+-	unsigned long flags;
++	unsigned long flags, ring_flags;
+ 	int i;
+ 
+ 	cldma_enable_irq(cd);
+ 
+ 	spin_lock_irqsave(&cd->timeout_lock, flags);
+-	/* Tell the engine where each ring starts. */
++	/*
++	 * Tell the engine where each ring starts. The ring lock keeps a
++	 * concurrent ccci_cldma_send() (the core still accepts TX in the
++	 * EXCEPTION state) or a late tx_done() from moving the cursor while
++	 * the ring is re-pointed and armed; lock order is timeout_lock ->
++	 * ring_lock everywhere (see cldma_apply_ring_map()).
++	 */
+ 	for (i = 0; i < CLDMA_TXQ_NUM; i++) {
++		spin_lock_irqsave(&cd->txq[i].ring_lock, ring_flags);
+ 		cldma_queue_switch_ring(cd, &cd->txq[i]);
+ 		cldma_write32(cd->ap_pdn_base, CLDMA_AP_TQSAR(i),
+ 			      lower_32_bits(cd->txq[i].tr_done->gpd_addr));
++		spin_unlock_irqrestore(&cd->txq[i].ring_lock, ring_flags);
+ 	}
+ 	for (i = 0; i < CLDMA_RXQ_NUM; i++) {
++		spin_lock_irqsave(&cd->rxq[i].ring_lock, ring_flags);
+ 		cldma_queue_switch_ring(cd, &cd->rxq[i]);
+ 		cldma_write32(cd->ap_base, CLDMA_AP_RQSAR(i),
+ 			      lower_32_bits(cd->rxq[i].tr_done->gpd_addr));
++		spin_unlock_irqrestore(&cd->rxq[i].ring_lock, ring_flags);
+ 	}
+ 	/* Make sure the start addresses are visible before the start command. */
+ 	wmb();
+@@ -1448,6 +1505,7 @@ struct ccci_cldma *ccci_cldma_create(const struct ccci_cldma_cfg *cfg)
+ 	cd->ap_pdn_base = cfg->ap_pdn_base;
+ 	cd->irq = cfg->irq;
+ 	spin_lock_init(&cd->timeout_lock);
++	mutex_init(&cd->start_lock);
+ 	atomic_set(&cd->irq_enabled, 0);
+ 
+ 	/* Always initialise the list heads: the error paths free them. */
+@@ -1513,14 +1571,11 @@ struct ccci_cldma *ccci_cldma_create(const struct ccci_cldma_cfg *cfg)
+ 		ring->type = RING_GPD;
+ 		ring->handle_tx_request = cldma_gpd_handle_tx_request;
+ 		ring->handle_tx_done = cldma_gpd_tx_collect;
+-		if (q == 3) {
+-			/*
+-			 * Queue 3 only uses a 4K ring in exception mode, which
+-			 * this API cannot enter; leave the ring empty.
+-			 */
+-			ring->length = 0;
+-			continue;
+-		}
++		/*
++		 * Queue 3 has a normal ring only for exception mode
++		 * (CLDMA_NORMAL_QUEUE_MASK, modem_cldma.c:113,1110); build it
++		 * now because the engine may be switched later.
++		 */
+ 		ring->length = cldma_normal_tx_queue_buffer_number[q];
+ 		ret = cldma_tx_ring_init(cd, ring);
+ 		if (ret)
+@@ -1534,10 +1589,6 @@ struct ccci_cldma *ccci_cldma_create(const struct ccci_cldma_cfg *cfg)
+ 		ring->type = RING_GPD;
+ 		ring->handle_rx_done = cldma_gpd_rx_collect;
+ 		ring->handle_rx_refill = cldma_gpd_rx_refill;
+-		if (q == 3) {
+-			ring->length = 0;
+-			continue;
+-		}
+ 		ring->length = cldma_normal_rx_queue_buffer_number[q];
+ 		ring->pkt_size = cldma_normal_rx_queue_buffer_size[q];
+ 		ret = cldma_rx_ring_init(cd, ring);
+@@ -1584,7 +1635,7 @@ void ccci_cldma_destroy(struct ccci_cldma *cd)
+ 	if (!cd || IS_ERR(cd))
+ 		return;
+ 
+-	if (cd->started)
++	if (READ_ONCE(cd->started))
+ 		ccci_cldma_stop(cd);
+ 
+ 	if (cd->irq_requested) {
+@@ -1614,13 +1665,53 @@ void ccci_cldma_destroy(struct ccci_cldma *cd)
+ 
+ int ccci_cldma_start(struct ccci_cldma *cd)
+ {
+-	int i;
++	unsigned long flags;
++	u32 val;
++	int i, ret;
+ 
+ 	if (!cd || IS_ERR(cd))
+ 		return -EINVAL;
+-	if (cd->started)
++
++	mutex_lock(&cd->start_lock);
++	if (READ_ONCE(cd->started)) {
++		mutex_unlock(&cd->start_lock);
+ 		return -EBUSY;
++	}
+ 
++	/*
++	 * Publish "started" before the rings are touched: a concurrent
++	 * ccci_cldma_set_exception_mode() takes the same timeout_lock and
++	 * only re-points rings while "started" is clear, so publishing here
++	 * keeps the map stable across the whole arm sequence. The whole
++	 * sequence itself is serialised by start_lock, so a parallel
++	 * ccci_cldma_stop() cannot interleave either.
++	 */
++	spin_lock_irqsave(&cd->timeout_lock, flags);
++	WRITE_ONCE(cd->started, true);
++	cldma_apply_ring_map(cd);
++	spin_unlock_irqrestore(&cd->timeout_lock, flags);
++
++	/*
++	 * RGU reset only on a cold start. Downstream resets the block in
++	 * md_cd_start() (modem_cldma.c:2340, guarded by ENABLE_CLDMA_AP_SIDE
++	 * in mt6735/ccci_config.h:44) and at the end of md_cldma_clear()
++	 * (modem_cldma.c:2468). The exception restart path
++	 * (HIF_EX_ALLQ_RESET) instead runs cldma_reset() + cldma_start()
++	 * (modem_cldma.c:2024-2027) without any block reset; the MD has
++	 * already acknowledged that stage and may still be draining data, so
++	 * asserting INFRA_RST0 there would drop its in-flight descriptors.
++	 * -ENODEV means the DT has no INFRA_AO window; normal mode still
++	 * works without the reset, so it is not an error.
++	 */
++	if (!READ_ONCE(cd->exception_mode)) {
++		ret = ccci_cldma_hw_reset(cd);
++		if (ret && ret != -ENODEV) {
++			/* Nothing was armed yet: roll the publication back. */
++			WRITE_ONCE(cd->started, false);
++			mutex_unlock(&cd->start_lock);
++			return ret;
++		}
++	}
+ 	cldma_hw_config(cd);
+ 	/* modem_cldma.c:2316: reset the TX sequence counters before arming. */
+ 	memset(cd->tx_seq_num, 0, sizeof(cd->tx_seq_num));
+@@ -1631,7 +1722,20 @@ int ccci_cldma_start(struct ccci_cldma *cd)
+ 		cldma_clear_rx_queue(cd, &cd->rxq[i]);
+ 
+ 	cldma_hw_start(cd);
+-	cd->started = true;
++
++	/*
++	 * modem_cldma.c:2026-2033: after arming, OUT DMA must have accepted
++	 * SO_CFG bit 0 (the register is in the PD domain and a write can be
++	 * lost). Downstream performs this check on the exception restart
++	 * only; doing it on every arm is a superset and costs one read.
++	 */
++	val = cldma_read32(cd->ap_base, CLDMA_AP_SO_CFG);
++	if (!(val & BIT(0))) {
++		dev_err(cd->dev, "AP OUTCLDMA enable lost, SO_CFG=0x%08x\n",
++			val);
++		cldma_write32(cd->ap_base, CLDMA_AP_SO_CFG, val | 0x05);
++	}
++	mutex_unlock(&cd->start_lock);
+ 	return 0;
+ }
+ 
+@@ -1642,8 +1746,11 @@ void ccci_cldma_stop(struct ccci_cldma *cd)
+ 	if (!cd || IS_ERR(cd))
+ 		return;
+ 
+-	if (!cd->started)
++	mutex_lock(&cd->start_lock);
++	if (!READ_ONCE(cd->started)) {
++		mutex_unlock(&cd->start_lock);
+ 		return;
++	}
+ 
+ 	cldma_hw_stop(cd);
+ 
+@@ -1653,7 +1760,19 @@ void ccci_cldma_stop(struct ccci_cldma *cd)
+ 	for (i = 0; i < CLDMA_RXQ_NUM; i++)
+ 		cldma_clear_rx_queue(cd, &cd->rxq[i]);
+ 
+-	cd->started = false;
++	WRITE_ONCE(cd->started, false);
++
++	/*
++	 * Downstream finishes md_cldma_clear() with md_cldma_hw_reset()
++	 * (modem_cldma.c:2468, again under ENABLE_CLDMA_AP_SIDE), after the
++	 * queues are cleared, so the next start begins from the RGU reset
++	 * state. The exception path (HIF_EX_INIT) calls cldma_stop_for_ee()
++	 * instead (modem_cldma.c:2005) and does not reset the block, so skip
++	 * it while the exception map is latched.
++	 */
++	if (!READ_ONCE(cd->exception_mode))
++		ccci_cldma_hw_reset(cd);
++	mutex_unlock(&cd->start_lock);
+ }
+ 
+ /*
+@@ -1741,3 +1860,96 @@ void ccci_cldma_set_rx_cb(struct ccci_cldma *cd,
+ 	WRITE_ONCE(cd->rx_ctx, ctx);
+ 	WRITE_ONCE(cd->rx_cb, cb);
+ }
++
++/*
++ * INFRA_AO window used by the RGU CLDMA reset. The core resolves the optional
++ * "mediatek,infracfg-ao" phandle into md->infra_ao (ccci_core.c,
++ * ccci_md_map_infra_ao()) and the platform probe hands it over; it is the
++ * same block downstream maps for "mediatek,INFRACFG_AO"
++ * (eccci/mt6735/ccci_platform.c:748-754) and holds INFRA_RST0/INFRA_RST1 at
++ * 0x0030/0x0034 (mt6735/cldma_reg.h:18-19).
++ */
++void ccci_cldma_set_infra_ao(struct ccci_cldma *cd, void __iomem *infra_ao)
++{
++	if (!cd || IS_ERR(cd))
++		return;
++	if (!infra_ao) {
++		dev_warn(cd->dev, "empty INFRA_AO window, RGU reset disabled\n");
++		return;
++	}
++
++	cd->infra_ao = infra_ao;
++	dev_dbg(cd->dev, "INFRA_AO window %p\n", infra_ao);
++}
++
++/*
++ * RGU reset of the CLDMA block, verbatim from downstream
++ * md_cldma_hw_reset() (eccci/mt6735/cldma_platform.c:55-71): assert
++ * CLDMA_AO_RST_MASK | CLDMA_PD_RST_MASK in INFRA_RST0, then write the same
++ * masks to INFRA_RST1 to release the reset. Callers are ccci_cldma_start()
++ * and ccci_cldma_stop(), which mirror md_cd_start() (modem_cldma.c:2340) and
++ * the end of md_cldma_clear() (modem_cldma.c:2468).
++ */
++int ccci_cldma_hw_reset(struct ccci_cldma *cd)
++{
++	unsigned long flags;
++	u32 reg_value;
++
++	if (!cd || IS_ERR(cd))
++		return -EINVAL;
++	if (!cd->infra_ao)
++		return -ENODEV;
++
++	spin_lock_irqsave(&cd->timeout_lock, flags);
++	reg_value = cldma_read32(cd->infra_ao, CLDMA_INFRA_RST0_REG);
++	reg_value &= ~CLDMA_RGU_RST_MASK;
++	reg_value |= CLDMA_RGU_RST_MASK;
++	cldma_write32(cd->infra_ao, CLDMA_INFRA_RST0_REG, reg_value);
++
++	reg_value = cldma_read32(cd->infra_ao, CLDMA_INFRA_RST1_REG);
++	reg_value &= ~CLDMA_RGU_RST_MASK;
++	reg_value |= CLDMA_RGU_RST_MASK;
++	cldma_write32(cd->infra_ao, CLDMA_INFRA_RST1_REG, reg_value);
++	spin_unlock_irqrestore(&cd->timeout_lock, flags);
++
++	dev_dbg(cd->dev, "CLDMA RGU reset via INFRA_RST0/1\n");
++	return 0;
++}
++
++/*
++ * modem_cldma.c:1094-1133. Latch the ring set used by the queues: network
++ * queues move from the 1.5K net ring to the 4K normal ring when their bit is
++ * in CLDMA_NORMAL_QUEUE_MASK (queue 3 moves, queues 4/5 keep the net ring),
++ * the other queues always use the normal ring. Downstream only re-points a
++ * queue when the engine is (re)armed, so a running engine keeps its current
++ * rings until the next ccci_cldma_start(), which applies the latched map
++ * before arming (same point as downstream's HIF_EX_ALLQ_RESET restart).
++ */
++int ccci_cldma_set_exception_mode(struct ccci_cldma *cd, bool on)
++{
++	unsigned long flags;
++
++	if (!cd || IS_ERR(cd))
++		return -EINVAL;
++
++	spin_lock_irqsave(&cd->timeout_lock, flags);
++	if (cd->exception_mode == on) {
++		spin_unlock_irqrestore(&cd->timeout_lock, flags);
++		return 0;
++	}
++	cd->exception_mode = on;
++	/*
++	 * Only latch while the engine runs; ccci_cldma_start() applies the
++	 * map before arming. "started" is written under start_lock, so this
++	 * READ_ONCE() can only observe a stable value: either the engine is
++	 * fully stopped (safe to re-point) or fully published (start owns
++	 * the map for this arm).
++	 */
++	if (!READ_ONCE(cd->started))
++		cldma_apply_ring_map(cd);
++	spin_unlock_irqrestore(&cd->timeout_lock, flags);
++
++	dev_info(cd->dev, "CLDMA %s ring set\n",
++		 on ? "exception" : "normal");
++	return 0;
++}
+diff --git a/drivers/misc/mediatek/ccci_cldma/ccci_cldma.h b/drivers/misc/mediatek/ccci_cldma/ccci_cldma.h
+index 5d7f90868..5e432b7b7 100644
+--- a/drivers/misc/mediatek/ccci_cldma/ccci_cldma.h
++++ b/drivers/misc/mediatek/ccci_cldma/ccci_cldma.h
+@@ -17,10 +17,12 @@
+ #define __CCCI_CLDMA_H
+ 
+ #include <linux/ccci.h>
++#include <linux/bits.h>
+ #include <linux/dmapool.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/interrupt.h>
+ #include <linux/kthread.h>
++#include <linux/mutex.h>
+ #include <linux/skbuff.h>
+ #include <linux/spinlock.h>
+ #include <linux/timer.h>
+@@ -57,6 +59,14 @@
+ 
+ /* modem_cldma.c:108: queues 3, 4 and 5. */
+ #define CLDMA_NET_QUEUE_MASK		0x38
++/*
++ * modem_cldma.c:113: queues that have a ring in the normal set. In exception
++ * mode cldma_queue_switch_ring() (modem_cldma.c:1094-1133) only moves a
++ * network queue to the normal 4K ring when it is also part of this mask, so
++ * queue 3 moves and queues 4/5 keep their net ring (their
++ * normal_*_queue2ring[] entry is -1 as well).
++ */
++#define CLDMA_NORMAL_QUEUE_MASK		0xCF
+ 
+ /* modem_cldma.c:113: queue 7 is the VT/UART logging queue watched by the timer. */
+ #define CLDMA_VT_QUEUE			7
+@@ -64,6 +74,21 @@
+ /* All eight CLDMA queues, cldma_reg.h:258. */
+ #define CLDMA_BM_ALL_QUEUE		0xFF
+ 
++/*
++ * INFRA_AO RGU reset registers for the CLDMA block, verbatim from
++ * mt6735/cldma_reg.h:18-21:
++ *   INFRA_RST0_REG 0x0030 - set CLDMA reset
++ *   INFRA_RST1_REG 0x0034 - clear CLDMA reset
++ *   CLDMA_AO_RST_MASK BIT(8), CLDMA_PD_RST_MASK BIT(26)
++ * Downstream asserts both masks in RST0 and clears them in RST1,
++ * mt6735/cldma_platform.c:55-71.
++ */
++#define CLDMA_INFRA_RST0_REG		0x0030
++#define CLDMA_INFRA_RST1_REG		0x0034
++#define CLDMA_AO_RST_MASK		BIT(8)
++#define CLDMA_PD_RST_MASK		BIT(26)
++#define CLDMA_RGU_RST_MASK		(CLDMA_AO_RST_MASK | CLDMA_PD_RST_MASK)
++
+ /* cldma_reg.h:239/242: L2 (per queue) interrupt groups. */
+ #define CLDMA_BM_INT_ALL		0xFFFFFFFF
+ #define CLDMA_BM_INT_ERROR		0x00FF0000
+@@ -292,6 +317,13 @@ struct ccci_cldma {
+ 	struct device *dev;
+ 	void __iomem *ap_base;		/* AP_CLDMA_AO */
+ 	void __iomem *ap_pdn_base;	/* AP_CLDMA_PDN */
++	/*
++	 * Optional INFRA_AO window holding the RGU CLDMA reset registers
++	 * INFRA_RST0/INFRA_RST1 (mt6735/cldma_reg.h:18-21). Set by the core
++	 * through ccci_cldma_set_infra_ao(); NULL disables the RGU reset and
++	 * keeps the normal-mode engine working.
++	 */
++	void __iomem *infra_ao;
+ 	unsigned int irq;
+ 	struct dma_pool *gpd_pool;
+ 
+@@ -319,7 +351,26 @@ struct ccci_cldma {
+ 	 */
+ 	u16 tx_seq_num[CCCI_MAX_CH_NUM];
+ 
++	/*
++	 * Serialises the whole (re)arm / stop sequence, which touches the
++	 * RGU, the start addresses and the queue cursors. Held across the
++	 * MMIO sequences and never taken from atomic context; timeout_lock
++	 * and the queue ring_locks nest inside it.
++	 */
++	struct mutex start_lock;
++	/*
++	 * Written under start_lock with WRITE_ONCE(), read with READ_ONCE()
++	 * by ccci_cldma_set_exception_mode() so that it can never re-point a
++	 * ring that ccci_cldma_start() has published but not yet armed.
++	 */
+ 	bool started;
++	/*
++	 * Non-network queues always use the normal rings; network queues use
++	 * the net rings unless this is set and they have a normal ring. The
++	 * core latches it through ccci_cldma_set_exception_mode() and the map
++	 * is applied when the engine is armed, modem_cldma.c:1094-1133.
++	 */
++	bool exception_mode;
+ 	bool irq_requested;
+ 	atomic_t irq_enabled;
+ };

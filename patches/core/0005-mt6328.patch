@@ -1,0 +1,602 @@
+diff --git a/drivers/mfd/mt6397-core.c b/drivers/mfd/mt6397-core.c
+index 3e58d0764..1945d53db 100644
+--- a/drivers/mfd/mt6397-core.c
++++ b/drivers/mfd/mt6397-core.c
+@@ -30,6 +30,9 @@
+ #define MT6323_RTC_BASE		0x8000
+ #define MT6323_RTC_SIZE		0x40
+ 
++#define MT6328_RTC_BASE		0x4000
++#define MT6328_RTC_SIZE		0x40
++
+ #define MT6357_RTC_BASE		0x0588
+ #define MT6357_RTC_SIZE		0x3c
+ 
+@@ -50,6 +53,11 @@ static const struct resource mt6323_rtc_resources[] = {
+ 	DEFINE_RES_IRQ(MT6323_IRQ_STATUS_RTC),
+ };
+ 
++static const struct resource mt6328_rtc_resources[] = {
++	DEFINE_RES_MEM(MT6328_RTC_BASE, MT6328_RTC_SIZE),
++	DEFINE_RES_IRQ(MT6328_IRQ_STATUS_RTC),
++};
++
+ static const struct resource mt6357_rtc_resources[] = {
+ 	DEFINE_RES_MEM(MT6357_RTC_BASE, MT6357_RTC_SIZE),
+ 	DEFINE_RES_IRQ(MT6357_IRQ_RTC),
+@@ -152,6 +160,11 @@ static const struct mfd_cell mt6328_devs[] = {
+ 	{
+ 		.name = "mt6328-regulator",
+ 		.of_compatible = "mediatek,mt6328-regulator"
++	}, {
++		.name = "mt6328-rtc",
++		.num_resources = ARRAY_SIZE(mt6328_rtc_resources),
++		.resources = mt6328_rtc_resources,
++		.of_compatible = "mediatek,mt6328-rtc",
+ 	}, {
+ 		.name = "mt6328-keys",
+ 		.num_resources = ARRAY_SIZE(mt6328_keys_resources),
+diff --git a/drivers/regulator/mt6328-regulator.c b/drivers/regulator/mt6328-regulator.c
+index b7ea46b2b..005e2b7aa 100644
+--- a/drivers/regulator/mt6328-regulator.c
++++ b/drivers/regulator/mt6328-regulator.c
+@@ -7,6 +7,7 @@
+  * Copyright (c) 2022 Yassine Oudjana <y.oudjana@protonmail.com>
+  */
+ 
++#include <linux/delay.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+@@ -21,6 +22,27 @@
+ #define MT6328_LDO_TABLE_MODE_NORMAL	0
+ #define MT6328_LDO_TABLE_MODE_LP	1
+ 
++/*
++ * PMIC revision and OTP register bits used by the VMC voltage-table
++ * workaround. Values ported from the Samsung/MTK downstream PMIC driver
++ * (drivers/misc/mediatek/power/mt6735/pmic.c).
++ */
++#define MT6328_SWCID_E1			0x2810
++#define MT6328_CKPDN_CON3_EFUSE_CK_PDN	BIT(2)
++#define MT6328_CKHWEN_CON0_EFUSE_CK_PDN_HWEN	BIT(6)
++#define MT6328_OTP_CON0_PA_MASK		0x3f
++#define MT6328_OTP_CON8_RD_TRIG		BIT(0)
++#define MT6328_OTP_CON11_RD_SW		BIT(0)
++#define MT6328_OTP_CON12_DOUT_SW_MASK	0xffff
++#define MT6328_OTP_CON13_RD_BUSY	BIT(0)
++#define MT6328_OTP_VMC_ADDR		0x1a	/* OTP word 0xd, byte address */
++
++/*
++ * VCAMD trim register field used by the 1.2 V voltage-table workaround.
++ * RG_VCAMD_CAL is SLDO_ANA_CON2[11:8] (upmu_hw.h MT6328_PMIC_RG_VCAMD_CAL_*).
++ */
++#define MT6328_VCAMD_CAL_MASK		0xf00
++
+ /*
+  * MT6328 regulators' information
+  *
+@@ -166,14 +188,6 @@ static const unsigned int ldo_volt_table6[] = {
+ 	2900000, 3000000, 3300000
+ };
+ 
+-static const unsigned int ldo_volt_table7[] = {
+-	2500000, 2900000, 3000000, 3300000
+-};
+-
+-static const unsigned int ldo_volt_table8[] = {
+-	1300000, 1800000, 2900000, 3300000
+-};
+-
+ static const unsigned int ldo_volt_table9[] = {
+ 	1200000, 1300000, 1500000, 1800000, 2000000, 2800000, 3000000, 3300000
+ };
+@@ -202,6 +216,30 @@ static const struct linear_range ldo_volt_range1[] = {
+ 	REGULATOR_LINEAR_RANGE(700000, 0, 0x7f, 6250)
+ };
+ 
++/*
++ * MT6328 E1 uses a different VMC voltage table depending on one OTP bit.
++ * Ported from the Samsung/MTK downstream PMIC driver.
++ */
++static const unsigned int vmc_e1_1_volt_table[] = {
++	2500000, 2900000, 3000000, 3300000
++};
++
++static const unsigned int vmc_e1_2_volt_table[] = {
++	1300000, 1800000, 2900000, 3300000
++};
++
++/*
++ * VCAMD 1.2 V (selector 3) trim remap. Ported from the Samsung/MTK
++ * downstream PMIC driver (upmu_set_rg_vcamd() and the mt6328_vcamd[] table).
++ * mt6328_vcamd_cal holds the factory trim cached at probe time, like the
++ * downstream vcamd_cal variable.
++ */
++static const u8 mt6328_vcamd_cal_map[16] = {
++	1, 2, 3, 4, 5, 6, 7, 7, 9, 10, 11, 12, 13, 14, 15, 0
++};
++
++static u8 mt6328_vcamd_cal;
++
+ static int mt6328_get_status(struct regulator_dev *rdev)
+ {
+ 	int ret;
+@@ -275,6 +313,40 @@ static unsigned int mt6328_ldo_table_get_mode(struct regulator_dev *rdev)
+ 	return mode;
+ }
+ 
++/*
++ * Voltage-table selector workarounds ported from the Samsung/MTK downstream
++ * PMIC driver (mtk_regulator_set_voltage_sel() in
++ * drivers/misc/mediatek/power/mt6735/pmic.c):
++ *  - VCAMD: selector 3 (1.2 V) remaps the RG_VCAMD_CAL trim through
++ *    mt6328_vcamd_cal_map[], any other selector restores the factory trim.
++ *  - VRF18_1: SLDO_ANA_CON8 bit 2 must be cleared for the 1.825 V selector
++ *    (selector 4) and set for all others.
++ */
++static int mt6328_ldo_table_set_voltage_sel(struct regulator_dev *rdev,
++					    unsigned int sel)
++{
++	struct mt6328_regulator_info *info = rdev_get_drvdata(rdev);
++	int ret;
++
++	ret = regulator_set_voltage_sel_regmap(rdev, sel);
++	if (ret)
++		return ret;
++
++	switch (info->desc.id) {
++	case MT6328_ID_VCAMD:
++		return regmap_update_bits(rdev->regmap, MT6328_SLDO_ANA_CON2,
++					  MT6328_VCAMD_CAL_MASK,
++					  (sel == 3 ?
++					   mt6328_vcamd_cal_map[mt6328_vcamd_cal] :
++					   mt6328_vcamd_cal) << 8);
++	case MT6328_ID_VRF18_1:
++		return regmap_update_bits(rdev->regmap, MT6328_SLDO_ANA_CON8,
++					  BIT(2), sel == 4 ? 0 : BIT(2));
++	default:
++		return 0;
++	}
++}
++
+ static const struct regulator_ops mt6328_volt_range_ops = {
+ 	.list_voltage = regulator_list_voltage_linear_range,
+ 	.map_voltage = regulator_map_voltage_linear_range,
+@@ -290,7 +362,7 @@ static const struct regulator_ops mt6328_volt_range_ops = {
+ static const struct regulator_ops mt6328_volt_table_ops = {
+ 	.list_voltage = regulator_list_voltage_table,
+ 	.map_voltage = regulator_map_voltage_iterate,
+-	.set_voltage_sel = regulator_set_voltage_sel_regmap,
++	.set_voltage_sel = mt6328_ldo_table_set_voltage_sel,
+ 	.get_voltage_sel = regulator_get_voltage_sel_regmap,
+ 	.set_voltage_time_sel = regulator_set_voltage_time_sel,
+ 	.enable = regulator_enable_regmap,
+@@ -317,7 +389,7 @@ static struct mt6328_regulator_info mt6328_regulators[] = {
+ 		buck_volt_range1, MT6328_VPA_CON9, MT6328_VPA_CON11, 0x3f,
+ 		MT6328_VPA_CON12, MT6328_VPA_CON7),
+ 	MT6328_BUCK("buck_vproc", VPROC, 600000, 1393750, 6250,
+-		buck_volt_range2, MT6328_VPROC_CON9, MT6328_VPA_CON11, 0x7f,
++		buck_volt_range2, MT6328_VPROC_CON9, MT6328_VPROC_CON11, 0x7f,
+ 		MT6328_VPROC_CON12, MT6328_VPROC_CON7),
+ 	MT6328_BUCK("buck_vcore1", VCORE1, 600000, 1393750, 6250,
+ 		buck_volt_range2, MT6328_VCORE1_CON9, MT6328_VCORE1_CON11, 0x7f,
+@@ -385,8 +457,13 @@ static struct mt6328_regulator_info mt6328_regulators[] = {
+ 		MT6328_VCAM_CON0, BIT(0)),
+ 	MT6328_REG_FIXED("ldo_vrf18_0", VRF18_0, MT6328_VRF18_0_CON0, 1, 1825000,
+ 		MT6328_VRF18_0_CON0, BIT(0)),
++	/*
++	 * VRF18_1 VOSEL is written as a 3-bit field by the downstream driver
++	 * (selector 4 = 1.825 V reaches SLDO_ANA_CON4 bit 6), so use a 0x70
++	 * mask here even though upmu_hw.h lists the field as 0x3.
++	 */
+ 	MT6328_LDO_TABLE("ldo_vrf18_1", VRF18_1, ldo_volt_table12,
+-		MT6328_VRF18_1_CON0, 1, MT6328_SLDO_ANA_CON4, 0x30,
++		MT6328_VRF18_1_CON0, 1, MT6328_SLDO_ANA_CON4, 0x70,
+ 		MT6328_VRF18_1_CON0, BIT(0)),
+ 	MT6328_REG_FIXED("ldo_vio18", VIO18, MT6328_VIO18_CON0, 1, 1800000,
+ 		MT6328_VIO18_CON0, BIT(0)),
+@@ -395,11 +472,8 @@ static struct mt6328_regulator_info mt6328_regulators[] = {
+ 	MT6328_LDO_TABLE("ldo_vcamio", VCAMIO, ldo_volt_table13,
+ 		MT6328_VCAMIO_CON0, 1, MT6328_SLDO_ANA_CON7, 0x30,
+ 		MT6328_VCAMIO_CON0, BIT(0)),
+-	MT6328_LDO_TABLE("ldo_vcamio", VCAMIO, ldo_volt_table13,
+-		MT6328_VCAMIO_CON0, 1, MT6328_SLDO_ANA_CON7, 0x30,
+-		MT6328_VCAMIO_CON0, BIT(0)),
+ 	MT6328_LDO_RANGE("ldo_vsram", VSRAM, 700000, 1493750, 6250,
+-		ldo_volt_range1, MT6328_VSRAM_CON9, 1, MT6328_SLDO_ANA_CON9,
++		ldo_volt_range1, MT6328_LDO_VSRAM_CON0, 1, MT6328_SLDO_ANA_CON9,
+ 		0x7f, MT6328_LDO_VSRAM_CON0, BIT(0)),
+ 	MT6328_LDO_TABLE("ldo_vm", VM, ldo_volt_table14,
+ 		MT6328_VM_CON0, 1, MT6328_SLDO_ANA_CON0, 0x3,
+@@ -432,17 +506,133 @@ static int mt6328_set_buck_vosel_reg(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
++static int mt6328_read_vmc_efuse(struct regmap *regmap, u32 *dout)
++{
++	unsigned int val = 0;
++	int i, ret;
++
++	/* Ported from the downstream PMIC driver's pmic_read_VMC_efuse(). */
++	ret = regmap_update_bits(regmap, MT6328_TOP_CKHWEN_CON0,
++				 MT6328_CKHWEN_CON0_EFUSE_CK_PDN_HWEN, 0);
++	if (ret)
++		goto out;
++	ret = regmap_update_bits(regmap, MT6328_TOP_CKPDN_CON3,
++				 MT6328_CKPDN_CON3_EFUSE_CK_PDN, 0);
++	if (ret)
++		goto out;
++	ret = regmap_update_bits(regmap, MT6328_OTP_CON11,
++				 MT6328_OTP_CON11_RD_SW,
++				 MT6328_OTP_CON11_RD_SW);
++	if (ret)
++		goto out;
++	ret = regmap_update_bits(regmap, MT6328_OTP_CON0,
++				 MT6328_OTP_CON0_PA_MASK,
++				 MT6328_OTP_VMC_ADDR);
++	if (ret)
++		goto out;
++
++	udelay(100);
++
++	ret = regmap_read(regmap, MT6328_OTP_CON8, &val);
++	if (ret)
++		goto out;
++	ret = regmap_update_bits(regmap, MT6328_OTP_CON8,
++				 MT6328_OTP_CON8_RD_TRIG,
++				 val & MT6328_OTP_CON8_RD_TRIG ? 0 :
++				 MT6328_OTP_CON8_RD_TRIG);
++	if (ret)
++		goto out;
++
++	udelay(300);
++
++	for (i = 0; i < 1000; i++) {
++		ret = regmap_read(regmap, MT6328_OTP_CON13, &val);
++		if (ret)
++			goto out;
++		if (!(val & MT6328_OTP_CON13_RD_BUSY))
++			break;
++		udelay(10);
++	}
++	if (val & MT6328_OTP_CON13_RD_BUSY) {
++		ret = -ETIMEDOUT;
++		goto out;
++	}
++
++	udelay(1000);
++
++	ret = regmap_read(regmap, MT6328_OTP_CON12, dout);
++	if (ret)
++		goto out;
++	*dout &= MT6328_OTP_CON12_DOUT_SW_MASK;
++
++out:
++	/* Re-enable the efuse clock on all paths, as the downstream code does. */
++	regmap_update_bits(regmap, MT6328_TOP_CKHWEN_CON0,
++			   MT6328_CKHWEN_CON0_EFUSE_CK_PDN_HWEN,
++			   MT6328_CKHWEN_CON0_EFUSE_CK_PDN_HWEN);
++	regmap_update_bits(regmap, MT6328_TOP_CKPDN_CON3,
++			   MT6328_CKPDN_CON3_EFUSE_CK_PDN,
++			   MT6328_CKPDN_CON3_EFUSE_CK_PDN);
++
++	return ret;
++}
++
++static void mt6328_apply_vmc_quirk(struct platform_device *pdev)
++{
++	struct mt6397_chip *mt6328 = dev_get_drvdata(pdev->dev.parent);
++	u32 swcid, dout = 0;
++	int ret;
++
++	ret = regmap_read(mt6328->regmap, MT6328_SWCID, &swcid);
++	if (ret) {
++		dev_warn(&pdev->dev, "failed to read SWCID: %d\n", ret);
++		return;
++	}
++
++	if (swcid != MT6328_SWCID_E1)
++		return;
++
++	ret = mt6328_read_vmc_efuse(mt6328->regmap, &dout);
++	if (ret) {
++		dev_warn(&pdev->dev, "failed to read VMC efuse: %d\n", ret);
++		return;
++	}
++
++	/* A non-zero OTP value selects the E1_2 table in the downstream code. */
++	if (dout) {
++		mt6328_regulators[MT6328_ID_VMC].desc.volt_table =
++			vmc_e1_2_volt_table;
++		dev_info(&pdev->dev, "MT6328 E1: using VMC E1_2 voltage table\n");
++	} else {
++		mt6328_regulators[MT6328_ID_VMC].desc.volt_table =
++			vmc_e1_1_volt_table;
++		dev_info(&pdev->dev, "MT6328 E1: using VMC E1_1 voltage table\n");
++	}
++}
++
+ static int mt6328_regulator_probe(struct platform_device *pdev)
+ {
+ 	struct mt6397_chip *mt6328 = dev_get_drvdata(pdev->dev.parent);
+ 	struct regulator_config config = {};
+ 	struct regulator_dev *rdev;
++	unsigned int regval;
+ 	int i;
+ 
+ 	/* Query buck controller to select activated voltage register part */
+ 	if (mt6328_set_buck_vosel_reg(pdev))
+ 		return -EIO;
+ 
++	mt6328_apply_vmc_quirk(pdev);
++
++	/*
++	 * Cache the factory VCAMD trim for the 1.2 V selector workaround,
++	 * like the downstream driver's vcamd_cal.
++	 */
++	if (regmap_read(mt6328->regmap, MT6328_SLDO_ANA_CON2, &regval))
++		return dev_err_probe(&pdev->dev, -EIO,
++				     "Failed to read VCAMD trim\n");
++	mt6328_vcamd_cal = (regval & MT6328_VCAMD_CAL_MASK) >> 8;
++
+ 	for (i = 0; i < MT6328_MAX_REGULATOR; i++) {
+ 		config.dev = &pdev->dev;
+ 		config.driver_data = &mt6328_regulators[i];
+diff --git a/drivers/rtc/rtc-mt6397.c b/drivers/rtc/rtc-mt6397.c
+index 692c00ff5..137bee0d7 100644
+--- a/drivers/rtc/rtc-mt6397.c
++++ b/drivers/rtc/rtc-mt6397.c
+@@ -37,19 +37,44 @@ static int mtk_rtc_write_trigger(struct mt6397_rtc *rtc)
+ 	return ret;
+ }
+ 
++/*
++ * Unlock the RTC write-protect register. The downstream driver does this once
++ * at late init (mtk_rtc_common.c, rtc_late_init()) and leaves it unlocked.
++ */
++static int mtk_rtc_unlock_writeif(struct mt6397_rtc *rtc)
++{
++	int ret;
++
++	ret = regmap_write(rtc->regmap, rtc->addr_base + rtc->data->prot,
++			   rtc->data->prot_unlock1);
++	if (ret)
++		return ret;
++
++	ret = mtk_rtc_write_trigger(rtc);
++	if (ret)
++		return ret;
++
++	ret = regmap_write(rtc->regmap, rtc->addr_base + rtc->data->prot,
++			   rtc->data->prot_unlock2);
++	if (ret)
++		return ret;
++
++	return mtk_rtc_write_trigger(rtc);
++}
++
+ static irqreturn_t mtk_rtc_irq_handler_thread(int irq, void *data)
+ {
+ 	struct mt6397_rtc *rtc = data;
+-	u32 irqsta, irqen;
++	u32 irqsta;
+ 	int ret;
+ 
+ 	ret = regmap_read(rtc->regmap, rtc->addr_base + RTC_IRQ_STA, &irqsta);
+ 	if ((ret >= 0) && (irqsta & RTC_IRQ_STA_AL)) {
+ 		rtc_update_irq(rtc->rtc_dev, 1, RTC_IRQF | RTC_AF);
+-		irqen = irqsta & ~RTC_IRQ_EN_AL;
+ 		mutex_lock(&rtc->lock);
+-		if (regmap_write(rtc->regmap, rtc->addr_base + RTC_IRQ_EN,
+-				 irqen) == 0)
++		if (regmap_update_bits(rtc->regmap,
++				       rtc->addr_base + RTC_IRQ_EN,
++				       RTC_IRQ_EN_AL, 0) == 0)
+ 			mtk_rtc_write_trigger(rtc);
+ 		mutex_unlock(&rtc->lock);
+ 
+@@ -175,6 +200,34 @@ static int mtk_rtc_read_alarm(struct device *dev, struct rtc_wkalrm *alm)
+ 	return ret;
+ }
+ 
++/*
++ * Clear the alarm and power-on-alarm latches before the caller reprograms
++ * the alarm time. RTC_IRQ_STA is read-clear and must only be read after the
++ * writes have been latched by a write trigger, matching the downstream RTC
++ * HAL (mt6328/mtk_rtc_hal.c, hal_rtc_clear_alarm()).
++ */
++static int mtk_rtc_clear_alarm(struct mt6397_rtc *rtc)
++{
++	u32 irqsta;
++	int ret;
++
++	ret = regmap_update_bits(rtc->regmap, rtc->addr_base + RTC_IRQ_EN,
++				 RTC_IRQ_EN_AL, 0);
++	if (ret)
++		return ret;
++
++	ret = regmap_update_bits(rtc->regmap, rtc->addr_base + RTC_PDN2,
++				 RTC_PDN2_PWRON_ALARM, 0);
++	if (ret)
++		return ret;
++
++	ret = mtk_rtc_write_trigger(rtc);
++	if (ret)
++		return ret;
++
++	return regmap_read(rtc->regmap, rtc->addr_base + RTC_IRQ_STA, &irqsta);
++}
++
+ static int mtk_rtc_set_alarm(struct device *dev, struct rtc_wkalrm *alm)
+ {
+ 	struct rtc_time *tm = &alm->time;
+@@ -185,6 +238,10 @@ static int mtk_rtc_set_alarm(struct device *dev, struct rtc_wkalrm *alm)
+ 	tm->tm_mon++;
+ 
+ 	mutex_lock(&rtc->lock);
++	ret = mtk_rtc_clear_alarm(rtc);
++	if (ret < 0)
++		goto exit;
++
+ 	ret = regmap_bulk_read(rtc->regmap, rtc->addr_base + RTC_AL_SEC,
+ 			       data, RTC_OFFSET_COUNT);
+ 	if (ret < 0)
+@@ -261,6 +318,9 @@ static int mtk_rtc_probe(struct platform_device *pdev)
+ 	rtc->addr_base = res->start;
+ 
+ 	rtc->data = of_device_get_match_data(&pdev->dev);
++	if (!rtc->data)
++		return dev_err_probe(&pdev->dev, -ENODEV,
++				     "Unsupported RTC variant\n");
+ 
+ 	rtc->irq = platform_get_irq(pdev, 0);
+ 	if (rtc->irq < 0)
+@@ -275,6 +335,14 @@ static int mtk_rtc_probe(struct platform_device *pdev)
+ 	if (IS_ERR(rtc->rtc_dev))
+ 		return PTR_ERR(rtc->rtc_dev);
+ 
++	if (rtc->data->prot) {
++		ret = mtk_rtc_unlock_writeif(rtc);
++		if (ret)
++			dev_warn(&pdev->dev,
++				 "failed to unlock RTC write protection: %d\n",
++				 ret);
++	}
++
+ 	ret = devm_request_threaded_irq(&pdev->dev, rtc->irq, NULL,
+ 					mtk_rtc_irq_handler_thread,
+ 					IRQF_ONESHOT | IRQF_TRIGGER_HIGH,
+@@ -330,8 +398,16 @@ static const struct mtk_rtc_data mt6397_rtc_data = {
+ 	.wrtgr = RTC_WRTGR_MT6397,
+ };
+ 
++static const struct mtk_rtc_data mt6328_rtc_data = {
++	.wrtgr = RTC_WRTGR_MT6328,
++	.prot = RTC_PROT_MT6328,
++	.prot_unlock1 = RTC_PROT_UNLOCK1_MT6328,
++	.prot_unlock2 = RTC_PROT_UNLOCK2_MT6328,
++};
++
+ static const struct of_device_id mt6397_rtc_of_match[] = {
+ 	{ .compatible = "mediatek,mt6323-rtc", .data = &mt6397_rtc_data },
++	{ .compatible = "mediatek,mt6328-rtc", .data = &mt6328_rtc_data },
+ 	{ .compatible = "mediatek,mt6357-rtc", .data = &mt6358_rtc_data },
+ 	{ .compatible = "mediatek,mt6358-rtc", .data = &mt6358_rtc_data },
+ 	{ .compatible = "mediatek,mt6397-rtc", .data = &mt6397_rtc_data },
+diff --git a/include/linux/mfd/mt6328/core.h b/include/linux/mfd/mt6328/core.h
+index 9a08aed72..d7ee56305 100644
+--- a/include/linux/mfd/mt6328/core.h
++++ b/include/linux/mfd/mt6328/core.h
+@@ -9,45 +9,45 @@
+ 
+ enum mt6328_irq_status_numbers {
+ 	MT6328_IRQ_STATUS_PWRKEY = 0,
+-	MT6328_IRQ_STATUS_HOMEKEY,
+-	MT6328_IRQ_STATUS_PWRKEY_R,
+-	MT6328_IRQ_STATUS_HOMEKEY_R,
+-	MT6328_IRQ_STATUS_THR_H,
+-	MT6328_IRQ_STATUS_THR_L,
+-	MT6328_IRQ_STATUS_BAT_H,
+-	MT6328_IRQ_STATUS_BAT_L,
+-	MT6328_IRQ_STATUS_RTC,
+-	MT6328_IRQ_STATUS_AUDIO,
+-	MT6328_IRQ_STATUS_ACCDET,
+-	MT6328_IRQ_STATUS_ACCDET_EINT,
+-	MT6328_IRQ_STATUS_ACCDET_NEGV,
+-	MT6328_IRQ_STATUS_NI_LBAT_INT,
++	MT6328_IRQ_STATUS_HOMEKEY = 1,
++	MT6328_IRQ_STATUS_PWRKEY_R = 2,
++	MT6328_IRQ_STATUS_HOMEKEY_R = 3,
++	MT6328_IRQ_STATUS_THR_H = 4,
++	MT6328_IRQ_STATUS_THR_L = 5,
++	MT6328_IRQ_STATUS_BAT_H = 6,
++	MT6328_IRQ_STATUS_BAT_L = 7,
++	MT6328_IRQ_STATUS_RTC = 9,
++	MT6328_IRQ_STATUS_AUDIO = 10,
++	MT6328_IRQ_STATUS_ACCDET = 12,
++	MT6328_IRQ_STATUS_ACCDET_EINT = 13,
++	MT6328_IRQ_STATUS_ACCDET_NEGV = 14,
++	MT6328_IRQ_STATUS_NI_LBAT_INT = 15,
+ 	MT6328_IRQ_STATUS_VPROC_OC = 16,
+-	MT6328_IRQ_STATUS_VSYS_OC,
+-	MT6328_IRQ_STATUS_VLTE_OC,
+-	MT6328_IRQ_STATUS_VCORE_OC,
+-	MT6328_IRQ_STATUS_VPA_OC,
+-	MT6328_IRQ_STATUS_LDO_OC,
+-	MT6328_IRQ_STATUS_BAT2_H,
+-	MT6328_IRQ_STATUS_BAT2_L,
+-	MT6328_IRQ_STATUS_VISMPS0_H,
+-	MT6328_IRQ_STATUS_VISMPS0_L,
+-	MT6328_IRQ_STATUS_AUXADC_IMP,
++	MT6328_IRQ_STATUS_VSYS_OC = 17,
++	MT6328_IRQ_STATUS_VLTE_OC = 18,
++	MT6328_IRQ_STATUS_VCORE_OC = 21,
++	MT6328_IRQ_STATUS_VPA_OC = 24,
++	MT6328_IRQ_STATUS_LDO_OC = 25,
++	MT6328_IRQ_STATUS_BAT2_H = 26,
++	MT6328_IRQ_STATUS_BAT2_L = 27,
++	MT6328_IRQ_STATUS_VISMPS0_H = 28,
++	MT6328_IRQ_STATUS_VISMPS0_L = 29,
++	MT6328_IRQ_STATUS_AUXADC_IMP = 30,
+ 	MT6328_IRQ_STATUS_OV = 32,
+-	MT6328_IRQ_STATUS_BVALID_DET,
+-	MT6328_IRQ_STATUS_VBATON_HV,
+-	MT6328_IRQ_STATUS_VBATON_UNDET,
+-	MT6328_IRQ_STATUS_WATCHDOG,
+-	MT6328_IRQ_STATUS_PCHR_CM_VDEC,
+-	MT6328_IRQ_STATUS_CHRDET,
+-	MT6328_IRQ_STATUS_PCHR_CM_VINC,
+-	MT6328_IRQ_STATUS_FG_BAT_H,
+-	MT6328_IRQ_STATUS_FG_BAT_L,
+-	MT6328_IRQ_STATUS_FG_CUR_H,
+-	MT6328_IRQ_STATUS_FG_CUR_L,
+-	MT6328_IRQ_STATUS_FG_ZCV,
+-	MT6328_IRQ_STATUS_SPKL_D,
+-	MT6328_IRQ_STATUS_SPKL_AB,
++	MT6328_IRQ_STATUS_BVALID_DET = 33,
++	MT6328_IRQ_STATUS_VBATON_HV = 34,
++	MT6328_IRQ_STATUS_VBATON_UNDET = 35,
++	MT6328_IRQ_STATUS_WATCHDOG = 36,
++	MT6328_IRQ_STATUS_PCHR_CM_VDEC = 37,
++	MT6328_IRQ_STATUS_CHRDET = 38,
++	MT6328_IRQ_STATUS_PCHR_CM_VINC = 39,
++	MT6328_IRQ_STATUS_FG_BAT_H = 40,
++	MT6328_IRQ_STATUS_FG_BAT_L = 41,
++	MT6328_IRQ_STATUS_FG_CUR_H = 42,
++	MT6328_IRQ_STATUS_FG_CUR_L = 43,
++	MT6328_IRQ_STATUS_FG_ZCV = 44,
++	MT6328_IRQ_STATUS_SPKL_D = 45,
++	MT6328_IRQ_STATUS_SPKL_AB = 46,
+ };
+ 
+-#endif /* __MFD_MT6323_CORE_H__ */
++#endif /* __MFD_MT6328_CORE_H__ */
+diff --git a/include/linux/mfd/mt6397/rtc.h b/include/linux/mfd/mt6397/rtc.h
+index 27883af44..bda24bcb4 100644
+--- a/include/linux/mfd/mt6397/rtc.h
++++ b/include/linux/mfd/mt6397/rtc.h
+@@ -21,6 +21,12 @@
+ #define RTC_WRTGR_MT6358       0x003a
+ #define RTC_WRTGR_MT6397       0x003c
+ #define RTC_WRTGR_MT6323       RTC_WRTGR_MT6397
++#define RTC_WRTGR_MT6328       0x003c
++
++/* MT6328 write-protect register; must be unlocked to update time/alarm */
++#define RTC_PROT_MT6328        0x0036
++#define RTC_PROT_UNLOCK1_MT6328 0x586a
++#define RTC_PROT_UNLOCK2_MT6328 0x9136
+ 
+ #define RTC_IRQ_STA            0x0002
+ #define RTC_IRQ_STA_AL         BIT(0)
+@@ -65,6 +71,10 @@
+ 
+ struct mtk_rtc_data {
+ 	u32                     wrtgr;
++	/* Optional write-protect register and its unlock sequence */
++	u32                     prot;
++	u16                     prot_unlock1;
++	u16                     prot_unlock2;
+ };
+ 
+ struct mt6397_rtc {
