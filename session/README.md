@@ -15,7 +15,9 @@
 | `README.md` | Plugin-generated index |
 
 This is the **no-artifacts** export. The full archive includes untruncated tool
-logs and the session artifact tree; it is retained locally and is not published.
+logs and the session artifact tree; it is published as a release asset:
+
+<https://github.com/ejrydhfs/sm-g532m-nura-parity/releases/tag/session-archive-2026-10-26>
 
 ## Sanitization
 

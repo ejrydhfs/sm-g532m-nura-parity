@@ -138,7 +138,10 @@ The complete fragment is `patches/core/0012-required-config.txt`.
 It contains the main transcript, agent metadata, job index and standalone HTML
 viewer. It is the **no-artifacts** variant: untruncated tool logs and binary
 artifact trees are excluded. One Google API key present in the raw transcript
-was redacted. The full 89 MB archive is retained locally and not published.
+was redacted. The full sanitized archive is published as a release asset.
+
+**Full sanitized archive (release asset):**
+<https://github.com/ejrydhfs/sm-g532m-nura-parity/releases/tag/session-archive-2026-10-26>
 
 See [`session/README.md`](session/README.md).
 
