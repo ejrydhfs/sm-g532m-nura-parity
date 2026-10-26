@@ -1,0 +1,385 @@
+diff --git a/drivers/iio/accel/bmc150-accel-core.c b/drivers/iio/accel/bmc150-accel-core.c
+index 42ccf0316..6630be85f 100644
+--- a/drivers/iio/accel/bmc150-accel-core.c
++++ b/drivers/iio/accel/bmc150-accel-core.c
+@@ -27,6 +27,9 @@
+ 
+ #define BMC150_ACCEL_REG_CHIP_ID		0x00
+ 
++/* Number of chip ID read attempts after power-on, as used by Samsung */
++#define BMC150_ACCEL_CHIP_ID_RETRIES		5
++
+ #define BMC150_ACCEL_REG_INT_STATUS_2		0x0B
+ #define BMC150_ACCEL_ANY_MOTION_MASK		0x07
+ #define BMC150_ACCEL_ANY_MOTION_BIT_X		BIT(0)
+@@ -50,6 +53,11 @@
+ /* Default BW: 125Hz */
+ #define BMC150_ACCEL_REG_PMU_BW		0x10
+ #define BMC150_ACCEL_DEF_BW			125
++/*
++ * The Samsung BMA2x2 driver programs PMU_BW = 0x0c, i.e. a 125 Hz filter
++ * bandwidth (250 Hz output data rate), for the BMA254.
++ */
++#define BMC150_ACCEL_BMA254_DEF_BW		250
+ 
+ #define BMC150_ACCEL_REG_RESET			0x14
+ #define BMC150_ACCEL_RESET_VAL			0xB6
+@@ -72,6 +80,8 @@
+ #define BMC150_ACCEL_INT_MODE_LATCH_RESET	0x80
+ #define BMC150_ACCEL_INT_MODE_LATCH_INT	0x0F
+ #define BMC150_ACCEL_INT_MODE_NON_LATCH_INT	0x00
++/* temporary latch of 250 ms, the value used by the Samsung BMA2x2 driver */
++#define BMC150_ACCEL_INT_MODE_LATCH_250MS	0x01
+ 
+ #define BMC150_ACCEL_REG_INT_EN_0		0x16
+ #define BMC150_ACCEL_INT_EN_BIT_SLP_X		BIT(0)
+@@ -97,9 +107,25 @@
+ #define BMC150_ACCEL_DEF_SLOPE_DURATION		1
+ /* in terms of multiples of g's/LSB, based on range */
+ #define BMC150_ACCEL_DEF_SLOPE_THRESHOLD	1
++/* threshold used by the Samsung driver for the any-motion alert */
++#define BMC150_ACCEL_BMA254_SLOPE_THRESHOLD	5
+ 
+ #define BMC150_ACCEL_REG_XOUT_L		0x02
+ 
++/*
++ * Offset compensation registers 0x38..0x3a. The two's complement value is
++ * subtracted from the raw acceleration data with a fixed resolution of
++ * 1/128 g per LSB, independent of the selected range.
++ */
++#define BMC150_ACCEL_REG_OFFSET_X	0x38
++
++/*
++ * Clamp for calibbias values before scaling. The offset registers can only
++ * represent +-127 LSB, i.e. at most 4064 raw LSB for any supported chip and
++ * range, so values beyond this are saturated.
++ */
++#define BMC150_ACCEL_CALIBBIAS_MAX	4096
++
+ #define BMC150_ACCEL_MAX_STARTUP_TIME_MS	100
+ 
+ /* Sleep Duration values */
+@@ -564,6 +590,19 @@ static int bmc150_accel_set_interrupt(struct bmc150_accel_data *data, int i,
+ 		goto out_fix_power_state;
+ 	}
+ 
++	/*
++	 * The any-motion interrupt is the only one which may have to wake the
++	 * system up. The Samsung driver enables the IRQ wake together with its
++	 * "reactive alert" (bma2x2_reactive_enable_store).
++	 */
++	if (i == BMC150_ACCEL_INT_ANY_MOTION) {
++		ret = state ? enable_irq_wake(data->irq) :
++			      disable_irq_wake(data->irq);
++		if (ret)
++			dev_warn(dev, "Failed to %s IRQ wake: %d\n",
++				 state ? "enable" : "disable", ret);
++	}
++
+ 	return 0;
+ 
+ out_fix_power_state:
+@@ -615,6 +654,94 @@ static int bmc150_accel_get_temp(struct bmc150_accel_data *data, int *val)
+ 	return IIO_VAL_INT;
+ }
+ 
++static int bmc150_accel_range_to_g(unsigned int range)
++{
++	switch (range) {
++	case BMC150_ACCEL_DEF_RANGE_2G:
++		return 2;
++	case BMC150_ACCEL_DEF_RANGE_4G:
++		return 4;
++	case BMC150_ACCEL_DEF_RANGE_8G:
++		return 8;
++	case BMC150_ACCEL_DEF_RANGE_16G:
++		return 16;
++	default:
++		return 0;
++	}
++}
++
++/*
++ * The BMA2x2 offset compensation registers (0x38..0x3a) contain a two's
++ * complement value which the chip subtracts from the raw acceleration data.
++ * Its resolution is fixed at 1/128 g per LSB [INFERENCE], while the raw data
++ * LSB size depends on the selected range and the chip resolution. Expose the
++ * offsets as calibbias expressed in raw sample units. The sign convention
++ * matches the Samsung BMA2x2 driver, which reports "value = acc - caldata"
++ * (bma2x2_work_func): a calibbias written here is subtracted from the raw
++ * samples.
++ */
++static int bmc150_accel_get_calibbias(struct bmc150_accel_data *data,
++				      struct iio_chan_spec const *chan,
++				      int *val)
++{
++	struct device *dev = regmap_get_device(data->regmap);
++	unsigned int reg_val;
++	int g, ret;
++
++	g = bmc150_accel_range_to_g(data->range);
++	if (!g) {
++		dev_err(dev, "Invalid range %u\n", data->range);
++		return -EINVAL;
++	}
++
++	mutex_lock(&data->mutex);
++	ret = regmap_read(data->regmap,
++			  BMC150_ACCEL_REG_OFFSET_X + chan->scan_index,
++			  &reg_val);
++	mutex_unlock(&data->mutex);
++	if (ret < 0) {
++		dev_err(dev, "Error reading offset register\n");
++		return ret;
++	}
++
++	*val = DIV_ROUND_CLOSEST((int)(s8)reg_val *
++				 (1 << (chan->scan_type.realbits - 8)), g);
++
++	return IIO_VAL_INT;
++}
++
++static int bmc150_accel_set_calibbias(struct bmc150_accel_data *data,
++				      struct iio_chan_spec const *chan,
++				      int val)
++{
++	struct device *dev = regmap_get_device(data->regmap);
++	int g, reg_val, ret;
++
++	g = bmc150_accel_range_to_g(data->range);
++	if (!g) {
++		dev_err(dev, "Invalid range %u\n", data->range);
++		return -EINVAL;
++	}
++
++	val = clamp(val, -BMC150_ACCEL_CALIBBIAS_MAX,
++		    BMC150_ACCEL_CALIBBIAS_MAX);
++	reg_val = DIV_ROUND_CLOSEST(val * g,
++				    1 << (chan->scan_type.realbits - 8));
++	reg_val = clamp(reg_val, -128, 127);
++
++	mutex_lock(&data->mutex);
++	ret = regmap_write(data->regmap,
++			   BMC150_ACCEL_REG_OFFSET_X + chan->scan_index,
++			   reg_val & 0xff);
++	mutex_unlock(&data->mutex);
++	if (ret < 0) {
++		dev_err(dev, "Error writing offset register\n");
++		return ret;
++	}
++
++	return 0;
++}
++
+ static int bmc150_accel_get_axis(struct bmc150_accel_data *data,
+ 				 struct iio_chan_spec const *chan,
+ 				 int *val)
+@@ -669,6 +796,10 @@ static int bmc150_accel_read_raw(struct iio_dev *indio_dev,
+ 		default:
+ 			return -EINVAL;
+ 		}
++	case IIO_CHAN_INFO_CALIBBIAS:
++		if (chan->type != IIO_ACCEL)
++			return -EINVAL;
++		return bmc150_accel_get_calibbias(data, chan, val);
+ 	case IIO_CHAN_INFO_OFFSET:
+ 		if (chan->type == IIO_TEMP) {
+ 			*val = BMC150_ACCEL_TEMP_CENTER_VAL;
+@@ -723,6 +854,10 @@ static int bmc150_accel_write_raw(struct iio_dev *indio_dev,
+ 		ret = bmc150_accel_set_bw(data, val, val2);
+ 		mutex_unlock(&data->mutex);
+ 		break;
++	case IIO_CHAN_INFO_CALIBBIAS:
++		if (chan->type != IIO_ACCEL)
++			return -EINVAL;
++		return bmc150_accel_set_calibbias(data, chan, val);
+ 	case IIO_CHAN_INFO_SCALE:
+ 		if (val)
+ 			return -EINVAL;
+@@ -1054,7 +1189,8 @@ static const struct iio_event_spec bmc150_accel_event = {
+ 	.type = IIO_ACCEL,						\
+ 	.modified = 1,							\
+ 	.channel2 = IIO_MOD_##_axis,					\
+-	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),			\
++	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |			\
++			      BIT(IIO_CHAN_INFO_CALIBBIAS),		\
+ 	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE) |		\
+ 				BIT(IIO_CHAN_INFO_SAMP_FREQ),		\
+ 	.scan_index = AXIS_##_axis,					\
+@@ -1216,7 +1352,7 @@ static void bmc150_accel_trig_reen(struct iio_trigger *trig)
+ 	mutex_lock(&data->mutex);
+ 	/* clear any latched interrupt */
+ 	ret = regmap_write(data->regmap, BMC150_ACCEL_REG_INT_RST_LATCH,
+-			   BMC150_ACCEL_INT_MODE_LATCH_INT |
++			   data->int_latch |
+ 			   BMC150_ACCEL_INT_MODE_LATCH_RESET);
+ 	mutex_unlock(&data->mutex);
+ 	if (ret < 0)
+@@ -1337,7 +1473,7 @@ static irqreturn_t bmc150_accel_irq_thread_handler(int irq, void *private)
+ 
+ 	if (ack) {
+ 		ret = regmap_write(data->regmap, BMC150_ACCEL_REG_INT_RST_LATCH,
+-				   BMC150_ACCEL_INT_MODE_LATCH_INT |
++				   data->int_latch |
+ 				   BMC150_ACCEL_INT_MODE_LATCH_RESET);
+ 		if (ret)
+ 			dev_err(dev, "Error writing reg_int_rst_latch\n");
+@@ -1547,45 +1683,83 @@ static const struct iio_buffer_setup_ops bmc150_accel_buffer_ops = {
+ 	.postdisable = bmc150_accel_buffer_postdisable,
+ };
+ 
++static const struct bmc150_accel_chip_info *
++bmc150_accel_get_chip_info(unsigned int chip_id)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(bmc150_accel_chip_info_tbl); i++) {
++		if (bmc150_accel_chip_info_tbl[i].chip_id == chip_id)
++			return &bmc150_accel_chip_info_tbl[i];
++	}
++
++	return NULL;
++}
++
+ static int bmc150_accel_chip_init(struct bmc150_accel_data *data)
+ {
+ 	struct device *dev = regmap_get_device(data->regmap);
++	bool bma254 = device_is_compatible(dev, "bosch,bma254");
+ 	int ret, i;
+-	unsigned int val;
++	unsigned int val = 0;
+ 
+ 	/*
+-	 * Reset chip to get it in a known good state. A delay of 1.8ms after
+-	 * reset is required according to the data sheets of supported chips.
++	 * Reset chip to get it in a known good state. The data sheets require
++	 * a delay of 1.8 ms after the reset; the Samsung driver waits 5 ms
++	 * (bma2x2_probe: usleep_range(4900, 5000)) and we do the same.
+ 	 */
+ 	regmap_write(data->regmap, BMC150_ACCEL_REG_RESET,
+ 		     BMC150_ACCEL_RESET_VAL);
+-	usleep_range(1800, 2500);
+-
+-	ret = regmap_read(data->regmap, BMC150_ACCEL_REG_CHIP_ID, &val);
+-	if (ret < 0) {
+-		dev_err(dev, "Error: Reading chip id\n");
+-		return ret;
+-	}
++	usleep_range(4900, 5000);
+ 
+-	dev_dbg(dev, "Chip Id %x\n", val);
+-	for (i = 0; i < ARRAY_SIZE(bmc150_accel_chip_info_tbl); i++) {
+-		if (bmc150_accel_chip_info_tbl[i].chip_id == val) {
+-			data->chip_info = &bmc150_accel_chip_info_tbl[i];
+-			break;
++	/*
++	 * The chip may not answer the first accesses after power-up. Retry the
++	 * chip ID read, like the Samsung driver does (5 attempts, 1 ms apart),
++	 * before giving up.
++	 */
++	for (i = 0; i < BMC150_ACCEL_CHIP_ID_RETRIES; i++) {
++		ret = regmap_read(data->regmap, BMC150_ACCEL_REG_CHIP_ID, &val);
++		if (!ret) {
++			data->chip_info = bmc150_accel_get_chip_info(val);
++			if (data->chip_info)
++				break;
+ 		}
++		usleep_range(1000, 1100);
+ 	}
+ 
+ 	if (!data->chip_info) {
++		if (ret < 0) {
++			dev_err(dev, "Error reading chip id: %d\n", ret);
++			return ret;
++		}
+ 		dev_err(dev, "Invalid chip %x\n", val);
+ 		return -ENODEV;
+ 	}
+ 
++	dev_dbg(dev, "Chip Id %x\n", val);
++
+ 	ret = bmc150_accel_set_mode(data, BMC150_ACCEL_SLEEP_MODE_NORMAL, 0);
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/*
++	 * The Samsung BMA2x2 driver configures the BMA254 with a 125 Hz
++	 * filter bandwidth (PMU_BW = 0x0c), a 250 ms interrupt latch
++	 * (INT_RST_LATCH = 0x01) and a slope threshold of 5 for the
++	 * any-motion "reactive" alert.
++	 */
++	if (bma254) {
++		data->int_latch = BMC150_ACCEL_INT_MODE_LATCH_250MS;
++		data->slope_thres = BMC150_ACCEL_BMA254_SLOPE_THRESHOLD;
++	} else {
++		data->int_latch = BMC150_ACCEL_INT_MODE_LATCH_INT;
++		data->slope_thres = BMC150_ACCEL_DEF_SLOPE_THRESHOLD;
++	}
++	data->slope_dur = BMC150_ACCEL_DEF_SLOPE_DURATION;
++
+ 	/* Set Bandwidth */
+-	ret = bmc150_accel_set_bw(data, BMC150_ACCEL_DEF_BW, 0);
++	ret = bmc150_accel_set_bw(data, bma254 ? BMC150_ACCEL_BMA254_DEF_BW :
++						 BMC150_ACCEL_DEF_BW, 0);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -1600,15 +1774,13 @@ static int bmc150_accel_chip_init(struct bmc150_accel_data *data)
+ 	data->range = BMC150_ACCEL_DEF_RANGE_4G;
+ 
+ 	/* Set default slope duration and thresholds */
+-	data->slope_thres = BMC150_ACCEL_DEF_SLOPE_THRESHOLD;
+-	data->slope_dur = BMC150_ACCEL_DEF_SLOPE_DURATION;
+ 	ret = bmc150_accel_update_slope(data);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	/* Set default as latched interrupts */
++	/* Set default latch mode */
+ 	ret = regmap_write(data->regmap, BMC150_ACCEL_REG_INT_RST_LATCH,
+-			   BMC150_ACCEL_INT_MODE_LATCH_INT |
++			   data->int_latch |
+ 			   BMC150_ACCEL_INT_MODE_LATCH_RESET);
+ 	if (ret < 0) {
+ 		dev_err(dev, "Error writing reg_int_rst_latch\n");
+@@ -1717,6 +1889,7 @@ int bmc150_accel_core_probe(struct device *dev, struct regmap *regmap, int irq,
+ 		 * flooding.
+ 		 */
+ 		ret = regmap_write(data->regmap, BMC150_ACCEL_REG_INT_RST_LATCH,
++				   data->int_latch |
+ 				   BMC150_ACCEL_INT_MODE_LATCH_RESET);
+ 		if (ret < 0) {
+ 			dev_err(dev, "Error writing reg_int_rst_latch\n");
+@@ -1791,7 +1964,19 @@ static int bmc150_accel_suspend(struct device *dev)
+ 	struct bmc150_accel_data *data = iio_priv(indio_dev);
+ 
+ 	mutex_lock(&data->mutex);
+-	bmc150_accel_set_mode(data, BMC150_ACCEL_SLEEP_MODE_SUSPEND, 0);
++	/*
++	 * Keep the sensor measuring while the any-motion interrupt is armed,
++	 * so that it can wake the system up. The Samsung driver does the same
++	 * for its "reactive alert": bma2x2_suspend() skips the suspend mode
++	 * transition when reactive_enable is set, and the alert is armed with
++	 * the chip in low-power mode (bma2x2_reactive_enable_store() enters
++	 * BMA2X2_MODE_LOWPOWER1, PMU_LPW mode bits 2). BMC150_ACCEL_SLEEP_MODE_LPM
++	 * programs the same PMU_LPW mode bits.
++	 */
++	if (atomic_read(&data->interrupts[BMC150_ACCEL_INT_ANY_MOTION].users))
++		bmc150_accel_set_mode(data, BMC150_ACCEL_SLEEP_MODE_LPM, 0);
++	else
++		bmc150_accel_set_mode(data, BMC150_ACCEL_SLEEP_MODE_SUSPEND, 0);
+ 	mutex_unlock(&data->mutex);
+ 
+ 	return 0;
+diff --git a/drivers/iio/accel/bmc150-accel.h b/drivers/iio/accel/bmc150-accel.h
+index e8f261983..7c27f5e34 100644
+--- a/drivers/iio/accel/bmc150-accel.h
++++ b/drivers/iio/accel/bmc150-accel.h
+@@ -74,6 +74,7 @@ struct bmc150_accel_data {
+ 		aligned_s64 ts;
+ 	} scan;
+ 	u8 bw_bits;
++	u8 int_latch;
+ 	u32 slope_dur;
+ 	u32 slope_thres;
+ 	u32 range;

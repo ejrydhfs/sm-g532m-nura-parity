@@ -1,0 +1,2466 @@
+diff --git a/drivers/misc/mediatek/Kconfig b/drivers/misc/mediatek/Kconfig
+index cba2e7fc4..69835af1a 100644
+--- a/drivers/misc/mediatek/Kconfig
++++ b/drivers/misc/mediatek/Kconfig
+@@ -7,3 +7,4 @@ source "drivers/misc/mediatek/ccci_cldma/Kconfig"
+ source "drivers/misc/mediatek/ccci_util/Kconfig"
+ source "drivers/misc/mediatek/btif/Kconfig"
+ source "drivers/misc/mediatek/connectivity/Kconfig"
++source "drivers/misc/mediatek/aee/Kconfig"
+diff --git a/drivers/misc/mediatek/Makefile b/drivers/misc/mediatek/Makefile
+index e77fb43c0..46f929c6d 100644
+--- a/drivers/misc/mediatek/Makefile
++++ b/drivers/misc/mediatek/Makefile
+@@ -7,3 +7,4 @@ obj-y += ccci_cldma/
+ obj-y += ccci_util/
+ obj-y += btif/
+ obj-y += connectivity/
++obj-$(CONFIG_MTK_AEE_FEATURE) += aee/
+diff --git a/drivers/misc/mediatek/aee/Kconfig b/drivers/misc/mediatek/aee/Kconfig
+new file mode 100644
+index 000000000..f7b16e206
+--- /dev/null
++++ b/drivers/misc/mediatek/aee/Kconfig
+@@ -0,0 +1,20 @@
++# SPDX-License-Identifier: GPL-2.0
++config MTK_AEE_FEATURE
++	bool "MediaTek AEE/AED exception dump client"
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	help
++	  AEE (Android Exception Engine) / AED (Android Exception Device)
++	  client interface of MT6735/MT6737T: the /dev/aed0 (external
++	  exception, EE) and /dev/aed1 (kernel exception, KE) misc devices,
++	  the AE_Msg request/response protocol used by the ROM AEE client,
++	  the exception-dump ("DB") ioctls, the /proc/aed entries and the
++	  aed_md_exception_api()/aed_md32_exception_api()/
++	  aed_scp_exception_api()/aed_combo_exception_api() entry points that
++	  the CCCI exception path calls when the modem, the DSP or the SCP
++	  reports an exception.
++
++	  Ported from the Samsung/MTK 3.18 downstream kernel
++	  drivers/misc/mediatek/aee/ (aed/aed-main.c, common/aee-common.c).
++
++	  Say Y to get /dev/aed0 and to deliver modem exception dumps to
++	  userspace.
+diff --git a/drivers/misc/mediatek/aee/Makefile b/drivers/misc/mediatek/aee/Makefile
+new file mode 100644
+index 000000000..e4615667b
+--- /dev/null
++++ b/drivers/misc/mediatek/aee/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_MTK_AEE_FEATURE)	+= aed-main.o
++obj-$(CONFIG_MTK_AEE_FEATURE)	+= aed-process.o
+diff --git a/drivers/misc/mediatek/aee/aed-main.c b/drivers/misc/mediatek/aee/aed-main.c
+new file mode 100644
+index 000000000..0f87a7783
+--- /dev/null
++++ b/drivers/misc/mediatek/aee/aed-main.c
+@@ -0,0 +1,1160 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek AED (Android Exception Device) driver.
++ *
++ * The ROM exposes two misc devices, "aed0" (external exception, EE) and
++ * "aed1" (kernel exception, KE) (vmlinux.strings:45359-45360, symbols
++ * aed_ee_open 0xc062a328 / aed_ke_open 0xc062a5a0, aed_ioctl 0xc062a614).
++ * They carry the AE_Msg request/response protocol of the AEE client
++ * (downstream aed/aed.h:63-167) and the exception-dump ("DB") ioctls.
++ *
++ * The modem exception path enters through aed_md_exception_api()
++ * (ROM 0xc0628298) and is served by the EE record queue below; the detail
++ * response carries the CCCI debug window through aee_dump_ccci_debug_info()
++ * exactly like downstream ee_gen_detail_msg() (aed-main.c:744-813).
++ *
++ * Ported from the Samsung/MTK 3.18 downstream kernel
++ * drivers/misc/mediatek/aee/aed/aed-main.c and
++ * drivers/misc/mediatek/aee/common/aee-common.c:
++ *   msg_create/msg_destroy/msg_copy_to_user()  aed-main.c:203-260
++ *   ee_gen_*_msg()                             aed-main.c:685-914
++ *   ee_destroy_log()/ee_queue_request()/
++ *   ee_worker()                                aed-main.c:816-968
++ *   aed_ee_open/release/poll/read/write()      aed-main.c:975-1105
++ *   aed_ke_open/release/poll/read/write()      aed-main.c:1107-1265
++ *   aed_ioctl_bt()                             aed-main.c:1268-1300
++ *   aed_ioctl()                                aed-main.c:1302-1526
++ *   external_exception()                       aed-main.c:1844-1917
++ *   aed_proc_init()/aed_proc_done()            aed-main.c:1961-2015
++ *   misc device registration + init/exit       aed-main.c:2036-2100
++ *   aed_md_exception_api() and the md32/scp/
++ *   combo variants                             aee-common.c:224-300
++ * Original copyright: Copyright (C) 2010/2015 MediaTek Inc. GPL-2.0.
++ *
++ * Deviations from the downstream code are listed in
++ * $M/logs/rem2-aee.md, section 6; every one of them is marked below with
++ * "DEVIATION".
++ */
++#include <linux/compat.h>
++#include <linux/completion.h>
++#include <linux/fs.h>
++#include <linux/hardirq.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/ioctl.h>
++#include <linux/kernel.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/poll.h>
++#include <linux/proc_fs.h>
++#include <linux/sched.h>
++#include <linux/sched/coredump.h>
++#include <linux/sched/mm.h>
++#include <linux/sched/signal.h>
++#include <linux/sched/task.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/string.h>
++#include <linux/thread_info.h>
++#include <linux/uaccess.h>
++#include <linux/vmalloc.h>
++#include <linux/wait.h>
++#include <linux/workqueue.h>
++
++#include <linux/aee.h>
++
++#if IS_ENABLED(CONFIG_MTK_CCCI) && !IS_MODULE(CONFIG_MTK_CCCI)
++#include <linux/ccci.h>
++#define AED_HAS_CCCI_DEBUG_INFO 1
++#endif
++
++#include "aed.h"
++
++/* aed-main.c:165 */
++#define MAX_EE_COREDUMP		0x800000
++/* aed-main.c:938: the EE worker waits up to 5 minutes for AE_IND_LOG_CLOSE */
++#define AED_EE_CLOSE_TIMEOUT	(5 * 60 * HZ)
++
++#define CURRENT_EE_COREDUMP	"current-ee-coredump"
++
++struct aee_req_queue {
++	struct list_head list;
++	spinlock_t lock;
++};
++
++/* aed-main.c:169-182 */
++struct aed_kerec {
++	char *msg;
++};
++
++struct aed_dev {
++	struct aed_eerec *eerec;
++	wait_queue_head_t eewait;
++
++	struct aed_kerec kerec;
++	wait_queue_head_t kewait;
++
++	/* protects eerec and every message buffer of both devices */
++	struct mutex msg_lock;
++};
++
++static struct aee_req_queue ee_queue;
++static struct work_struct ee_work;
++static DECLARE_COMPLETION(aed_ee_com);
++
++/*
++ * aed-main.c:66-84.  aee_mode defaults to AEE_MODE_NOT_INIT downstream and
++ * external_exception() refuses to run while it is >= AEE_MODE_CUSTOMER_USER
++ * (aed-main.c:1862); the ROM's AED daemon raises it to a working mode through
++ * AEEIOCTL_SET_AEE_MODE.  This tree has no such daemon, so the default is the
++ * non-suppressing MTK user mode (DEVIATION, see the report).
++ */
++static int aee_mode = AEE_MODE_MTK_USER;
++
++static struct aed_dev aed_dev;
++/* aed-main.c:2036-2050 */
++static struct miscdevice aed_ee_dev = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "aed0",
++	.mode = 0600,
++};
++
++static struct miscdevice aed_ke_dev = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "aed1",
++	.mode = 0600,
++};
++
++static struct proc_dir_entry *aed_proc_dir;
++static struct proc_dir_entry *aed_ee_coredump;
++
++static long aed_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
++
++/* ------------------------------------------------------------------ */
++/* Message utilities, aed-main.c:203-260                              */
++/* ------------------------------------------------------------------ */
++
++static void msg_destroy(char **ppmsg)
++{
++	if (*ppmsg) {
++		vfree(*ppmsg);
++		*ppmsg = NULL;
++	}
++}
++
++static struct AE_Msg *msg_create(char **ppmsg, int extra_size)
++{
++	struct AE_Msg *msg;
++
++	msg_destroy(ppmsg);
++	*ppmsg = vzalloc(sizeof(struct AE_Msg) + extra_size);
++	if (!*ppmsg)
++		return NULL;
++
++	msg = (struct AE_Msg *)*ppmsg;
++	msg->len = extra_size;
++	return msg;
++}
++
++/*
++ * aed-main.c:219-260.  DEVIATION: a short user buffer is clamped to the
++ * remaining message instead of returning -EFAULT with a shortened count,
++ * which is the normal read(2) contract.
++ */
++static ssize_t msg_copy_to_user(const char *msg, char __user *buf,
++				size_t count, loff_t *f_pos)
++{
++	size_t len;
++
++	if (!msg)
++		return 0;
++
++	len = ((struct AE_Msg *)msg)->len + sizeof(struct AE_Msg);
++	if (*f_pos >= len)
++		return 0;
++
++	if (*f_pos + count > len)
++		count = len - *f_pos;
++
++	if (copy_to_user(buf, msg + *f_pos, count))
++		return -EFAULT;
++
++	*f_pos += count;
++	return count;
++}
++
++/* ------------------------------------------------------------------ */
++/* External exception record                                          */
++/* ------------------------------------------------------------------ */
++
++/* caller holds aed_dev.msg_lock */
++static void ee_free_record(struct aed_eerec *eerec)
++{
++	msg_destroy(&eerec->msg);
++	kfree(eerec->ee_log);
++	kfree(eerec->ee_phy);
++	kfree(eerec);
++}
++
++static void ee_destroy_log(void)
++{
++	struct aed_eerec *eerec;
++
++	mutex_lock(&aed_dev.msg_lock);
++	eerec = aed_dev.eerec;
++	aed_dev.eerec = NULL;
++	if (eerec)
++		ee_free_record(eerec);
++	mutex_unlock(&aed_dev.msg_lock);
++}
++
++/* ------------------------------------------------------------------ */
++/* Text builder for the EE detail response                            */
++/* ------------------------------------------------------------------ */
++
++struct aed_detail {
++	char *buf;
++	size_t size;
++	size_t len;
++};
++
++static void aed_detail_printf(struct aed_detail *d, const char *fmt, ...)
++	__printf(2, 3);
++static void aed_detail_printf(struct aed_detail *d, const char *fmt, ...)
++{
++	va_list args;
++	int n;
++
++	if (d->len >= d->size)
++		return;
++
++	va_start(args, fmt);
++	n = vscnprintf(d->buf + d->len, d->size - d->len, fmt, args);
++	va_end(args);
++	d->len += n;
++}
++
++/* aed-main.c:790-800: four 32-bit words per line */
++static void aed_detail_hexwords(struct aed_detail *d, const void *data, size_t len)
++{
++	const u32 *words = data;
++	size_t off;
++
++	for (off = 0; off + 16 <= len; off += 16)
++		aed_detail_printf(d, "0x%08X 0x%08X 0x%08X 0x%08X\n",
++				  words[off / 4 + 0], words[off / 4 + 1],
++				  words[off / 4 + 2], words[off / 4 + 3]);
++
++	/* a length that is not a multiple of 16 must not lose its tail */
++	for (; off + 4 <= len; off += 4)
++		aed_detail_printf(d, "0x%08X\n", words[off / 4]);
++}
++
++/* ------------------------------------------------------------------ */
++/* EE message generators, aed-main.c:685-914                         */
++/* ------------------------------------------------------------------ */
++
++static void ee_gen_notavail_msg(struct aed_eerec *eerec)
++{
++	struct AE_Msg *rep_msg = msg_create(&eerec->msg, 0);
++
++	if (!rep_msg)
++		return;
++
++	rep_msg->cmdType = AE_RSP;
++	rep_msg->arg = AE_NOT_AVAILABLE;
++	rep_msg->len = 0;
++}
++
++static void ee_gen_class_msg(struct aed_eerec *eerec)
++{
++#define EX_CLASS_EE_STR "External (EE)"
++#define EX_CLASS_EE_SIZE 14
++	struct AE_Msg *rep_msg;
++	char *data;
++
++	rep_msg = msg_create(&eerec->msg, EX_CLASS_EE_SIZE);
++	if (!rep_msg)
++		return;
++
++	data = (char *)rep_msg + sizeof(struct AE_Msg);
++	rep_msg->cmdType = AE_RSP;
++	rep_msg->cmdId = AE_REQ_CLASS;
++	rep_msg->len = EX_CLASS_EE_SIZE;
++	strncpy(data, EX_CLASS_EE_STR, EX_CLASS_EE_SIZE);
++}
++
++static void ee_gen_type_msg(struct aed_eerec *eerec)
++{
++	struct AE_Msg *rep_msg;
++	char *data;
++	size_t len = strlen(eerec->assert_type) + 1;
++
++	rep_msg = msg_create(&eerec->msg, len);
++	if (!rep_msg)
++		return;
++
++	data = (char *)rep_msg + sizeof(struct AE_Msg);
++	rep_msg->cmdType = AE_RSP;
++	rep_msg->cmdId = AE_REQ_TYPE;
++	rep_msg->len = len;
++	strscpy(data, eerec->assert_type, len);
++}
++
++static void ee_gen_process_msg(struct aed_eerec *eerec)
++{
++#define PROCESS_STRLEN 512
++	struct AE_Msg *rep_msg;
++	char *data;
++	int n;
++
++	rep_msg = msg_create(&eerec->msg, PROCESS_STRLEN);
++	if (!rep_msg)
++		return;
++
++	data = (char *)rep_msg + sizeof(struct AE_Msg);
++	n = snprintf(data, PROCESS_STRLEN, "%s", eerec->exp_filename);
++
++	rep_msg->cmdType = AE_RSP;
++	rep_msg->cmdId = AE_REQ_PROCESS;
++	rep_msg->len = n + 1;
++}
++
++/*
++ * aed-main.c:744-813.  For an assert_type of "modem" the detail string starts
++ * with "mdN:" and the CCCI debug record of that modem is appended as a hex
++ * dump, fetched through aee_dump_ccci_debug_info() (frozen <linux/ccci.h> ABI,
++ * ROM 0xc0508b54).
++ *
++ * DEVIATION: the CCCI window is ioremapped by the Nura CCCI core
++ * (ccci_boot.c:302/332/382), so it is copied out with memcpy_fromio() before
++ * being formatted; the downstream ARM32 code dereferenced it directly.  The
++ * message size is the exact byte count instead of downstream's
++ * (ee_log_size + ccci_log_size) * 4 + 128.
++ */
++static void ee_gen_detail_msg(struct aed_eerec *eerec)
++{
++	struct AE_Msg *rep_msg = NULL;
++	struct aed_detail d;
++	void *ccci_win = NULL;
++	char *ccci = NULL;
++	int ccci_size = 0;
++	size_t total;
++
++	if (!strncmp(eerec->assert_type, "md32", 4)) {
++		total = (size_t)eerec->ee_log_size + 128;
++		if (total > INT_MAX / 2)
++			return;
++
++		rep_msg = msg_create(&eerec->msg, (int)total);
++		if (!rep_msg)
++			return;
++
++		memset(&d, 0, sizeof(d));
++		d.buf = (char *)rep_msg + sizeof(struct AE_Msg);
++		d.size = total;
++		aed_detail_printf(&d, "== EXTERNAL EXCEPTION LOG ==\n%s\n",
++				  (char *)eerec->ee_log);
++		goto out;
++	}
++
++#ifdef AED_HAS_CCCI_DEBUG_INFO
++	if (!strncmp(eerec->assert_type, "modem", 5)) {
++		int md_id = 0;
++
++		if (sscanf(eerec->exp_filename, "md%d:", &md_id) != 1 ||
++		    aee_dump_ccci_debug_info(md_id, &ccci_win, &ccci_size) ||
++		    !ccci_win || ccci_size <= 0) {
++			ccci_win = NULL;
++			ccci_size = 0;
++		}
++	}
++#endif
++
++	if (ccci_size > 0) {
++		ccci = kmalloc(ccci_size, GFP_KERNEL);
++		if (!ccci) {
++			ccci_size = 0;
++		} else {
++			memcpy_fromio(ccci, (const void __iomem *)ccci_win,
++				      ccci_size);
++		}
++	}
++
++	total = (size_t)eerec->ee_log_size + ccci_size + 256;
++	if (total > INT_MAX / 2)
++		goto out;
++
++	rep_msg = msg_create(&eerec->msg, (int)total);
++	if (!rep_msg)
++		goto out;
++
++	memset(&d, 0, sizeof(d));
++	d.buf = (char *)rep_msg + sizeof(struct AE_Msg);
++	d.size = total;
++
++	aed_detail_printf(&d, "== EXTERNAL EXCEPTION LOG ==\n");
++	if (eerec->ee_log) {
++		aed_detail_hexwords(&d, eerec->ee_log, eerec->ee_log_size);
++	} else {
++		aed_detail_printf(&d, "kmalloc fail, no log available\n");
++	}
++	aed_detail_printf(&d, "== MEM DUMP(%d) ==\n", eerec->ee_phy_size);
++
++	if (ccci) {
++		aed_detail_printf(&d, "== CCCI LOG ==\n");
++		aed_detail_hexwords(&d, ccci, ccci_size);
++		aed_detail_printf(&d, "== MEM DUMP(%d) ==\n", ccci_size);
++	}
++
++out:
++	kfree(ccci);
++
++	if (!rep_msg)
++		return;
++
++	rep_msg->cmdType = AE_RSP;
++	rep_msg->cmdId = AE_REQ_DETAIL;
++	rep_msg->arg = AE_PASS_BY_MEM;
++	rep_msg->len = d.len + 1;
++}
++
++static void ee_gen_coredump_msg(struct aed_eerec *eerec)
++{
++	struct AE_Msg *rep_msg;
++	char *data;
++
++	rep_msg = msg_create(&eerec->msg, 256);
++	if (!rep_msg)
++		return;
++
++	data = (char *)rep_msg + sizeof(struct AE_Msg);
++	rep_msg->cmdType = AE_RSP;
++	rep_msg->cmdId = AE_REQ_COREDUMP;
++	rep_msg->arg = 0;
++	snprintf(data, 256, "/proc/aed/%s", CURRENT_EE_COREDUMP);
++	rep_msg->len = strlen(data) + 1;
++}
++
++/* ------------------------------------------------------------------ */
++/* EE queue, worker and notification, aed-main.c:938-968, 1884-1917   */
++/* ------------------------------------------------------------------ */
++
++static void ee_queue_request(struct aed_eerec *eerec)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&ee_queue.lock, flags);
++	list_add_tail(&eerec->list, &ee_queue.list);
++	spin_unlock_irqrestore(&ee_queue.lock, flags);
++	queue_work(system_wq, &ee_work);
++}
++
++/*
++ * aed-main.c:884-914 (ee_gen_ind_msg).  Returns true when the record became
++ * the current one and was announced to userspace.
++ */
++static bool ee_gen_ind_msg(struct aed_eerec *eerec)
++{
++	struct AE_Msg *rep_msg;
++
++	mutex_lock(&aed_dev.msg_lock);
++	if (aed_dev.eerec) {
++		mutex_unlock(&aed_dev.msg_lock);
++		pr_warn("AED: more than one EE message queued, dropping\n");
++		return false;
++	}
++	aed_dev.eerec = eerec;
++
++	/*
++	 * DEVIATION: the completion is armed before the message can be seen,
++	 * so an immediate AE_IND_LOG_CLOSE cannot be lost (downstream arms it
++	 * after publishing, aed-main.c:901-904).
++	 */
++	init_completion(&aed_ee_com);
++
++	rep_msg = msg_create(&eerec->msg, 0);
++	if (rep_msg) {
++		rep_msg->cmdType = AE_IND;
++		rep_msg->cmdId = AE_IND_EXP_RAISED;
++		rep_msg->arg = AE_EE;
++		rep_msg->len = 0;
++		rep_msg->dbOption = eerec->db_opt;
++	}
++	mutex_unlock(&aed_dev.msg_lock);
++
++	wake_up(&aed_dev.eewait);
++	if (!wait_for_completion_timeout(&aed_ee_com, AED_EE_CLOSE_TIMEOUT))
++		pr_err("AED: EE TIMEOUT, no close event, skip\n");
++
++	return true;
++}
++
++static void ee_worker(struct work_struct *work)
++{
++	struct aed_eerec *eerec;
++	unsigned long flags;
++
++	for (;;) {
++		spin_lock_irqsave(&ee_queue.lock, flags);
++		if (list_empty(&ee_queue.list)) {
++			spin_unlock_irqrestore(&ee_queue.lock, flags);
++			break;
++		}
++		eerec = list_first_entry(&ee_queue.list, struct aed_eerec,
++					 list);
++		list_del(&eerec->list);
++		spin_unlock_irqrestore(&ee_queue.lock, flags);
++
++		if (ee_gen_ind_msg(eerec)) {
++			ee_destroy_log();
++		} else {
++			/*
++			 * DEVIATION: downstream destroys the *current* record in
++			 * this case (ee_worker(), aed-main.c:956-967); free the
++			 * dropped one instead.
++			 */
++			mutex_lock(&aed_dev.msg_lock);
++			ee_free_record(eerec);
++			mutex_unlock(&aed_dev.msg_lock);
++		}
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* /dev/aed0 file operations, aed-main.c:975-1105                     */
++/* ------------------------------------------------------------------ */
++
++static int aed_ee_open(struct inode *inode, struct file *filp)
++{
++	return 0;
++}
++
++static int aed_ee_release(struct inode *inode, struct file *filp)
++{
++	return 0;
++}
++
++static __poll_t aed_ee_poll(struct file *file, struct poll_table_struct *ptable)
++{
++	__poll_t mask = 0;
++
++	poll_wait(file, &aed_dev.eewait, ptable);
++
++	mutex_lock(&aed_dev.msg_lock);
++	if (aed_dev.eerec && aed_dev.eerec->msg)
++		mask = EPOLLIN | EPOLLRDNORM | EPOLLOUT | EPOLLWRNORM;
++	mutex_unlock(&aed_dev.msg_lock);
++
++	return mask;
++}
++
++static ssize_t aed_ee_read(struct file *filp, char __user *buf, size_t count,
++			   loff_t *f_pos)
++{
++	ssize_t ret;
++
++	mutex_lock(&aed_dev.msg_lock);
++	ret = msg_copy_to_user(aed_dev.eerec ? aed_dev.eerec->msg : NULL,
++			       buf, count, f_pos);
++	mutex_unlock(&aed_dev.msg_lock);
++
++	return ret;
++}
++
++static ssize_t aed_ee_write(struct file *filp, const char __user *buf,
++			    size_t count, loff_t *f_pos)
++{
++	struct aed_eerec *eerec;
++	struct AE_Msg msg;
++	ssize_t ret;
++
++	*f_pos = 0;
++
++	mutex_lock(&aed_dev.msg_lock);
++	eerec = aed_dev.eerec;
++	if (!eerec) {
++		/* aed-main.c:1004-1006 */
++		ret = -ENODEV;
++		goto out;
++	}
++
++	/* a new request invalidates the previous response (aed-main.c:998) */
++	msg_destroy(&eerec->msg);
++
++	if (count != sizeof(struct AE_Msg)) {
++		ret = -EINVAL;
++		goto out;
++	}
++	if (copy_from_user(&msg, buf, count)) {
++		ret = -EFAULT;
++		goto out;
++	}
++
++	if (msg.cmdType == AE_REQ) {
++		switch (msg.cmdId) {
++		case AE_REQ_CLASS:
++			ee_gen_class_msg(eerec);
++			break;
++		case AE_REQ_TYPE:
++			ee_gen_type_msg(eerec);
++			break;
++		case AE_REQ_DETAIL:
++			ee_gen_detail_msg(eerec);
++			break;
++		case AE_REQ_PROCESS:
++			ee_gen_process_msg(eerec);
++			break;
++		case AE_REQ_BACKTRACE:
++			/* aed-main.c:1038: EE has no kernel backtrace */
++			ee_gen_notavail_msg(eerec);
++			break;
++		case AE_REQ_COREDUMP:
++			ee_gen_coredump_msg(eerec);
++			break;
++		default:
++			ee_gen_notavail_msg(eerec);
++			break;
++		}
++	} else if (msg.cmdType == AE_IND && msg.cmdId == AE_IND_LOG_CLOSE) {
++		complete(&aed_ee_com);
++	}
++
++	ret = count;
++out:
++	mutex_unlock(&aed_dev.msg_lock);
++	return ret;
++}
++
++/* ------------------------------------------------------------------ */
++/* /dev/aed1 file operations, aed-main.c:1107-1265                    */
++/* ------------------------------------------------------------------ */
++
++/*
++ * There is no kernel exception ("KE") producer in this tree: ipanic, mrdump,
++ * the DRAM console and aee_oops_create()/aee_kernel_exception_api() are not
++ * ported (see the report).  The device is registered because the ROM exposes
++ * it and because a client may poll/open it; every request is answered with the
++ * AE_NOT_AVAILABLE indication, which is exactly what downstream returns when
++ * no oops is queued (ke_log_avail() false, aed-main.c:1014-1020).
++ */
++static void ke_gen_notavail_msg(void)
++{
++	struct AE_Msg *rep_msg = msg_create(&aed_dev.kerec.msg, 0);
++
++	if (!rep_msg)
++		return;
++
++	rep_msg->cmdType = AE_RSP;
++	rep_msg->arg = AE_NOT_AVAILABLE;
++	rep_msg->len = 0;
++}
++
++static int aed_ke_open(struct inode *inode, struct file *filp)
++{
++	return 0;
++}
++
++static int aed_ke_release(struct inode *inode, struct file *filp)
++{
++	return 0;
++}
++
++static __poll_t aed_ke_poll(struct file *file, struct poll_table_struct *ptable)
++{
++	__poll_t mask = 0;
++
++	poll_wait(file, &aed_dev.kewait, ptable);
++
++	mutex_lock(&aed_dev.msg_lock);
++	if (aed_dev.kerec.msg)
++		mask = EPOLLIN | EPOLLRDNORM | EPOLLOUT | EPOLLWRNORM;
++	mutex_unlock(&aed_dev.msg_lock);
++
++	return mask;
++}
++
++static ssize_t aed_ke_read(struct file *filp, char __user *buf, size_t count,
++			   loff_t *f_pos)
++{
++	ssize_t ret;
++
++	mutex_lock(&aed_dev.msg_lock);
++	ret = msg_copy_to_user(aed_dev.kerec.msg, buf, count, f_pos);
++	mutex_unlock(&aed_dev.msg_lock);
++
++	return ret;
++}
++
++static ssize_t aed_ke_write(struct file *filp, const char __user *buf,
++			    size_t count, loff_t *f_pos)
++{
++	struct AE_Msg msg;
++
++	*f_pos = 0;
++
++	if (count != sizeof(struct AE_Msg))
++		return -EINVAL;
++	if (copy_from_user(&msg, buf, count))
++		return -EFAULT;
++
++	if (msg.cmdType == AE_REQ) {
++		mutex_lock(&aed_dev.msg_lock);
++		ke_gen_notavail_msg();
++		mutex_unlock(&aed_dev.msg_lock);
++	}
++
++	return count;
++}
++
++/* ------------------------------------------------------------------ */
++/* ioctls, aed-main.c:1268-1526                                       */
++/* ------------------------------------------------------------------ */
++
++/*
++ * aed-main.c:1268-1300 (aed_ioctl_bt).  On success the caller's aee_ioctl is
++ * updated (detail = AE_DEFAULT, size = frame count) and the frames are written
++ * to ioctl.out.
++ */
++static long aed_ioctl_bt(unsigned long arg)
++{
++	struct aee_process_bt bt;
++	struct aee_ioctl ioctl;
++	void *frames;
++	long ret;
++
++	if (copy_from_user(&ioctl, (struct aee_ioctl __user *)arg,
++			   sizeof(ioctl)))
++		return -EFAULT;
++
++	/* aed-process.c:171-204 writes at most AEE_NR_FRAME frames */
++	frames = kzalloc(sizeof(struct aee_bt_frame) * AEE_NR_FRAME,
++			 GFP_KERNEL);
++	if (!frames)
++		return -ENOMEM;
++
++	bt.pid = ioctl.pid;
++	bt.nr_entries = 0;
++	bt.entries = frames;
++
++	ret = aed_get_process_bt(&bt);
++	if (ret)
++		goto out;
++
++	ioctl.detail = AE_DEFAULT;
++	ioctl.size = bt.nr_entries;
++	if (copy_to_user((struct aee_ioctl __user *)arg, &ioctl,
++			 sizeof(ioctl))) {
++		ret = -EFAULT;
++		goto out;
++	}
++	if (!ioctl.out ||
++	    copy_to_user((struct aee_bt_frame __user *)(unsigned long)ioctl.out,
++			 frames, sizeof(struct aee_bt_frame) * AEE_NR_FRAME))
++		ret = -EFAULT;
++
++out:
++	kfree(frames);
++	return ret;
++}
++
++/*
++ * aed-main.c:1360-1435 (AEEIOCTL_GET_THREAD_REG).  The client library tries
++ * the 296-byte encoding first and falls back to the 76-byte one; the 76-byte
++ * payload only describes an AArch32 task, so it is refused for a 64-bit one.
++ */
++static long aed_ioctl_get_thread_reg(unsigned long arg, bool wide)
++{
++	struct task_struct *task;
++	const struct pt_regs *regs;
++	int i;
++
++	if (wide) {
++		struct aee_thread_reg64 out;
++
++		if (copy_from_user(&out, (void __user *)arg, sizeof(out)))
++			return -EFAULT;
++		if (out.tid <= 0)
++			return -EINVAL;
++
++		task = aed_find_task(out.tid);
++		if (!task)
++			return -EINVAL;
++
++		regs = task_pt_regs(task);
++		if (!regs) {
++			put_task_struct(task);
++			return -EINVAL;
++		}
++
++		/* arch/arm64/include/asm/ptrace.h:154-167 */
++		memcpy(out.regs, &regs->user_regs, sizeof(regs->user_regs));
++		out.regs[34] = regs->orig_x0;
++		out.regs[35] = (u32)regs->syscallno;
++
++		put_task_struct(task);
++
++		if (copy_to_user((void __user *)arg, &out, sizeof(out)))
++			return -EFAULT;
++		return 0;
++	}
++
++	{
++		struct aee_thread_reg out;
++
++		if (copy_from_user(&out, (void __user *)arg, sizeof(out)))
++			return -EFAULT;
++		if (out.tid <= 0)
++			return -EINVAL;
++
++		task = aed_find_task(out.tid);
++		if (!task)
++			return -EINVAL;
++
++		if (!is_compat_thread(task_thread_info(task))) {
++			/* a 64-bit task has no AArch32 register file */
++			put_task_struct(task);
++			return -EOPNOTSUPP;
++		}
++
++		regs = task_pt_regs(task);
++		if (!regs) {
++			put_task_struct(task);
++			return -EINVAL;
++		}
++
++		/*
++		 * AArch32 view of an arm64 pt_regs: r0-r12 live in regs[0..12],
++		 * the AArch32 SP/PC are the low halves of sp/pc, CPSR is PSTATE
++		 * and ARM_orig_r0 is orig_x0.  [INFERENCE] from the
++		 * architecture register mapping.
++		 */
++		for (i = 0; i < 13; i++)
++			out.regs[i] = (u32)regs->regs[i];
++		out.regs[13] = (u32)regs->sp;
++		out.regs[14] = (u32)regs->regs[14];
++		out.regs[15] = (u32)regs->pc;
++		out.regs[16] = (u32)regs->pstate;
++		out.regs[17] = (u32)regs->orig_x0;
++
++		put_task_struct(task);
++
++		if (copy_to_user((void __user *)arg, &out, sizeof(out)))
++			return -EFAULT;
++		return 0;
++	}
++}
++
++/* aed-main.c:1460-1495 (AEEIOCTL_CHECK_SUID_DUMPABLE) */
++static long aed_ioctl_check_dumpable(unsigned long arg)
++{
++	struct task_struct *task;
++	struct mm_struct *mm;
++	int pid, dumpable;
++	long ret = 0;
++
++	if (copy_from_user(&pid, (void __user *)arg, sizeof(pid)))
++		return -EFAULT;
++	if (pid <= 0)
++		return -EINVAL;
++
++	rcu_read_lock();
++	task = find_task_by_vpid(pid);
++	if (!task) {
++		rcu_read_unlock();
++		return -EINVAL;
++	}
++	mm = get_task_mm(task);
++	rcu_read_unlock();
++	if (!mm)
++		return -EINVAL;
++
++	dumpable = get_dumpable(mm);
++	if (dumpable == 0)
++		set_dumpable(mm, 1);
++
++	mmput(mm);
++	return ret;
++}
++
++static long aed_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	long ret;
++
++	switch (cmd) {
++	case AEEIOCTL_GET_THREAD_REG:
++		return aed_ioctl_get_thread_reg(arg, false);
++	case AEEIOCTL_GET_THREAD_REG64:
++		return aed_ioctl_get_thread_reg(arg, true);
++	case AEEIOCTL_GET_PROCESS_BT:
++		return aed_ioctl_bt(arg);
++	case AEEIOCTL_SET_AEE_MODE:
++		if (copy_from_user(&aee_mode, (void __user *)arg,
++				   sizeof(aee_mode)))
++			return -EFAULT;
++		pr_info("AED: aee mode = %d\n", aee_mode);
++		return 0;
++	case AEEIOCTL_CHECK_SUID_DUMPABLE:
++		return aed_ioctl_check_dumpable(arg);
++	default:
++		/*
++		 * DAL/red-screen/RT-monitor/WDT ioctls need subsystems that this
++		 * tree does not have; they are listed in the report as deferred.
++		 */
++		ret = -EOPNOTSUPP;
++		break;
++	}
++
++	return ret;
++}
++
++/* ------------------------------------------------------------------ */
++/* /proc/aed/current-ee-coredump, aed-main.c:1961-1985                */
++/* ------------------------------------------------------------------ */
++
++static ssize_t aed_ee_coredump_read(struct file *filp, char __user *buf,
++				    size_t count, loff_t *pos)
++{
++	ssize_t ret;
++
++	mutex_lock(&aed_dev.msg_lock);
++	if (!aed_dev.eerec || !aed_dev.eerec->ee_phy) {
++		ret = 0;
++	} else {
++		ret = simple_read_from_buffer(buf, count, pos,
++					      aed_dev.eerec->ee_phy,
++					      aed_dev.eerec->ee_phy_size);
++	}
++	mutex_unlock(&aed_dev.msg_lock);
++
++	return ret;
++}
++
++static const struct proc_ops aed_ee_coredump_ops = {
++	.proc_read = aed_ee_coredump_read,
++};
++
++static int aed_proc_init(void)
++{
++	aed_proc_dir = proc_mkdir("aed", NULL);
++	if (!aed_proc_dir)
++		return -ENOMEM;
++
++	aed_ee_coredump = proc_create(CURRENT_EE_COREDUMP, 0400, aed_proc_dir,
++				      &aed_ee_coredump_ops);
++	if (!aed_ee_coredump) {
++		remove_proc_entry("aed", NULL);
++		aed_proc_dir = NULL;
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
++static void aed_proc_done(void)
++{
++	if (aed_ee_coredump)
++		proc_remove(aed_ee_coredump);
++	if (aed_proc_dir)
++		remove_proc_entry("aed", NULL);
++}
++
++/* ------------------------------------------------------------------ */
++/* External exception entry, aed-main.c:1844-1917 + aee-common.c:224-300 */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Runs in the CCCI exception worker and may be called from any context, so
++ * every allocation is GFP_ATOMIC and nothing sleeps.  DEVIATION: the record
++ * payloads are kmalloc'ed instead of vmalloc_user()'ed (aed-main.c:1893-1907),
++ * because vmalloc may sleep; they are exported to userspace through
++ * /proc/aed/current-ee-coredump instead.
++ */
++static void external_exception(const char *assert_type, const int *log,
++			       int log_size, const int *phy, int phy_size,
++			       const char *detail, const int db_opt)
++{
++	struct aed_eerec *eerec;
++
++	if (aee_mode >= AEE_MODE_CUSTOMER_USER) {
++		pr_info("AED: external exception in mode %d, skipped\n",
++			aee_mode);
++		return;
++	}
++
++	eerec = kzalloc(sizeof(*eerec), GFP_ATOMIC);
++	if (!eerec) {
++		pr_err("AED: cannot allocate EE record\n");
++		return;
++	}
++	INIT_LIST_HEAD(&eerec->list);
++
++	if (log && log_size > 0) {
++		eerec->ee_log = kmalloc(log_size, GFP_ATOMIC);
++		if (eerec->ee_log) {
++			memcpy(eerec->ee_log, log, log_size);
++			eerec->ee_log_size = log_size;
++		}
++	}
++	if (!eerec->ee_log) {
++		/* aed-main.c:1876-1882: keep a zeroed placeholder log */
++		eerec->ee_log = kzalloc(16, GFP_ATOMIC);
++		if (!eerec->ee_log) {
++			kfree(eerec);
++			return;
++		}
++		eerec->ee_log_size = 16;
++	}
++
++	if (in_interrupt() || phy_size < 0 || phy_size > MAX_EE_COREDUMP)
++		phy_size = 0;
++
++	if (phy && phy_size > 0) {
++		eerec->ee_phy = kmalloc(phy_size, GFP_ATOMIC);
++		if (eerec->ee_phy) {
++			memcpy(eerec->ee_phy, phy, phy_size);
++			eerec->ee_phy_size = phy_size;
++		}
++	}
++
++	strscpy(eerec->assert_type, assert_type ?: "", sizeof(eerec->assert_type));
++	strscpy(eerec->exp_filename, detail ?: "", sizeof(eerec->exp_filename));
++	eerec->db_opt = db_opt;
++
++	ee_queue_request(eerec);
++}
++
++void aed_md_exception_api(const int *log, int log_size, const int *phy,
++			  int phy_size, const char *detail, const int db_opt)
++{
++	external_exception("modem", log, log_size, phy, phy_size, detail,
++			   db_opt);
++}
++EXPORT_SYMBOL_GPL(aed_md_exception_api);
++
++void aed_md32_exception_api(const int *log, int log_size, const int *phy,
++			    int phy_size, const char *detail, const int db_opt)
++{
++	external_exception("md32", log, log_size, phy, phy_size, detail,
++			   db_opt);
++}
++EXPORT_SYMBOL_GPL(aed_md32_exception_api);
++
++void aed_scp_exception_api(const int *log, int log_size, const int *phy,
++			   int phy_size, const char *detail, const int db_opt)
++{
++	external_exception("scp", log, log_size, phy, phy_size, detail,
++			   db_opt);
++}
++EXPORT_SYMBOL_GPL(aed_scp_exception_api);
++
++void aed_combo_exception_api(const int *log, int log_size, const int *phy,
++			     int phy_size, const char *detail, const int db_opt)
++{
++	external_exception("combo", log, log_size, phy, phy_size, detail,
++			   db_opt);
++}
++EXPORT_SYMBOL_GPL(aed_combo_exception_api);
++
++/* ------------------------------------------------------------------ */
++/* File operations and module plumbing, aed-main.c:2020-2100          */
++/* ------------------------------------------------------------------ */
++
++static const struct file_operations aed_ee_fops = {
++	.owner = THIS_MODULE,
++	.open = aed_ee_open,
++	.release = aed_ee_release,
++	.poll = aed_ee_poll,
++	.read = aed_ee_read,
++	.write = aed_ee_write,
++	.unlocked_ioctl = aed_ioctl,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl = aed_ioctl,
++#endif
++};
++
++static const struct file_operations aed_ke_fops = {
++	.owner = THIS_MODULE,
++	.open = aed_ke_open,
++	.release = aed_ke_release,
++	.poll = aed_ke_poll,
++	.read = aed_ke_read,
++	.write = aed_ke_write,
++	.unlocked_ioctl = aed_ioctl,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl = aed_ioctl,
++#endif
++};
++
++static int __init aed_init(void)
++{
++	int ret;
++
++	/* the uapi numbers must match the ioctl encodings of aed.h:151-161 */
++	BUILD_BUG_ON(AEEIOCTL_GET_THREAD_REG !=
++		     _IOW('p', 0x07, struct aee_thread_reg));
++	BUILD_BUG_ON(AEEIOCTL_GET_THREAD_REG64 !=
++		     _IOW('p', 0x07, struct aee_thread_reg64));
++	BUILD_BUG_ON(AEEIOCTL_GET_PROCESS_BT !=
++		     _IOW('p', 0x04, struct aee_ioctl));
++	BUILD_BUG_ON(AEEIOCTL_CHECK_SUID_DUMPABLE != _IOR('p', 0x08, int));
++	BUILD_BUG_ON(AEEIOCTL_SET_AEE_MODE != _IOR('p', 0x06, int));
++	BUILD_BUG_ON(sizeof(struct AE_Msg) != 24);
++	BUILD_BUG_ON(sizeof(struct aee_ioctl) != 32);
++	BUILD_BUG_ON(sizeof(struct aee_thread_reg) != 76);
++	BUILD_BUG_ON(sizeof(struct aee_thread_reg64) != 296);
++	BUILD_BUG_ON(sizeof(struct aee_bt_frame) != 256);
++
++	ret = aed_proc_init();
++	if (ret)
++		return ret;
++
++	mutex_init(&aed_dev.msg_lock);
++	spin_lock_init(&ee_queue.lock);
++	INIT_LIST_HEAD(&ee_queue.list);
++	init_waitqueue_head(&aed_dev.eewait);
++	init_waitqueue_head(&aed_dev.kewait);
++	INIT_WORK(&ee_work, ee_worker);
++
++	aed_ee_dev.fops = &aed_ee_fops;
++	ret = misc_register(&aed_ee_dev);
++	if (ret) {
++		pr_err("AED: failed to register aed0(ee) device!\n");
++		aed_proc_done();
++		return ret;
++	}
++
++	aed_ke_dev.fops = &aed_ke_fops;
++	ret = misc_register(&aed_ke_dev);
++	if (ret) {
++		pr_err("AED: failed to register aed1(ke) device!\n");
++		misc_deregister(&aed_ee_dev);
++		aed_proc_done();
++		return ret;
++	}
++
++	pr_info("AED: /dev/aed0 (ee) and /dev/aed1 (ke) registered\n");
++	return 0;
++}
++
++static void __exit aed_exit(void)
++{
++	cancel_work_sync(&ee_work);
++	ee_destroy_log();
++
++	misc_deregister(&aed_ke_dev);
++	misc_deregister(&aed_ee_dev);
++
++	mutex_lock(&aed_dev.msg_lock);
++	msg_destroy(&aed_dev.kerec.msg);
++	mutex_unlock(&aed_dev.msg_lock);
++
++	aed_proc_done();
++}
++module_init(aed_init);
++module_exit(aed_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("MediaTek AED (AEE exception dump) driver");
++MODULE_AUTHOR("MediaTek Inc.");
+diff --git a/drivers/misc/mediatek/aee/aed-process.c b/drivers/misc/mediatek/aee/aed-process.c
+new file mode 100644
+index 000000000..d327026ae
+--- /dev/null
++++ b/drivers/misc/mediatek/aee/aed-process.c
+@@ -0,0 +1,84 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Per-process backtrace for the AEEIOCTL_GET_PROCESS_BT dump ioctl.
++ *
++ * Ported from the Samsung/MTK 3.18 downstream kernel
++ * drivers/misc/mediatek/aee/aed/aed-process.c:35-204 (aed_get_process_bt,
++ * aed_get_bt, aed_save_trace and the cross-CPU barrier).  Original
++ * copyright: Copyright (C) 2015 MediaTek Inc. GPL-2.0.
++ *
++ * The result is the aee_process_bt frame array of
++ * include/mt-plat/aee.h:65-84: for every PC a 64-bit address plus a %pS
++ * symbol.  The downstream ARM32 code also fills frame->lr; its arm64 build
++ * leaves lr/lr_symbol zero (aed-process.c:88-91), which is what this port
++ * does as well.
++ *
++ * DEVIATION: the upstream walker (walk_stackframe() with a task stackframe)
++ * is replaced by stack_trace_save_tsk(), the architected arm64 unwinder, and
++ * the cross-CPU "stop the other CPUs" barrier of aed-process.c:139-166 is not
++ * reproduced: it only made the dump more atomic on a 32-bit kernel and needs
++ * the downstream arch/stacktrace.h internals.
++ */
++#include <linux/kernel.h>
++#include <linux/ptrace.h>
++#include <linux/sched.h>
++#include <linux/sched/signal.h>
++#include <linux/sched/task.h>
++#include <linux/slab.h>
++#include <linux/stacktrace.h>
++#include <linux/string.h>
++
++#include "aed.h"
++
++int aed_get_process_bt(struct aee_process_bt *bt)
++{
++	struct aee_bt_frame *frames;
++	struct task_struct *task;
++	unsigned long *pcs;
++	bool allowed;
++	unsigned int nr, i;
++	int ret = 0;
++
++	if (!bt || !bt->entries || (int)bt->pid <= 0)
++		return -EINVAL;
++
++	frames = bt->entries;
++	memset(frames, 0, sizeof(*frames) * AEE_NR_FRAME);
++	bt->nr_entries = 0;
++
++	task = aed_find_task(bt->pid);
++	if (!task)
++		return -EINVAL;
++
++	pcs = kcalloc(AEE_NR_FRAME, sizeof(*pcs), GFP_KERNEL);
++	if (!pcs) {
++		ret = -ENOMEM;
++		goto out_put_task;
++	}
++
++	/* aed-process.c:181-190 */
++	ret = mutex_lock_killable(&task->signal->cred_guard_mutex);
++	if (ret)
++		goto out_free;
++
++	allowed = ptrace_may_access(task, PTRACE_MODE_ATTACH_REALCREDS);
++	mutex_unlock(&task->signal->cred_guard_mutex);
++	if (!allowed) {
++		ret = -EPERM;
++		goto out_free;
++	}
++
++	nr = stack_trace_save_tsk(task, pcs, AEE_NR_FRAME, 0);
++	for (i = 0; i < nr; i++) {
++		frames[i].pc = pcs[i];
++		snprintf(frames[i].pc_symbol, AEE_SZ_SYMBOL_S, "%pS",
++			 (void *)pcs[i]);
++	}
++	bt->nr_entries = nr;
++
++out_free:
++	kfree(pcs);
++out_put_task:
++	put_task_struct(task);
++	return ret;
++}
+diff --git a/drivers/misc/mediatek/aee/aed.h b/drivers/misc/mediatek/aee/aed.h
+new file mode 100644
+index 000000000..f2316bd25
+--- /dev/null
++++ b/drivers/misc/mediatek/aee/aed.h
+@@ -0,0 +1,65 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * MediaTek AED (Android Exception Device) driver private definitions.
++ *
++ * Ported from the Samsung/MTK 3.18 downstream kernel:
++ *   drivers/misc/mediatek/aee/aed/aed-main.c:155-200
++ *     (struct aed_eerec, struct aed_kerec, struct aed_dev)
++ *   drivers/misc/mediatek/include/mt-plat/aee.h:80-84 (struct aee_process_bt)
++ *
++ * Original copyright: Copyright (C) 2010/2015 MediaTek Inc. GPL-2.0.
++ */
++#ifndef __MTK_AED_H
++#define __MTK_AED_H
++
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/rcupdate.h>
++#include <linux/sched.h>
++#include <linux/types.h>
++#include <linux/wait.h>
++#include <uapi/linux/aee.h>
++
++/*
++ * aed-main.c:155-167.  exp_linenum/fatal1/fatal2 of the downstream record are
++ * only used by the legacy aed_md_exception1()/aed_md32_exception1() entry
++ * points, which this tree does not have; the remaining fields are the ones the
++ * AE_Msg response generators and the /proc coredump reader use.
++ */
++struct aed_eerec {		/* external exception record */
++	struct list_head list;
++	char assert_type[32];
++	char exp_filename[512];
++
++	int *ee_log;
++	int ee_log_size;
++	int *ee_phy;
++	int ee_phy_size;
++	char *msg;
++	int db_opt;
++};
++
++/* include/mt-plat/aee.h:80-84 */
++struct aee_process_bt {
++	__u32 pid;
++	__u32 nr_entries;
++	struct aee_bt_frame *entries;
++};
++
++int aed_get_process_bt(struct aee_process_bt *bt);
++
++/* look up a process by pid in the caller's pid namespace, with a reference */
++static inline struct task_struct *aed_find_task(u32 vpid)
++{
++	struct task_struct *task;
++
++	rcu_read_lock();
++	task = find_task_by_vpid((pid_t)vpid);
++	if (task)
++		get_task_struct(task);
++	rcu_read_unlock();
++
++	return task;
++}
++
++#endif /* __MTK_AED_H */
+diff --git a/drivers/misc/mediatek/ccci/ccci_exception.c b/drivers/misc/mediatek/ccci/ccci_exception.c
+index fa2fbff6c..93e7b8581 100644
+--- a/drivers/misc/mediatek/ccci/ccci_exception.c
++++ b/drivers/misc/mediatek/ccci/ccci_exception.c
+@@ -32,6 +32,7 @@
+  * at CCCI_SMEM_OFFSET_EXREC (port_kernel.c:3125-3135); the build has no
+  * MD_UMOLY_EE_SUPPORT, so the EX_LOG_T layout applies.
+  */
++#include <linux/aee.h>
+ #include <linux/ccci.h>
+ #include <linux/byteorder/generic.h>
+ #include <linux/delay.h>
+@@ -619,6 +620,43 @@ static void ccci_ex_build(struct ccci_md *md, unsigned int reason,
+ 	mutex_unlock(&ex->dump_lock);
+ 	kvfree(old);
+ 
++#if IS_ENABLED(CONFIG_MTK_AEE_FEATURE)
++	/*
++	 * Hand the exception record to the AEE client, exactly where downstream
++	 * ccci_aed() does (port_kernel.c:2335-2336):
++	 *
++	 *  - the EX_LOG_T record selected above (MD_EX_REC_OK packet or the
++	 *    EXREC window), port_kernel.c:2318-2333;
++	 *  - the first MD_IMG_DUMP_SIZE bytes of the modem image,
++	 *    port_kernel.c:2329-2333 (CCCI_MD_IMG_DUMP_SIZE == 256,
++	 *    ccci_priv.h:852);
++	 *  - the "mdN:<module>" detail string, port_kernel.c:2304.  The image
++	 *    information suffix that downstream appends through
++	 *    ccci_get_md_info_str() (port_kernel.c:2295) has no equivalent in
++	 *    this tree, so the reason name is used as the module text;
++	 *  - DB_OPT_DEFAULT | DB_OPT_FTRACE, port_kernel.c:2347.
++	 */
++	{
++		u8 img[CCCI_MD_IMG_DUMP_SIZE];
++		const int *img_p = NULL;
++		int img_len = 0;
++		char detail[64];
++
++		if (md->img_vir && md->img_size >= sizeof(img)) {
++			memcpy_fromio(img, md->img_vir, sizeof(img));
++			img_p = (const int *)img;
++			img_len = sizeof(img);
++		}
++
++		snprintf(detail, sizeof(detail), "md%u:%s", md->id + 1,
++			 ccci_ex_reason_name(reason));
++
++		aed_md_exception_api((const int *)record, (int)record_len,
++				     img_p, img_len, detail,
++				     DB_OPT_DEFAULT | DB_OPT_FTRACE);
++	}
++#endif
++
+ 	ccci_md_err(md,
+ 		    "exception dump #%u ready (%zu bytes, reason %s), full hex in ccci_dump/debugfs\n",
+ 		    count, t.len, ccci_ex_reason_name(reason));
+diff --git a/include/uapi/linux/aee.h b/include/uapi/linux/aee.h
+new file mode 100644
+index 000000000..6a25ee58c
+--- /dev/null
++++ b/include/uapi/linux/aee.h
+@@ -0,0 +1,194 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * MediaTek AEE/AED exception ("DB") client ABI.
++ *
++ * The values, message layout and ioctl numbers are copied from the
++ * Samsung/MTK 3.18 downstream GPL tree that matches the SM-G532M ROM:
++ *
++ *   drivers/misc/mediatek/aee/aed/aed.h:39-167
++ *     - AE_INVALID/AE_NOT_AVAILABLE/AE_DEFAULT : :39-41
++ *     - enum AEE_MODE                          : :43-49
++ *     - enum AE_PASS_METHOD                    : :58-61
++ *     - enum AE_CMD_TYPE                       : :63
++ *     - enum AE_CMD_ID                         : :65-108
++ *     - struct AE_Msg                          : :110-125
++ *     - struct aee_ioctl                       : :141-148
++ *     - AEEIOCTL_*                             : :151-161
++ *   drivers/misc/mediatek/aee/aed/aed.h:147-149 (AEE_NR_FRAME)
++ *   drivers/misc/mediatek/include/mt-plat/aee.h:65-107 (aee_bt_frame,
++ *     aee_process_bt, aee_thread_reg)
++ *
++ * Original copyright: Copyright (C) 2015 MediaTek Inc., GPL-2.0.
++ *
++ * The client library shipped in the ROM (/lib/libaed.so, ELF32 ARM) talks
++ * to the AED daemon over the abstract socket "com.mtk.aee.aed" and uses
++ * exactly one ioctl on /dev/aed0: AEEIOCTL_GET_THREAD_REG, requested with
++ * both the 296-byte (64-bit pt_regs) and the 76-byte (32-bit pt_regs)
++ * command encoding (libaed.so: aee_ioctl_get_reg, file offset 0x4674).
++ */
++#ifndef _UAPI_LINUX_AEE_H
++#define _UAPI_LINUX_AEE_H
++
++#ifdef __KERNEL__
++#include <linux/types.h>
++#else
++#include <stdint.h>
++typedef uint32_t __u32;
++typedef uint64_t __u64;
++typedef int32_t __s32;
++#endif
++
++/* aed.h:39-41 */
++#define AE_INVALID		0xAEEFF000
++#define AE_NOT_AVAILABLE	0xAEE00000
++#define AE_DEFAULT		0xAEE00001
++
++/* aed.h:43-49 */
++enum AEE_MODE {
++	AEE_MODE_MTK_ENG = 1,
++	AEE_MODE_MTK_USER,
++	AEE_MODE_CUSTOMER_ENG,
++	AEE_MODE_CUSTOMER_USER,
++	AEE_MODE_NOT_INIT
++};
++
++/* aed.h:58-61 */
++enum AE_PASS_METHOD {
++	AE_PASS_BY_MEM,
++	AE_PASS_BY_FILE,
++	AE_PASS_METHOD_END
++};
++
++/* aed.h:63 */
++enum AE_CMD_TYPE { AE_REQ, AE_RSP, AE_IND, AE_CMD_TYPE_END };
++
++/*
++ * aed.h:65-108.  The numeric values are the ABI; keep the downstream names
++ * and order so the encoder used by the AED daemon/libaed stays compatible.
++ */
++enum AE_CMD_ID {
++	AE_REQ_IDX,
++
++	AE_REQ_CLASS,
++	AE_REQ_TYPE,
++	AE_REQ_PROCESS,
++	AE_REQ_MODULE,
++	AE_REQ_BACKTRACE,
++	AE_REQ_DETAIL,		/* Content of response message rule:
++				 *   if msg.arg1==AE_PASS_BY_FILE => msg->data=file path
++				 */
++
++	AE_REQ_ROOT_LOG_DIR,
++	AE_REQ_CURR_LOG_DIR,
++	AE_REQ_DFLT_LOG_DIR,
++	AE_REQ_MAIN_LOG_FILE_PATH,
++
++	AE_IND_FATAL_RAISED,	/* fatal event raised, indicate AED to notify users */
++	AE_IND_EXP_RAISED,	/* exception event raised, indicate AED to notify users */
++	AE_IND_WRN_RAISED,	/* warning event raised, indicate AED to notify users */
++	AE_IND_REM_RAISED,	/* reminding event raised, indicate AED to notify users */
++
++	AE_IND_LOG_STATUS,	/* arg = AE_ERR */
++	AE_IND_LOG_CLOSE,	/* arg = AE_ERR */
++
++	AE_REQ_SWITCH_DAL_BEEP,	/* arg: dal on|off, seq: beep on|off */
++	AE_REQ_DB_COUNT,	/* arg: db count */
++	AE_REQ_DB_FORCE_PATH,	/* arg: force db path yes\no */
++	AE_REQ_SWITCH_EXP_LEVEL,
++	AE_REQ_IS_AED_READY,	/* query if AED is ready for service */
++	AE_REQ_COREDUMP,	/* msg->data=file path */
++	AE_REQ_SET_READFLAG,	/* set read flag msg */
++	AE_REQ_E2S_INIT,	/* Init notification of client side(application layer) of Exp2Server */
++	AE_REQ_USERSPACEBACKTRACE = 40,
++	AE_REQ_USER_REG,
++	AE_REQ_USER_MAPS,
++	AE_CMD_ID_END
++};
++
++/* aed.h:110-125 (24 bytes on both ABIs) */
++struct AE_Msg {
++	__u32 cmdType;		/* enum AE_CMD_TYPE */
++	__u32 cmdId;		/* enum AE_CMD_ID */
++	union {
++		__u32 seq;	/* sequence number for error checking */
++		__s32 pid;	/* process id */
++	};
++	union {
++		__u32 arg;	/* simple argument */
++		__u32 cls;	/* enum AE_EXP_CLASS (int-plat/aee.h:33-53) */
++	};
++	union {
++		__u32 len;	/* dynamic length argument */
++		__s32 id;	/* desired id */
++	};
++	__u32 dbOption;		/* DB dump option, int-plat/aee.h:186-218 */
++};
++
++/* aed.h:130-140 -- kernel ioctl argument, aed.h:141-148 */
++struct aee_ioctl {
++	__u32 pid;
++	__u32 detail;
++	__u32 size;
++	__u32 pad;
++	__u64 in;
++	__u64 out;
++};
++
++/*
++ * aed.h:87-90 (32-bit kernel ABI: pid_t is 4 bytes) and
++ * include/mt-plat/aee.h:65-85 (struct aee_bt_frame is 256 bytes: two u64,
++ * five u32 of padding and two symbol strings).
++ */
++#define AEE_NR_FRAME		32
++#define AEE_SZ_SYMBOL_S		80
++#define AEE_SZ_SYMBOL_L		140
++
++struct aee_bt_frame {
++	__u64 pc;
++	__u64 lr;
++	__u32 pad[5];
++	char pc_symbol[AEE_SZ_SYMBOL_S];
++	char lr_symbol[AEE_SZ_SYMBOL_L];
++};
++
++/*
++ * include/mt-plat/aee.h:87-90: pid_t tid + struct pt_regs.  The client library
++ * requests the 32-bit view as a 76-byte payload (_IOW('p', 0x07, 76), see
++ * libaed.so aee_ioctl_get_reg) and the 64-bit view as a 296-byte payload
++ * (_IOW('p', 0x07, 296); 4-byte tid + 4 bytes padding + a 288-byte 3.18/4.x
++ * arm64 pt_regs: 34 u64 of user_pt_regs, orig_x0, syscallno).
++ */
++struct aee_thread_reg {
++	__s32 tid;
++	__u32 regs[18];		/* arm32 struct pt_regs: uregs[0..17] */
++};
++
++struct aee_thread_reg64 {
++	__s32 tid;
++	__u32 pad;
++	__u64 regs[36];
++};
++
++/*
++ * aed.h:151-161, expanded with the uapi struct sizes above.  The literal
++ * values are asserted against _IOW()/_IOR() in the kernel driver
++ * (drivers/misc/mediatek/aee/aed-main.c) because this header must not
++ * depend on <linux/ioctl.h> when it is compiled for the host tool.
++ */
++#define AEEIOCTL_DAL_SHOW		0x44007001	/* _IOW('p', 0x01, struct aee_dal_show[1024]) */
++#define AEEIOCTL_DAL_CLEAN		0x00007002	/* _IO('p', 0x02) */
++#define AEEIOCTL_SETCOLOR		0x400c7003	/* _IOW('p', 0x03, struct aee_dal_setcolor[12]) */
++#define AEEIOCTL_GET_PROCESS_BT		0x40207004	/* _IOW('p', 0x04, struct aee_ioctl[32]) */
++#define AEEIOCTL_GET_SMP_INFO		0x80047005	/* _IOR('p', 0x05, int) */
++#define AEEIOCTL_SET_AEE_MODE		0x80047006	/* _IOR('p', 0x06, int) */
++#define AEEIOCTL_GET_THREAD_REG		0x404c7007	/* _IOW('p', 0x07, struct aee_thread_reg[76]) */
++#define AEEIOCTL_GET_THREAD_REG64	0x41287007	/* _IOW('p', 0x07, struct aee_thread_reg64[296]) */
++#define AEEIOCTL_CHECK_SUID_DUMPABLE	0x80047008	/* _IOR('p', 0x08, int) */
++#define AEEIOCTL_WDT_KICK_POWERKEY	0x80047009	/* _IOR('p', 0x09, int) */
++#define AEEIOCTL_RT_MON_Kick		0x8004700a	/* _IOR('p', 0x0A, int) */
++#define AEEIOCTL_SET_FORECE_RED_SCREEN	0x8004700b	/* _IOR('p', 0x0B, int) */
++#define AEEIOCTL_SET_SF_STATE		0x8008700c	/* _IOR('p', 0x0C, long long[8]) */
++#define AEEIOCTL_GET_SF_STATE		0x4008700d	/* _IOW('p', 0x0D, long long[8]) */
++#define AEEIOCTL_USER_IOCTL_TO_KERNEL_WANING 0x8004700e	/* _IOR('p', 0x0E, int) */
++
++#endif /* _UAPI_LINUX_AEE_H */
+diff --git a/tools/mediatek/aee/.gitignore b/tools/mediatek/aee/.gitignore
+new file mode 100644
+index 000000000..be0b94790
+--- /dev/null
++++ b/tools/mediatek/aee/.gitignore
+@@ -0,0 +1 @@
++aee-db
+diff --git a/tools/mediatek/aee/Makefile b/tools/mediatek/aee/Makefile
+new file mode 100644
+index 000000000..fcf5e52d3
+--- /dev/null
++++ b/tools/mediatek/aee/Makefile
+@@ -0,0 +1,23 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# aee-db: host/target client for the MediaTek AED (/dev/aed0) ABI.
++# Build from this directory or from the kernel tree root with
++#   make -C tools/mediatek/aee
++#
++srctree ?= ../../..
++CC ?= gcc
++CFLAGS ?= -O2 -Wall -Wextra -Werror
++CPPFLAGS += -I$(srctree)/include/uapi
++
++all: aee-db
++
++aee-db: aee-db.c $(srctree)/include/uapi/linux/aee.h
++	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ aee-db.c
++
++check: aee-db
++	./aee-db --selftest
++
++clean:
++	rm -f aee-db
++
++.PHONY: all check clean
+diff --git a/tools/mediatek/aee/aee-db.c b/tools/mediatek/aee/aee-db.c
+new file mode 100644
+index 000000000..9059ad788
+--- /dev/null
++++ b/tools/mediatek/aee/aee-db.c
+@@ -0,0 +1,788 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * aee-db - userspace client for the MediaTek AED (AEE exception dump) ABI.
++ *
++ * Speaks the AE_Msg request/response protocol on <device> (default
++ * /dev/aed0, the EE device of the ROM) and the dump ioctls that the ABI
++ * header include/uapi/linux/aee.h describes.  The tool is the reference
++ * consumer of the kernel driver in drivers/misc/mediatek/aee/ and is also
++ * usable to inspect a live exception record:
++ *
++ *   aee-db query            pending AE_IND_* indication (AE_Msg header)
++ *   aee-db class|type|process|module|backtrace|detail|coredump
++ *   aee-db ccci --md 1      detail dump, checks that the record is md1's
++ *   aee-db close            AE_IND_LOG_CLOSE (releases the kernel record)
++ *   aee-db regs --pid N     AEEIOCTL_GET_THREAD_REG(64) with fallback
++ *   aee-db bt --pid N       AEEIOCTL_GET_PROCESS_BT
++ *   aee-db --selftest       ABI layout + encoder/decoder KATs, no device
++ *
++ * The AED daemon protocol is request/response on one open file: write one
++ * 24-byte struct AE_Msg, read a 24-byte response header and, when response.len
++ * is non-zero, response.len payload bytes.
++ */
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#include <linux/aee.h>
++
++#define DEFAULT_DEVICE	"/dev/aed0"
++#define DEFAULT_TIMEOUT	5000
++#define MAX_PAYLOAD	65536
++
++static const char *progname = "aee-db";
++
++static void errmsg(const char *fmt, ...)
++{
++	va_list ap;
++
++	fprintf(stderr, "%s: ", progname);
++	va_start(ap, fmt);
++	vfprintf(stderr, fmt, ap);
++	va_end(ap);
++	fputc('\n', stderr);
++}
++
++/* ------------------------------------------------------------------ */
++/* AE_Msg names, mirroring libaed.so aee_aed_get_cmd_type/name()      */
++/* ------------------------------------------------------------------ */
++
++static const char *cmd_type_name(uint32_t type)
++{
++	switch (type) {
++	case AE_REQ:
++		return "REQ";
++	case AE_RSP:
++		return "RSP";
++	case AE_IND:
++		return "IND";
++	default:
++		return "UNKNOWN";
++	}
++}
++
++static const char *cmd_id_name(uint32_t id)
++{
++	switch (id) {
++	case AE_REQ_IDX:
++		return "IDX";
++	case AE_REQ_CLASS:
++		return "CLASS";
++	case AE_REQ_TYPE:
++		return "TYPE";
++	case AE_REQ_PROCESS:
++		return "PROCESS";
++	case AE_REQ_MODULE:
++		return "MODULE";
++	case AE_REQ_BACKTRACE:
++		return "BACKTRACE";
++	case AE_REQ_DETAIL:
++		return "DETAIL";
++	case AE_REQ_COREDUMP:
++		return "COREDUMP";
++	case AE_IND_FATAL_RAISED:
++		return "FATAL_RAISED";
++	case AE_IND_EXP_RAISED:
++		return "EXP_RAISED";
++	case AE_IND_WRN_RAISED:
++		return "WRN_RAISED";
++	case AE_IND_REM_RAISED:
++		return "REM_RAISED";
++	case AE_IND_LOG_STATUS:
++		return "LOG_STATUS";
++	case AE_IND_LOG_CLOSE:
++		return "LOG_CLOSE";
++	case AE_REQ_USERSPACEBACKTRACE:
++		return "USERSPACEBACKTRACE";
++	case AE_REQ_USER_REG:
++		return "USER_REG";
++	case AE_REQ_USER_MAPS:
++		return "USER_MAPS";
++	default:
++		return "UNKNOWN";
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* ABI encoder / decoder (used by the wire path and by the KATs)       */
++/* ------------------------------------------------------------------ */
++
++static void msg_encode(unsigned char *buf, const struct AE_Msg *msg)
++{
++	memset(buf, 0, sizeof(struct AE_Msg));
++	memcpy(buf + 0, &msg->cmdType, 4);
++	memcpy(buf + 4, &msg->cmdId, 4);
++	memcpy(buf + 8, &msg->seq, 4);
++	memcpy(buf + 12, &msg->arg, 4);
++	memcpy(buf + 16, &msg->len, 4);
++	memcpy(buf + 20, &msg->dbOption, 4);
++}
++
++static void msg_decode(struct AE_Msg *msg, const unsigned char *buf)
++{
++	memset(msg, 0, sizeof(*msg));
++	memcpy(&msg->cmdType, buf + 0, 4);
++	memcpy(&msg->cmdId, buf + 4, 4);
++	memcpy(&msg->seq, buf + 8, 4);
++	memcpy(&msg->arg, buf + 12, 4);
++	memcpy(&msg->len, buf + 16, 4);
++	memcpy(&msg->dbOption, buf + 20, 4);
++}
++
++static void msg_print(const char *prefix, const struct AE_Msg *msg)
++{
++	printf("%s: cmdType=%s(%u) cmdId=%s(%u) seq/pid=%d arg/cls=0x%08x len/id=%u dbOption=0x%08x\n",
++	       prefix, cmd_type_name(msg->cmdType), msg->cmdType,
++	       cmd_id_name(msg->cmdId), msg->cmdId, msg->pid, msg->arg,
++	       msg->len, msg->dbOption);
++
++	if (msg->len == 0) {
++		if (msg->arg == AE_NOT_AVAILABLE)
++			printf("%s: no log available (AE_NOT_AVAILABLE)\n",
++			       prefix);
++		return;
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* Device transport                                                    */
++/* ------------------------------------------------------------------ */
++
++static int dev_write_msg(int fd, const struct AE_Msg *req)
++{
++	unsigned char buf[sizeof(struct AE_Msg)];
++	ssize_t n;
++
++	msg_encode(buf, req);
++	n = write(fd, buf, sizeof(buf));
++	if (n < 0) {
++		errmsg("write: %s", strerror(errno));
++		return -1;
++	}
++	if (n != (ssize_t)sizeof(buf)) {
++		errmsg("short write (%zd)", n);
++		return -1;
++	}
++	return 0;
++}
++
++static int dev_read_msg(int fd, struct AE_Msg *rsp, char **payload, int timeout_ms)
++{
++	unsigned char *buf;
++	struct pollfd pfd = { .fd = fd, .events = POLLIN };
++	ssize_t n;
++	int ret;
++
++	*payload = NULL;
++
++	ret = poll(&pfd, 1, timeout_ms);
++	if (ret < 0) {
++		errmsg("poll: %s", strerror(errno));
++		return -1;
++	}
++	if (ret == 0) {
++		errmsg("timed out after %d ms waiting for a response", timeout_ms);
++		return -1;
++	}
++
++	buf = calloc(1, sizeof(struct AE_Msg) + MAX_PAYLOAD);
++	if (!buf) {
++		errmsg("out of memory");
++		return -1;
++	}
++
++	n = read(fd, buf, sizeof(struct AE_Msg) + MAX_PAYLOAD);
++	if (n < 0) {
++		errmsg("read: %s", strerror(errno));
++		free(buf);
++		return -1;
++	}
++	if (n < (ssize_t)sizeof(struct AE_Msg)) {
++		errmsg("short read (%zd, need %zu)", n, sizeof(struct AE_Msg));
++		free(buf);
++		return -1;
++	}
++
++	msg_decode(rsp, buf);
++	if (rsp->len > MAX_PAYLOAD || (ssize_t)(sizeof(struct AE_Msg) + rsp->len) > n) {
++		errmsg("response payload length %u does not match read %zd",
++		       rsp->len, n);
++		free(buf);
++		return -1;
++	}
++
++	if (rsp->len) {
++		*payload = malloc((size_t)rsp->len + 1);
++		if (!*payload) {
++			errmsg("out of memory");
++			free(buf);
++			return -1;
++		}
++		memcpy(*payload, buf + sizeof(struct AE_Msg), rsp->len);
++		(*payload)[rsp->len] = '\0';
++	}
++
++	free(buf);
++	return 0;
++}
++
++static void print_payload(const char *payload, uint32_t len)
++{
++	uint32_t i;
++
++	if (!payload)
++		return;
++
++	printf("--- payload (%u bytes) ---\n", len);
++	fwrite(payload, 1, len, stdout);
++	if (len && payload[len - 1] != '\n')
++		fputc('\n', stdout);
++	printf("--- end payload ---\n");
++
++	/* a text payload is printed as is; keep the hex view for control bytes */
++	for (i = 0; i < len; i++) {
++		if ((unsigned char)payload[i] != '\0' && payload[i] != '\n' &&
++		    payload[i] != '\t' && (unsigned char)payload[i] < 0x20) {
++			printf("payload contains binary data, use --raw\n");
++			return;
++		}
++	}
++}
++
++static int dev_open(const char *device)
++{
++	int fd = open(device, O_RDWR);
++
++	if (fd < 0)
++		errmsg("cannot open %s: %s", device, strerror(errno));
++	return fd;
++}
++
++/* ------------------------------------------------------------------ */
++/* Commands                                                           */
++/* ------------------------------------------------------------------ */
++
++static int cmd_request(const char *device, uint32_t cmd_id, int timeout_ms,
++		       bool expect_payload)
++{
++	struct AE_Msg req = { 0 };
++	struct AE_Msg rsp;
++	int ret = 0;
++	char *payload;
++	int fd;
++
++	fd = dev_open(device);
++	if (fd < 0)
++		return 1;
++
++	req.cmdType = AE_REQ;
++	req.cmdId = cmd_id;
++	if (dev_write_msg(fd, &req)) {
++		ret = 1;
++		goto out;
++	}
++
++	if (dev_read_msg(fd, &rsp, &payload, timeout_ms)) {
++		ret = 1;
++		goto out;
++	}
++
++	msg_print("response", &rsp);
++	if (expect_payload)
++		print_payload(payload, rsp.len);
++	free(payload);
++
++out:
++	close(fd);
++	return ret;
++}
++
++static int cmd_query(const char *device, int timeout_ms)
++{
++	struct pollfd pfd;
++	int ret;
++	int fd;
++
++	fd = dev_open(device);
++	if (fd < 0)
++		return 1;
++
++	pfd.fd = fd;
++	pfd.events = POLLIN;
++	ret = poll(&pfd, 1, timeout_ms);
++	if (ret < 0)
++		errmsg("poll: %s", strerror(errno));
++	else if (ret == 0)
++		errmsg("no pending exception indication after %d ms", timeout_ms);
++	else
++		printf("pending indication, revents=0x%x\n", pfd.revents);
++
++	close(fd);
++	return ret > 0 ? 0 : 1;
++}
++
++static int cmd_ccci(const char *device, int md, int timeout_ms)
++{
++	struct AE_Msg req = { 0 };
++	struct AE_Msg rsp;
++	char *process = NULL;
++	char *payload = NULL;
++	int ret = 1;
++	int fd;
++
++	fd = dev_open(device);
++	if (fd < 0)
++		return 1;
++
++	/* the detail path keys off the "mdN:" prefix of AE_REQ_PROCESS */
++	req.cmdType = AE_REQ;
++	req.cmdId = AE_REQ_PROCESS;
++	if (dev_write_msg(fd, &req))
++		goto out;
++	if (dev_read_msg(fd, &rsp, &process, timeout_ms))
++		goto out;
++	msg_print("process", &rsp);
++	printf("process: %s\n", process ? process : "");
++
++	if (md > 0) {
++		char prefix[16];
++		int len = snprintf(prefix, sizeof(prefix), "md%d:", md);
++
++		if (!process || strncmp(process, prefix, (size_t)len)) {
++			printf("ccci: record is not md%d, no CCCI window for it\n",
++			       md);
++			ret = 0;
++			goto out;
++		}
++	}
++
++	req.cmdType = AE_REQ;
++	req.cmdId = AE_REQ_DETAIL;
++	if (dev_write_msg(fd, &req))
++		goto out;
++	if (dev_read_msg(fd, &rsp, &payload, timeout_ms))
++		goto out;
++
++	msg_print("detail", &rsp);
++	print_payload(payload, rsp.len);
++
++	if (payload && strstr(payload, "== CCCI LOG =="))
++		printf("ccci: CCCI debug window present\n");
++	else
++		printf("ccci: no CCCI debug window in this record\n");
++
++	{
++		struct AE_Msg ind = { 0 };
++
++		ind.cmdType = AE_IND;
++		ind.cmdId = AE_IND_LOG_CLOSE;
++		if (dev_write_msg(fd, &ind))
++			goto out;
++	}
++	ret = 0;
++
++out:
++	free(process);
++	free(payload);
++	close(fd);
++	return ret;
++}
++
++static int cmd_close(const char *device)
++{
++	struct AE_Msg ind = { 0 };
++	int fd, ret = 0;
++
++	fd = dev_open(device);
++	if (fd < 0)
++		return 1;
++
++	ind.cmdType = AE_IND;
++	ind.cmdId = AE_IND_LOG_CLOSE;
++	if (dev_write_msg(fd, &ind))
++		ret = 1;
++	else
++		printf("sent AE_IND_LOG_CLOSE\n");
++
++	close(fd);
++	return ret;
++}
++
++static int cmd_regs(const char *device, int pid)
++{
++	struct aee_thread_reg64 wide;
++	struct aee_thread_reg narrow;
++	int fd, ret = 0, i;
++
++	if (pid <= 0) {
++		errmsg("regs needs --pid");
++		return 2;
++	}
++
++	fd = dev_open(device);
++	if (fd < 0)
++		return 1;
++
++	memset(&wide, 0, sizeof(wide));
++	wide.tid = pid;
++	if (ioctl(fd, AEEIOCTL_GET_THREAD_REG64, &wide) == 0) {
++		printf("AEEIOCTL_GET_THREAD_REG64: tid %d\n", wide.tid);
++		for (i = 0; i < 34; i++)
++			printf("  x%-2d = 0x%016llx\n", i,
++			       (unsigned long long)wide.regs[i]);
++		printf("  orig_x0 = 0x%016llx syscallno = %llu\n",
++		       (unsigned long long)wide.regs[34],
++		       (unsigned long long)wide.regs[35]);
++		goto out;
++	}
++
++	memset(&narrow, 0, sizeof(narrow));
++	narrow.tid = pid;
++	if (ioctl(fd, AEEIOCTL_GET_THREAD_REG, &narrow) == 0) {
++		static const char *const names[18] = {
++			"r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8",
++			"r9", "r10", "fp", "ip", "sp", "lr", "pc", "cpsr",
++			"orig_r0",
++		};
++
++		printf("AEEIOCTL_GET_THREAD_REG: tid %d\n", narrow.tid);
++		for (i = 0; i < 18; i++)
++			printf("  %-7s = 0x%08x\n", names[i], narrow.regs[i]);
++		goto out;
++	}
++
++	errmsg("no thread register ABI accepted for pid %d: %s", pid,
++	       strerror(errno));
++	ret = 1;
++out:
++	close(fd);
++	return ret;
++}
++
++static int cmd_bt(const char *device, int pid)
++{
++	struct aee_bt_frame *frames;
++	struct aee_ioctl arg;
++	int fd, ret = 0;
++	uint32_t i;
++
++	if (pid <= 0) {
++		errmsg("bt needs --pid");
++		return 2;
++	}
++
++	fd = dev_open(device);
++	if (fd < 0)
++		return 1;
++
++	frames = calloc(AEE_NR_FRAME, sizeof(*frames));
++	if (!frames) {
++		errmsg("out of memory");
++		close(fd);
++		return 1;
++	}
++
++	memset(&arg, 0, sizeof(arg));
++	arg.pid = (uint32_t)pid;
++	arg.out = (uint64_t)(uintptr_t)frames;
++	arg.size = AEE_NR_FRAME;
++
++	if (ioctl(fd, AEEIOCTL_GET_PROCESS_BT, &arg)) {
++		errmsg("AEEIOCTL_GET_PROCESS_BT: %s", strerror(errno));
++		ret = 1;
++		goto out;
++	}
++
++	printf("AEEIOCTL_GET_PROCESS_BT: pid %u detail 0x%08x frames %u\n",
++	       arg.pid, arg.detail, arg.size);
++	for (i = 0; i < arg.size && i < AEE_NR_FRAME; i++)
++		printf("  [%02u] pc=0x%016llx %s\n", i,
++		       (unsigned long long)frames[i].pc, frames[i].pc_symbol);
++
++out:
++	free(frames);
++	close(fd);
++	return ret;
++}
++
++/* ------------------------------------------------------------------ */
++/* Selftest: ABI layout, ioctl encoding and codec KATs                */
++/* ------------------------------------------------------------------ */
++
++static int selftest_failures;
++
++#define CHECK(cond) do {						\
++	if (!(cond)) {							\
++		fprintf(stderr, "FAIL %s:%d: %s\n", __func__, __LINE__,	\
++			#cond);						\
++		selftest_failures++;					\
++	}								\
++} while (0)
++
++#define CHECK_EQ(a, b) do {						\
++	unsigned long long __a = (unsigned long long)(a);		\
++	unsigned long long __b = (unsigned long long)(b);		\
++	if (__a != __b) {						\
++		fprintf(stderr, "FAIL %s:%d: %s (0x%llx) != %s (0x%llx)\n", \
++			__func__, __LINE__, #a, __a, #b, __b);		\
++		selftest_failures++;					\
++	}								\
++} while (0)
++
++static void kat_layout(void)
++{
++	CHECK_EQ(sizeof(struct AE_Msg), 24);
++	CHECK_EQ(offsetof(struct AE_Msg, cmdType), 0);
++	CHECK_EQ(offsetof(struct AE_Msg, cmdId), 4);
++	CHECK_EQ(offsetof(struct AE_Msg, seq), 8);
++	CHECK_EQ(offsetof(struct AE_Msg, arg), 12);
++	CHECK_EQ(offsetof(struct AE_Msg, len), 16);
++	CHECK_EQ(offsetof(struct AE_Msg, dbOption), 20);
++
++	CHECK_EQ(sizeof(struct aee_ioctl), 32);
++	CHECK_EQ(offsetof(struct aee_ioctl, pid), 0);
++	CHECK_EQ(offsetof(struct aee_ioctl, detail), 4);
++	CHECK_EQ(offsetof(struct aee_ioctl, size), 8);
++	CHECK_EQ(offsetof(struct aee_ioctl, in), 16);
++	CHECK_EQ(offsetof(struct aee_ioctl, out), 24);
++
++	CHECK_EQ(sizeof(struct aee_thread_reg), 76);
++	CHECK_EQ(sizeof(struct aee_thread_reg64), 296);
++	CHECK_EQ(sizeof(struct aee_bt_frame), 256);
++	CHECK_EQ(offsetof(struct aee_bt_frame, pc_symbol), 36);
++	CHECK_EQ(offsetof(struct aee_bt_frame, lr_symbol), 116);
++}
++
++static void kat_ioctl_numbers(void)
++{
++	CHECK_EQ(AEEIOCTL_GET_PROCESS_BT, _IOW('p', 0x04, struct aee_ioctl));
++	CHECK_EQ(AEEIOCTL_GET_THREAD_REG, _IOW('p', 0x07, struct aee_thread_reg));
++	CHECK_EQ(AEEIOCTL_GET_THREAD_REG64,
++		 _IOW('p', 0x07, struct aee_thread_reg64));
++	CHECK_EQ(AEEIOCTL_CHECK_SUID_DUMPABLE, _IOR('p', 0x08, int));
++	CHECK_EQ(AEEIOCTL_SET_AEE_MODE, _IOR('p', 0x06, int));
++	CHECK_EQ(AEEIOCTL_GET_THREAD_REG, 0x404c7007);
++	CHECK_EQ(AEEIOCTL_GET_THREAD_REG64, 0x41287007);
++	CHECK_EQ(AEEIOCTL_GET_PROCESS_BT, 0x40207004);
++}
++
++static void kat_cmd_ids(void)
++{
++	CHECK_EQ(AE_REQ, 0);
++	CHECK_EQ(AE_RSP, 1);
++	CHECK_EQ(AE_IND, 2);
++	CHECK_EQ(AE_REQ_CLASS, 1);
++	CHECK_EQ(AE_REQ_TYPE, 2);
++	CHECK_EQ(AE_REQ_PROCESS, 3);
++	CHECK_EQ(AE_REQ_MODULE, 4);
++	CHECK_EQ(AE_REQ_BACKTRACE, 5);
++	CHECK_EQ(AE_REQ_DETAIL, 6);
++	CHECK_EQ(AE_IND_FATAL_RAISED, 11);
++	CHECK_EQ(AE_IND_EXP_RAISED, 12);
++	CHECK_EQ(AE_IND_WRN_RAISED, 13);
++	CHECK_EQ(AE_IND_REM_RAISED, 14);
++	CHECK_EQ(AE_IND_LOG_STATUS, 15);
++	CHECK_EQ(AE_IND_LOG_CLOSE, 16);
++	CHECK_EQ(AE_REQ_COREDUMP, 22);
++	CHECK_EQ(AE_REQ_USERSPACEBACKTRACE, 40);
++	CHECK_EQ(AE_REQ_USER_REG, 41);
++	CHECK_EQ(AE_REQ_USER_MAPS, 42);
++	CHECK_EQ(AE_PASS_BY_MEM, 0);
++	CHECK_EQ(AE_PASS_BY_FILE, 1);
++	CHECK_EQ(AE_NOT_AVAILABLE, 0xAEE00000);
++	CHECK_EQ(AE_DEFAULT, 0xAEE00001);
++}
++
++static void kat_msg_codec(void)
++{
++	unsigned char buf[sizeof(struct AE_Msg)];
++	struct AE_Msg in = { 0 };
++	struct AE_Msg out;
++
++	in.cmdType = AE_REQ;
++	in.cmdId = AE_REQ_DETAIL;
++	in.seq = 0x12345678;
++	in.arg = AE_PASS_BY_MEM;
++	in.len = 4096;
++	in.dbOption = 0x80000001;
++
++	msg_encode(buf, &in);
++
++	/* exact wire bytes: little-endian 32-bit fields, ABI order */
++	CHECK_EQ(buf[0], AE_REQ);
++	CHECK_EQ(buf[4], AE_REQ_DETAIL);
++	CHECK_EQ(buf[8], 0x78);
++	CHECK_EQ(buf[9], 0x56);
++	CHECK_EQ(buf[10], 0x34);
++	CHECK_EQ(buf[11], 0x12);
++	CHECK_EQ(buf[20], 0x01);
++	CHECK_EQ(buf[23], 0x80);
++
++	msg_decode(&out, buf);
++	CHECK_EQ(out.cmdType, in.cmdType);
++	CHECK_EQ(out.cmdId, in.cmdId);
++	CHECK_EQ(out.seq, in.seq);
++	CHECK_EQ(out.arg, in.arg);
++	CHECK_EQ(out.len, in.len);
++	CHECK_EQ(out.dbOption, in.dbOption);
++
++	/* an indication as the kernel builds it for a modem exception */
++	memset(&in, 0, sizeof(in));
++	in.cmdType = AE_IND;
++	in.cmdId = AE_IND_EXP_RAISED;
++	in.arg = 6;			/* AE_EE */
++	in.dbOption = 0x1;		/* DB_OPT_DEFAULT|DB_OPT_FTRACE */
++	msg_encode(buf, &in);
++	msg_decode(&out, buf);
++	CHECK_EQ(out.cmdType, AE_IND);
++	CHECK_EQ(out.cmdId, AE_IND_EXP_RAISED);
++	CHECK_EQ(out.arg, 6);
++	CHECK_EQ(out.dbOption, 1);
++}
++
++static void kat_ioctl_struct(void)
++{
++	struct aee_ioctl arg = { 0 };
++	uint64_t out = 0x1122334455667788ULL;
++	uint64_t in = 0x8877665544332211ULL;
++
++	arg.pid = 42;
++	arg.detail = AE_DEFAULT;
++	arg.size = AEE_NR_FRAME;
++	arg.in = in;
++	arg.out = out;
++
++	CHECK_EQ(arg.pid, 42);
++	CHECK_EQ(arg.detail, 0xAEE00001);
++	CHECK_EQ(arg.in, in);
++	CHECK_EQ(arg.out, out);
++}
++
++static int run_selftest(void)
++{
++	selftest_failures = 0;
++
++	kat_layout();
++	kat_ioctl_numbers();
++	kat_cmd_ids();
++	kat_msg_codec();
++	kat_ioctl_struct();
++
++	if (selftest_failures) {
++		fprintf(stderr, "%d selftest check(s) failed\n",
++			selftest_failures);
++		return 3;
++	}
++
++	printf("selftest: %s %s\n", __DATE__, "OK: 5 KAT groups, "
++	       "24-byte AE_Msg, 32-byte aee_ioctl, "
++	       "0x404c7007/0x41287007 thread-reg ioctls");
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* CLI                                                                */
++/* ------------------------------------------------------------------ */
++
++static void usage(void)
++{
++	printf("usage: %s [--device PATH] [--timeout MS] <command>\n"
++	       "\n"
++	       "commands:\n"
++	       "  query                     wait for a pending AE_IND_* release\n"
++	       "  class|type|process|module|backtrace|detail|coredump\n"
++	       "                            send the AE_REQ_* request and print\n"
++	       "                            the response and its payload\n"
++	       "  ccci [--md N]             AE_REQ_DETAIL with the CCCI window\n"
++	       "  close                     send AE_IND_LOG_CLOSE\n"
++	       "  regs --pid N              AEEIOCTL_GET_THREAD_REG(64)\n"
++	       "  bt --pid N                AEEIOCTL_GET_PROCESS_BT\n"
++	       "  --selftest                ABI layout and codec KATs\n",
++	       progname);
++}
++
++int main(int argc, char **argv)
++{
++	const char *device = DEFAULT_DEVICE;
++	int timeout_ms = DEFAULT_TIMEOUT;
++	const char *cmd = NULL;
++	int md = 0;
++	int pid = 0;
++	int i;
++
++	if (argc > 1 && (strcmp(argv[1], "-h") == 0 ||
++			 strcmp(argv[1], "--help") == 0)) {
++		usage();
++		return 0;
++	}
++
++	for (i = 1; i < argc; i++) {
++		const char *a = argv[i];
++
++		if (strcmp(a, "--device") == 0 && i + 1 < argc) {
++			device = argv[++i];
++		} else if (strcmp(a, "--timeout") == 0 && i + 1 < argc) {
++			timeout_ms = atoi(argv[++i]);
++		} else if (strcmp(a, "--md") == 0 && i + 1 < argc) {
++			md = atoi(argv[++i]);
++		} else if (strcmp(a, "--pid") == 0 && i + 1 < argc) {
++			pid = atoi(argv[++i]);
++		} else if (strcmp(a, "--selftest") == 0) {
++			return run_selftest();
++		} else if (a[0] == '-') {
++			errmsg("unknown option %s", a);
++			usage();
++			return 2;
++		} else if (!cmd) {
++			cmd = a;
++		} else {
++			errmsg("unexpected argument %s", a);
++			usage();
++			return 2;
++		}
++	}
++
++	if (!cmd) {
++		usage();
++		return 2;
++	}
++
++	if (!strcmp(cmd, "query"))
++		return cmd_query(device, timeout_ms);
++	if (!strcmp(cmd, "class"))
++		return cmd_request(device, AE_REQ_CLASS, timeout_ms, false);
++	if (!strcmp(cmd, "type"))
++		return cmd_request(device, AE_REQ_TYPE, timeout_ms, false);
++	if (!strcmp(cmd, "process"))
++		return cmd_request(device, AE_REQ_PROCESS, timeout_ms, false);
++	if (!strcmp(cmd, "module"))
++		return cmd_request(device, AE_REQ_MODULE, timeout_ms, false);
++	if (!strcmp(cmd, "backtrace"))
++		return cmd_request(device, AE_REQ_BACKTRACE, timeout_ms, false);
++	if (!strcmp(cmd, "detail"))
++		return cmd_request(device, AE_REQ_DETAIL, timeout_ms, true);
++	if (!strcmp(cmd, "coredump"))
++		return cmd_request(device, AE_REQ_COREDUMP, timeout_ms, false);
++	if (!strcmp(cmd, "ccci"))
++		return cmd_ccci(device, md, timeout_ms);
++	if (!strcmp(cmd, "close"))
++		return cmd_close(device);
++	if (!strcmp(cmd, "regs"))
++		return cmd_regs(device, pid);
++	if (!strcmp(cmd, "bt"))
++		return cmd_bt(device, pid);
++
++	errmsg("unknown command %s", cmd);
++	usage();
++	return 2;
++}

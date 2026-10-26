@@ -1,0 +1,4100 @@
+diff --git a/drivers/misc/mediatek/connectivity/wlan/Kconfig b/drivers/misc/mediatek/connectivity/wlan/Kconfig
+index 062d69668..a62b2181d 100644
+--- a/drivers/misc/mediatek/connectivity/wlan/Kconfig
++++ b/drivers/misc/mediatek/connectivity/wlan/Kconfig
+@@ -5,13 +5,35 @@
+ config MTK_WCN_WLAN
+ 	tristate "MediaTek WCN WLAN driver"
+ 	depends on MTK_WCN_WMT
++	depends on CFG80211
+ 	depends on ARCH_MEDIATEK || COMPILE_TEST
+ 	select CRC32
+-	select RFKILL
+ 	select FW_LOADER
+ 	help
+ 	  Host driver for the MediaTek WLAN function embedded in the
+-	  connectivity subsystem.  It owns the AHB host interface, the
+-	  firmware download path and the WMT function power sequencing.
++	  connectivity subsystem (MT6628/MT6627 gen2, AHB host interface
++	  with optional AP-DMA).  It owns the AHB host interface, the
++	  firmware download path and the WMT function power sequencing, and
++	  exposes one cfg80211 station interface plus its Ethernet netdev.
++
++	  Supported feature set, and nothing beyond it:
++
++	  - station (infrastructure) mode on 2.4 GHz channels 1 to 14,
++	    legacy rates only, no 5 GHz band;
++	  - open (no encryption) networks only.  There is no key offload,
++	    so WPA/WPA2/802.1X association requests are rejected with
++	    -EOPNOTSUPP instead of associating unencrypted;
++	  - software scan: probe requests are built by the host and sent
++	    through the HIF, beacons and probe responses received from the
++	    HIF are reported to cfg80211.  Passive scans send no frames;
++	  - no AP, IBSS, mesh, P2P or monitor interface, no hardware scan,
++	    no scheduled scan, no remain-on-channel and no WoWLAN.
++
++	  The interface is controlled through cfg80211 only (iw,
++	  wpa_supplicant); the driver registers no private character
++	  device or ioctl ABI.
++
++	  Building without CONFIG_RFKILL is supported; the rfkill switch is
++	  then simply absent and WLAN is controlled through WMT.
+ 
+ 	  The module is called mtk_wcn_wlan.
+diff --git a/drivers/misc/mediatek/connectivity/wlan/Makefile b/drivers/misc/mediatek/connectivity/wlan/Makefile
+index b634cbf6a..23607b8de 100644
+--- a/drivers/misc/mediatek/connectivity/wlan/Makefile
++++ b/drivers/misc/mediatek/connectivity/wlan/Makefile
+@@ -6,4 +6,5 @@ ccflags-y += -I$(srctree)/drivers/misc/mediatek/connectivity/include
+ 
+ obj-$(CONFIG_MTK_WCN_WLAN) += mtk_wcn_wlan.o
+ 
+-mtk_wcn_wlan-y := wlan_main.o wlan_ahb.o wlan_fw.o
++mtk_wcn_wlan-y := wlan_main.o wlan_ahb.o wlan_fw.o \
++		  wlan_mac.o wlan_netdev.o wlan_mgmt.o wlan_txrx.o wlan_cmd.o
+diff --git a/drivers/misc/mediatek/connectivity/wlan/wlan_ahb.c b/drivers/misc/mediatek/connectivity/wlan/wlan_ahb.c
+index 565201551..f054a89d5 100644
+--- a/drivers/misc/mediatek/connectivity/wlan/wlan_ahb.c
++++ b/drivers/misc/mediatek/connectivity/wlan/wlan_ahb.c
+@@ -11,8 +11,10 @@
+  * Copyright (C) 2013 MediaTek Inc.
+  *
+  * The block implements the register/PIO/PDMA half of the gen2 HIF only.
+- * The gen2 802.11 MAC layer (nic/, mgmt/) is not part of this driver, so
+- * received frames are drained and counted instead of being dispatched.
++ * Received buffers are handed to the 802.11 MAC layer in wlan_mac.c
++ * unchanged, exactly like HifAhbISR()/wlanIST() pass them to
++ * nicRxProcessRFBs() in the downstream driver (ahb.c:1215-1249,
++ * wlan_lib.c:1800-1850, nic_rx.c:2734-2823).
+  */
+ 
+ #include <linux/delay.h>
+@@ -418,16 +420,16 @@ void mtk_wlan_hif_hw_init(struct mtk_wlan_hif *hif)
+ }
+ 
+ /*
+- * Bottom half of the HIF interrupt.  The hard handler only masks the source
+- * and defers, exactly like HifAhbISR() waking the IST (ahb.c:1215-1249).
+- * There is no 802.11 stack to deliver frames to yet, so RX is drained.
++ * Read one frame from a HIF data port.  The port carries ALIGN_4(packet
++ * length) bytes plus one hardware appended DW with the checksum status
++ * (nic_rx.c:2887-2890), so the read length is not the value in WRPLR.
+  */
+ static void mtk_wlan_hif_rx_drain(struct mtk_wlan_hif *hif, u32 port)
+ {
+ 	unsigned int i;
+ 
+ 	for (i = 0; i < MTK_WLAN_HIF_RX_DRAIN_MAX; i++) {
+-		u32 len, val;
++		u32 len, read_len, val;
+ 
+ 		val = mtk_wlan_hif_readl(hif, MCR_WRPLR);
+ 		if (port == MCR_WRDR1)
+@@ -437,19 +439,28 @@ static void mtk_wlan_hif_rx_drain(struct mtk_wlan_hif *hif, u32 port)
+ 		if (!len)
+ 			break;
+ 
+-		if (len > MTK_WLAN_RX_MAX_PKT_SIZE) {
++		read_len = ALIGN(len, 4) + MTK_WLAN_HIF_HW_APPENDED_LEN;
++		if (len > MTK_WLAN_RX_MAX_PKT_SIZE ||
++		    read_len > MTK_WLAN_HIF_RX_BUF_SIZE) {
++			/*
++			 * A length beyond the documented maximum means the
++			 * port is out of sync; there is no way to resynchronise
++			 * a PIO/PDMA FIFO, so stop draining this port.
++			 */
+ 			dev_warn(hif->dev,
+ 				 "RX port %#x frame of %u bytes dropped\n",
+ 				 port, len);
++			atomic_inc(&hif->rx_dropped);
+ 			break;
+ 		}
+ 
+-		if (mtk_wlan_hif_port_read(hif, port, len, hif->rx_buf,
+-					   MTK_WLAN_RX_MAX_PKT_SIZE)) {
++		if (mtk_wlan_hif_port_read(hif, port, read_len, hif->rx_buf,
++					   MTK_WLAN_HIF_RX_BUF_SIZE)) {
+ 			atomic_inc(&hif->rx_dropped);
+ 			break;
+ 		}
+-		atomic_inc(&hif->rx_dropped);
++
++		mtk_wlan_mac_rx(hif, hif->rx_buf, read_len);
+ 	}
+ 
+ 	if (i)
+@@ -500,10 +511,15 @@ static void mtk_wlan_hif_irq_work(struct work_struct *work)
+ 		dev_warn(hif->dev, "HIF abnormal interrupt, WASR=0x%08x\n",
+ 			 mtk_wlan_hif_readl(hif, MCR_WASR));
+ 
+-	if (hisr & WHISR_TX_DONE_INT)
++	if (hisr & WHISR_TX_DONE_INT) {
++		u32 wtsr0 = mtk_wlan_hif_readl(hif, MCR_WTSR0);
++		u32 wtsr1 = mtk_wlan_hif_readl(hif, MCR_WTSR1);
++
++		/* Each byte is the released TX buffer count of one TC. */
+ 		dev_dbg(hif->dev, "TX done, WTSR0=0x%08x WTSR1=0x%08x\n",
+-			mtk_wlan_hif_readl(hif, MCR_WTSR0),
+-			mtk_wlan_hif_readl(hif, MCR_WTSR1));
++			wtsr0, wtsr1);
++		mtk_wlan_mac_tx_done(hif, wtsr0, wtsr1);
++	}
+ 
+ 	/* Re-enable unconditionally, like nicEnableInterrupt() at the end of
+ 	 * wlanIST() (wlan_lib.c:1846-1847).
+@@ -656,7 +672,7 @@ static int mtk_wlan_ahb_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, PTR_ERR(hif->clk),
+ 				     "cannot get wifi-dma clock\n");
+ 
+-	hif->rx_buf = devm_kmalloc(dev, MTK_WLAN_RX_MAX_PKT_SIZE, GFP_KERNEL);
++	hif->rx_buf = devm_kmalloc(dev, MTK_WLAN_HIF_RX_BUF_SIZE, GFP_KERNEL);
+ 	if (!hif->rx_buf)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/misc/mediatek/connectivity/wlan/wlan_cmd.c b/drivers/misc/mediatek/connectivity/wlan/wlan_cmd.c
+new file mode 100644
+index 000000000..50d7e0501
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wlan/wlan_cmd.c
+@@ -0,0 +1,598 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WLAN gen2 firmware command/event channel.
++ *
++ * The gen2 firmware is configured with Set commands written to HIF TX port 1
++ * (traffic class TC4) and answers them with EVENT_ID_CMD_RESULT events on the
++ * HIF RX side.  This file implements that transport and the three commands
++ * needed to make the firmware aware of a station association:
++ *
++ *   CMD_ID_BSS_ACTIVATE_CTRL   network activation, nicActivateNetwork()
++ *   CMD_ID_UPDATE_STA_RECORD   AP peer record, cnmStaSendUpdateCmd()
++ *   CMD_ID_SET_BSS_INFO        BSS state, nicUpdateBss()
++ *   CMD_ID_REMOVE_STA_RECORD   peer removal, cnmStaSendRemoveCmd()
++ *
++ * Ported from Samsung/MTK downstream:
++ *   include/nic/cmd_buf.h      (CMD_INFO_T, CMD_HDR_SIZE)
++ *   include/nic_cmd_event.h    (WIFI_CMD_T / WIFI_EVENT_T, CMD_* structs)
++ *   nic/nic_tx.c:1597-1761     (nicTxCmd: command PDU framing, port 1)
++ *   common/wlan_lib.c:2037-2098 (wlanSendCommand: TC4, one credit)
++ *   nic/nic_rx.c:1789-1830     (EVENT_ID_CMD_RESULT, matched by sequence)
++ *   nic/nic.c:1966-2103        (nicUpdateBss)
++ *   nic/nic.c:1902-1927        (nicActivateNetwork)
++ *   mgmt/cnm_mem.c:1129-1238   (cnmStaSendUpdateCmd / cnmStaSendRemoveCmd)
++ *   mgmt/rate.c:80-254         (rate IE to rate-set conversion)
++ *   mgmt/rlm.c:1713-1745       (rlmFillSyncCmdParam)
++ *
++ * Copyright (C) 2013 MediaTek Inc.
++ */
++
++#include <linux/build_bug.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/etherdevice.h>
++#include <linux/jiffies.h>
++#include <linux/kernel.h>
++#include <linux/string.h>
++#include <net/cfg80211.h>
++
++#include "wlan_cmd.h"
++#include "wlan_mac.h"
++
++/*
++ * Values copied from the downstream enums:
++ *
++ *   ENUM_PARAM_MEDIA_STATE_T       wlan_oid.h:394-399   CONNECTED = 0
++ *   ENUM_PARAM_AUTH_MODE_T         wlan_oid.h:302-315   AUTH_MODE_OPEN = 0 or 1
++ *   ENUM_WEP_STATUS_T              wlan_oid.h:321-335   ENCRYPTION_DISABLED = 1
++ *   ENUM_STA_TYPE_T                wlan_def.h:769-783   LEGACY_AP = BIT(0)|BIT(6)
++ *   ENUM_PHY_TYPE_INDEX_T          wlan_def.h:547-555   HR_DSSS = 0, ERP = 1
++ *   ENUM_OP_MODE_T                 wlan_def.h:563-571   INFRASTRUCTURE = 0
++ *   ENUM_BAND_T                    wlan_def.h:582-587   BAND_2G4 = 1
++ *   ENUM_CHNL_EXT_T                wlan_def.h:574-579   CHNL_EXT_SCN = 0
++ *   ENUM_HIDDEN_SSID_TYPE_T        p2p_fsm.h:500-505    NONE = 0
++ *   STA_STATE_1 / STA_STATE_3      mac.h:261-263         0 / 2
++ *   PHY_TYPE_BIT_* / RATE_SET_*    wlan_def.h:293-388
++ *
++ * The firmware AUTH_MODE_OPEN value is 0: nicUpdateBss() stores
++ * eAuthMode - 1 when CFG_SUPPORT_802_11R is built in (nic.c:2049-2058), and
++ * AUTH_MODE_OPEN is followed by no other value without it (wlan_oid.h:302-315);
++ * both cases write 0 for an open network.
++ */
++#define MTK_WLAN_MEDIA_STATE_CONNECTED		0
++#define MTK_WLAN_MEDIA_STATE_DISCONNECTED	1
++#define MTK_WLAN_AUTH_MODE_OPEN_FW		0
++#define MTK_WLAN_ENCRYPTION_DISABLED		1
++#define MTK_WLAN_STA_TYPE_LEGACY_AP		(BIT(0) | BIT(6))
++#define MTK_WLAN_OP_MODE_INFRASTRUCTURE		0
++#define MTK_WLAN_BAND_2G4			1
++#define MTK_WLAN_CHNL_EXT_SCN			0
++#define MTK_WLAN_HIDDEN_SSID_NONE		0
++#define MTK_WLAN_PHY_TYPE_HR_DSSS_INDEX		0
++#define MTK_WLAN_PHY_TYPE_ERP_INDEX		1
++#define MTK_WLAN_PHY_TYPE_BIT_HR_DSSS		BIT(0)
++#define MTK_WLAN_PHY_TYPE_BIT_ERP		BIT(1)
++#define MTK_WLAN_PHY_TYPE_SET_802_11BG \
++	(MTK_WLAN_PHY_TYPE_BIT_HR_DSSS | MTK_WLAN_PHY_TYPE_BIT_ERP)
++
++/* RATE_SET_* bits, wlan_def.h:322-360. */
++#define MTK_WLAN_RATE_SET_HR_DSSS \
++	(BIT(0) | BIT(1) | BIT(2) | BIT(3))
++#define MTK_WLAN_RATE_SET_OFDM \
++	(BIT(6) | BIT(7) | BIT(8) | BIT(9) | BIT(10) | BIT(11) | \
++	 BIT(12) | BIT(13))
++#define MTK_WLAN_RATE_SET_ALL_ABG \
++	(MTK_WLAN_RATE_SET_HR_DSSS | MTK_WLAN_RATE_SET_OFDM)
++
++/* ERP IE bits, mac.h:848-849. */
++#define MTK_WLAN_ERP_USE_PROTECTION		BIT(1)
++#define MTK_WLAN_ERP_BARKER_PREAMBLE		BIT(2)
++
++/* ucCheckId of CMD_SET_BSS_RLM_PARAM_T, rlm.c:1741. */
++#define MTK_WLAN_RLM_CHECK_ID			0x72
++
++/*
++ * Supported-rate codes in 500 kb/s units, in RATE_*_INDEX order
++ * (aucDataRate[], rate.c:80-96; values from mac.h:234-247).
++ */
++static const u8 mtk_wlan_data_rates[] = {
++	2, 4, 11, 22, 44, 66, 12, 18, 24, 36, 48, 72, 96, 108,
++};
++
++/* RATE_BASIC_BIT / RATE_MASK, mac.h:250-251. */
++#define MTK_WLAN_RATE_MASK			GENMASK(6, 0)
++#define MTK_WLAN_RATE_BASIC			BIT(7)
++
++static_assert(sizeof(struct mtk_wlan_cmd_hdr) == 8);
++static_assert(sizeof(struct mtk_wlan_event_hdr) == 8);
++static_assert(sizeof(struct mtk_wlan_event_cmd_result) == 4);
++static_assert(sizeof(struct mtk_wlan_cmd_bss_activate) == 4);
++static_assert(sizeof(struct mtk_wlan_cmd_set_bss_rlm) == 16);
++static_assert(sizeof(struct mtk_wlan_cmd_set_bss_info) == 80);
++static_assert(offsetof(struct mtk_wlan_cmd_set_bss_info, rlm) == 64);
++static_assert(sizeof(struct mtk_wlan_cmd_update_sta) == 40);
++static_assert(sizeof(struct mtk_wlan_cmd_remove_sta) == 8);
++
++/**
++ * mtk_wlan_cmd_init - initialize the command channel state
++ * @mac: MAC instance
++ */
++void mtk_wlan_cmd_init(struct mtk_wlan_mac *mac)
++{
++	mutex_init(&mac->cmd.lock);
++	spin_lock_init(&mac->cmd.wait_lock);
++	init_completion(&mac->cmd.done);
++	mac->cmd.aborted = false;
++}
++
++/* Allow commands again after the firmware came back up. */
++void mtk_wlan_cmd_reset(struct mtk_wlan_mac *mac)
++{
++	spin_lock_bh(&mac->cmd.wait_lock);
++	mac->cmd.aborted = false;
++	mac->cmd.pending = false;
++	spin_unlock_bh(&mac->cmd.wait_lock);
++}
++
++/**
++ * mtk_wlan_cmd_cancel - release the command in flight without poisoning the channel
++ * @mac: MAC instance
++ *
++ * Used when a connect attempt is cancelled while the firmware is still up:
++ * the waiting command returns -ECANCELED, and the teardown commands that
++ * follow still work.
++ */
++void mtk_wlan_cmd_cancel(struct mtk_wlan_mac *mac)
++{
++	bool wake = false;
++
++	spin_lock_bh(&mac->cmd.wait_lock);
++	if (mac->cmd.pending) {
++		mac->cmd.result = -ECANCELED;
++		wake = true;
++	}
++	spin_unlock_bh(&mac->cmd.wait_lock);
++
++	if (wake)
++		complete(&mac->cmd.done);
++}
++
++/**
++ * mtk_wlan_cmd_abort - fail the command in flight after a firmware loss
++ * @mac: MAC instance
++ *
++ * Called from the firmware-down path.  The sender is released with -ENETDOWN
++ * and every later command fails immediately until mtk_wlan_cmd_reset().
++ */
++void mtk_wlan_cmd_abort(struct mtk_wlan_mac *mac)
++{
++	bool wake = false;
++
++	spin_lock_bh(&mac->cmd.wait_lock);
++	mac->cmd.aborted = true;
++	if (mac->cmd.pending) {
++		mac->cmd.result = -ENETDOWN;
++		wake = true;
++	}
++	spin_unlock_bh(&mac->cmd.wait_lock);
++
++	if (wake)
++		complete(&mac->cmd.done);
++}
++
++/**
++ * mtk_wlan_cmd_event - dispatch one HIF RX event buffer
++ * @mac: MAC instance
++ * @buf: event payload starting at WIFI_EVENT_T
++ * @len: payload length
++ *
++ * Only command results are consumed here.  The firmware may emit further
++ * unsolicited events (STA record activation, channel privilege, ...); they
++ * have no consumer in this port and are ignored.  Matching is by sequence
++ * number like nicGetPendingCmdInfo() (nic.c:1406-1437); the command id in the
++ * payload is only checked for diagnostics.
++ */
++void mtk_wlan_cmd_event(struct mtk_wlan_mac *mac, const u8 *buf, size_t len)
++{
++	const struct mtk_wlan_event_hdr *ev = (const void *)buf;
++	const struct mtk_wlan_event_cmd_result *res;
++	bool wake = false, mismatch = false;
++	u8 pending_cid = 0;
++	int result;
++
++	if (len < MTK_WLAN_EVENT_HDR_LEN + sizeof(*res))
++		return;
++	if (ev->eid != MTK_WLAN_EVENT_ID_CMD_RESULT)
++		return;
++	if (le16_to_cpu(ev->packet_len) <
++	    MTK_WLAN_EVENT_HDR_LEN + sizeof(*res))
++		return;
++
++	res = (const void *)(buf + MTK_WLAN_EVENT_HDR_LEN);
++	switch (res->status) {
++	case MTK_WLAN_CMD_STATUS_SUCCESS:
++		result = 0;
++		break;
++	case MTK_WLAN_CMD_STATUS_REJECTED:
++		result = -EIO;
++		break;
++	case MTK_WLAN_CMD_STATUS_UNKNOWN:
++		result = -EOPNOTSUPP;
++		break;
++	default:
++		result = -EIO;
++		break;
++	}
++
++	spin_lock_bh(&mac->cmd.wait_lock);
++	if (!mac->cmd.pending || ev->seq != mac->cmd.seq) {
++		spin_unlock_bh(&mac->cmd.wait_lock);
++		return;
++	}
++	pending_cid = mac->cmd.cid;
++	mismatch = res->cmd_id != pending_cid;
++	mac->cmd.result = result;
++	wake = true;
++	spin_unlock_bh(&mac->cmd.wait_lock);
++
++	if (mismatch)
++		dev_warn_ratelimited(mac->dev,
++				     "command result cid 0x%02x for pending 0x%02x\n",
++				     res->cmd_id, pending_cid);
++	if (wake)
++		complete(&mac->cmd.done);
++}
++
++/*
++ * Send one command PDU and optionally wait for its result event.
++ *
++ * Framing follows nicTxCmd() (nic_tx.c:1700-1740): the buffer is
++ * WIFI_CMD_T + payload, its first DW is the HIF TX header's first DW, the
++ * packet type is HIF_TX_PKT_TYPE_CMD on TC4/port 1 and the length is padded
++ * to a DW (TFCB_FRAME_PAD_TO_DW(), hif_tx.h:206).  One TC4 buffer is used
++ * (wlanSendCommand(), wlan_lib.c:2077-2086); the TX-done interrupt returns it.
++ */
++static int mtk_wlan_cmd_send(struct mtk_wlan_mac *mac, u8 cid, bool set_query,
++			     bool need_resp, const void *payload, size_t len)
++{
++	struct mtk_wlan_hif *hif = mac->hif;
++	struct mtk_wlan_cmd_hdr *hdr;
++	u8 buf[MTK_WLAN_CMD_BUF_MAX];
++	size_t total = ALIGN(MTK_WLAN_CMD_HDR_LEN + len, 4);
++	unsigned int tries;
++	unsigned long timeout;
++	int ret;
++
++	if (!READ_ONCE(mac->fw_up))
++		return -ENETDOWN;
++	if (MTK_WLAN_CMD_HDR_LEN + len > sizeof(buf))
++		return -EMSGSIZE;
++
++	mutex_lock(&mac->cmd.lock);
++
++	for (tries = 0; tries < MTK_WLAN_CMD_TRIES; tries++) {
++		if (mtk_wlan_tc_acquire(mac, MTK_WLAN_TC4))
++			break;
++		msleep(MTK_WLAN_CMD_POLL_MS);
++	}
++	if (tries == MTK_WLAN_CMD_TRIES) {
++		mutex_unlock(&mac->cmd.lock);
++		return -EBUSY;
++	}
++
++	memset(buf, 0, total);
++	hdr = (struct mtk_wlan_cmd_hdr *)buf;
++
++	spin_lock_bh(&mac->cmd.wait_lock);
++	if (mac->cmd.aborted || !READ_ONCE(mac->fw_up)) {
++		spin_unlock_bh(&mac->cmd.wait_lock);
++		mtk_wlan_tc_release(mac, MTK_WLAN_TC4, 1);
++		mutex_unlock(&mac->cmd.lock);
++		return -ENETDOWN;
++	}
++	mac->cmd.seq++;
++	mac->cmd.cid = cid;
++	mac->cmd.result = 0;
++	mac->cmd.pending = need_resp;
++	reinit_completion(&mac->cmd.done);
++	hdr->seq = mac->cmd.seq;
++	spin_unlock_bh(&mac->cmd.wait_lock);
++
++	hdr->tx_byte_count_user_priority =
++		cpu_to_le16((u16)total & HIF_TX_HDR_TX_BYTE_COUNT_MASK);
++	hdr->ether_type_offset = 0;
++	hdr->resource_pkttype_csflags =
++		FIELD_PREP(HIF_TX_HDR_RESOURCE_MASK, MTK_WLAN_TC4) |
++		FIELD_PREP(HIF_TX_HDR_PACKET_TYPE_MASK, HIF_TX_PKT_TYPE_CMD);
++	hdr->cid = cid;
++	hdr->set_query = set_query ? 1 : 0;
++	if (len)
++		memcpy(buf + MTK_WLAN_CMD_HDR_LEN, payload, len);
++
++	mutex_lock(&mac->tx_lock);
++	ret = mtk_wlan_hif_port_write(hif, MCR_WTDR1, total, buf, total);
++	mutex_unlock(&mac->tx_lock);
++
++	if (ret) {
++		mtk_wlan_tc_release(mac, MTK_WLAN_TC4, 1);
++		spin_lock_bh(&mac->cmd.wait_lock);
++		mac->cmd.pending = false;
++		spin_unlock_bh(&mac->cmd.wait_lock);
++		mutex_unlock(&mac->cmd.lock);
++		return ret;
++	}
++
++	if (need_resp) {
++		timeout = msecs_to_jiffies(MTK_WLAN_CMD_TIMEOUT_MS);
++		if (!wait_for_completion_timeout(&mac->cmd.done, timeout)) {
++			dev_warn(mac->dev, "command 0x%02x seq %u timed out\n",
++				 cid, hdr->seq);
++			ret = -ETIMEDOUT;
++		} else {
++			ret = mac->cmd.result;
++		}
++	}
++
++	spin_lock_bh(&mac->cmd.wait_lock);
++	mac->cmd.pending = false;
++	spin_unlock_bh(&mac->cmd.wait_lock);
++	mutex_unlock(&mac->cmd.lock);
++
++	return ret;
++}
++
++/* Convert one Supported/Extended Supported Rates element to rate-set bits. */
++static u16 mtk_wlan_rate_set_from_element(const struct element *ie, u16 *basic)
++{
++	unsigned int i, j;
++	u16 set = 0;
++
++	if (!ie)
++		return 0;
++
++	for (i = 0; i < ie->datalen; i++) {
++		u8 code = ie->data[i] & MTK_WLAN_RATE_MASK;
++
++		for (j = 0; j < ARRAY_SIZE(mtk_wlan_data_rates); j++) {
++			if (code != mtk_wlan_data_rates[j])
++				continue;
++			set |= BIT(j);
++			if (ie->data[i] & MTK_WLAN_RATE_BASIC)
++				*basic |= BIT(j);
++			break;
++		}
++	}
++
++	return set;
++}
++
++/**
++ * mtk_wlan_cmd_prepare_ap - derive the firmware AP parameters from a BSS entry
++ * @mac: MAC instance
++ * @bss: BSS the station is about to join, reference held by the caller
++ *
++ * Fills the operational/basic rate sets, PHY type set and protection
++ * parameters the BSS and STA record commands carry.  Downstream derives them
++ * from the beacon/probe response in rateGetRateSetFromIEs() (rate.c:178-254)
++ * and the scan descriptor, and copies them into STA_RECORD_T/BSS_INFO_T in
++ * bssCreateStaRecFromBssDesc() (bss.c:614-662).
++ *
++ * Return: 0 on success, -EINVAL when the AP advertises no usable 2.4 GHz rate.
++ */
++int mtk_wlan_cmd_prepare_ap(struct mtk_wlan_mac *mac, struct cfg80211_bss *bss)
++{
++	const struct element *ie;
++	u16 op = 0, basic = 0;
++	u8 phy = 0;
++	bool barker = false;
++
++	ie = ieee80211_bss_get_elem(bss, WLAN_EID_SUPP_RATES);
++	op |= mtk_wlan_rate_set_from_element(ie, &basic);
++	ie = ieee80211_bss_get_elem(bss, WLAN_EID_EXT_SUPP_RATES);
++	op |= mtk_wlan_rate_set_from_element(ie, &basic);
++	if (!op) {
++		dev_dbg(mac->dev, "AP %pM advertises no supported rates\n",
++			bss->bssid);
++		return -EINVAL;
++	}
++
++	if (op & MTK_WLAN_RATE_SET_HR_DSSS)
++		phy |= MTK_WLAN_PHY_TYPE_BIT_HR_DSSS;
++	if (op & MTK_WLAN_RATE_SET_OFDM)
++		phy |= MTK_WLAN_PHY_TYPE_BIT_ERP;
++	phy &= MTK_WLAN_PHY_TYPE_SET_802_11BG;
++	if (!phy)
++		return -EINVAL;
++
++	ie = ieee80211_bss_get_elem(bss, WLAN_EID_ERP_INFO);
++	if (ie && ie->datalen >= 1) {
++		mac->ap_erp_protect = !!(ie->data[0] & MTK_WLAN_ERP_USE_PROTECTION);
++		barker = !!(ie->data[0] & MTK_WLAN_ERP_BARKER_PREAMBLE);
++	} else {
++		mac->ap_erp_protect = false;
++	}
++
++	mac->ap_rate_set = op;
++	mac->ap_basic_rate_set = basic;
++	mac->ap_phy_type_set = phy;
++	mac->ap_nonht_phy = (phy & MTK_WLAN_PHY_TYPE_BIT_ERP) ?
++			    MTK_WLAN_PHY_TYPE_ERP_INDEX :
++			    MTK_WLAN_PHY_TYPE_HR_DSSS_INDEX;
++	mac->ap_short_preamble =
++		(bss->capability & WLAN_CAPABILITY_SHORT_PREAMBLE) && !barker;
++	mac->ap_short_slot =
++		!!(bss->capability & WLAN_CAPABILITY_SHORT_SLOT_TIME);
++
++	return 0;
++}
++
++/**
++ * mtk_wlan_cmd_bss_activate - activate or deactivate the AIS network
++ * @mac: MAC instance
++ * @active: %true to activate
++ *
++ * nicActivateNetwork()/nicDeactivateNetwork(), nic.c:1902-1958.
++ *
++ * Return: 0 on success, negative errno otherwise.
++ */
++int mtk_wlan_cmd_bss_activate(struct mtk_wlan_mac *mac, bool active)
++{
++	struct mtk_wlan_cmd_bss_activate cmd = {
++		.net_type_index = MTK_WLAN_NETWORK_TYPE_AIS,
++		.active = active ? 1 : 0,
++	};
++
++	return mtk_wlan_cmd_send(mac, MTK_WLAN_CMD_ID_BSS_ACTIVATE_CTRL, true,
++				 false, &cmd, sizeof(cmd));
++}
++
++/**
++ * mtk_wlan_cmd_set_bss_info - sync the BSS state to the firmware
++ * @mac: MAC instance
++ * @connected: %true for the connected state
++ *
++ * nicUpdateBss(), nic.c:1966-2090, with rlmFillSyncCmdParam()
++ * (rlm.c:1713-1745) for the embedded RLM parameters.
++ *
++ * Return: 0 on success, negative errno otherwise.
++ */
++int mtk_wlan_cmd_set_bss_info(struct mtk_wlan_mac *mac, bool connected)
++{
++	struct mtk_wlan_cmd_set_bss_info cmd = { };
++	u8 ssid_len = min_t(u8, mac->ssid_len, sizeof(cmd.ssid));
++
++	cmd.net_type_index = MTK_WLAN_NETWORK_TYPE_AIS;
++	cmd.connection_state = connected ? MTK_WLAN_MEDIA_STATE_CONNECTED :
++			       MTK_WLAN_MEDIA_STATE_DISCONNECTED;
++	cmd.current_op_mode = MTK_WLAN_OP_MODE_INFRASTRUCTURE;
++	cmd.ssid_len = ssid_len;
++	memcpy(cmd.ssid, mac->ssid, ssid_len);
++	memcpy(cmd.bssid, mac->bssid, ETH_ALEN);
++	cmd.is_qbss = 0;
++	cmd.operational_rate_set = cpu_to_le16(mac->ap_rate_set);
++	cmd.bss_basic_rate_set = cpu_to_le16(mac->ap_basic_rate_set);
++	cmd.sta_rec_idx_of_ap = mac->sta_valid ? mac->sta_index :
++				MTK_WLAN_STA_REC_NOT_FOUND;
++	cmd.nonht_basic_phy_type = mac->ap_nonht_phy;
++	cmd.auth_mode = MTK_WLAN_AUTH_MODE_OPEN_FW;
++	cmd.enc_status = MTK_WLAN_ENCRYPTION_DISABLED;
++	cmd.phy_type_set = mac->ap_phy_type_set;
++	memcpy(cmd.own_mac, mac->mac_addr, ETH_ALEN);
++	cmd.wapi_mode = 0;
++	cmd.is_ap_mode = 0;
++	cmd.hidden_ssid_mode = MTK_WLAN_HIDDEN_SSID_NONE;
++	cmd.rlm.net_type_index = MTK_WLAN_NETWORK_TYPE_AIS;
++	cmd.rlm.rf_band = MTK_WLAN_BAND_2G4;
++	cmd.rlm.primary_channel = (u8)mac->channel;
++	cmd.rlm.rf_sco = MTK_WLAN_CHNL_EXT_SCN;
++	cmd.rlm.erp_protect_mode = mac->ap_erp_protect ? 1 : 0;
++	cmd.rlm.ht_protect_mode = 0;	/* HT_PROTECT_MODE_NONE, rlm_protection.h:74 */
++	cmd.rlm.gf_operation_mode = 0;	/* GF_MODE_NORMAL, rlm_protection.h:83 */
++	cmd.rlm.tx_rifs_mode = 0;	/* RIFS_MODE_NORMAL, rlm_protection.h:91 */
++	cmd.rlm.use_short_preamble = mac->ap_short_preamble ? 1 : 0;
++	cmd.rlm.use_short_slot_time = mac->ap_short_slot ? 1 : 0;
++	cmd.rlm.check_id = MTK_WLAN_RLM_CHECK_ID;
++
++	return mtk_wlan_cmd_send(mac, MTK_WLAN_CMD_ID_SET_BSS_INFO, true, false,
++				 &cmd, sizeof(cmd));
++}
++
++/**
++ * mtk_wlan_cmd_update_sta - create or update the AP peer record
++ * @mac: MAC instance
++ * @state: %MTK_WLAN_STA_STATE_1 or %MTK_WLAN_STA_STATE_3
++ * @aid: association id, only used for state 3
++ * @need_resp: wait for the firmware result event
++ *
++ * cnmStaSendUpdateCmd(), cnm_mem.c:1129-1215, with the fields
++ * cnmStaRecChangeState() synchronises (cnm_mem.c:1032-1056).  The peer is the
++ * AP itself, so the record type is STA_TYPE_LEGACY_AP (ais_fsm.c:1372).
++ *
++ * Return: 0 on success, negative errno otherwise.
++ */
++int mtk_wlan_cmd_update_sta(struct mtk_wlan_mac *mac, u8 state, u16 aid,
++			    bool need_resp)
++{
++	struct mtk_wlan_cmd_update_sta cmd = { };
++
++	cmd.index = mac->sta_index;
++	cmd.sta_type = MTK_WLAN_STA_TYPE_LEGACY_AP;
++	memcpy(cmd.mac_addr, mac->bssid, ETH_ALEN);
++	cmd.assoc_id = cpu_to_le16(aid);
++	cmd.listen_interval = cpu_to_le16(MTK_WLAN_LISTEN_INTERVAL);
++	cmd.net_type_index = MTK_WLAN_NETWORK_TYPE_AIS;
++	cmd.desired_phy_type_set = mac->ap_phy_type_set;
++	cmd.desired_nonht_rate_set =
++		cpu_to_le16(mac->ap_rate_set & MTK_WLAN_RATE_SET_ALL_ABG);
++	cmd.bss_basic_rate_set = cpu_to_le16(mac->ap_basic_rate_set);
++	cmd.is_qos = 0;
++	cmd.is_uapsd_supported = 0;
++	cmd.sta_state = state;
++	cmd.mcs_set = 0;
++	cmd.sup_mcs32 = 0;
++	cmd.ampdu_param = 0;
++	cmd.ht_cap_info = 0;
++	cmd.ht_extended_cap = 0;
++	cmd.tx_beamforming_cap = 0;
++	cmd.asel_cap = 0;
++	cmd.rcpi = READ_ONCE(mac->last_signal);
++	cmd.need_resp = need_resp ? 1 : 0;
++	cmd.uapsd_ac = 0;
++	cmd.uapsd_sp = 0;
++
++	return mtk_wlan_cmd_send(mac, MTK_WLAN_CMD_ID_UPDATE_STA_RECORD, true,
++				 need_resp, &cmd, sizeof(cmd));
++}
++
++/**
++ * mtk_wlan_cmd_remove_sta - delete the AP peer record
++ * @mac: MAC instance
++ *
++ * cnmStaSendRemoveCmd(), cnm_mem.c:1220-1238.
++ *
++ * Return: 0 on success, negative errno otherwise.
++ */
++int mtk_wlan_cmd_remove_sta(struct mtk_wlan_mac *mac)
++{
++	struct mtk_wlan_cmd_remove_sta cmd = { };
++
++	cmd.index = mac->sta_index;
++	memcpy(cmd.mac_addr, mac->bssid, ETH_ALEN);
++
++	return mtk_wlan_cmd_send(mac, MTK_WLAN_CMD_ID_REMOVE_STA_RECORD, true,
++				 false, &cmd, sizeof(cmd));
++}
++
++/**
++ * mtk_wlan_cmd_teardown - release the firmware association state
++ * @mac: MAC instance
++ *
++ * Downstream disconnects by moving AIS to PARAM_MEDIA_STATE_DISCONNECTED and
++ * calling nicUpdateBss() (ais_fsm.c:4072-4080), which is the SET_BSS_INFO
++ * command below.  The driver-side STA record is then freed without a chip
++ * sync (cnmStaRecFree(..., FALSE), ais_fsm.c:4975), so downstream does not
++ * send CMD_ID_REMOVE_STA_RECORD for an AIS peer (that command is used by P2P
++ * and TDLS, p2p_func.c:1103 and tdls.c:4331).  This port does send it: the
++ * command and its payload are part of the same firmware ABI, it makes the
++ * next association start from a clean record, and the result is not awaited.
++ * The network is finally deactivated like nicDeactivateNetwork() does.
++ */
++int mtk_wlan_cmd_teardown(struct mtk_wlan_mac *mac)
++{
++	int ret;
++
++	if (!READ_ONCE(mac->fw_up))
++		return -ENETDOWN;
++
++	ret = mtk_wlan_cmd_set_bss_info(mac, false);
++	if (mac->sta_valid) {
++		if (mtk_wlan_cmd_remove_sta(mac))
++			dev_dbg(mac->dev, "cannot remove STA record %u\n",
++				mac->sta_index);
++	}
++	mtk_wlan_cmd_bss_activate(mac, false);
++
++	mac->sta_valid = false;
++	mac->aid = 0;
++	return ret;
++}
+diff --git a/drivers/misc/mediatek/connectivity/wlan/wlan_cmd.h b/drivers/misc/mediatek/connectivity/wlan/wlan_cmd.h
+new file mode 100644
+index 000000000..597f59c12
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wlan/wlan_cmd.h
+@@ -0,0 +1,191 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * MediaTek WLAN gen2 firmware command/event channel - wire definitions.
++ *
++ * Ported from Samsung/MTK downstream:
++ *   include/nic_cmd_event.h   (WIFI_CMD_T, WIFI_EVENT_T, CMD and EVENT structs)
++ *   include/nic/cmd_buf.h     (CMD_INFO_T, CMD_HDR_SIZE)
++ *   nic/nic.c                 (nicUpdateBss, nicActivateNetwork,
++ *                              cnmStaRecChangeState callers)
++ *   mgmt/cnm_mem.c            (cnmStaSendUpdateCmd, cnmStaSendRemoveCmd)
++ *   nic/nic_tx.c              (nicTxCmd command framing, TC4/port 1)
++ *   nic/nic_rx.c              (EVENT_ID_CMD_RESULT matching, nic_rx.c:1789)
++ *
++ * Copyright (C) 2013 MediaTek Inc.
++ */
++
++#ifndef _MTK_WLAN_CMD_H
++#define _MTK_WLAN_CMD_H
++
++#include <linux/types.h>
++
++struct mtk_wlan_mac;
++struct cfg80211_bss;
++
++/* WIFI_CMD_T, nic_cmd_event.h:919-929; CMD_HDR_SIZE is hif_tx.h:98. */
++#define MTK_WLAN_CMD_HDR_LEN		8
++/* WIFI_EVENT_T, nic_cmd_event.h:932-941; EVENT_HDR_SIZE is nic_cmd_event.h:660. */
++#define MTK_WLAN_EVENT_HDR_LEN		8
++/* Largest PDU this port sends: CMD_SET_BSS_INFO (80 bytes). */
++#define MTK_WLAN_CMD_BUF_MAX		128
++
++/* ENUM_CMD_ID_T, nic_cmd_event.h:678-702. */
++#define MTK_WLAN_CMD_ID_BSS_ACTIVATE_CTRL	0x15
++#define MTK_WLAN_CMD_ID_SET_BSS_INFO		0x16
++#define MTK_WLAN_CMD_ID_UPDATE_STA_RECORD	0x17
++#define MTK_WLAN_CMD_ID_REMOVE_STA_RECORD	0x18
++
++/* ENUM_EVENT_ID_T, nic_cmd_event.h:809-811. */
++#define MTK_WLAN_EVENT_ID_CMD_RESULT		1
++
++/* STA_STATE_1 / STA_STATE_3, mac.h:261-263. */
++#define MTK_WLAN_STA_STATE_1			0
++#define MTK_WLAN_STA_STATE_3			2
++
++/* EVENT_CMD_RESULT.ucStatus, nic_cmd_event.h:1175-1179. */
++#define MTK_WLAN_CMD_STATUS_SUCCESS		0
++#define MTK_WLAN_CMD_STATUS_REJECTED		1
++#define MTK_WLAN_CMD_STATUS_UNKNOWN		2
++
++/*
++ * Response timeout.  The downstream OID layer waits for
++ * kalOidComplete() with a 5 s timeout (the value documented next to the
++ * wait in gl_kal.c:2445-2449).
++ */
++#define MTK_WLAN_CMD_TIMEOUT_MS			5000
++/*
++ * Local policy: how long to wait for a free TC4 buffer before giving up.
++ * Downstream polls TC4 resources in the caller (nicTxPollingResource(),
++ * nic_tx.c:633-697) instead of inside the HIF write.
++ */
++#define MTK_WLAN_CMD_TRIES			100
++#define MTK_WLAN_CMD_POLL_MS			2
++
++/* WIFI_CMD_T, nic_cmd_event.h:919-929.  First DW shared with HIF_TX_HEADER_T. */
++struct mtk_wlan_cmd_hdr {
++	__le16 tx_byte_count_user_priority;
++	u8 ether_type_offset;
++	u8 resource_pkttype_csflags;
++	u8 cid;
++	u8 set_query;
++	u8 seq;
++	u8 reserved;
++} __packed;
++
++/* WIFI_EVENT_T, nic_cmd_event.h:932-941. */
++struct mtk_wlan_event_hdr {
++	__le16 packet_len;
++	__le16 packet_type;
++	u8 eid;
++	u8 seq;
++	u8 reserved[2];
++} __packed;
++
++/* EVENT_CMD_RESULT, nic_cmd_event.h:1175-1179. */
++struct mtk_wlan_event_cmd_result {
++	u8 cmd_id;
++	u8 status;
++	u8 reserved[2];
++} __packed;
++
++/* CMD_BSS_ACTIVATE_CTRL, nic_cmd_event.h:1414-1418. */
++struct mtk_wlan_cmd_bss_activate {
++	u8 net_type_index;
++	u8 active;
++	u8 reserved[2];
++} __packed;
++
++/* CMD_SET_BSS_RLM_PARAM_T, nic_cmd_event.h:1420-1435. */
++struct mtk_wlan_cmd_set_bss_rlm {
++	u8 net_type_index;
++	u8 rf_band;
++	u8 primary_channel;
++	u8 rf_sco;
++	u8 erp_protect_mode;
++	u8 ht_protect_mode;
++	u8 gf_operation_mode;
++	u8 tx_rifs_mode;
++	__le16 ht_op_info3;
++	__le16 ht_op_info2;
++	u8 ht_op_info1;
++	u8 use_short_preamble;
++	u8 use_short_slot_time;
++	u8 check_id;
++} __packed;
++
++/* CMD_SET_BSS_INFO, nic_cmd_event.h:1437-1460. */
++struct mtk_wlan_cmd_set_bss_info {
++	u8 net_type_index;
++	u8 connection_state;
++	u8 current_op_mode;
++	u8 ssid_len;
++	u8 ssid[32];
++	u8 bssid[6];
++	u8 is_qbss;
++	u8 reserved1;
++	__le16 operational_rate_set;
++	__le16 bss_basic_rate_set;
++	u8 sta_rec_idx_of_ap;
++	u8 reserved2;
++	u8 reserved3;
++	u8 nonht_basic_phy_type;
++	u8 auth_mode;
++	u8 enc_status;
++	u8 phy_type_set;
++	u8 own_mac[6];
++	u8 wapi_mode;
++	u8 is_ap_mode;
++	u8 hidden_ssid_mode;
++	struct mtk_wlan_cmd_set_bss_rlm rlm;
++} __packed;
++
++/* CMD_UPDATE_STA_RECORD_T, nic_cmd_event.h:1462-1488. */
++struct mtk_wlan_cmd_update_sta {
++	u8 index;
++	u8 sta_type;
++	u8 mac_addr[6];
++	__le16 assoc_id;
++	__le16 listen_interval;
++	u8 net_type_index;
++	u8 desired_phy_type_set;
++	__le16 desired_nonht_rate_set;
++	__le16 bss_basic_rate_set;
++	u8 is_qos;
++	u8 is_uapsd_supported;
++	u8 sta_state;
++	u8 mcs_set;
++	u8 sup_mcs32;
++	u8 ampdu_param;
++	__le16 ht_cap_info;
++	__le16 ht_extended_cap;
++	__le32 tx_beamforming_cap;
++	u8 asel_cap;
++	u8 rcpi;
++	u8 need_resp;
++	u8 uapsd_ac;
++	u8 uapsd_sp;
++	u8 reserved[3];
++} __packed;
++
++/* CMD_REMOVE_STA_RECORD_T, nic_cmd_event.h:1490-1494. */
++struct mtk_wlan_cmd_remove_sta {
++	u8 index;
++	u8 reserved;
++	u8 mac_addr[6];
++} __packed;
++
++/* wlan_cmd.c */
++void mtk_wlan_cmd_init(struct mtk_wlan_mac *mac);
++void mtk_wlan_cmd_reset(struct mtk_wlan_mac *mac);
++void mtk_wlan_cmd_abort(struct mtk_wlan_mac *mac);
++void mtk_wlan_cmd_cancel(struct mtk_wlan_mac *mac);
++void mtk_wlan_cmd_event(struct mtk_wlan_mac *mac, const u8 *buf, size_t len);
++int mtk_wlan_cmd_prepare_ap(struct mtk_wlan_mac *mac, struct cfg80211_bss *bss);
++int mtk_wlan_cmd_bss_activate(struct mtk_wlan_mac *mac, bool active);
++int mtk_wlan_cmd_set_bss_info(struct mtk_wlan_mac *mac, bool connected);
++int mtk_wlan_cmd_update_sta(struct mtk_wlan_mac *mac, u8 state, u16 aid,
++			    bool need_resp);
++int mtk_wlan_cmd_remove_sta(struct mtk_wlan_mac *mac);
++int mtk_wlan_cmd_teardown(struct mtk_wlan_mac *mac);
++
++#endif /* _MTK_WLAN_CMD_H */
+diff --git a/drivers/misc/mediatek/connectivity/wlan/wlan_hif.h b/drivers/misc/mediatek/connectivity/wlan/wlan_hif.h
+index f906698dd..c4936b41f 100644
+--- a/drivers/misc/mediatek/connectivity/wlan/wlan_hif.h
++++ b/drivers/misc/mediatek/connectivity/wlan/wlan_hif.h
+@@ -144,12 +144,25 @@ enum mtk_wlan_pdma_burst {
+ 	HIF_PDMA_BURST_4_4,
+ };
+ 
++/* hif_rx.h:115-116: HIF_RX_HW_APPENDED_LEN. */
++#define MTK_WLAN_HIF_HW_APPENDED_LEN	4
++
+ /*
+  * Largest frame the firmware can hand up: CFG_RX_MAX_PKT_SIZE,
+  * config.h:1179 (28 + 2312 + 12).
+  */
+ #define MTK_WLAN_RX_MAX_PKT_SIZE	2352
+ 
++/*
++ * The HIF data port carries ALIGN_4(u2PacketLen) bytes plus one hardware
++ * appended DW holding the checksum status (nic_rx.c:2887-2890).  Both
++ * together may exceed MTK_WLAN_RX_MAX_PKT_SIZE by up to four bytes, so the
++ * bounce buffer keeps that much slack.
++ */
++#define MTK_WLAN_HIF_RX_BUF_SIZE	(MTK_WLAN_RX_MAX_PKT_SIZE + 4)
++
++struct mtk_wlan_mac;
++
+ /**
+  * struct mtk_wlan_hif - WLAN AHB host interface instance
+  * @dev: platform device
+@@ -166,10 +179,11 @@ enum mtk_wlan_pdma_burst {
+  * @resetting: a whole-chip reset is in progress
+  * @suspended: system suspend masked the HIF interrupt
+  * @tx_count: frames handed to the HIF TX data port (WMT bus counter)
+- * @rx_dropped: RX frames drained without an 802.11 stack to deliver to
++ * @rx_dropped: RX frames drained without a valid length or read error
+  * @cmd_seq: command sequence number used by the firmware download
+  * @io_lock: serializes port/DMA transactions
+  * @state_lock: serializes bring-up and teardown
++ * @mac: 802.11 MAC/cfg80211 instance, owned by wlan_mac.c
+  * @rx_buf: bounce buffer for the RX drain in &irq_work
+  * @irq_work: HIF interrupt bottom half
+  * @fatal_work: deferred chip assert after a fatal HIF error
+@@ -198,6 +212,7 @@ struct mtk_wlan_hif {
+ 	u8 cmd_seq;
+ 	struct mutex io_lock;		/* serializes port/DMA transactions */
+ 	struct mutex state_lock;	/* serializes bring-up and teardown */
++	struct mtk_wlan_mac *mac;	/* 802.11 MAC/cfg80211 instance */
+ 	u8 *rx_buf;
+ 	struct work_struct irq_work;
+ 	struct delayed_work fatal_work;
+@@ -239,6 +254,14 @@ void mtk_wlan_hif_stop(struct mtk_wlan_hif *hif);
+ /* wlan_fw.c */
+ int mtk_wlan_fw_bringup(struct mtk_wlan_hif *hif);
+ 
++/*
++ * wlan_mac.c hooks used by the HIF.  @buf holds one complete RX buffer as it
++ * left the data port: HIF_RX_HEADER_T, payload and the hardware appended
++ * length/checksum DW, @len bytes in total.
++ */
++void mtk_wlan_mac_rx(struct mtk_wlan_hif *hif, const u8 *buf, u32 len);
++void mtk_wlan_mac_tx_done(struct mtk_wlan_hif *hif, u32 wtsr0, u32 wtsr1);
++
+ /* wlan_main.c */
+ int mtk_wlan_main_attach(struct mtk_wlan_hif *hif);
+ void mtk_wlan_main_detach(struct mtk_wlan_hif *hif);
+diff --git a/drivers/misc/mediatek/connectivity/wlan/wlan_mac.c b/drivers/misc/mediatek/connectivity/wlan/wlan_mac.c
+new file mode 100644
+index 000000000..174e5d077
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wlan/wlan_mac.c
+@@ -0,0 +1,457 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WLAN gen2 802.11 MAC and cfg80211 instance.
++ *
++ * This file creates the wiphy and the Ethernet netdev, keeps them in sync
++ * with the firmware state, owns the received-frame dispatch and implements
++ * the cfg80211 operations that are backed by real hardware state: software
++ * scan, open-system connect/disconnect and get_station.
++ *
++ * Ported from Samsung/MTK downstream:
++ *   os/linux/gl_init.c      (wlanNetRegister/wlanNetUnregister, wiphy setup)
++ *   os/linux/gl_cfg80211.c  (mtk_wlan_ops, scan/connect result reporting)
++ *   nic/nic_rx.c            (nicRxProcessRFBs: RX packet type dispatch,
++ *                            nic_rx.c:2734-2823)
++ *   os/linux/gl_kal.c       (kalIndicateStatusAndComplete)
++ *   os/linux/gl_rst.c       (reset start/end notifications)
++ *
++ * Copyright (C) 2013 MediaTek Inc.
++ */
++
++#include <linux/etherdevice.h>
++#include <linux/ieee80211.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/netdevice.h>
++#include <linux/of_net.h>
++#include <linux/slab.h>
++#include <net/cfg80211.h>
++
++#include "wlan_cmd.h"
++#include "wlan_mac.h"
++
++/* Largest IE blob accepted for a scan request (fits a probe request). */
++#define MTK_WLAN_SCAN_IE_MAX	256
++
++/* 2.4 GHz channels 1..14, IEEE 802.11-2016 17.4.2.4. */
++static struct ieee80211_channel mtk_wlan_channels_2ghz[] = {
++	{ .center_freq = 2412, .hw_value = 1, .max_power = 20, },
++	{ .center_freq = 2417, .hw_value = 2, .max_power = 20, },
++	{ .center_freq = 2422, .hw_value = 3, .max_power = 20, },
++	{ .center_freq = 2427, .hw_value = 4, .max_power = 20, },
++	{ .center_freq = 2432, .hw_value = 5, .max_power = 20, },
++	{ .center_freq = 2437, .hw_value = 6, .max_power = 20, },
++	{ .center_freq = 2442, .hw_value = 7, .max_power = 20, },
++	{ .center_freq = 2447, .hw_value = 8, .max_power = 20, },
++	{ .center_freq = 2452, .hw_value = 9, .max_power = 20, },
++	{ .center_freq = 2457, .hw_value = 10, .max_power = 20, },
++	{ .center_freq = 2462, .hw_value = 11, .max_power = 20, },
++	{ .center_freq = 2467, .hw_value = 12, .max_power = 20, },
++	{ .center_freq = 2472, .hw_value = 13, .max_power = 20, },
++	/* Channel 14 is Japan only, DSSS/CCK, passive scan only. */
++	{ .center_freq = 2484, .hw_value = 14, .max_power = 20,
++	  .flags = IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_NO_OFDM, },
++};
++
++/*
++ * Supported 2.4 GHz rates, in cfg80211 units of 100 kb/s.  hw_value is the
++ * 500 kb/s rate code the firmware and the 802.11 Supported Rates element use
++ * (mac.h:234-247); bitrate and rate code therefore agree by construction.
++ * There is no HT capability here: this port associates without HT IEs.
++ */
++static struct ieee80211_rate mtk_wlan_rates_2ghz[] = {
++	{ .bitrate = 10,  .hw_value = MTK_WLAN_RATE_1M, },
++	{ .bitrate = 20,  .hw_value = MTK_WLAN_RATE_2M, },
++	{ .bitrate = 55,  .hw_value = MTK_WLAN_RATE_5_5M, },
++	{ .bitrate = 110, .hw_value = MTK_WLAN_RATE_11M, },
++	{ .bitrate = 60,  .hw_value = MTK_WLAN_RATE_6M, },
++	{ .bitrate = 90,  .hw_value = MTK_WLAN_RATE_9M, },
++	{ .bitrate = 120, .hw_value = MTK_WLAN_RATE_12M, },
++	{ .bitrate = 180, .hw_value = MTK_WLAN_RATE_18M, },
++	{ .bitrate = 240, .hw_value = MTK_WLAN_RATE_24M, },
++	{ .bitrate = 360, .hw_value = MTK_WLAN_RATE_36M, },
++	{ .bitrate = 480, .hw_value = MTK_WLAN_RATE_48M, },
++	{ .bitrate = 540, .hw_value = MTK_WLAN_RATE_54M, },
++};
++
++static struct ieee80211_supported_band mtk_wlan_band_2ghz = {
++	.band		= NL80211_BAND_2GHZ,
++	.channels	= mtk_wlan_channels_2ghz,
++	.n_channels	= ARRAY_SIZE(mtk_wlan_channels_2ghz),
++	.bitrates	= mtk_wlan_rates_2ghz,
++	.n_bitrates	= ARRAY_SIZE(mtk_wlan_rates_2ghz),
++};
++
++/*
++ * cfg80211 operations.  Only what the hardware can actually do is listed:
++ * no key offload (so the wiphy advertises no cipher suite), no AP/IBSS/P2P,
++ * no remain-on-channel, no scheduled scan, no hardware scan.
++ */
++static int mtk_wlan_cfg80211_scan(struct wiphy *wiphy,
++				  struct cfg80211_scan_request *request)
++{
++	return mtk_wlan_mgmt_scan(wiphy_priv(wiphy), request);
++}
++
++static void mtk_wlan_cfg80211_abort_scan(struct wiphy *wiphy,
++					 struct wireless_dev *wdev)
++{
++	mtk_wlan_mgmt_abort_scan(wiphy_priv(wiphy));
++}
++
++static int mtk_wlan_cfg80211_connect(struct wiphy *wiphy,
++				     struct net_device *dev,
++				     struct cfg80211_connect_params *sme)
++{
++	return mtk_wlan_mgmt_connect(wiphy_priv(wiphy), sme);
++}
++
++static int mtk_wlan_cfg80211_disconnect(struct wiphy *wiphy,
++					struct net_device *dev, u16 reason_code)
++{
++	return mtk_wlan_mgmt_disconnect(wiphy_priv(wiphy), reason_code);
++}
++
++static int mtk_wlan_cfg80211_get_station(struct wiphy *wiphy,
++					 struct net_device *dev, const u8 *mac,
++					 struct station_info *sinfo)
++{
++	struct mtk_wlan_mac *m = wiphy_priv(wiphy);
++	bool have_signal;
++	u8 rcpi;
++
++	if (!READ_ONCE(m->connected) || !ether_addr_equal(mac, m->bssid))
++		return -ENOENT;
++
++	/*
++	 * Only the fields the HIF actually reports are filled.  The RX header
++	 * carries RCPI for every received frame (hif_rx.h:96-113,
++	 * RCPI_TO_dBm() mac.h:2533-2534); it carries no rate, so no rate
++	 * information is invented here.  Packet and byte counters are MAC
++	 * level frames, not the per-station counters downstream derives from
++	 * wlanoidQueryStaStatistics(), so they are not reported either.
++	 */
++	spin_lock_bh(&m->rx_lock);
++	have_signal = m->have_signal;
++	rcpi = m->last_signal;
++	spin_unlock_bh(&m->rx_lock);
++
++	if (have_signal) {
++		sinfo->signal = (s8)mtk_wlan_rcpi_to_dbm(rcpi);
++		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
++	}
++
++	sinfo->connected_time = jiffies_to_msecs(jiffies - m->assoc_ts) / 1000;
++	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_CONNECTED_TIME);
++
++	return 0;
++}
++
++static const struct cfg80211_ops mtk_wlan_cfg80211_ops = {
++	.scan		= mtk_wlan_cfg80211_scan,
++	.abort_scan	= mtk_wlan_cfg80211_abort_scan,
++	.connect	= mtk_wlan_cfg80211_connect,
++	.disconnect	= mtk_wlan_cfg80211_disconnect,
++	.get_station	= mtk_wlan_cfg80211_get_station,
++};
++
++/*
++ * Expected channels from the HIF RX header, HIF_RX_HDR_GET_CHNL_NUM()
++ * hif_rx.h:152-155.
++ */
++static u8 mtk_wlan_hw_channel(u8 hw_channel)
++{
++	if (hw_channel > HIF_RX_HW_CHNL_NUM_MAX_4G_5G)
++		return hw_channel - HIF_RX_HW_CHNL_NUM_MAX_4G_5G;
++	return hw_channel;
++}
++
++/**
++ * mtk_wlan_mac_rx - dispatch one frame drained from a HIF data port
++ * @hif: host interface
++ * @buf: complete buffer as it left the data port
++ * @len: buffer length including the hardware appended DW
++ *
++ * Data and management frames use the layout nicRxFillRFB()/nicRxProcessRFBs()
++ * work on (nic_rx.c:1044-1085 and 2734-2823): HIF_RX_HEADER_T, then the
++ * payload at HIF_RX_HDR_SIZE + header offset, with the packet length covering
++ * both.  Events are different: the first DW of WIFI_EVENT_T is shared with
++ * HIF_RX_HEADER_T (nic_cmd_event.h:613), so the event header starts at offset
++ * 0 and its body at EVENT_HDR_SIZE = 8 (nic_rx.c:1750-1775).
++ */
++void mtk_wlan_mac_rx(struct mtk_wlan_hif *hif, const u8 *buf, u32 len)
++{
++	const struct mtk_wlan_hif_rx_header *rx =
++		(const struct mtk_wlan_hif_rx_header *)buf;
++	struct mtk_wlan_mac *mac = hif->mac;
++	u32 pkt_len, payload_off, payload_len;
++	u16 type_field;
++	unsigned int pkt_type;
++	bool is_80211;
++	u8 channel, rcpi;
++
++	if (!mac)
++		return;
++
++	if (len < MTK_WLAN_HIF_RX_HDR_LEN + MTK_WLAN_HIF_HW_APPENDED_LEN) {
++		atomic_inc(&mac->rx_dropped);
++		return;
++	}
++
++	pkt_len = le16_to_cpu(rx->packet_len);
++	if (pkt_len < MTK_WLAN_EVENT_HDR_LEN ||
++	    ALIGN(pkt_len, 4) + MTK_WLAN_HIF_HW_APPENDED_LEN > len) {
++		atomic_inc(&mac->rx_dropped);
++		return;
++	}
++
++	type_field = le16_to_cpu(rx->packet_type);
++	pkt_type = FIELD_GET(HIF_RX_HDR_PACKET_TYPE_MASK, type_field);
++
++	if (pkt_type == HIF_RX_PKT_TYPE_EVENT) {
++		/*
++		 * Firmware command results and unsolicited events.  The
++		 * command channel consumes EVENT_ID_CMD_RESULT and ignores
++		 * the rest, like nicRxProcessEventPacket() (nic_rx.c:1750).
++		 */
++		mtk_wlan_cmd_event(mac, buf, len);
++		return;
++	}
++
++	if (pkt_len < MTK_WLAN_HIF_RX_HDR_LEN) {
++		atomic_inc(&mac->rx_dropped);
++		return;
++	}
++
++	payload_off = MTK_WLAN_HIF_RX_HDR_LEN +
++		      (rx->hdr_len_offset & HIF_RX_HDR_HEADER_OFFSET_MASK);
++	if (payload_off > pkt_len) {
++		atomic_inc(&mac->rx_dropped);
++		return;
++	}
++	payload_len = pkt_len - payload_off;
++
++	is_80211 = rx->reorder_pal_tcl & HIF_RX_HDR_80211_HEADER_FORMAT;
++	channel = mtk_wlan_hw_channel(rx->hw_channel);
++	rcpi = rx->rcpi;
++
++	switch (pkt_type) {
++	case HIF_RX_PKT_TYPE_DATA:
++		mtk_wlan_rx_data(mac, buf + payload_off, payload_len,
++				 is_80211);
++		break;
++	case HIF_RX_PKT_TYPE_MANAGEMENT:
++		mtk_wlan_rx_mgmt(mac, buf + payload_off, payload_len, channel,
++				 rcpi);
++		break;
++	default:
++		atomic_inc(&mac->rx_dropped);
++		break;
++	}
++}
++
++/* Register or unregister the netdev after a firmware transition. */
++static void mtk_wlan_link_work(struct work_struct *work)
++{
++	struct mtk_wlan_mac *mac = container_of(work, struct mtk_wlan_mac,
++						link_work);
++
++	if (READ_ONCE(mac->fw_up)) {
++		if (!mac->registered)
++			mtk_wlan_netdev_register(mac);
++		return;
++	}
++
++	if (!mac->registered)
++		return;
++
++	/*
++	 * Let the scan and connect workers finish: both report their own
++	 * abort/failure through cfg80211, so the wiphy state stays consistent
++	 * until the netdev goes away.
++	 */
++	mtk_wlan_mgmt_quiesce(mac);
++	cancel_work_sync(&mac->tx_work);
++	mtk_wlan_netdev_unregister(mac);
++}
++
++/**
++ * mtk_wlan_mac_fw_up - the firmware finished downloading
++ * @hif: host interface
++ *
++ * Called after mtk_wlan_fw_bringup() reported success.  The netdev is
++ * published from a work item because the caller may hold WMT internal locks
++ * that must not be taken underneath the RTNL.
++ */
++void mtk_wlan_mac_fw_up(struct mtk_wlan_hif *hif)
++{
++	struct mtk_wlan_mac *mac = hif->mac;
++
++	if (!mac)
++		return;
++
++	WRITE_ONCE(mac->fw_up, true);
++	WRITE_ONCE(mac->state, MTK_WLAN_STATE_IDLE);
++	WRITE_ONCE(mac->connected, false);
++	mac->sta_valid = false;
++	mac->aid = 0;
++	mtk_wlan_cmd_reset(mac);
++	schedule_work(&mac->link_work);
++}
++
++/**
++ * mtk_wlan_mac_fw_down - the firmware stopped or the chip is resetting
++ * @hif: host interface
++ *
++ * Aborts a pending scan or connect, reports a lost association and drops the
++ * netdev so userspace never sees an interface that claims to be up while the
++ * firmware is gone.
++ */
++void mtk_wlan_mac_fw_down(struct mtk_wlan_hif *hif)
++{
++	struct mtk_wlan_mac *mac = hif->mac;
++
++	if (!mac)
++		return;
++
++	WRITE_ONCE(mac->fw_up, false);
++	mtk_wlan_mgmt_quiesce(mac);
++	schedule_work(&mac->link_work);
++}
++
++/**
++ * mtk_wlan_mac_attach - create the wiphy, netdev and MAC state
++ * @hif: host interface
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++int mtk_wlan_mac_attach(struct mtk_wlan_hif *hif)
++{
++	struct mtk_wlan_mac *mac;
++	struct wiphy *wiphy;
++	u8 addr[ETH_ALEN];
++	u8 credits[MTK_WLAN_TC_NUM] = MTK_WLAN_TC_CREDITS_INIT;
++	int ret;
++
++	wiphy = wiphy_new(&mtk_wlan_cfg80211_ops, sizeof(*mac));
++	if (!wiphy) {
++		dev_err(hif->dev, "cannot allocate wiphy\n");
++		return -ENOMEM;
++	}
++	mac = wiphy_priv(wiphy);
++	mac->hif = hif;
++	mac->wiphy = wiphy;
++	mac->dev = hif->dev;
++
++	mutex_init(&mac->lock);
++	mutex_init(&mac->tx_lock);
++	spin_lock_init(&mac->txq_lock);
++	spin_lock_init(&mac->rx_lock);
++	skb_queue_head_init(&mac->txq);
++	init_completion(&mac->mgmt_done);
++	mtk_wlan_cmd_init(mac);
++	memcpy(mac->tc_max, credits, sizeof(credits));
++	memcpy(mac->tc_credits, credits, sizeof(credits));
++
++	/*
++	 * The single AIS peer uses STA record index 0: cnmStaRecAlloc()
++	 * (cnm_mem.c:808-830) returns the first free slot and the transmit
++	 * path rejects only STA_REC_INDEX_BMCAST/NOT_FOUND (que_mgt.h:766).
++	 */
++	mac->sta_index = 0;
++
++	mac->tx_buf = devm_kmalloc(hif->dev, MTK_WLAN_TX_BUF_SIZE, GFP_KERNEL);
++	if (!mac->tx_buf) {
++		ret = -ENOMEM;
++		goto err_wiphy;
++	}
++
++	INIT_WORK(&mac->link_work, mtk_wlan_link_work);
++	INIT_WORK(&mac->tx_work, mtk_wlan_tx_work);
++	INIT_WORK(&mac->scan_work, mtk_wlan_mgmt_scan_work);
++	INIT_WORK(&mac->connect_work, mtk_wlan_mgmt_connect_work);
++
++	/*
++	 * The permanent address lives in the "WIFI" NVRAM section the
++	 * downstream driver reads in glLoadNvram() (gl_init.c:1119-1150,
++	 * WIFI_CFG_PARAM_STRUCT.aucMacAddress) and then programs through
++	 * wlanoidSetCurrentAddr.  Neither the NVRAM file nor the firmware
++	 * command queue exists in this port, so the address comes from the
++	 * device tree ("local-mac-address") when present; otherwise the
++	 * netdev gets a random locally administered address in
++	 * mtk_wlan_netdev_create().
++	 */
++	if (of_get_mac_address(hif->dev->of_node, addr))
++		eth_zero_addr(mac->mac_addr);
++	else
++		ether_addr_copy(mac->mac_addr, addr);
++
++	set_wiphy_dev(wiphy, hif->dev);
++	/*
++	 * One station interface on 2.4 GHz only.  No 5 GHz band pointer, no
++	 * AP/IBSS/P2P mode, no remain-on-channel and no scheduled scan: the
++	 * firmware command interface needed for all of those is not part of
++	 * this port.  Hardware scan does not exist either - only the .scan
++	 * callback below is implemented (gl_init.c:1583-1612 sets the same
++	 * station interface, but also ADHOC and the 5 GHz band, both of which
++	 * this port does not support).
++	 */
++	wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
++	wiphy->bands[NL80211_BAND_2GHZ] = &mtk_wlan_band_2ghz;
++	wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
++	wiphy->max_scan_ssids = MTK_WLAN_MAX_SCAN_SSIDS;
++	wiphy->max_scan_ie_len = MTK_WLAN_SCAN_IE_MAX;
++	/*
++	 * No cipher suites at all: there is no key offload, so cfg80211 has
++	 * nothing to install and only open networks can be joined.
++	 */
++	wiphy->cipher_suites = NULL;
++	wiphy->n_cipher_suites = 0;
++
++	ret = wiphy_register(wiphy);
++	if (ret) {
++		dev_err(hif->dev, "cannot register wiphy: %d\n", ret);
++		goto err_wiphy;
++	}
++
++	ret = mtk_wlan_netdev_create(mac);
++	if (ret)
++		goto err_wiphy_unregister;
++
++	hif->mac = mac;
++
++	return 0;
++
++err_wiphy_unregister:
++	wiphy_unregister(wiphy);
++err_wiphy:
++	wiphy_free(wiphy);
++	return ret;
++}
++
++/**
++ * mtk_wlan_mac_detach - tear the MAC layer down
++ * @hif: host interface
++ */
++void mtk_wlan_mac_detach(struct mtk_wlan_hif *hif)
++{
++	struct mtk_wlan_mac *mac = hif->mac;
++
++	if (!mac)
++		return;
++
++	WRITE_ONCE(mac->fw_up, false);
++
++	/* Let pending scan/connect work report their abort to cfg80211. */
++	mtk_wlan_mgmt_quiesce(mac);
++	cancel_work_sync(&mac->link_work);
++	cancel_work_sync(&mac->tx_work);
++
++	mtk_wlan_netdev_unregister(mac);
++	mtk_wlan_netdev_destroy(mac);
++	skb_queue_purge(&mac->txq);
++
++	wiphy_unregister(mac->wiphy);
++	wiphy_free(mac->wiphy);	/* frees @mac, which is wiphy_priv() */
++	hif->mac = NULL;
++}
+diff --git a/drivers/misc/mediatek/connectivity/wlan/wlan_mac.h b/drivers/misc/mediatek/connectivity/wlan/wlan_mac.h
+new file mode 100644
+index 000000000..3c22f86f7
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wlan/wlan_mac.h
+@@ -0,0 +1,491 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * MediaTek WLAN gen2 802.11 MAC layer - private definitions.
++ *
++ * The host side of the MT6628/MT6735 WLAN function is split in two:
++ *
++ *  - the HIF (wlan_ahb.c) moves HIF_TX_HEADER_T prefixed buffers to the
++ *    firmware and hands every received buffer up unchanged;
++ *  - this layer owns the cfg80211 wiphy, the Ethernet netdev, the TX
++ *    queue with its TC credit accounting, the 802.3 <-> 802.11 data
++ *    conversion and the STA management state machine (scan/auth/assoc).
++ *
++ * Firmware data frames are exchanged in 802.3 format, management frames in
++ * 802.11 format; see the comments at the individual frame builders.
++ *
++ * Ported from Samsung/MTK downstream:
++ *   include/nic/hif_tx.h, include/nic/hif_rx.h   (HIF headers)
++ *   include/nic/nic_tx.h, nic/nic_tx.c           (TC accounting, TX header)
++ *   os/linux/gl_init.c, os/linux/gl_kal.c        (wiphy/netdev glue, RX)
++ *   mgmt/auth.c, mgmt/assoc.c                    (auth/assoc frames)
++ *   mgmt/scan.c, mgmt/scan_fsm.c                 (BSS results, probe)
++ *   os/linux/gl_rst.c                            (reset handling)
++ *
++ * Copyright (C) 2013 MediaTek Inc.
++ */
++
++#ifndef _MTK_WLAN_MAC_H
++#define _MTK_WLAN_MAC_H
++
++#include <linux/bitfield.h>
++#include <linux/bits.h>
++#include <linux/etherdevice.h>
++#include <linux/ieee80211.h>
++#include <linux/netdevice.h>
++#include <linux/skbuff.h>
++#include <linux/spinlock.h>
++#include <linux/workqueue.h>
++#include <net/cfg80211.h>
++
++#include "wlan_hif.h"
++
++/*
++ * HIF TX header, hif_tx.h:145-163.  Field offsets are the ones annotated by
++ * the DW/byte comments at hif_tx.h:106-137:
++ *
++ *   DW0.0-1 u2TxByteCount_UserPriority   DW2.0-1 u2SeqNo
++ *   DW0.2   ucEtherTypeOffset            DW2.2   ucStaRecIdx
++ *   DW0.3   ucResource_PktType_CSflags   DW2.3   ucForwardingType_SessionID
++ *   DW1.0   ucWlanHeaderLength           DW3.0   ucPacketSeqNo
++ *   DW1.1   ucPktFormtId_Flags           DW3.1   ucAck_BIP_BasicRate
++ *   DW1.2-3 u2LLH                        DW3.2-3 aucReserved
++ */
++#define MTK_WLAN_HIF_TX_HDR_LEN		16
++#define MTK_WLAN_HIF_RX_HDR_LEN		12
++
++/* hif_tx.h:106-137. */
++#define HIF_TX_HDR_TX_BYTE_COUNT_MASK		GENMASK(11, 0)
++#define HIF_TX_HDR_USER_PRIORITY_OFFSET		12
++#define HIF_TX_HDR_ETHER_TYPE_OFFSET_MASK	GENMASK(7, 0)
++#define HIF_TX_HDR_RESOURCE_MASK		GENMASK(5, 2)
++#define HIF_TX_HDR_RESOURCE_OFFSET		2
++#define HIF_TX_HDR_PACKET_TYPE_MASK		GENMASK(7, 6)
++#define HIF_TX_HDR_PACKET_TYPE_OFFSET		6
++#define HIF_TX_HDR_WLAN_HEADER_LEN_MASK		GENMASK(5, 0)
++#define HIF_TX_HDR_FORMAT_ID_MASK		GENMASK(2, 0)
++#define HIF_TX_HDR_NETWORK_TYPE_MASK		GENMASK(5, 4)
++#define HIF_TX_HDR_NETWORK_TYPE_OFFSET		4
++#define HIF_TX_HDR_FLAG_1X_FRAME		BIT(6)
++#define HIF_TX_HDR_FLAG_802_11_FORMAT		BIT(7)
++#define HIF_TX_HDR_PS_FORWARDING_TYPE_MASK	GENMASK(1, 0)
++#define HIF_TX_HDR_PS_SESSION_ID_OFFSET		2
++#define HIF_TX_HDR_BURST_END			BIT(5)
++#define HIF_TX_HDR_NEED_ACK			BIT(0)
++#define HIF_TX_HDR_BIP				BIT(1)
++#define HIF_TX_HDR_BASIC_RATE			BIT(2)
++#define HIF_TX_HDR_NEED_TX_DONE_STATUS		BIT(3)
++#define HIF_TX_HDR_RTS				BIT(4)
++
++/* ENUM_HIF_TX_PKT_TYPE_T, hif_tx.h:178-185. */
++enum mtk_wlan_hif_tx_pkt_type {
++	HIF_TX_PKT_TYPE_DATA = 0,
++	HIF_TX_PKT_TYPE_CMD,
++	HIF_TX_PKT_TYPE_HIF_LOOPBACK,
++	HIF_TX_PKT_TYPE_MANAGEMENT,
++};
++
++/* ENUM_HIF_RX_PKT_TYPE_T, hif_rx.h:118-124. */
++enum mtk_wlan_hif_rx_pkt_type {
++	HIF_RX_PKT_TYPE_DATA = 0,
++	HIF_RX_PKT_TYPE_EVENT,
++	HIF_RX_PKT_TYPE_TX_LOOPBACK,
++	HIF_RX_PKT_TYPE_MANAGEMENT,
++};
++
++/* hif_rx.h:94-112. */
++#define HIF_RX_HDR_PACKET_TYPE_MASK	GENMASK(1, 0)
++#define HIF_RX_HDR_SEC_MODE_MASK	GENMASK(5, 2)
++#define HIF_RX_HDR_SEC_MODE_OFFSET	2
++#define HIF_RX_HDR_HEADER_LEN		GENMASK(7, 2)
++#define HIF_RX_HDR_HEADER_LEN_OFFSET	2
++#define HIF_RX_HDR_HEADER_OFFSET_MASK	GENMASK(1, 0)
++#define HIF_RX_HDR_80211_HEADER_FORMAT	BIT(0)
++#define HIF_RX_HDR_DO_REORDER		BIT(1)
++#define HIF_RX_HDR_PAL			BIT(2)
++#define HIF_RX_HDR_TCL			BIT(3)
++#define HIF_RX_HDR_NETWORK_IDX_MASK	GENMASK(7, 4)
++#define HIF_RX_HDR_NETWORK_IDX_OFFSET	4
++#define HIF_RX_HDR_SEQ_NO_MASK		GENMASK(11, 0)
++#define HIF_RX_HDR_TID_MASK		GENMASK(14, 12)
++#define HIF_RX_HDR_TID_OFFSET		12
++#define HIF_RX_HDR_BAR_FRAME		BIT(15)
++#define HIF_RX_HW_CHNL_NUM_MAX_2G4	14
++#define HIF_RX_HW_CHNL_NUM_MAX_4G_5G	(255 - HIF_RX_HW_CHNL_NUM_MAX_2G4)
++
++/*
++ * Traffic classes, nic_tx.h:357-363.  TC0..TC3 carry WMM access categories
++ * on HIF TX port 0, TC4 carries commands and management frames on port 1,
++ * TC5 carries broadcast/data frames that have no peer record.
++ */
++enum mtk_wlan_tc {
++	MTK_WLAN_TC0 = 0,
++	MTK_WLAN_TC1,
++	MTK_WLAN_TC2,
++	MTK_WLAN_TC3,
++	MTK_WLAN_TC4,
++	MTK_WLAN_TC5,
++	MTK_WLAN_TC_NUM
++};
++
++/*
++ * Initial TC buffer counts, NIC_TX_BUFF_COUNT_* with CFG_SRAM_SIZE_OPTION 1
++ * chosen for MT6735 (nic_tx.h:299-304, gen2/Makefile:82-84).
++ */
++#define MTK_WLAN_TC_CREDITS_INIT { 1, 36, 1, 1, 4, 1 }
++
++/* Default association listen interval, DEFAULT_LISTEN_INTERVAL mac.h:227. */
++#define MTK_WLAN_LISTEN_INTERVAL	10
++
++/* Supported 2.4 GHz 500 kb/s rate codes, mac.h:234-247. */
++#define MTK_WLAN_RATE_1M		2
++#define MTK_WLAN_RATE_2M		4
++#define MTK_WLAN_RATE_5_5M		11
++#define MTK_WLAN_RATE_11M		22
++#define MTK_WLAN_RATE_6M		12
++#define MTK_WLAN_RATE_9M		18
++#define MTK_WLAN_RATE_12M		24
++#define MTK_WLAN_RATE_18M		36
++#define MTK_WLAN_RATE_24M		48
++#define MTK_WLAN_RATE_36M		72
++#define MTK_WLAN_RATE_48M		96
++#define MTK_WLAN_RATE_54M		108
++#define MTK_WLAN_RATE_BASIC_BIT		BIT(7)
++
++/*
++ * Convert an RCPI value from the HIF RX header to dBm.  RCPI_TO_dBm()
++ * mac.h:2533-2534 with RCPI_HIGH_BOUND (220) and NDBM_LOW_BOUND_FOR_RCPI
++ * (110) from mac.h:265-267.
++ */
++static inline int mtk_wlan_rcpi_to_dbm(u8 rcpi)
++{
++	if (rcpi > 220)
++		rcpi = 220;
++	return (rcpi >> 1) - 110;
++}
++
++/* Network type index, NETWORK_TYPE_AIS_INDEX wlan_def.h:513-517. */
++#define MTK_WLAN_NETWORK_TYPE_AIS	0
++
++/* STA_REC_INDEX_NOT_FOUND, cnm_mem.h:501 / que_mgt.h:309. */
++#define MTK_WLAN_STA_REC_NOT_FOUND	0xFE
++
++/* 802.11 header/LLC sizes used by the frame builders. */
++#define MTK_WLAN_MAC_HDR_LEN		24	/* WLAN_MAC_MGMT_HEADER_LEN */
++#define MTK_WLAN_QOS_CTRL_LEN		2
++#define MTK_WLAN_LLC_LEN		8	/* LLC(3) + SNAP(5) */
++#define MTK_WLAN_ETH_HDR_LEN		14
++
++/* Largest 802.11 frame this driver builds (firmware limit 2312 body). */
++#define MTK_WLAN_TX_FRAME_MAX		MTK_WLAN_RX_MAX_PKT_SIZE
++#define MTK_WLAN_TX_BUF_SIZE		(MTK_WLAN_HIF_TX_HDR_LEN + \
++					 MTK_WLAN_TX_FRAME_MAX)
++/* Largest management frame (probe/assoc request with all user IEs). */
++#define MTK_WLAN_MGMT_FRAME_MAX		512
++/* Associated IEs kept for cfg80211_connect_result(). */
++#define MTK_WLAN_ASSOC_IES_MAX		256
++
++/* TX queue depth before the netdev queue is stopped. */
++#define MTK_WLAN_TXQ_DEPTH		64
++
++/* Management frame retries and per-attempt timeout. */
++#define MTK_WLAN_MGMT_RETRIES		3
++#define MTK_WLAN_MGMT_TIMEOUT_MS	1000
++
++/*
++ * Dwell time per channel when cfg80211 does not request one (ms), and the
++ * polling interval used so an abort is noticed while dwelling.
++ */
++#define MTK_WLAN_SCAN_DWELL_MS		40
++#define MTK_WLAN_SCAN_POLL_MS		10
++#define MTK_WLAN_SCAN_DWELL_MAX_MS	1000
++/* Maximum number of SSIDs probed per channel (max_scan_ssids). */
++#define MTK_WLAN_MAX_SCAN_SSIDS		4
++
++/**
++ * struct mtk_wlan_hif_tx_header - HIF TX header, 16 bytes (hif_tx.h:145-163)
++ * @tx_byte_count_user_priority: TX byte count in bits 11:0, user priority
++ *	(or, for TC4, any value) in bits 15:12
++ * @ether_type_offset: offset of the EtherType in 16-bit words from the start
++ *	of this header (nic_tx.c:1409-1416)
++ * @resource_pkttype_csflags: TC in bits 5:2, packet type in bits 7:6, TX
++ *	checksum offload flags in bits 1:0 (unused here)
++ * @wlan_header_length: length of the 802.11 MAC header, 0 for 802.3 frames
++ * @pktfmtid_flags: format id bits 2:0, network type bits 5:4, 802.1x flag
++ *	bit 6, 802.11 format flag bit 7
++ * @llh: PAL/BOW link header, unused
++ * @seq_no: ACL sequence number, unused
++ * @sta_rec_idx: firmware STA record index, %MTK_WLAN_STA_REC_NOT_FOUND when
++ *	the driver has no peer record
++ * @forwarding_type_sessionid: PS forwarding type bits 1:0, PS session id
++ *	bits 4:2, burst end bit 5
++ * @packet_seq_no: driver packet sequence for TX-done matching, unused
++ * @ack_bip_basicrate: need-ack bit 0, BIP bit 1, basic rate bit 2, need
++ *	TX-done status bit 3, RTS bit 4
++ * @reserved: padding to 16 bytes
++ */
++struct mtk_wlan_hif_tx_header {
++	__le16 tx_byte_count_user_priority;
++	u8 ether_type_offset;
++	u8 resource_pkttype_csflags;
++	u8 wlan_header_length;
++	u8 pktfmtid_flags;
++	__le16 llh;
++	__le16 seq_no;
++	u8 sta_rec_idx;
++	u8 forwarding_type_sessionid;
++	u8 packet_seq_no;
++	u8 ack_bip_basicrate;
++	u8 reserved[2];
++} __packed;
++
++/**
++ * struct mtk_wlan_hif_rx_header - HIF RX header, 12 bytes (hif_rx.h:96-113)
++ * @packet_len: length of header plus payload, hardware appended DW excluded
++ * @packet_type: packet type bits 1:0, security mode bits 5:2
++ * @hdr_len_offset: 802.11 MAC header length in bits 7:2, header offset in
++ *	bits 1:0
++ * @reorder_pal_tcl: 802.11 format bit 0, do-reorder bit 1, PAL bit 2, TCL
++ *	bit 3, network index bits 7:4
++ * @seq_no_tid: sequence number bits 11:0, TID bits 14:12, BAR flag bit 15
++ * @sta_rec_idx: firmware STA record index
++ * @rcpi: received channel power indicator, RCPI_TO_dBm() mac.h:2533
++ * @hw_channel: hardware channel number, HIF_RX_HDR_GET_CHNL_NUM() hif_rx.h:152
++ * @reserved: padding to 12 bytes
++ */
++struct mtk_wlan_hif_rx_header {
++	__le16 packet_len;
++	__le16 packet_type;
++	u8 hdr_len_offset;
++	u8 reorder_pal_tcl;
++	__le16 seq_no_tid;
++	u8 sta_rec_idx;
++	u8 rcpi;
++	u8 hw_channel;
++	u8 reserved;
++} __packed;
++
++/**
++ * enum mtk_wlan_state - connection state of the STA interface
++ * @MTK_WLAN_STATE_DOWN: firmware is not running
++ * @MTK_WLAN_STATE_IDLE: firmware runs, interface not connected
++ * @MTK_WLAN_STATE_SCANNING: a software scan is in progress
++ * @MTK_WLAN_STATE_CONNECTING: auth/assoc exchange in progress
++ * @MTK_WLAN_STATE_CONNECTED: associated to &struct mtk_wlan_mac.bssid
++ */
++enum mtk_wlan_state {
++	MTK_WLAN_STATE_DOWN,
++	MTK_WLAN_STATE_IDLE,
++	MTK_WLAN_STATE_SCANNING,
++	MTK_WLAN_STATE_CONNECTING,
++	MTK_WLAN_STATE_CONNECTED,
++};
++
++/**
++ * struct mtk_wlan_mgmt_rsp - a management response matched by the waiter
++ * @status: status code field of the response
++ * @aid: association id, valid for an association response only
++ * @ies: IEs following the fixed fields
++ * @ies_len: length of @ies
++ */
++struct mtk_wlan_mgmt_rsp {
++	u16 status;
++	u16 aid;
++	u8 ies[MTK_WLAN_ASSOC_IES_MAX];
++	size_t ies_len;
++};
++
++/**
++ * struct mtk_wlan_cmd - one gen2 firmware command in flight
++ * @lock: serializes command senders
++ * @wait_lock: protects @pending, @seq, @cid, @result and @aborted
++ * @done: completed by the command-result event or by an abort
++ * @seq: sequence number of the pending command
++ * @cid: command id of the pending command
++ * @result: completion status, 0 or a negative errno
++ * @pending: a command is waiting for its result
++ * @aborted: the firmware went away; further commands fail with -ENETDOWN
++ */
++struct mtk_wlan_cmd {
++	struct mutex lock;
++	spinlock_t wait_lock;
++	struct completion done;
++	u8 seq;
++	u8 cid;
++	int result;
++	bool pending;
++	bool aborted;
++};
++
++/**
++ * struct mtk_wlan_mac - 802.11 MAC and cfg80211 instance
++ * @hif: host interface this instance is bound to
++ * @dev: device used for DMA, firmware and logging
++ * @wiphy: registered wiphy, created in mtk_wlan_mac_attach()
++ * @ndev: Ethernet netdev, registered while the firmware is up
++ * @wdev: wireless_dev embedded in @ndev
++ * @link_work: registers/unregisters @ndev after a firmware transition
++ * @tx_work: drains &txq into the HIF TX data port
++ * @scan_work: software scan, builds and transmits probe requests
++ * @connect_work: auth/assoc state machine
++ * @lock: serializes the scan and connect operations
++ * @tx_lock: serializes HIF frame assembly and port writes
++ * @txq_lock: protects &txq and &tc_credits
++ * @txq: frames queued by the netdev transmit path
++ * @tc_credits: remaining firmware TX buffers per traffic class
++ * @tc_max: initial TX buffers per traffic class
++ * @fw_up: firmware finished downloading and the HIF is live
++ * @registered: @ndev is registered with the stack
++ * @state: connection state
++ * @mac_addr: own MAC address
++ * @bssid: associated AP, valid when connected
++ * @ssid: SSID of the current association
++ * @ssid_len: length of @ssid
++ * @channel: 2.4 GHz channel of the current association
++ * @assoc_ts: jiffies when the association completed
++ * @scan_req: scan request being processed, owned by cfg80211
++ * @scan_aborted: scan was cancelled and must report %aborted
++ * @connect_aborted: a local disconnect cancelled the association attempt
++ * @connect_bss: BSS entry taken by %mtk_wlan_mgmt_connect() and handed to
++ *	cfg80211 with the connect result (cfg80211.h:8620-8640)
++ * @mgmt_done: completed when a matching management response arrives
++ * @mgmt_stype: frame subtype the waiter expects, 0 when nobody waits
++ * @mgmt_peer: transmitter address the waiter expects
++ * @mgmt_err: set when the firmware went down while waiting
++ * @mgmt_rsp: response stored by the RX path
++ * @rx_lock: protects the management response slot and the last RCPI
++ * @assoc_ie: association IEs supplied by cfg80211, copied out of @sme
++ * @assoc_ie_len: length of @assoc_ie
++ * @req_ie: association request IEs reported to cfg80211
++ * @req_ie_len: length of @req_ie
++ * @connected: an association is established
++ * @last_signal: last RCPI reported by the HIF RX header
++ * @have_signal: @last_signal is valid
++ * @ap_rate_set: operational rate set of the AP, RATE_SET_* bits
++ * @ap_basic_rate_set: basic rate set of the AP, RATE_SET_* bits
++ * @ap_phy_type_set: PHY_TYPE_BIT_* set derived from the AP's rate set
++ * @ap_nonht_phy: PHY_TYPE_*_INDEX used for slot time and CWmin
++ * @ap_short_preamble: AP allows the short preamble
++ * @ap_short_slot: AP uses the short slot time
++ * @ap_erp_protect: AP ERP IE requests protection
++ * @sta_index: firmware STA record index of the AP
++ * @sta_valid: @sta_index exists in the firmware
++ * @aid: association id from the association response
++ * @cmd: firmware command/event channel state
++ * @tx_dropped: frames dropped by the driver before reaching the HIF
++ * @rx_dropped: frames dropped because they were malformed or unroutable
++ * @tx_buf: assembly buffer for one HIF TX header plus frame
++ */
++struct mtk_wlan_mac {
++	struct mtk_wlan_hif *hif;
++	struct device *dev;
++	struct wiphy *wiphy;
++	struct net_device *ndev;
++	struct wireless_dev *wdev;
++
++	struct work_struct link_work;
++	struct work_struct tx_work;
++	struct work_struct scan_work;
++	struct work_struct connect_work;
++
++	struct mutex lock;
++	struct mutex tx_lock;
++	spinlock_t txq_lock;
++	struct sk_buff_head txq;
++	u8 tc_credits[MTK_WLAN_TC_NUM];
++	u8 tc_max[MTK_WLAN_TC_NUM];
++
++	bool fw_up;
++	bool registered;
++	enum mtk_wlan_state state;
++
++	u8 mac_addr[ETH_ALEN];
++	u8 bssid[ETH_ALEN];
++	u8 ssid[IEEE80211_MAX_SSID_LEN];
++	u8 ssid_len;
++	u16 channel;
++	unsigned long assoc_ts;
++
++	struct cfg80211_scan_request *scan_req;
++	bool scan_aborted;
++	bool connect_aborted;
++	struct cfg80211_bss *connect_bss;
++
++	struct completion mgmt_done;
++	u16 mgmt_stype;
++	u8 mgmt_peer[ETH_ALEN];
++	int mgmt_err;
++	struct mtk_wlan_mgmt_rsp mgmt_rsp;
++	spinlock_t rx_lock;
++
++	u8 assoc_ie[MTK_WLAN_ASSOC_IES_MAX];
++	size_t assoc_ie_len;
++	u8 req_ie[MTK_WLAN_ASSOC_IES_MAX];
++	size_t req_ie_len;
++
++	bool connected;
++	u8 last_signal;
++	bool have_signal;
++
++	/* AP parameters for the firmware BSS/STA record commands. */
++	u16 ap_rate_set;
++	u16 ap_basic_rate_set;
++	u8 ap_phy_type_set;
++	u8 ap_nonht_phy;
++	bool ap_short_preamble;
++	bool ap_short_slot;
++	bool ap_erp_protect;
++	u8 sta_index;
++	bool sta_valid;
++	u16 aid;
++
++	struct mtk_wlan_cmd cmd;
++
++	atomic_t tx_dropped;
++	atomic_t rx_dropped;
++
++	u8 *tx_buf;
++};
++
++/* wlan_mac.c */
++int mtk_wlan_mac_attach(struct mtk_wlan_hif *hif);
++void mtk_wlan_mac_detach(struct mtk_wlan_hif *hif);
++void mtk_wlan_mac_fw_up(struct mtk_wlan_hif *hif);
++void mtk_wlan_mac_fw_down(struct mtk_wlan_hif *hif);
++
++/* wlan_netdev.c */
++int mtk_wlan_netdev_create(struct mtk_wlan_mac *mac);
++void mtk_wlan_netdev_destroy(struct mtk_wlan_mac *mac);
++int mtk_wlan_netdev_register(struct mtk_wlan_mac *mac);
++void mtk_wlan_netdev_unregister(struct mtk_wlan_mac *mac);
++void mtk_wlan_netdev_rx(struct mtk_wlan_mac *mac, struct sk_buff *skb);
++void mtk_wlan_netdev_wake_tx(struct mtk_wlan_mac *mac);
++void mtk_wlan_netdev_link_changed(struct mtk_wlan_mac *mac, bool up);
++
++/* wlan_txrx.c */
++int mtk_wlan_mgmt_tx(struct mtk_wlan_mac *mac, const u8 *frame, size_t len);
++int mtk_wlan_data_tx(struct mtk_wlan_mac *mac, struct sk_buff *skb);
++void mtk_wlan_tx_work(struct work_struct *work);
++struct sk_buff *mtk_wlan_rx_80211_to_8023(struct mtk_wlan_mac *mac,
++					  const u8 *frame, size_t len);
++bool mtk_wlan_tc_acquire(struct mtk_wlan_mac *mac, unsigned int tc);
++void mtk_wlan_tc_release(struct mtk_wlan_mac *mac, unsigned int tc,
++			 unsigned int count);
++void mtk_wlan_rx_data(struct mtk_wlan_mac *mac, const u8 *frame, size_t len,
++		      bool is_80211);
++
++/* wlan_mgmt.c */
++int mtk_wlan_mgmt_scan(struct mtk_wlan_mac *mac,
++		       struct cfg80211_scan_request *req);
++void mtk_wlan_mgmt_abort_scan(struct mtk_wlan_mac *mac);
++void mtk_wlan_mgmt_scan_work(struct work_struct *work);
++int mtk_wlan_mgmt_connect(struct mtk_wlan_mac *mac,
++			  struct cfg80211_connect_params *sme);
++int mtk_wlan_mgmt_disconnect(struct mtk_wlan_mac *mac, u16 reason);
++void mtk_wlan_mgmt_connect_work(struct work_struct *work);
++void mtk_wlan_mgmt_quiesce(struct mtk_wlan_mac *mac);
++void mtk_wlan_rx_mgmt(struct mtk_wlan_mac *mac, const u8 *frame, size_t len,
++		      u8 channel, u8 rcpi);
++void mtk_wlan_mgmt_deauth_rx(struct mtk_wlan_mac *mac, u16 reason,
++			     bool locally);
++
++#endif /* _MTK_WLAN_MAC_H */
+diff --git a/drivers/misc/mediatek/connectivity/wlan/wlan_main.c b/drivers/misc/mediatek/connectivity/wlan/wlan_main.c
+index ab5cac557..d17e40c20 100644
+--- a/drivers/misc/mediatek/connectivity/wlan/wlan_main.c
++++ b/drivers/misc/mediatek/connectivity/wlan/wlan_main.c
+@@ -20,6 +20,7 @@
+ 
+ #include "mtk_wcn_wmt.h"
+ #include "wlan_hif.h"
++#include "wlan_mac.h"
+ 
+ /* Exactly one connectivity subsystem instance. */
+ static struct mtk_wlan_hif *mtk_wlan_hif;
+@@ -77,6 +78,12 @@ static void mtk_wlan_reset_cb(enum mtk_wcn_wmt_drv src,
+ 		WRITE_ONCE(hif->resetting, true);
+ 		if (hif->was_up)
+ 			mtk_wlan_hif_set_int_enable(hif, false);
++		/*
++		 * Same user visible effect as wifi_reset_start(): the media
++		 * is disconnected and the interface stops pretending to be
++		 * up while the connectivity chip is reset.
++		 */
++		mtk_wlan_mac_fw_down(hif);
+ 		break;
+ 	case MTK_WLAN_RESET_END:
+ 	case MTK_WLAN_RESET_END_FAIL:
+@@ -109,6 +116,16 @@ static int mtk_wlan_wmt_probe(void)
+ 	}
+ 	mutex_unlock(&hif->state_lock);
+ 
++	/*
++	 * Publish or withdraw the netdev.  Done outside &hif->state_lock and
++	 * from a work item because registering and unregistering a netdev
++	 * takes the RTNL.
++	 */
++	if (ret)
++		mtk_wlan_mac_fw_down(hif);
++	else
++		mtk_wlan_mac_fw_up(hif);
++
+ 	return ret;
+ }
+ 
+@@ -124,6 +141,8 @@ static int mtk_wlan_wmt_remove(void)
+ 	mtk_wlan_hif_stop(hif);
+ 	mutex_unlock(&hif->state_lock);
+ 
++	mtk_wlan_mac_fw_down(hif);
++
+ 	return 0;
+ }
+ 
+@@ -152,11 +171,15 @@ static const struct mtk_wcn_wmt_wlan_cb mtk_wlan_wmt_cb = {
+ };
+ 
+ /*
+- * rfkill only drives the WMT WIFI function; the 802.11 interface this switch
+- * describes is not implemented yet.  The ROM has no rfkill integration
+- * (neither gl_init.c nor gl_kal.c register one); the control channel is
+- * /dev/wmtWifi (wmt_chrdev_wifi.c).
++ * rfkill drives the WMT WIFI function.  Blocking it powers the connectivity
++ * subsystem down, which calls mtk_wlan_wmt_remove() and therefore withdraws
++ * the netdev as well, so a blocked switch can never leave an interface that
++ * looks up while the firmware is gone.  The ROM has no rfkill integration
++ * (neither gl_init.c nor gl_kal.c register one); the control channel there is
++ * /dev/wmtWifi (wmt_chrdev_wifi.c).  The switch is optional: without
++ * CONFIG_RFKILL, WMT remains the only control path, exactly as on the ROM.
+  */
++#if IS_ENABLED(CONFIG_RFKILL)
+ static int mtk_wlan_rfkill_set_block(void *data, bool blocked)
+ {
+ 	struct mtk_wlan_hif *hif = data;
+@@ -167,6 +190,8 @@ static int mtk_wlan_rfkill_set_block(void *data, bool blocked)
+ 	if (blocked) {
+ 		if (READ_ONCE(hif->up))
+ 			mtk_wcn_wmt_func_off(WMTDRV_WIFI);
++		/* Make sure no interface survives a failed power-off. */
++		mtk_wlan_mac_fw_down(hif);
+ 	} else if (!READ_ONCE(hif->up)) {
+ 		if (!mtk_wcn_wmt_func_on(WMTDRV_WIFI)) {
+ 			dev_err(hif->dev, "cannot power WLAN on\n");
+@@ -180,6 +205,7 @@ static int mtk_wlan_rfkill_set_block(void *data, bool blocked)
+ static const struct rfkill_ops mtk_wlan_rfkill_ops = {
+ 	.set_block = mtk_wlan_rfkill_set_block,
+ };
++#endif /* CONFIG_RFKILL */
+ 
+ int mtk_wlan_main_attach(struct mtk_wlan_hif *hif)
+ {
+@@ -189,6 +215,18 @@ int mtk_wlan_main_attach(struct mtk_wlan_hif *hif)
+ 
+ 	INIT_WORK(&hif->reset_work, mtk_wlan_reset_work);
+ 
++	/*
++	 * Create the wiphy and the netdev first: the WMT callbacks registered
++	 * below may power the firmware up before this function returns.
++	 */
++	ret = mtk_wlan_mac_attach(hif);
++	if (ret) {
++		dev_err(hif->dev, "cannot create the 802.11 interface: %d\n",
++			ret);
++		WRITE_ONCE(mtk_wlan_hif, NULL);
++		return ret;
++	}
++
+ 	/* Register the reset notifier first so it covers bring-up failures. */
+ 	ret = mtk_wcn_wmt_msgcb_reg(WMTDRV_WIFI, mtk_wlan_reset_cb);
+ 	if (ret)
+@@ -196,18 +234,21 @@ int mtk_wlan_main_attach(struct mtk_wlan_hif *hif)
+ 	else
+ 		hif->msgcb_registered = true;
+ 
++#if IS_ENABLED(CONFIG_RFKILL)
+ 	hif->rfkill = rfkill_alloc("mtk-wlan", hif->dev, RFKILL_TYPE_WLAN,
+ 				   &mtk_wlan_rfkill_ops, hif);
+-	if (hif->rfkill) {
++	if (IS_ERR(hif->rfkill)) {
++		dev_warn(hif->dev, "cannot allocate rfkill\n");
++		hif->rfkill = NULL;
++	} else {
+ 		ret = rfkill_register(hif->rfkill);
+ 		if (ret) {
+ 			dev_err(hif->dev, "cannot register rfkill: %d\n", ret);
+ 			rfkill_destroy(hif->rfkill);
+ 			hif->rfkill = NULL;
+ 		}
+-	} else {
+-		dev_warn(hif->dev, "cannot allocate rfkill\n");
+ 	}
++#endif /* CONFIG_RFKILL */
+ 
+ 	if (mtk_wcn_wmt_wlan_reg(&mtk_wlan_wmt_cb)) {
+ 		dev_err(hif->dev, "cannot register with WMT\n");
+@@ -220,6 +261,7 @@ int mtk_wlan_main_attach(struct mtk_wlan_hif *hif)
+ 			mtk_wcn_wmt_msgcb_unreg(WMTDRV_WIFI);
+ 			hif->msgcb_registered = false;
+ 		}
++		mtk_wlan_mac_detach(hif);
+ 		WRITE_ONCE(mtk_wlan_hif, NULL);
+ 		return -EIO;
+ 	}
+@@ -251,6 +293,8 @@ void mtk_wlan_main_detach(struct mtk_wlan_hif *hif)
+ 		hif->rfkill = NULL;
+ 	}
+ 
++	mtk_wlan_mac_detach(hif);
++
+ 	WRITE_ONCE(mtk_wlan_hif, NULL);
+ }
+ 
+diff --git a/drivers/misc/mediatek/connectivity/wlan/wlan_mgmt.c b/drivers/misc/mediatek/connectivity/wlan/wlan_mgmt.c
+new file mode 100644
+index 000000000..ffd75a9cb
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wlan/wlan_mgmt.c
+@@ -0,0 +1,1185 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WLAN gen2 STA management: software scan and open-system
++ * authentication/association.
++ *
++ * Ported from Samsung/MTK downstream:
++ *   mgmt/auth.c          (authComposeAuthFrameHeaderAndFF, authSendAuthFrame,
++ *                         authSendDeauthFrame)
++ *   mgmt/assoc.c         (assocComposeReAssocReqFrameHeaderAndFF,
++ *                         assocBuildReAssocReqFrameCommonIEs,
++ *                         assocBuildCapabilityInfo)
++ *   mgmt/ais_fsm.c       (AIS auth/assoc state machine, deauth on disconnect)
++ *   mgmt/scan.c          (BSS result parsing from beacons/probe responses,
++ *                         scanUpdateBssDesc(): trust the DS/HT channel IE)
++ *   mgmt/scan_fsm.c      (scan request handling; downstream sends
++ *                         CMD_ID_SCAN_REQ to the firmware, which this port
++ *                         cannot do)
++ *   os/linux/gl_kal.c    (kalIndicateStatusAndComplete: connect/disconnect
++ *                         notifications to cfg80211)
++ *
++ * The downstream driver lets the firmware run the scan and keeps the
++ * firmware STA record in sync over CMD_ID_UPDATE_STA_RECORD and
++ * CMD_ID_SET_BSS_INFO; this port drives the same management frames from the
++ * host and has no firmware command queue, see the report for the resulting
++ * boundary.
++ *
++ * Copyright (C) 2013 MediaTek Inc.
++ */
++
++#include <linux/delay.h>
++#include <linux/etherdevice.h>
++#include <linux/ieee80211.h>
++#include <linux/jiffies.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/timekeeping.h>
++
++#include "wlan_cmd.h"
++#include "wlan_mac.h"
++
++/* 2.4 GHz basic rate set advertised in probe/assoc requests (500 kb/s). */
++static const u8 mtk_wlan_basic_rates[] = {
++	MTK_WLAN_RATE_1M | MTK_WLAN_RATE_BASIC_BIT,
++	MTK_WLAN_RATE_2M | MTK_WLAN_RATE_BASIC_BIT,
++	MTK_WLAN_RATE_5_5M | MTK_WLAN_RATE_BASIC_BIT,
++	MTK_WLAN_RATE_11M | MTK_WLAN_RATE_BASIC_BIT,
++};
++
++/* OFDM rates moved to the Extended Supported Rates element (8 octets). */
++static const u8 mtk_wlan_ofdm_rates[] = {
++	MTK_WLAN_RATE_6M,
++	MTK_WLAN_RATE_9M,
++	MTK_WLAN_RATE_12M,
++	MTK_WLAN_RATE_18M,
++	MTK_WLAN_RATE_24M,
++	MTK_WLAN_RATE_36M,
++	MTK_WLAN_RATE_48M,
++	MTK_WLAN_RATE_54M,
++};
++
++/* Append one information element, returns the number of bytes written. */
++static size_t mtk_wlan_ie_put(u8 *buf, size_t off, u8 id, const void *data,
++			      size_t len)
++{
++	buf[off] = id;
++	buf[off + 1] = (u8)len;
++	if (len)
++		memcpy(buf + off + 2, data, len);
++	return len + 2;
++}
++
++/*
++ * Build a probe request for one channel and one SSID.  The element set
++ * (SSID, supported rates, DS parameter set, extended supported rates,
++ * followed by the IEs requested by cfg80211) follows 802.11-2016 9.3.3.9;
++ * the DS element is mandatory in a probe request and tells the AP which
++ * channel the STA is probing (ELEM_ID_DS_PARAMS, mac.h:760).
++ */
++static int mtk_wlan_build_probe_req(struct mtk_wlan_mac *mac, u8 channel,
++				    const u8 *ssid, size_t ssid_len,
++				    const u8 *extra_ie, size_t extra_ie_len,
++				    u8 *buf, size_t bufsz)
++{
++	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)buf;
++	size_t len = MTK_WLAN_MAC_HDR_LEN;
++	u8 ds = channel;
++
++	if (MTK_WLAN_MAC_HDR_LEN + 2 + ssid_len + 2 + sizeof(mtk_wlan_basic_rates) +
++	    2 + 1 + 2 + sizeof(mtk_wlan_ofdm_rates) + extra_ie_len > bufsz)
++		return -EMSGSIZE;
++	if (ssid_len > IEEE80211_MAX_SSID_LEN)
++		return -EINVAL;
++
++	mgmt->frame_control = cpu_to_le16(IEEE80211_FTYPE_MGMT |
++					  IEEE80211_STYPE_PROBE_REQ);
++	mgmt->duration = 0;
++	eth_broadcast_addr(mgmt->da);
++	ether_addr_copy(mgmt->sa, mac->mac_addr);
++	eth_broadcast_addr(mgmt->bssid);
++	mgmt->seq_ctrl = 0;
++
++	len += mtk_wlan_ie_put(buf, len, WLAN_EID_SSID, ssid, ssid_len);
++	len += mtk_wlan_ie_put(buf, len, WLAN_EID_SUPP_RATES,
++			       mtk_wlan_basic_rates,
++			       sizeof(mtk_wlan_basic_rates));
++	len += mtk_wlan_ie_put(buf, len, WLAN_EID_DS_PARAMS, &ds, sizeof(ds));
++	len += mtk_wlan_ie_put(buf, len, WLAN_EID_EXT_SUPP_RATES,
++			       mtk_wlan_ofdm_rates,
++			       sizeof(mtk_wlan_ofdm_rates));
++	if (extra_ie_len) {
++		memcpy(buf + len, extra_ie, extra_ie_len);
++		len += extra_ie_len;
++	}
++
++	return len;
++}
++
++/* Scan channels are restricted to the 2.4 GHz band this chip supports. */
++static bool mtk_wlan_channel_usable(const struct ieee80211_channel *chan)
++{
++	return chan->band == NL80211_BAND_2GHZ &&
++	       !(chan->flags & IEEE80211_CHAN_DISABLED);
++}
++
++/*
++ * Dwell time for one channel.  cfg80211 reports it in TUs (1 TU = 1024 us,
++ * cfg80211.h:2860-2864) when the scan request sets it.  The value is bounded
++ * so a malformed request cannot park a scan for minutes; the bound is a
++ * driver policy, not a hardware limit.
++ */
++static unsigned int mtk_wlan_scan_dwell_ms(const struct cfg80211_scan_request *req)
++{
++	u64 us;
++
++	if (!req->duration)
++		return MTK_WLAN_SCAN_DWELL_MS;
++
++	us = (u64)req->duration * 1024;
++	return clamp_t(u64, DIV_ROUND_UP_ULL(us, 1000), 1,
++		       MTK_WLAN_SCAN_DWELL_MAX_MS);
++}
++
++/*
++ * Wait for the dwell time, polling the abort flag and the firmware state.
++ * Return: %false when the scan was cancelled or the firmware went away.
++ */
++static bool mtk_wlan_scan_wait(struct mtk_wlan_mac *mac, unsigned int ms)
++{
++	unsigned long end = jiffies + msecs_to_jiffies(ms);
++
++	do {
++		if (READ_ONCE(mac->scan_aborted) || !READ_ONCE(mac->fw_up))
++			return false;
++		msleep(MTK_WLAN_SCAN_POLL_MS);
++	} while (time_before(jiffies, end));
++
++	return !READ_ONCE(mac->scan_aborted) && READ_ONCE(mac->fw_up);
++}
++
++/**
++ * mtk_wlan_mgmt_scan - start a software scan
++ * @mac: MAC instance
++ * @req: cfg80211 scan request, valid until cfg80211_scan_done()
++ *
++ * Return: 0 when the scan was started, negative errno otherwise.
++ */
++int mtk_wlan_mgmt_scan(struct mtk_wlan_mac *mac,
++		       struct cfg80211_scan_request *req)
++{
++	if (!READ_ONCE(mac->fw_up))
++		return -ENETDOWN;
++	if (READ_ONCE(mac->state) == MTK_WLAN_STATE_CONNECTING)
++		return -EBUSY;
++	if (!req->n_channels)
++		return -EINVAL;
++	if (READ_ONCE(mac->scan_req))
++		return -EBUSY;
++
++	WRITE_ONCE(mac->scan_aborted, false);
++	WRITE_ONCE(mac->scan_req, req);
++	WRITE_ONCE(mac->state, MTK_WLAN_STATE_SCANNING);
++	schedule_work(&mac->scan_work);
++
++	return 0;
++}
++
++/**
++ * mtk_wlan_mgmt_abort_scan - cancel a running scan
++ * @mac: MAC instance
++ *
++ * The worker notices the flag within one dwell poll, stops probing and
++ * reports the scan as aborted through cfg80211_scan_done(), as the cfg80211
++ * abort_scan callback requires.  Completion is always done by the worker, so
++ * the request is signalled exactly once.
++ */
++void mtk_wlan_mgmt_abort_scan(struct mtk_wlan_mac *mac)
++{
++	WRITE_ONCE(mac->scan_aborted, true);
++}
++
++/* Report a scan completion exactly once, from the worker or its fallback. */
++static void mtk_wlan_scan_complete(struct mtk_wlan_mac *mac,
++				   struct cfg80211_scan_request *req,
++				   bool aborted)
++{
++	struct cfg80211_scan_info info = {
++		.aborted = aborted,
++	};
++
++	WRITE_ONCE(mac->scan_req, NULL);
++	if (READ_ONCE(mac->state) == MTK_WLAN_STATE_SCANNING)
++		WRITE_ONCE(mac->state, READ_ONCE(mac->fw_up) ?
++			   (READ_ONCE(mac->connected) ?
++			    MTK_WLAN_STATE_CONNECTED : MTK_WLAN_STATE_IDLE) :
++			   MTK_WLAN_STATE_DOWN);
++
++	cfg80211_scan_done(req, &info);
++}
++
++/**
++ * mtk_wlan_mgmt_scan_work - transmit probe requests on every requested channel
++ * @work: &struct mtk_wlan_mac.scan_work
++ *
++ * The firmware owns the RF channel; without a firmware channel-switch or
++ * scan command the host can only transmit probe requests and collect the
++ * responses that the firmware receives on its current channel.  Passive
++ * scans (no SSID in the request) send nothing and only collect beacons.
++ * See the report for this hardware-scan boundary.
++ */
++void mtk_wlan_mgmt_scan_work(struct work_struct *work)
++{
++	struct mtk_wlan_mac *mac = container_of(work, struct mtk_wlan_mac,
++						scan_work);
++	struct cfg80211_scan_request *req = READ_ONCE(mac->scan_req);
++	u8 frame[MTK_WLAN_MGMT_FRAME_MAX];
++	bool aborted = false;
++	unsigned int i, s;
++
++	if (!req)
++		return;
++
++	for (i = 0; i < req->n_channels; i++) {
++		const struct ieee80211_channel *chan = req->channels[i];
++		u8 number;
++
++		if (READ_ONCE(mac->scan_aborted) || !READ_ONCE(mac->fw_up)) {
++			aborted = true;
++			break;
++		}
++		if (!mtk_wlan_channel_usable(chan))
++			continue;
++
++		number = ieee80211_frequency_to_channel(chan->center_freq);
++
++		/*
++		 * No probe request on a no-IR channel (regulatory rule) and
++		 * none at all for a passive scan, which cfg80211 expresses by
++		 * n_ssids == 0.
++		 */
++		if (req->n_ssids && !(chan->flags & IEEE80211_CHAN_NO_IR)) {
++			for (s = 0; s < req->n_ssids; s++) {
++				const u8 *ssid = req->ssids[s].ssid;
++				size_t ssid_len = req->ssids[s].ssid_len;
++				int len;
++
++				len = mtk_wlan_build_probe_req(mac, number, ssid,
++							       ssid_len, req->ie,
++							       req->ie_len, frame,
++							       sizeof(frame));
++				if (len < 0) {
++					dev_warn_ratelimited(mac->dev,
++							     "cannot build probe request: %d\n",
++							     len);
++					continue;
++				}
++
++				if (mtk_wlan_mgmt_tx(mac, frame, len)) {
++					dev_warn_ratelimited(mac->dev,
++							     "probe request TX failed on channel %u\n",
++							     number);
++					if (!READ_ONCE(mac->fw_up)) {
++						aborted = true;
++						break;
++					}
++				}
++			}
++		}
++
++		if (aborted)
++			break;
++		if (!mtk_wlan_scan_wait(mac, mtk_wlan_scan_dwell_ms(req))) {
++			aborted = true;
++			break;
++		}
++	}
++
++	mtk_wlan_scan_complete(mac, req, aborted);
++}
++
++/*
++ * Compose an authentication frame, authComposeAuthFrameHeaderAndFF()
++ * auth.c:258-325: address 1 is the BSSID, address 2 our MAC and address 3
++ * the BSSID for the first transaction; the body carries algorithm,
++ * transaction sequence number and status code.
++ */
++static size_t mtk_wlan_build_auth(struct mtk_wlan_mac *mac,
++				  const u8 *peer, u16 seq, u16 status,
++				  u8 *buf, size_t bufsz)
++{
++	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)buf;
++
++	if (bufsz < MTK_WLAN_MAC_HDR_LEN + 6)
++		return 0;
++
++	mgmt->frame_control = cpu_to_le16(IEEE80211_FTYPE_MGMT |
++					  IEEE80211_STYPE_AUTH);
++	mgmt->duration = 0;
++	ether_addr_copy(mgmt->da, peer);
++	ether_addr_copy(mgmt->sa, mac->mac_addr);
++	ether_addr_copy(mgmt->bssid, peer);
++	mgmt->seq_ctrl = 0;
++	mgmt->u.auth.auth_alg = cpu_to_le16(WLAN_AUTH_OPEN);
++	mgmt->u.auth.auth_transaction = cpu_to_le16(seq);
++	mgmt->u.auth.status_code = cpu_to_le16(status);
++
++	return MTK_WLAN_MAC_HDR_LEN + 6;
++}
++
++/*
++ * Compose an association request, assocComposeReAssocReqFrameHeaderAndFF()
++ * assoc.c:747-823 and assocBuildReAssocReqFrameCommonIEs() assoc.c:587-731:
++ * capability information (ESS only, no privacy, assocBuildCapabilityInfo()
++ * assoc.c:505-575), listen interval, SSID, supported rates, extended
++ * supported rates and the IEs requested by cfg80211.
++ *
++ * @ies receives the IEs starting at the SSID element for
++ * cfg80211_connect_result().
++ */
++static int mtk_wlan_build_assoc_req(struct mtk_wlan_mac *mac, const u8 *peer,
++				    const u8 *extra_ie, size_t extra_ie_len,
++				    u8 *buf, size_t bufsz,
++				    u8 *ies, size_t ies_sz, size_t *ies_len)
++{
++	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)buf;
++	size_t len = MTK_WLAN_MAC_HDR_LEN + 4;
++	size_t ie_start = len, ie_out_len;
++
++	if (MTK_WLAN_MAC_HDR_LEN + 4 + 2 + mac->ssid_len +
++	    2 + sizeof(mtk_wlan_basic_rates) + 2 +
++	    sizeof(mtk_wlan_ofdm_rates) + extra_ie_len > bufsz)
++		return -EMSGSIZE;
++
++	mgmt->frame_control = cpu_to_le16(IEEE80211_FTYPE_MGMT |
++					  IEEE80211_STYPE_ASSOC_REQ);
++	mgmt->duration = 0;
++	ether_addr_copy(mgmt->da, peer);
++	ether_addr_copy(mgmt->sa, mac->mac_addr);
++	ether_addr_copy(mgmt->bssid, peer);
++	mgmt->seq_ctrl = 0;
++
++	/* CAP_INFO_ESS, station not CF-pollable, no privacy (open only). */
++	mgmt->u.assoc_req.capab_info = cpu_to_le16(WLAN_CAPABILITY_ESS);
++	mgmt->u.assoc_req.listen_interval =
++		cpu_to_le16(MTK_WLAN_LISTEN_INTERVAL);
++
++	len += mtk_wlan_ie_put(buf, len, WLAN_EID_SSID, mac->ssid,
++			       mac->ssid_len);
++	len += mtk_wlan_ie_put(buf, len, WLAN_EID_SUPP_RATES,
++			       mtk_wlan_basic_rates,
++			       sizeof(mtk_wlan_basic_rates));
++	len += mtk_wlan_ie_put(buf, len, WLAN_EID_EXT_SUPP_RATES,
++			       mtk_wlan_ofdm_rates,
++			       sizeof(mtk_wlan_ofdm_rates));
++	if (extra_ie_len) {
++		memcpy(buf + len, extra_ie, extra_ie_len);
++		len += extra_ie_len;
++	}
++
++	ie_out_len = min(len - ie_start, ies_sz);
++	memcpy(ies, buf + ie_start, ie_out_len);
++	*ies_len = ie_out_len;
++
++	return len;
++}
++
++/* Compose a deauthentication frame, authSendDeauthFrame() auth.c:932-1139. */
++static size_t mtk_wlan_build_deauth(struct mtk_wlan_mac *mac, const u8 *peer,
++				    u16 reason, u8 *buf, size_t bufsz)
++{
++	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)buf;
++
++	if (bufsz < MTK_WLAN_MAC_HDR_LEN + 2)
++		return 0;
++
++	mgmt->frame_control = cpu_to_le16(IEEE80211_FTYPE_MGMT |
++					  IEEE80211_STYPE_DEAUTH);
++	mgmt->duration = 0;
++	ether_addr_copy(mgmt->da, peer);
++	ether_addr_copy(mgmt->sa, mac->mac_addr);
++	ether_addr_copy(mgmt->bssid, peer);
++	mgmt->seq_ctrl = 0;
++	mgmt->u.deauth.reason_code = cpu_to_le16(reason);
++
++	return MTK_WLAN_MAC_HDR_LEN + 2;
++}
++
++/*
++ * Transmit one management frame and wait for the matching response.  The RX
++ * path stores the response and completes &mac->mgmt_done.  A firmware-down
++ * or a locally requested disconnect releases the wait with an error, so the
++ * caller never sleeps longer than one timeout after the exchange is over.
++ */
++static int mtk_wlan_mgmt_exchange(struct mtk_wlan_mac *mac, u16 stype,
++				  const u8 *peer, const u8 *frame, size_t len,
++				  struct mtk_wlan_mgmt_rsp *rsp)
++{
++	unsigned long timeout = msecs_to_jiffies(MTK_WLAN_MGMT_TIMEOUT_MS);
++	int tries;
++
++	for (tries = 0; tries < MTK_WLAN_MGMT_RETRIES; tries++) {
++		int ret;
++
++		if (!READ_ONCE(mac->fw_up))
++			return -ENETDOWN;
++		if (READ_ONCE(mac->connect_aborted))
++			return -ECANCELED;
++		if (READ_ONCE(mac->state) != MTK_WLAN_STATE_CONNECTING)
++			return -ECANCELED;
++
++		reinit_completion(&mac->mgmt_done);
++		spin_lock_bh(&mac->rx_lock);
++		mac->mgmt_stype = stype;
++		ether_addr_copy(mac->mgmt_peer, peer);
++		mac->mgmt_err = 0;
++		mac->mgmt_rsp.ies_len = 0;
++		spin_unlock_bh(&mac->rx_lock);
++
++		ret = mtk_wlan_mgmt_tx(mac, frame, len);
++		if (ret) {
++			spin_lock_bh(&mac->rx_lock);
++			mac->mgmt_stype = 0;
++			spin_unlock_bh(&mac->rx_lock);
++			return ret;
++		}
++
++		if (!wait_for_completion_timeout(&mac->mgmt_done, timeout)) {
++			dev_dbg(mac->dev, "no response to subtype %#x, retry %d\n",
++				stype, tries);
++			spin_lock_bh(&mac->rx_lock);
++			mac->mgmt_stype = 0;
++			spin_unlock_bh(&mac->rx_lock);
++			continue;
++		}
++
++		spin_lock_bh(&mac->rx_lock);
++		mac->mgmt_stype = 0;
++		ret = mac->mgmt_err;
++		if (!ret)
++			*rsp = mac->mgmt_rsp;
++		spin_unlock_bh(&mac->rx_lock);
++
++		return ret;
++	}
++
++	return -ETIMEDOUT;
++}
++
++/*
++ * Release the BSS reference taken by mtk_wlan_mgmt_connect() when no result
++ * is going to be reported to cfg80211.  Called with &mac->lock held.
++ */
++static void mtk_wlan_connect_release(struct mtk_wlan_mac *mac)
++{
++	struct cfg80211_bss *bss = mac->connect_bss;
++
++	mac->connect_bss = NULL;
++	if (bss)
++		cfg80211_put_bss(mac->wiphy, bss);
++}
++
++/*
++ * Report a failed connection attempt.  cfg80211 expects either an explicit
++ * status code from the peer or a timeout notification, never silence.  The
++ * BSS reference from connect() is handed over to cfg80211, which consumes it
++ * on every path (sme.c:837-848).  Called with &mac->lock held.
++ *
++ * @status: peer status code, or -1 for a failure without a status code
++ */
++static void mtk_wlan_connect_report_fail(struct mtk_wlan_mac *mac, int status,
++					 enum nl80211_timeout_reason reason)
++{
++	struct cfg80211_bss *bss = mac->connect_bss;
++
++	mac->connect_bss = NULL;
++	if (mac->registered)
++		cfg80211_connect_bss(mac->ndev, mac->bssid, bss, mac->req_ie,
++				     mac->req_ie_len, NULL, 0, status,
++				     GFP_KERNEL, reason);
++	else if (bss)
++		cfg80211_put_bss(mac->wiphy, bss);
++}
++
++/* Release the firmware association state after a failed or cancelled attempt. */
++static void mtk_wlan_connect_fw_teardown(struct mtk_wlan_mac *mac)
++{
++	mtk_wlan_cmd_teardown(mac);
++	mac->sta_valid = false;
++	mac->aid = 0;
++}
++
++/**
++ * mtk_wlan_mgmt_connect_work - open-system auth/assoc state machine
++ * @work: &struct mtk_wlan_mac.connect_work
++ *
++ * Mirrors aaaFsmRunEventRxAuth()/aisFsmRunEventJoinComplete(): activate the
++ * AIS network and create the AP peer record, send the authentication request,
++ * wait for the authentication response carrying transaction sequence 2 and
++ * status 0, send the association request, wait for an association response,
++ * then update the peer record to associated and sync the BSS state before
++ * cfg80211 is told about the connection.  Only open-system authentication is
++ * advertised, so a challenge-text exchange never happens.
++ */
++void mtk_wlan_mgmt_connect_work(struct work_struct *work)
++{
++	struct mtk_wlan_mac *mac = container_of(work, struct mtk_wlan_mac,
++						connect_work);
++	struct mtk_wlan_mgmt_rsp rsp;
++	u8 frame[MTK_WLAN_MGMT_FRAME_MAX];
++	u8 req_ies[MTK_WLAN_ASSOC_IES_MAX];
++	size_t req_ies_len = 0;
++	size_t len;
++	int ret;
++
++	mutex_lock(&mac->lock);
++
++	if (READ_ONCE(mac->state) != MTK_WLAN_STATE_CONNECTING ||
++	    READ_ONCE(mac->connect_aborted)) {
++		/* Cancelled before the worker ran: nothing to report. */
++		mtk_wlan_connect_release(mac);
++		mutex_unlock(&mac->lock);
++		return;
++	}
++	if (!READ_ONCE(mac->fw_up)) {
++		WRITE_ONCE(mac->state, MTK_WLAN_STATE_DOWN);
++		mtk_wlan_connect_report_fail(mac, -1,
++					     NL80211_TIMEOUT_UNSPECIFIED);
++		mutex_unlock(&mac->lock);
++		return;
++	}
++
++	/*
++	 * Firmware bring-up for the join: activate the AIS network
++	 * (nicActivateNetwork(), ais_fsm.c:1873) and install the AP peer
++	 * record in its initial state (ais_fsm.c:1372-1384).
++	 */
++	ret = mtk_wlan_cmd_bss_activate(mac, true);
++	if (ret) {
++		WRITE_ONCE(mac->state, MTK_WLAN_STATE_DOWN);
++		mtk_wlan_connect_report_fail(mac, -1,
++					     NL80211_TIMEOUT_UNSPECIFIED);
++		mutex_unlock(&mac->lock);
++		return;
++	}
++	ret = mtk_wlan_cmd_update_sta(mac, MTK_WLAN_STA_STATE_1, 0, false);
++	if (ret) {
++		mtk_wlan_connect_fw_teardown(mac);
++		WRITE_ONCE(mac->state, MTK_WLAN_STATE_IDLE);
++		mtk_wlan_connect_report_fail(mac, -1,
++					     NL80211_TIMEOUT_UNSPECIFIED);
++		mutex_unlock(&mac->lock);
++		return;
++	}
++	mac->sta_valid = true;
++
++	/* Step 1: open-system authentication, transaction sequence 1. */
++	len = mtk_wlan_build_auth(mac, mac->bssid, 1, 0, frame, sizeof(frame));
++	if (!len) {
++		mtk_wlan_connect_fw_teardown(mac);
++		WRITE_ONCE(mac->state, MTK_WLAN_STATE_IDLE);
++		mtk_wlan_connect_report_fail(mac, -1, NL80211_TIMEOUT_AUTH);
++		mutex_unlock(&mac->lock);
++		return;
++	}
++
++	ret = mtk_wlan_mgmt_exchange(mac, IEEE80211_STYPE_AUTH, mac->bssid,
++				     frame, len, &rsp);
++	if (ret) {
++		bool cancelled = READ_ONCE(mac->connect_aborted) ||
++				 READ_ONCE(mac->state) !=
++				 MTK_WLAN_STATE_CONNECTING;
++		bool down = ret == -ENETDOWN || !READ_ONCE(mac->fw_up);
++
++		mtk_wlan_connect_fw_teardown(mac);
++		if (cancelled) {
++			mtk_wlan_connect_release(mac);
++			mutex_unlock(&mac->lock);
++			return;
++		}
++		WRITE_ONCE(mac->state, down ? MTK_WLAN_STATE_DOWN :
++			   MTK_WLAN_STATE_IDLE);
++		mtk_wlan_connect_report_fail(mac, -1, NL80211_TIMEOUT_AUTH);
++		mutex_unlock(&mac->lock);
++		return;
++	}
++	if (rsp.status != WLAN_STATUS_SUCCESS) {
++		mtk_wlan_connect_fw_teardown(mac);
++		WRITE_ONCE(mac->state, MTK_WLAN_STATE_IDLE);
++		mtk_wlan_connect_report_fail(mac, rsp.status,
++					     NL80211_TIMEOUT_UNSPECIFIED);
++		mutex_unlock(&mac->lock);
++		return;
++	}
++
++	/* Step 2: association request. */
++	ret = mtk_wlan_build_assoc_req(mac, mac->bssid, mac->assoc_ie,
++				       mac->assoc_ie_len, frame, sizeof(frame),
++				       req_ies, sizeof(req_ies), &req_ies_len);
++	if (ret < 0) {
++		mtk_wlan_connect_fw_teardown(mac);
++		WRITE_ONCE(mac->state, MTK_WLAN_STATE_IDLE);
++		mtk_wlan_connect_report_fail(mac, WLAN_STATUS_UNSPECIFIED_FAILURE,
++					     NL80211_TIMEOUT_UNSPECIFIED);
++		mutex_unlock(&mac->lock);
++		return;
++	}
++	len = ret;
++
++	ret = mtk_wlan_mgmt_exchange(mac, IEEE80211_STYPE_ASSOC_RESP,
++				     mac->bssid, frame, len, &rsp);
++	if (ret) {
++		bool cancelled = READ_ONCE(mac->connect_aborted) ||
++				 READ_ONCE(mac->state) !=
++				 MTK_WLAN_STATE_CONNECTING;
++		bool down = ret == -ENETDOWN || !READ_ONCE(mac->fw_up);
++
++		mtk_wlan_connect_fw_teardown(mac);
++		if (cancelled) {
++			mtk_wlan_connect_release(mac);
++			mutex_unlock(&mac->lock);
++			return;
++		}
++		WRITE_ONCE(mac->state, down ? MTK_WLAN_STATE_DOWN :
++			   MTK_WLAN_STATE_IDLE);
++		mtk_wlan_connect_report_fail(mac, -1, NL80211_TIMEOUT_ASSOC);
++		mutex_unlock(&mac->lock);
++		return;
++	}
++	if (rsp.status != WLAN_STATUS_SUCCESS) {
++		mtk_wlan_connect_fw_teardown(mac);
++		WRITE_ONCE(mac->state, MTK_WLAN_STATE_IDLE);
++		mtk_wlan_connect_report_fail(mac, rsp.status,
++					     NL80211_TIMEOUT_UNSPECIFIED);
++		mutex_unlock(&mac->lock);
++		return;
++	}
++
++	/*
++	 * Step 3: the AP accepted us.  Move the peer record to class 3 with
++	 * the assigned AID (cnmStaRecChangeState() with STA_STATE_3 sends the
++	 * update and waits for the result, cnm_mem.c:1032-1056), then sync the
++	 * BSS state; downstream does exactly this before indicating the media
++	 * state to the host (ais_fsm.c:3353-3358).
++	 */
++	mac->aid = rsp.aid;
++	ret = mtk_wlan_cmd_update_sta(mac, MTK_WLAN_STA_STATE_3, mac->aid, true);
++	if (ret) {
++		dev_warn(mac->dev, "cannot update the STA record: %d\n", ret);
++		mtk_wlan_connect_fw_teardown(mac);
++		WRITE_ONCE(mac->state, READ_ONCE(mac->fw_up) ?
++			   MTK_WLAN_STATE_IDLE : MTK_WLAN_STATE_DOWN);
++		mtk_wlan_connect_report_fail(mac, -1,
++					     NL80211_TIMEOUT_UNSPECIFIED);
++		mutex_unlock(&mac->lock);
++		return;
++	}
++	ret = mtk_wlan_cmd_set_bss_info(mac, true);
++	if (ret) {
++		dev_warn(mac->dev, "cannot set the BSS info: %d\n", ret);
++		mtk_wlan_connect_fw_teardown(mac);
++		WRITE_ONCE(mac->state, READ_ONCE(mac->fw_up) ?
++			   MTK_WLAN_STATE_IDLE : MTK_WLAN_STATE_DOWN);
++		mtk_wlan_connect_report_fail(mac, -1,
++					     NL80211_TIMEOUT_UNSPECIFIED);
++		mutex_unlock(&mac->lock);
++		return;
++	}
++
++	ether_addr_copy(mac->req_ie, req_ies);
++	mac->req_ie_len = req_ies_len;
++	WRITE_ONCE(mac->connected, true);
++	mac->assoc_ts = jiffies;
++	WRITE_ONCE(mac->state, MTK_WLAN_STATE_CONNECTED);
++	mtk_wlan_netdev_link_changed(mac, true);
++
++	{
++		struct cfg80211_bss *bss = mac->connect_bss;
++
++		mac->connect_bss = NULL;
++		if (mac->registered)
++			cfg80211_connect_bss(mac->ndev, mac->bssid, bss,
++					     mac->req_ie, mac->req_ie_len,
++					     rsp.ies, rsp.ies_len,
++					     WLAN_STATUS_SUCCESS, GFP_KERNEL,
++					     NL80211_TIMEOUT_UNSPECIFIED);
++		else if (bss)
++			cfg80211_put_bss(mac->wiphy, bss);
++	}
++	mutex_unlock(&mac->lock);
++
++	dev_info(mac->dev, "associated to %pM on channel %u\n", mac->bssid,
++		 mac->channel);
++}
++
++/*
++ * Tear down the association state, report it to cfg80211 and stop the TX
++ * path.  Takes &mac->lock itself.
++ */
++static void mtk_wlan_link_down(struct mtk_wlan_mac *mac, u16 reason,
++			       bool locally)
++{
++	bool was_connected;
++	struct sk_buff *skb;
++
++	mutex_lock(&mac->lock);
++	was_connected = READ_ONCE(mac->connected);
++	WRITE_ONCE(mac->connected, false);
++	if (READ_ONCE(mac->state) != MTK_WLAN_STATE_DOWN)
++		WRITE_ONCE(mac->state, READ_ONCE(mac->fw_up) ?
++			   MTK_WLAN_STATE_IDLE : MTK_WLAN_STATE_DOWN);
++	mtk_wlan_netdev_link_changed(mac, false);
++	mutex_unlock(&mac->lock);
++
++	/*
++	 * Release the firmware peer/BSS state: SET_BSS_INFO disconnected, the
++	 * STA record remove command and network deactivation.  Skipped when
++	 * the firmware is already gone.
++	 */
++	if (was_connected || mac->sta_valid)
++		mtk_wlan_cmd_teardown(mac);
++
++	while ((skb = skb_dequeue(&mac->txq)))
++		dev_kfree_skb(skb);
++
++	if (was_connected && mac->registered)
++		cfg80211_disconnected(mac->ndev, reason, NULL, 0, locally,
++				      GFP_KERNEL);
++}
++
++/**
++ * mtk_wlan_mgmt_deauth_rx - handle a deauthentication/disassociation frame
++ * @mac: MAC instance
++ * @reason: reason code from the frame
++ * @locally: %true when the driver itself initiated the teardown
++ */
++void mtk_wlan_mgmt_deauth_rx(struct mtk_wlan_mac *mac, u16 reason,
++			     bool locally)
++{
++	if (!READ_ONCE(mac->connected))
++		return;
++
++	dev_info(mac->dev, "%s by %pM, reason %u\n",
++		 locally ? "disconnected" : "disassociated", mac->bssid,
++		 reason);
++	mtk_wlan_link_down(mac, reason, locally);
++}
++
++/**
++ * mtk_wlan_mgmt_disconnect - locally requested disconnect
++ * @mac: MAC instance
++ * @reason: reason code to send in the deauthentication frame
++ *
++ * Handles both states cfg80211 can ask about: an established association is
++ * deauthenticated and reported; an association attempt in progress is
++ * aborted and the worker releases the frame/bss state without reporting a
++ * result, because cfg80211 already abandoned the request.
++ *
++ * Return: 0 on success, -ENOTCONN when not associated or connecting.
++ */
++int mtk_wlan_mgmt_disconnect(struct mtk_wlan_mac *mac, u16 reason)
++{
++	u8 frame[MTK_WLAN_MAC_HDR_LEN + 2];
++	bool connecting = READ_ONCE(mac->state) == MTK_WLAN_STATE_CONNECTING;
++	bool fw_up;
++	size_t len;
++
++	/*
++	 * Cancel an association attempt before taking &mac->lock: the connect
++	 * worker holds that lock while it waits for a management response, so
++	 * the exchange must be released first.
++	 */
++	if (connecting) {
++		WRITE_ONCE(mac->connect_aborted, true);
++		mtk_wlan_cmd_cancel(mac);
++		spin_lock_bh(&mac->rx_lock);
++		if (mac->mgmt_stype) {
++			mac->mgmt_err = -ECANCELED;
++			complete(&mac->mgmt_done);
++		}
++		spin_unlock_bh(&mac->rx_lock);
++		flush_work(&mac->connect_work);
++	}
++
++	mutex_lock(&mac->lock);
++	if (!READ_ONCE(mac->connected)) {
++		if (READ_ONCE(mac->state) == MTK_WLAN_STATE_CONNECTING)
++			WRITE_ONCE(mac->state, READ_ONCE(mac->fw_up) ?
++				   MTK_WLAN_STATE_IDLE : MTK_WLAN_STATE_DOWN);
++		mutex_unlock(&mac->lock);
++		return connecting ? 0 : -ENOTCONN;
++	}
++
++	/* aisFsmDisconnect() deauthenticates the current AP, auth.c:932. */
++	len = mtk_wlan_build_deauth(mac, mac->bssid, reason, frame,
++				    sizeof(frame));
++	fw_up = READ_ONCE(mac->fw_up);
++	mutex_unlock(&mac->lock);
++
++	if (len && fw_up)
++		mtk_wlan_mgmt_tx(mac, frame, len);
++
++	mtk_wlan_link_down(mac, reason, true);
++	return 0;
++}
++
++/**
++ * mtk_wlan_mgmt_connect - validate and start an open-system connection
++ * @mac: MAC instance
++ * @sme: cfg80211 connect parameters, only valid during this call
++ *
++ * Only open networks with open-system authentication are supported; the
++ * wiphy advertises no cipher suites at all.  Everything else is rejected
++ * with a real error instead of a fabricated success.  The BSS reference is
++ * kept until the connect worker reports the result.
++ *
++ * Return: 0 when the connection was started, negative errno otherwise.
++ */
++int mtk_wlan_mgmt_connect(struct mtk_wlan_mac *mac,
++			  struct cfg80211_connect_params *sme)
++{
++	struct cfg80211_bss *bss;
++	struct ieee80211_channel *chan;
++	const u8 *bssid = sme->bssid;
++	int ret = 0;
++
++	if (!READ_ONCE(mac->fw_up))
++		return -ENETDOWN;
++	if (READ_ONCE(mac->state) == MTK_WLAN_STATE_CONNECTING ||
++	    READ_ONCE(mac->connected))
++		return -EALREADY;
++	if (sme->auth_type != NL80211_AUTHTYPE_OPEN_SYSTEM &&
++	    sme->auth_type != NL80211_AUTHTYPE_AUTOMATIC)
++		return -EOPNOTSUPP;
++	if (!sme->ssid || sme->ssid_len > IEEE80211_MAX_SSID_LEN)
++		return -EINVAL;
++	if (sme->ie_len > MTK_WLAN_ASSOC_IES_MAX)
++		return -E2BIG;
++
++	/*
++	 * No key offload: reject every form of encryption material, whether
++	 * it arrives in the crypto parameters, as a key, or as a WPA/RSN IE
++	 * inside the association IEs.
++	 */
++	if (sme->privacy || sme->key || sme->key_len || sme->mfp ||
++	    sme->crypto.wpa_versions || sme->crypto.n_ciphers_pairwise ||
++	    sme->crypto.n_akm_suites ||
++	    (sme->ie_len &&
++	     (cfg80211_find_ie(WLAN_EID_RSN, sme->ie, sme->ie_len) ||
++	      cfg80211_find_vendor_ie(WLAN_OUI_MICROSOFT,
++				      WLAN_OUI_TYPE_MICROSOFT_WPA,
++				      sme->ie, sme->ie_len)))) {
++		dev_info(mac->dev,
++			 "connect: encryption is not supported (no key offload)\n");
++		return -EOPNOTSUPP;
++	}
++
++	bss = cfg80211_get_bss(mac->wiphy, sme->channel, bssid, sme->ssid,
++			       sme->ssid_len, IEEE80211_BSS_TYPE_ESS,
++			       IEEE80211_PRIVACY_ANY);
++	if (!bss) {
++		dev_dbg(mac->dev, "connect: requested BSS not in scan results\n");
++		return -ENOENT;
++	}
++
++	chan = bss->channel;
++	if (!bssid)
++		bssid = bss->bssid;
++
++	if (bss->capability & WLAN_CAPABILITY_PRIVACY) {
++		/* Documented boundary: no key offload, so no WPA/RSN. */
++		dev_info(mac->dev, "connect: %pM requires encryption, unsupported\n",
++			 bssid);
++		ret = -EOPNOTSUPP;
++		goto out_put;
++	}
++	if (!chan || chan->band != NL80211_BAND_2GHZ) {
++		ret = -EOPNOTSUPP;
++		goto out_put;
++	}
++
++	/*
++	 * Derive the firmware AP parameters (rate sets, PHY types, protection)
++	 * from the BSS IEs before committing to the attempt.
++	 */
++	ret = mtk_wlan_cmd_prepare_ap(mac, bss);
++	if (ret)
++		goto out_put;
++
++	/* Stop a software scan that is still running. */
++	mtk_wlan_mgmt_abort_scan(mac);
++
++	mutex_lock(&mac->lock);
++	if (READ_ONCE(mac->state) == MTK_WLAN_STATE_CONNECTING ||
++	    READ_ONCE(mac->connected)) {
++		mutex_unlock(&mac->lock);
++		ret = -EALREADY;
++		goto out_put;
++	}
++
++	ether_addr_copy(mac->bssid, bssid);
++	mac->channel = ieee80211_frequency_to_channel(chan->center_freq);
++	memcpy(mac->ssid, sme->ssid, sme->ssid_len);
++	mac->ssid_len = sme->ssid_len;
++	if (sme->ie_len)
++		memcpy(mac->assoc_ie, sme->ie, sme->ie_len);
++	mac->assoc_ie_len = sme->ie_len;
++	mac->req_ie_len = 0;
++	mac->sta_valid = false;
++	mac->aid = 0;
++	mac->connect_bss = bss;	/* ownership moves to the worker/cfg80211 */
++	WRITE_ONCE(mac->connect_aborted, false);
++	WRITE_ONCE(mac->state, MTK_WLAN_STATE_CONNECTING);
++	mutex_unlock(&mac->lock);
++
++	schedule_work(&mac->connect_work);
++	return 0;
++
++out_put:
++	cfg80211_put_bss(mac->wiphy, bss);
++	return ret;
++}
++
++/**
++ * mtk_wlan_mgmt_quiesce - abort scan/connect after the firmware went away
++ * @mac: MAC instance
++ *
++ * Called from the firmware-down and teardown paths.  A running scan reports
++ * itself aborted, a waiting management exchange is released with -ENETDOWN
++ * so the connect worker reports a timeout, and an established connection is
++ * reported as disconnected.  Every cfg80211 notification is emitted by the
++ * worker or by mtk_wlan_link_down(), exactly once.
++ */
++void mtk_wlan_mgmt_quiesce(struct mtk_wlan_mac *mac)
++{
++	struct cfg80211_scan_request *req;
++
++	/* Release a command wait first: the transport is gone. */
++	mtk_wlan_cmd_abort(mac);
++
++	WRITE_ONCE(mac->scan_aborted, true);
++	flush_work(&mac->scan_work);
++
++	/*
++	 * The worker clears scan_req before calling cfg80211_scan_done(), so a
++	 * request still present here was queued but never executed.  Report it
++	 * rather than leaking it.
++	 */
++	req = READ_ONCE(mac->scan_req);
++	if (req)
++		mtk_wlan_scan_complete(mac, req, true);
++
++	spin_lock_bh(&mac->rx_lock);
++	if (mac->mgmt_stype) {
++		mac->mgmt_err = -ENETDOWN;
++		complete(&mac->mgmt_done);
++	}
++	spin_unlock_bh(&mac->rx_lock);
++	flush_work(&mac->connect_work);
++
++	if (READ_ONCE(mac->state) == MTK_WLAN_STATE_SCANNING)
++		WRITE_ONCE(mac->state, READ_ONCE(mac->fw_up) ?
++			   (READ_ONCE(mac->connected) ?
++			    MTK_WLAN_STATE_CONNECTED : MTK_WLAN_STATE_IDLE) :
++			   MTK_WLAN_STATE_DOWN);
++	if (READ_ONCE(mac->state) == MTK_WLAN_STATE_CONNECTING)
++		WRITE_ONCE(mac->state, READ_ONCE(mac->fw_up) ?
++			   MTK_WLAN_STATE_IDLE : MTK_WLAN_STATE_DOWN);
++
++	if (READ_ONCE(mac->connected))
++		mtk_wlan_link_down(mac, 0, false);
++}
++
++/* Report a beacon/probe response to cfg80211 scan results. */
++static void mtk_wlan_rx_bss(struct mtk_wlan_mac *mac,
++			    struct ieee80211_mgmt *mgmt, size_t len,
++			    u8 channel, u8 rcpi)
++{
++	struct cfg80211_inform_bss data = { };
++	struct cfg80211_bss *bss;
++	struct ieee80211_channel *chan;
++	const u8 *ie;
++	size_t fixed = offsetof(struct ieee80211_mgmt, u.beacon.variable);
++	u32 freq;
++
++	/*
++	 * Trust the DS parameter set like scanUpdateBssDesc()
++	 * (scan.c:1975-1987); fall back to the channel reported by the HIF RX
++	 * header.  Only 2.4 GHz exists in this port.
++	 */
++	if (len >= fixed) {
++		ie = cfg80211_find_ie(WLAN_EID_DS_PARAMS,
++				      mgmt->u.beacon.variable, len - fixed);
++		if (ie && ie[1] == 1 && ie[2] >= 1 && ie[2] <= 14)
++			channel = ie[2];
++	}
++
++	freq = ieee80211_channel_to_frequency(channel, NL80211_BAND_2GHZ);
++	chan = ieee80211_get_channel(mac->wiphy, freq);
++	if (!chan) {
++		atomic_inc(&mac->rx_dropped);
++		return;
++	}
++
++	data.chan = chan;
++	data.signal = mtk_wlan_rcpi_to_dbm(rcpi) * 100;
++	data.boottime_ns = ktime_get_boottime_ns();
++
++	bss = cfg80211_inform_bss_frame_data(mac->wiphy, &data, mgmt, len,
++					     GFP_KERNEL);
++	if (!bss)
++		return;
++
++	cfg80211_put_bss(mac->wiphy, bss);
++}
++
++/*
++ * Association id from an association response, assoc.c:1183-1200: the AID is
++ * the low 14 bits, with the downstream workaround for APs that raise bits 6
++ * and 7 instead of bits 14 and 15.
++ */
++static u16 mtk_wlan_assoc_id(u16 aid)
++{
++	if ((aid & BIT(6)) && (aid & BIT(7)) && !(aid & GENMASK(15, 8)))
++		return aid & ~GENMASK(7, 6);
++	return aid & GENMASK(13, 0);
++}
++
++/*
++ * Deliver a management response to a waiting exchange.  The waiter checks
++ * the subtype and the transmitter address, so a stale frame can never
++ * complete a newer request.
++ */
++static void mtk_wlan_mgmt_complete(struct mtk_wlan_mac *mac, u16 stype,
++				   const u8 *sa, u16 status, u16 aid,
++				   const u8 *ies, size_t ies_len, u8 rcpi)
++{
++	spin_lock_bh(&mac->rx_lock);
++
++	if (mac->mgmt_stype != stype ||
++	    !ether_addr_equal(mac->mgmt_peer, sa)) {
++		spin_unlock_bh(&mac->rx_lock);
++		atomic_inc(&mac->rx_dropped);
++		return;
++	}
++
++	mac->mgmt_rsp.status = status;
++	mac->mgmt_rsp.aid = aid;
++	mac->mgmt_rsp.ies_len = min(ies_len, sizeof(mac->mgmt_rsp.ies));
++	if (mac->mgmt_rsp.ies_len)
++		memcpy(mac->mgmt_rsp.ies, ies, mac->mgmt_rsp.ies_len);
++	mac->last_signal = rcpi;
++	mac->have_signal = true;
++	mac->mgmt_stype = 0;
++
++	spin_unlock_bh(&mac->rx_lock);
++	complete(&mac->mgmt_done);
++}
++
++/* Update the RCPI reported for the AP the station is associated with. */
++static void mtk_wlan_update_signal(struct mtk_wlan_mac *mac, const u8 *sa,
++				   u8 rcpi)
++{
++	spin_lock_bh(&mac->rx_lock);
++	if (READ_ONCE(mac->connected) &&
++	    ether_addr_equal(sa, mac->bssid)) {
++		mac->last_signal = rcpi;
++		mac->have_signal = true;
++	}
++	spin_unlock_bh(&mac->rx_lock);
++}
++
++/**
++ * mtk_wlan_rx_mgmt - dispatch one received 802.11 management frame
++ * @mac: MAC instance
++ * @frame: frame including the MAC header
++ * @len: frame length
++ * @channel: channel reported by the HIF RX header
++ * @rcpi: RCPI reported by the HIF RX header
++ */
++void mtk_wlan_rx_mgmt(struct mtk_wlan_mac *mac, const u8 *frame, size_t len,
++		      u8 channel, u8 rcpi)
++{
++	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)frame;
++	__le16 fc;
++
++	if (len < MTK_WLAN_MAC_HDR_LEN) {
++		atomic_inc(&mac->rx_dropped);
++		return;
++	}
++
++	fc = mgmt->frame_control;
++
++	/*
++	 * Scan results are only collected while cfg80211 is waiting for them;
++	 * a beacon received while idle is of no use to this driver (it has no
++	 * roaming implementation).
++	 */
++	if (ieee80211_is_beacon(fc) || ieee80211_is_probe_resp(fc)) {
++		if (len < MTK_WLAN_MAC_HDR_LEN + 12) {
++			atomic_inc(&mac->rx_dropped);
++			return;
++		}
++		mtk_wlan_update_signal(mac, mgmt->sa, rcpi);
++		if (READ_ONCE(mac->scan_req))
++			mtk_wlan_rx_bss(mac, mgmt, len, channel, rcpi);
++		return;
++	}
++
++	if (ieee80211_is_auth(fc)) {
++		if (len < MTK_WLAN_MAC_HDR_LEN + 6) {
++			atomic_inc(&mac->rx_dropped);
++			return;
++		}
++		/*
++		 * Only the second transaction of an open-system exchange is a
++		 * response: algorithm 0, sequence 2 (aaa_fsm.c:415-430).
++		 */
++		if (le16_to_cpu(mgmt->u.auth.auth_transaction) != 2 ||
++		    le16_to_cpu(mgmt->u.auth.auth_alg) != WLAN_AUTH_OPEN) {
++			atomic_inc(&mac->rx_dropped);
++			return;
++		}
++		mtk_wlan_mgmt_complete(mac, IEEE80211_STYPE_AUTH, mgmt->sa,
++				       le16_to_cpu(mgmt->u.auth.status_code), 0,
++				       mgmt->u.auth.variable,
++				       len - MTK_WLAN_MAC_HDR_LEN - 6, rcpi);
++		return;
++	}
++
++	if (ieee80211_is_assoc_resp(fc)) {
++		if (len < MTK_WLAN_MAC_HDR_LEN + 6) {
++			atomic_inc(&mac->rx_dropped);
++			return;
++		}
++		mtk_wlan_mgmt_complete(mac, IEEE80211_STYPE_ASSOC_RESP,
++				       mgmt->sa,
++				       le16_to_cpu(mgmt->u.assoc_resp.status_code),
++				       mtk_wlan_assoc_id(
++					       le16_to_cpu(mgmt->u.assoc_resp.aid)),
++				       mgmt->u.assoc_resp.variable,
++				       len - MTK_WLAN_MAC_HDR_LEN - 6, rcpi);
++		return;
++	}
++
++	if (ieee80211_is_deauth(fc) || ieee80211_is_disassoc(fc)) {
++		u16 reason;
++
++		if (len < MTK_WLAN_MAC_HDR_LEN + 2) {
++			atomic_inc(&mac->rx_dropped);
++			return;
++		}
++		reason = le16_to_cpu(mgmt->u.deauth.reason_code);
++		if (!ether_addr_equal(mgmt->sa, mac->bssid)) {
++			atomic_inc(&mac->rx_dropped);
++			return;
++		}
++		mtk_wlan_mgmt_deauth_rx(mac, reason, false);
++		return;
++	}
++
++	/*
++	 * Association requests, probes, action frames and anything else are
++	 * not part of the STA-only interface built here.
++	 */
++	atomic_inc(&mac->rx_dropped);
++}
+diff --git a/drivers/misc/mediatek/connectivity/wlan/wlan_netdev.c b/drivers/misc/mediatek/connectivity/wlan/wlan_netdev.c
+new file mode 100644
+index 000000000..71192442b
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wlan/wlan_netdev.c
+@@ -0,0 +1,267 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WLAN gen2 Ethernet netdev.
++ *
++ * The WLAN function presents itself as a plain Ethernet interface.  RX: the
++ * firmware normally decapsulates data frames to 802.3 and the buffer is fed
++ * straight to eth_type_trans() (os/linux/gl_kal.c:1509-1612
++ * kalRxIndicatePkts); 802.11 format buffers are converted in wlan_txrx.c.
++ * TX: the driver builds the 802.11 data frame itself (wlan_txrx.c), because
++ * this port has no firmware STA record and therefore cannot ask the
++ * firmware to convert an 802.3 frame.
++ *
++ * Ported from Samsung/MTK downstream:
++ *   os/linux/gl_init.c        (netdev allocation, registration, netdev ops)
++ *   os/linux/gl_kal.c         (kalRxIndicatePkts)
++ *   os/linux/gl_hook_api.c    (interface state glue)
++ *
++ * Copyright (C) 2013 MediaTek Inc.
++ */
++
++#include <linux/etherdevice.h>
++#include <linux/if_arp.h>
++#include <linux/netdevice.h>
++#include <linux/skbuff.h>
++
++#include "wlan_mac.h"
++
++/**
++ * mtk_wlan_netdev_rx - hand a received Ethernet frame to the stack
++ * @mac: MAC instance
++ * @skb: Ethernet frame starting at the destination address
++ *
++ * Frames are delivered with netif_rx() because the HIF drain runs in a
++ * workqueue (process context), not in the interrupt handler.
++ */
++void mtk_wlan_netdev_rx(struct mtk_wlan_mac *mac, struct sk_buff *skb)
++{
++	struct net_device *ndev = mac->ndev;
++	unsigned int len = skb->len;
++
++	if (!ndev || !READ_ONCE(mac->registered) || !netif_running(ndev)) {
++		atomic_inc(&mac->rx_dropped);
++		dev_kfree_skb(skb);
++		return;
++	}
++
++	skb->dev = ndev;
++	skb->protocol = eth_type_trans(skb, ndev);
++	ndev->stats.rx_packets++;
++	ndev->stats.rx_bytes += len;
++
++	if (netif_rx(skb) == NET_RX_DROP) {
++		ndev->stats.rx_dropped++;
++		atomic_inc(&mac->rx_dropped);
++	}
++}
++
++/*
++ * Transmit.  The frame cannot be written to the HIF from this context
++ * because the PDMA path takes a mutex, so it is queued and drained by
++ * &mtk_wlan_mac.tx_work (the downstream driver has a dedicated TX thread for
++ * the same reason, nic_tx.c:916-960 nicTxMsduInfoList).
++ */
++static netdev_tx_t mtk_wlan_netdev_start_xmit(struct sk_buff *skb,
++					      struct net_device *ndev)
++{
++	struct mtk_wlan_mac *mac = netdev_priv(ndev);
++
++	if (!READ_ONCE(mac->fw_up) || !READ_ONCE(mac->connected)) {
++		atomic_inc(&mac->tx_dropped);
++		ndev->stats.tx_dropped++;
++		dev_kfree_skb_any(skb);
++		return NETDEV_TX_OK;
++	}
++
++	skb_queue_tail(&mac->txq, skb);
++	schedule_work(&mac->tx_work);
++
++	if (skb_queue_len(&mac->txq) >= MTK_WLAN_TXQ_DEPTH)
++		netif_tx_stop_all_queues(ndev);
++
++	return NETDEV_TX_OK;
++}
++
++static int mtk_wlan_netdev_open(struct net_device *ndev)
++{
++	struct mtk_wlan_mac *mac = netdev_priv(ndev);
++
++	if (!READ_ONCE(mac->fw_up))
++		return -ENETDOWN;
++
++	if (READ_ONCE(mac->connected)) {
++		netif_carrier_on(ndev);
++		netif_tx_start_all_queues(ndev);
++	} else {
++		netif_carrier_off(ndev);
++		netif_tx_stop_all_queues(ndev);
++	}
++
++	return 0;
++}
++
++static int mtk_wlan_netdev_stop(struct net_device *ndev)
++{
++	struct mtk_wlan_mac *mac = netdev_priv(ndev);
++	struct sk_buff *skb;
++
++	netif_tx_stop_all_queues(ndev);
++	netif_carrier_off(ndev);
++
++	/* Frames still queued belong to this interface: drop them. */
++	while ((skb = skb_dequeue(&mac->txq)))
++		dev_kfree_skb(skb);
++
++	return 0;
++}
++
++static void mtk_wlan_netdev_set_multicast(struct net_device *ndev)
++{
++	/*
++	 * The firmware has no host-visible multicast filter register in this
++	 * HIF (the MCR set in mtreg.h:81-143 has none) and the packet filter
++	 * OID that downstream uses here (wlanoidSetCurrentPacketFilter() from
++	 * wlanSetMulticastList(), gl_init.c:1698-1770) needs the firmware
++	 * command queue this port does not implement.  The receiver keeps its
++	 * firmware default, so there is nothing to program; the list is
++	 * accepted for the interface to come up.
++	 */
++}
++
++static const struct net_device_ops mtk_wlan_netdev_ops = {
++	.ndo_open		= mtk_wlan_netdev_open,
++	.ndo_stop		= mtk_wlan_netdev_stop,
++	.ndo_start_xmit		= mtk_wlan_netdev_start_xmit,
++	.ndo_set_rx_mode	= mtk_wlan_netdev_set_multicast,
++};
++
++/**
++ * mtk_wlan_netdev_create - allocate the Ethernet netdev and its wireless_dev
++ * @mac: MAC instance
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++int mtk_wlan_netdev_create(struct mtk_wlan_mac *mac)
++{
++	struct wireless_dev *wdev;
++	struct net_device *ndev;
++
++	ndev = alloc_netdev(sizeof(*wdev), "wlan%d", NET_NAME_ENUM, ether_setup);
++	if (!ndev)
++		return -ENOMEM;
++
++	ndev->netdev_ops = &mtk_wlan_netdev_ops;
++	SET_NETDEV_DEV(ndev, mac->dev);
++
++	eth_hw_addr_set(ndev, mac->mac_addr);
++	ndev->addr_len = ETH_ALEN;
++	if (!is_valid_ether_addr(ndev->dev_addr)) {
++		eth_hw_addr_random(ndev);
++		ether_addr_copy(mac->mac_addr, ndev->dev_addr);
++		dev_info(mac->dev,
++			 "no MAC address in the device tree, using random %pM\n",
++			 ndev->dev_addr);
++	}
++
++	netif_carrier_off(ndev);
++	netif_tx_stop_all_queues(ndev);
++
++	wdev = netdev_priv(ndev);
++	wdev->wiphy = mac->wiphy;
++	wdev->iftype = NL80211_IFTYPE_STATION;
++	wdev->netdev = ndev;
++	ndev->ieee80211_ptr = wdev;
++
++	mac->ndev = ndev;
++	mac->wdev = wdev;
++
++	return 0;
++}
++
++/**
++ * mtk_wlan_netdev_register - publish the netdev while the firmware runs
++ * @mac: MAC instance
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++int mtk_wlan_netdev_register(struct mtk_wlan_mac *mac)
++{
++	int ret;
++
++	if (READ_ONCE(mac->registered))
++		return 0;
++
++	/* cfg80211 picks the wireless_dev up from NETDEV_REGISTER. */
++	ret = register_netdevice(mac->ndev);
++	if (ret) {
++		dev_err(mac->dev, "cannot register %s: %d\n",
++			mac->ndev->name, ret);
++		return ret;
++	}
++
++	WRITE_ONCE(mac->registered, true);
++	dev_info(mac->dev, "%s registered, address %pM\n", mac->ndev->name,
++		 mac->ndev->dev_addr);
++
++	return 0;
++}
++
++/*
++ * Drop the netdev.  unregister_netdevice() closes it first, i.e. ndo_stop()
++ * runs while the cfg80211 wdev is still registered.
++ */
++void mtk_wlan_netdev_unregister(struct mtk_wlan_mac *mac)
++{
++	if (!READ_ONCE(mac->registered))
++		return;
++
++	unregister_netdevice(mac->ndev);
++	WRITE_ONCE(mac->registered, false);
++}
++
++void mtk_wlan_netdev_destroy(struct mtk_wlan_mac *mac)
++{
++	if (!mac->ndev)
++		return;
++
++	free_netdev(mac->ndev);
++	mac->ndev = NULL;
++	mac->wdev = NULL;
++}
++
++/**
++ * mtk_wlan_netdev_link_changed - reflect the connection state on the netdev
++ * @mac: MAC instance
++ * @up: %true when the STA is associated
++ */
++void mtk_wlan_netdev_link_changed(struct mtk_wlan_mac *mac, bool up)
++{
++	struct net_device *ndev = mac->ndev;
++
++	if (!ndev || !READ_ONCE(mac->registered))
++		return;
++
++	if (up) {
++		netif_carrier_on(ndev);
++		if (netif_running(ndev))
++			netif_tx_wake_all_queues(ndev);
++	} else {
++		netif_tx_stop_all_queues(ndev);
++		netif_carrier_off(ndev);
++	}
++}
++
++/* Wake the TX queue after the firmware returned buffers. */
++void mtk_wlan_netdev_wake_tx(struct mtk_wlan_mac *mac)
++{
++	struct net_device *ndev = mac->ndev;
++
++	if (!ndev || !READ_ONCE(mac->registered) ||
++	    !READ_ONCE(mac->connected))
++		return;
++
++	if (!netif_running(ndev))
++		return;
++
++	netif_tx_wake_all_queues(ndev);
++}
+diff --git a/drivers/misc/mediatek/connectivity/wlan/wlan_txrx.c b/drivers/misc/mediatek/connectivity/wlan/wlan_txrx.c
+new file mode 100644
+index 000000000..1354c8d27
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wlan/wlan_txrx.c
+@@ -0,0 +1,501 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WLAN gen2 HIF TX framing, TX queueing and data conversion.
++ *
++ * Data frames travel in 802.3 format and the firmware builds their 802.11
++ * header (nic_tx.c:1400-1480, 2000-2018).  Management frames are built by
++ * wlan_mgmt.c and travel as complete 802.11 frames on TC4.  Received 802.11
++ * format data frames (HIF RX header format bit) are converted back to 802.3
++ * before they reach the stack.
++ *
++ * Ported from Samsung/MTK downstream:
++ *   nic/nic_tx.c              (nicTxMsduQueue header fill, TC resource
++ *                              accounting, TX port selection)
++ *   include/nic/hif_tx.h      (HIF_TX_HEADER_T and its flag bit fields)
++ *   include/nic/hif_rx.h      (HIF_RX_HEADER_T)
++ *   nic/nic_rx.c              (port read length with the appended DW)
++ *   nic/que_mgt.c             (TC per access category, no-STA fallback)
++ *   os/linux/gl_kal.c         (kalRxIndicatePkts: 802.3 frames to the stack)
++ *   include/nic/mac.h         (margins, RCPI)
++ *
++ * Copyright (C) 2013 MediaTek Inc.
++ */
++
++#include <linux/delay.h>
++#include <linux/etherdevice.h>
++#include <linux/ieee80211.h>
++#include <linux/jiffies.h>
++#include <linux/skbuff.h>
++#include <linux/unaligned.h>
++
++#include "wlan_mac.h"
++
++/*
++ * Firmware TX buffer credits.  WTSR0 holds one released-buffer count per
++ * byte for TC0..TC3, WTSR1 does the same for TC4..TC5; the driver adds the
++ * released counts to its own per-TC counters (nicTxReleaseResource(),
++ * nic_tx.c:698-738, and HAL_READ_TX_RELEASED_COUNT(), hal.h:511-521).
++ */
++void mtk_wlan_tc_release(struct mtk_wlan_mac *mac, unsigned int tc,
++			 unsigned int count)
++{
++	spin_lock_bh(&mac->txq_lock);
++	if (mac->tc_credits[tc] + count > mac->tc_max[tc])
++		mac->tc_credits[tc] = mac->tc_max[tc];
++	else
++		mac->tc_credits[tc] += count;
++	spin_unlock_bh(&mac->txq_lock);
++}
++
++/**
++ * mtk_wlan_tc_acquire - reserve one firmware TX buffer of @tc
++ * @mac: MAC instance
++ * @tc: traffic class, %MTK_WLAN_TC0 .. %MTK_WLAN_TC5
++ *
++ * Return: %true when a buffer was reserved.
++ */
++bool mtk_wlan_tc_acquire(struct mtk_wlan_mac *mac, unsigned int tc)
++{
++	bool ok = false;
++
++	spin_lock_bh(&mac->txq_lock);
++	if (mac->tc_credits[tc]) {
++		mac->tc_credits[tc]--;
++		ok = true;
++	}
++	spin_unlock_bh(&mac->txq_lock);
++
++	return ok;
++}
++
++/*
++ * Reserve one buffer of @tc only when at least @min buffers are free.  The
++ * management path uses a two-buffer watermark for TC4, exactly like
++ * nicTxAcquireResource() does for security/management frames
++ * (nic_tx.c:559-571); one buffer is then consumed.
++ */
++static bool mtk_wlan_tc_acquire_min(struct mtk_wlan_mac *mac, unsigned int tc,
++				    u8 min)
++{
++	bool ok = false;
++
++	spin_lock_bh(&mac->txq_lock);
++	if (mac->tc_credits[tc] >= min) {
++		mac->tc_credits[tc]--;
++		ok = true;
++	}
++	spin_unlock_bh(&mac->txq_lock);
++
++	return ok;
++}
++
++/**
++ * mtk_wlan_mac_tx_done - account TX buffers released by the firmware
++ * @hif: host interface
++ * @wtsr0: MCR_WTSR0 contents
++ * @wtsr1: MCR_WTSR1 contents
++ *
++ * Called from the HIF interrupt bottom half while the firmware is up.  Each
++ * byte of the two status registers is the number of TX buffers the firmware
++ * released for the corresponding traffic class (nic_tx.c:712-716).
++ */
++void mtk_wlan_mac_tx_done(struct mtk_wlan_hif *hif, u32 wtsr0, u32 wtsr1)
++{
++	struct mtk_wlan_mac *mac = hif->mac;
++	unsigned int tc;
++
++	if (!mac || !READ_ONCE(mac->fw_up))
++		return;
++
++	for (tc = 0; tc < 4; tc++)
++		mtk_wlan_tc_release(mac, tc, (wtsr0 >> (tc * 8)) & 0xff);
++	mtk_wlan_tc_release(mac, MTK_WLAN_TC4, wtsr1 & 0xff);
++	mtk_wlan_tc_release(mac, MTK_WLAN_TC5, (wtsr1 >> 8) & 0xff);
++
++	mtk_wlan_netdev_wake_tx(mac);
++	if (READ_ONCE(mac->connected))
++		schedule_work(&mac->tx_work);
++}
++
++/* EtherType is two octets (802.11-2016 9.2.2); the offset is measured from
++ * the HIF TX header like the downstream ETHER_TYPE_LEN use at nic_tx.c:1414.
++ */
++#define MTK_WLAN_ETH_TYPE_LEN		2
++
++/*
++ * Everything the HIF TX header needs for one frame.  Management frames carry
++ * a complete 802.11 header (nic_tx.c:1660-1700); data frames carry an 802.3
++ * frame and the firmware builds the 802.11 header itself (nic_tx.c:1400-1460,
++ * fgIs802_11 = FALSE, ucMacHeaderLength = ETH_HLEN from nicTxMsduInfoList
++ * nic_tx.c:2000-2018).
++ */
++struct mtk_wlan_tx_params {
++	unsigned int tc;
++	unsigned int pkt_type;
++	u8 wlan_hdr_len;
++	u8 ether_off;
++	u8 sta_idx;
++	u8 user_priority;
++	bool is_80211;
++	bool ack;
++	bool basic_rate;
++	size_t total;
++};
++
++/*
++ * Fill the 16-byte HIF TX header in @mac->tx_buf.  The caller holds
++ * &mac->tx_lock and has already placed the frame right behind the header.
++ *
++ * The flag set follows nic_tx.c:1400-1480: @is_80211 selects
++ * HIF_TX_HDR_FLAG_802_11_FORMAT, @ack and @basic_rate are HIF_TX_HDR_NEED_ACK
++ * and HIF_TX_HDR_BASIC_RATE (management sets both, auth.c:442 and
++ * assoc.c:934; data sets neither, nic_tx.c:1461-1474 and 1940).  @ether_off
++ * is the EtherType offset in 16-bit words counted from the HIF header.
++ */
++static void mtk_wlan_tx_hdr_fill(struct mtk_wlan_mac *mac,
++				 const struct mtk_wlan_tx_params *p)
++{
++	struct mtk_wlan_hif_tx_header *hdr =
++		(struct mtk_wlan_hif_tx_header *)mac->tx_buf;
++
++	memset(hdr, 0, MTK_WLAN_HIF_TX_HDR_LEN);
++	hdr->tx_byte_count_user_priority =
++		cpu_to_le16(((u16)p->total & HIF_TX_HDR_TX_BYTE_COUNT_MASK) |
++			    ((u16)p->user_priority <<
++			     HIF_TX_HDR_USER_PRIORITY_OFFSET));
++	hdr->ether_type_offset = p->ether_off & HIF_TX_HDR_ETHER_TYPE_OFFSET_MASK;
++	hdr->resource_pkttype_csflags =
++		FIELD_PREP(HIF_TX_HDR_RESOURCE_MASK, p->tc) |
++		FIELD_PREP(HIF_TX_HDR_PACKET_TYPE_MASK, p->pkt_type);
++	hdr->wlan_header_length = p->wlan_hdr_len &
++				  HIF_TX_HDR_WLAN_HEADER_LEN_MASK;
++	hdr->pktfmtid_flags =
++		FIELD_PREP(HIF_TX_HDR_NETWORK_TYPE_MASK,
++			   MTK_WLAN_NETWORK_TYPE_AIS) |
++		(p->is_80211 ? HIF_TX_HDR_FLAG_802_11_FORMAT : 0);
++	hdr->sta_rec_idx = p->sta_idx;
++	hdr->forwarding_type_sessionid = 0;	/* PS_FORWARDING_TYPE_NON_PS */
++	hdr->ack_bip_basicrate =
++		(p->ack ? HIF_TX_HDR_NEED_ACK : 0) |
++		(p->basic_rate ? HIF_TX_HDR_BASIC_RATE : 0);
++}
++
++/*
++ * Push the prepared buffer through the data port.  Called with &mac->tx_lock
++ * held and one TC buffer already reserved.
++ */
++static int mtk_wlan_tx_flush(struct mtk_wlan_mac *mac, unsigned int tc,
++			     size_t total, size_t frame_len)
++{
++	struct mtk_wlan_hif *hif = mac->hif;
++	u16 port;
++	int ret;
++
++	/* TC4 is the only class that uses HIF TX port 1 (nic_tx.c:872-880). */
++	port = (tc == MTK_WLAN_TC4) ? MCR_WTDR1 : MCR_WTDR0;
++
++	ret = mtk_wlan_hif_port_write(hif, port, total, mac->tx_buf, total);
++	if (ret) {
++		/* Give the buffer back, the firmware never saw it. */
++		mtk_wlan_tc_release(mac, tc, 1);
++		atomic_inc(&mac->tx_dropped);
++		if (mac->registered)
++			mac->ndev->stats.tx_errors++;
++		return ret;
++	}
++
++	if (mac->registered) {
++		mac->ndev->stats.tx_packets++;
++		mac->ndev->stats.tx_bytes += frame_len;
++	}
++	return 0;
++}
++
++/**
++ * mtk_wlan_mgmt_tx - transmit one 802.11 management frame
++ * @mac: MAC instance
++ * @frame: complete 802.11 management frame including the MAC header
++ * @len: frame length
++ *
++ * Management frames travel in 802.11 format on TC4 (auth.c:430-442), with
++ * the WLAN header length and the EtherType offset filled in exactly like
++ * nicTxMsduQueue() does for TX_PACKET_MGMT (nic_tx.c:1409-1420).
++ *
++ * Return: 0, -EBUSY when no TX buffer is free, or another negative errno.
++ */
++int mtk_wlan_mgmt_tx(struct mtk_wlan_mac *mac, const u8 *frame, size_t len)
++{
++	struct mtk_wlan_tx_params p = {
++		.tc = MTK_WLAN_TC4,
++		.pkt_type = HIF_TX_PKT_TYPE_MANAGEMENT,
++		.wlan_hdr_len = MTK_WLAN_MAC_HDR_LEN,
++		.ether_off = (MTK_WLAN_HIF_TX_HDR_LEN +
++			      MTK_WLAN_MAC_HDR_LEN) >> 1,
++		.sta_idx = mac->sta_valid ? mac->sta_index :
++			   MTK_WLAN_STA_REC_NOT_FOUND,
++		.is_80211 = true,
++		.ack = true,
++		.basic_rate = true,
++	};
++	size_t total;
++	unsigned int tries;
++	int ret;
++
++	if (!READ_ONCE(mac->fw_up))
++		return -ENETDOWN;
++	if (len > MTK_WLAN_MGMT_FRAME_MAX)
++		return -EMSGSIZE;
++
++	total = ALIGN(MTK_WLAN_HIF_TX_HDR_LEN + len, 4);
++
++	/*
++	 * TC4 only has four buffers in this configuration; the firmware
++	 * returns them with the TX-done interrupt, so poll briefly like
++	 * nicTxPollingResource() (nic_tx.c:633-697) instead of failing the
++	 * management exchange on a transient shortage.  Two buffers must be
++	 * free before one is taken, the same watermark nicTxAcquireResource()
++	 * applies to management/802.1x frames (nic_tx.c:559-571).
++	 */
++	for (tries = 0; tries < 100; tries++) {
++		if (mtk_wlan_tc_acquire_min(mac, MTK_WLAN_TC4, 2))
++			break;
++		msleep(2);
++	}
++	if (tries == 100)
++		return -EBUSY;
++
++	mutex_lock(&mac->tx_lock);
++	memset(mac->tx_buf, 0, total);
++	p.total = total;
++	mtk_wlan_tx_hdr_fill(mac, &p);
++	memcpy(mac->tx_buf + MTK_WLAN_HIF_TX_HDR_LEN, frame, len);
++	ret = mtk_wlan_tx_flush(mac, MTK_WLAN_TC4, total, len);
++	mutex_unlock(&mac->tx_lock);
++
++	return ret;
++}
++
++/**
++ * mtk_wlan_data_tx - hand one Ethernet frame to the firmware data path
++ * @mac: MAC instance
++ * @skb: Ethernet frame
++ *
++ * Data frames are written in 802.3 format; the firmware builds the 802.11
++ * header, which is downstream's default data path (nic_tx.c:2000-2018 sets
++ * fgIs802_11 = FALSE and ucMacHeaderLength = ETH_HLEN; the EtherType offset
++ * comes from the 802.3 branch at nic_tx.c:1404-1416).  The peer record index
++ * from CMD_UPDATE_STA_RECORD is carried in the HIF header, so the firmware
++ * can find the station instead of using STA_REC_INDEX_NOT_FOUND.
++ *
++ * Ownership: the frame is consumed on every return value except -EBUSY; on
++ * -EBUSY no firmware TX buffer was available and the caller keeps the skb
++ * (the data path has 36 TC1 buffers, nic_tx.h:298-303, and the firmware
++ * returns them from the TX-done interrupt).
++ *
++ * Return: 0 on success, -EBUSY when no TX buffer was free, another negative
++ * errno when the frame was dropped.
++ */
++int mtk_wlan_data_tx(struct mtk_wlan_mac *mac, struct sk_buff *skb)
++{
++	struct mtk_wlan_tx_params p = {
++		.tc = MTK_WLAN_TC1,
++		.pkt_type = HIF_TX_PKT_TYPE_DATA,
++		.wlan_hdr_len = MTK_WLAN_ETH_HDR_LEN,
++		.ether_off = (MTK_WLAN_ETH_HDR_LEN - MTK_WLAN_ETH_TYPE_LEN +
++			      MTK_WLAN_HIF_TX_HDR_LEN) >> 1,
++		.sta_idx = mac->sta_valid ? mac->sta_index :
++			   MTK_WLAN_STA_REC_NOT_FOUND,
++		.is_80211 = false,
++		.ack = false,
++		.basic_rate = false,
++	};
++	size_t total;
++	int ret;
++
++	if (skb->len < MTK_WLAN_ETH_HDR_LEN ||
++	    skb->len > MTK_WLAN_TX_FRAME_MAX) {
++		atomic_inc(&mac->tx_dropped);
++		if (mac->registered)
++			mac->ndev->stats.tx_dropped++;
++		consume_skb(skb);
++		return -EMSGSIZE;
++	}
++
++	if (!mtk_wlan_tc_acquire(mac, MTK_WLAN_TC1))
++		return -EBUSY;
++
++	total = ALIGN(MTK_WLAN_HIF_TX_HDR_LEN + skb->len, 4);
++	mutex_lock(&mac->tx_lock);
++	memset(mac->tx_buf, 0, total);
++	memcpy(mac->tx_buf + MTK_WLAN_HIF_TX_HDR_LEN, skb->data, skb->len);
++	p.total = total;
++	mtk_wlan_tx_hdr_fill(mac, &p);
++	ret = mtk_wlan_tx_flush(mac, MTK_WLAN_TC1, total, skb->len);
++	mutex_unlock(&mac->tx_lock);
++
++	consume_skb(skb);
++	return ret;
++}
++
++/**
++ * mtk_wlan_tx_work - drain the netdev TX queue into the HIF
++ * @work: &struct mtk_wlan_mac.tx_work
++ */
++void mtk_wlan_tx_work(struct work_struct *work)
++{
++	struct mtk_wlan_mac *mac = container_of(work, struct mtk_wlan_mac,
++						tx_work);
++	struct sk_buff *skb;
++
++	while (READ_ONCE(mac->fw_up) && READ_ONCE(mac->connected)) {
++		skb = skb_dequeue(&mac->txq);
++		if (!skb)
++			break;
++
++		/*
++		 * The HIF write reads skb->data linearly.  Linearising here
++		 * (process context) rather than in ndo_start_xmit keeps the
++		 * atomic transmit path cheap.
++		 */
++		if (skb_is_nonlinear(skb) && skb_linearize(skb)) {
++			atomic_inc(&mac->tx_dropped);
++			if (mac->registered)
++				mac->ndev->stats.tx_dropped++;
++			dev_kfree_skb(skb);
++			continue;
++		}
++
++		if (mtk_wlan_data_tx(mac, skb) == -EBUSY) {
++			/* No TC1 buffer left: keep the frame for the next round. */
++			skb_queue_head(&mac->txq, skb);
++			if (mac->registered)
++				netif_tx_stop_all_queues(mac->ndev);
++			return;
++		}
++	}
++
++	if (mac->registered && READ_ONCE(mac->fw_up) && mac->connected)
++		netif_tx_wake_all_queues(mac->ndev);
++}
++
++/**
++ * mtk_wlan_rx_80211_to_8023 - convert a received 802.11 data frame
++ * @mac: MAC instance
++ * @frame: 802.11 frame including the MAC header
++ * @len: frame length
++ *
++ * The firmware normally decapsulates data frames and hands up 802.3
++ * (kalRxIndicatePkts() feeds the skb straight to eth_type_trans(),
++ * gl_kal.c:1583-1612), but the HIF RX header can announce 802.11 format.
++ * Then the driver strips the header itself: FromDS frames reverse the ToDS
++ * address mapping and carry the EtherType in an RFC 1042 LLC/SNAP header.
++ *
++ * Return: new skb holding the Ethernet frame, %NULL when it cannot be used.
++ */
++struct sk_buff *mtk_wlan_rx_80211_to_8023(struct mtk_wlan_mac *mac,
++					  const u8 *frame, size_t len)
++{
++	const struct ieee80211_hdr *hdr = (const struct ieee80211_hdr *)frame;
++	const u8 *da, *sa, *snap;
++	struct sk_buff *skb;
++	size_t hdr_len, payload_len;
++	__le16 fc;
++
++	if (len < MTK_WLAN_MAC_HDR_LEN)
++		return NULL;
++
++	fc = hdr->frame_control;
++	if (!ieee80211_is_data(fc))
++		return NULL;
++
++	/* No key offload, so encrypted frames are unusable here. */
++	if (ieee80211_has_protected(fc)) {
++		atomic_inc(&mac->rx_dropped);
++		return NULL;
++	}
++
++	if (!ieee80211_has_fromds(fc)) {
++		/*
++		 * An infrastructure STA receives only FromDS data.  ToDS and
++		 * IBSS frames belong to paths this driver does not implement.
++		 */
++		atomic_inc(&mac->rx_dropped);
++		return NULL;
++	}
++
++	hdr_len = MTK_WLAN_MAC_HDR_LEN;
++	if (ieee80211_is_data_qos(fc)) {
++		__le16 qos;
++
++		if (len < hdr_len + MTK_WLAN_QOS_CTRL_LEN)
++			return NULL;
++		qos = get_unaligned_le16(frame + hdr_len);
++		/* An A-MSDU payload is not an LLC/SNAP frame; drop it. */
++		if (le16_to_cpu(qos) & IEEE80211_QOS_CTL_A_MSDU_PRESENT) {
++			atomic_inc(&mac->rx_dropped);
++			return NULL;
++		}
++		hdr_len += MTK_WLAN_QOS_CTRL_LEN;
++	}
++	if (ieee80211_has_a4(fc))
++		hdr_len += 2 * ETH_ALEN;
++	if (len < hdr_len + MTK_WLAN_LLC_LEN)
++		return NULL;
++
++	snap = frame + hdr_len;
++	if (snap[0] != 0xaa || snap[1] != 0xaa || snap[2] != 0x03)
++		return NULL;
++
++	da = (const u8 *)ieee80211_get_DA((struct ieee80211_hdr *)frame);
++	sa = (const u8 *)ieee80211_get_SA((struct ieee80211_hdr *)frame);
++	payload_len = len - hdr_len - MTK_WLAN_LLC_LEN;
++
++	skb = dev_alloc_skb(MTK_WLAN_ETH_HDR_LEN + payload_len + NET_IP_ALIGN);
++	if (!skb) {
++		atomic_inc(&mac->rx_dropped);
++		return NULL;
++	}
++	skb_reserve(skb, NET_IP_ALIGN);
++
++	skb_put(skb, MTK_WLAN_ETH_HDR_LEN);
++	ether_addr_copy(skb->data, da);
++	ether_addr_copy(skb->data + ETH_ALEN, sa);
++	memcpy(skb->data + 2 * ETH_ALEN, snap + 6, 2);
++	skb_put_data(skb, frame + hdr_len + MTK_WLAN_LLC_LEN, payload_len);
++
++	return skb;
++}
++
++/**
++ * mtk_wlan_rx_data - deliver one firmware data frame to the netdev
++ * @mac: MAC instance
++ * @frame: payload after the HIF RX header
++ * @len: payload length
++ * @is_80211: HIF RX header announced 802.11 format
++ */
++void mtk_wlan_rx_data(struct mtk_wlan_mac *mac, const u8 *frame, size_t len,
++		      bool is_80211)
++{
++	struct sk_buff *skb;
++
++	if (is_80211) {
++		skb = mtk_wlan_rx_80211_to_8023(mac, frame, len);
++		if (!skb)
++			return;
++	} else {
++		/* Already an Ethernet frame (kalProcessRxPacket()). */
++		if (len < MTK_WLAN_ETH_HDR_LEN) {
++			atomic_inc(&mac->rx_dropped);
++			return;
++		}
++		skb = dev_alloc_skb(len + NET_IP_ALIGN);
++		if (!skb) {
++			atomic_inc(&mac->rx_dropped);
++			return;
++		}
++		skb_reserve(skb, NET_IP_ALIGN);
++		skb_put_data(skb, frame, len);
++	}
++
++	mtk_wlan_netdev_rx(mac, skb);
++}

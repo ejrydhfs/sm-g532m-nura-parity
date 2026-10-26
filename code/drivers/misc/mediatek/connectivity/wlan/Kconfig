@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# MediaTek WLAN (MT6627 on CONSYS, AHB/PDMA host interface).
+
+config MTK_WCN_WLAN
+	tristate "MediaTek WCN WLAN driver"
+	depends on MTK_WCN_WMT
+	depends on CFG80211
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	select CRC32
+	select FW_LOADER
+	help
+	  Host driver for the MediaTek WLAN function embedded in the
+	  connectivity subsystem (MT6628/MT6627 gen2, AHB host interface
+	  with optional AP-DMA).  It owns the AHB host interface, the
+	  firmware download path and the WMT function power sequencing, and
+	  exposes one cfg80211 station interface plus its Ethernet netdev.
+
+	  Supported feature set, and nothing beyond it:
+
+	  - station (infrastructure) mode on 2.4 GHz channels 1 to 14,
+	    legacy rates only, no 5 GHz band;
+	  - open (no encryption) networks only.  There is no key offload,
+	    so WPA/WPA2/802.1X association requests are rejected with
+	    -EOPNOTSUPP instead of associating unencrypted;
+	  - software scan: probe requests are built by the host and sent
+	    through the HIF, beacons and probe responses received from the
+	    HIF are reported to cfg80211.  Passive scans send no frames;
+	  - no AP, IBSS, mesh, P2P or monitor interface, no hardware scan,
+	    no scheduled scan, no remain-on-channel and no WoWLAN.
+
+	  The interface is controlled through cfg80211 only (iw,
+	  wpa_supplicant); the driver registers no private character
+	  device or ioctl ABI.
+
+	  Building without CONFIG_RFKILL is supported; the rfkill switch is
+	  then simply absent and WLAN is controlled through WMT.
+
+	  The module is called mtk_wcn_wlan.

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0
+config MTK_AEE_FEATURE
+	bool "MediaTek AEE/AED exception dump client"
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	help
+	  AEE (Android Exception Engine) / AED (Android Exception Device)
+	  client interface of MT6735/MT6737T: the /dev/aed0 (external
+	  exception, EE) and /dev/aed1 (kernel exception, KE) misc devices,
+	  the AE_Msg request/response protocol used by the ROM AEE client,
+	  the exception-dump ("DB") ioctls, the /proc/aed entries and the
+	  aed_md_exception_api()/aed_md32_exception_api()/
+	  aed_scp_exception_api()/aed_combo_exception_api() entry points that
+	  the CCCI exception path calls when the modem, the DSP or the SCP
+	  reports an exception.
+
+	  Ported from the Samsung/MTK 3.18 downstream kernel
+	  drivers/misc/mediatek/aee/ (aed/aed-main.c, common/aee-common.c).
+
+	  Say Y to get /dev/aed0 and to deliver modem exception dumps to
+	  userspace.

@@ -1,0 +1,1116 @@
+diff --git a/Documentation/devicetree/bindings/media/mediatek,mt6735-vcodec.yaml b/Documentation/devicetree/bindings/media/mediatek,mt6735-vcodec.yaml
+index a0fa5d93f..becc5dcf1 100644
+--- a/Documentation/devicetree/bindings/media/mediatek,mt6735-vcodec.yaml
++++ b/Documentation/devicetree/bindings/media/mediatek,mt6735-vcodec.yaml
+@@ -43,23 +43,32 @@ properties:
+ 
+   clocks:
+     minItems: 3
+-    maxItems: 4
++    maxItems: 6
+     description: |
+-      Clock tree of the engine, in the order the driver enables it.  The
+-      driver takes the clocks in device tree order and disables them in
+-      reverse order, so the list must follow the enable sequence of the
+-      hardware: the SMI common clock of the mmsys first, then the engine
+-      clock and its SMI LARB clock, followed by the topckgen VDEC clock mux
+-      for the decoder.
++      Clock tree of the engine, in the order the driver enables it during
++      power-on.  The driver takes the first three clocks in device tree
++      order and disables them in reverse order, so the list must follow the
++      enable sequence of the hardware: the SMI common clock of the mmsys
++      first, then the engine clock and its SMI LARB clock.
++
++      The decoder may additionally describe the topckgen VDEC clock mux and
++      its two DVFS parent clocks (syspll1_d2 and syspll1_d4) so that the
++      driver can scale the decoder between 273 MHz and 136.5 MHz.  Those
++      three are optional; without them the decoder keeps the clock parent
++      selected at boot.
+ 
+   clock-names:
+     minItems: 3
+-    maxItems: 4
++    maxItems: 6
+     items:
+-      enum: [smi-common, smi-larb1, smi-larb3, vdec, venc, vdec-sel]
++      enum: [smi_common, smi_larb1, smi_larb3, vdec, venc, vdec_sel,
++             vdec_sel_high, vdec_sel_low]
+     description:
+-      Descriptive names for the clocks; the driver enables all described
+-      clocks in order and does not look them up by name.
++      Names of the clocks above.  The decoder driver looks its clocks up by
++      name, so its first three entries must be "smi_common", "vdec" and
++      "smi_larb1"; "vdec_sel", "vdec_sel_high" and "vdec_sel_low" name the
++      optional DVFS trio.  The encoder driver takes all clocks in device
++      tree order and does not look them up by name.
+ 
+   power-domains:
+     minItems: 2
+@@ -101,19 +110,28 @@ allOf:
+             - const: vdec
+             - const: gcon
+         clocks:
++          minItems: 3
++          maxItems: 6
+           items:
+             - description: mmsys SMI common clock
+             - description: vdecsys VDEC clock
+             - description: vdecsys SMI LARB1 clock
+-            - description: topckgen VDEC clock mux
++            - description: topckgen VDEC clock mux (optional, DVFS)
++            - description: topckgen syspll1_d2 parent (optional, DVFS)
++            - description: topckgen syspll1_d4 parent (optional, DVFS)
+         clock-names:
++          minItems: 3
++          maxItems: 6
+           items:
+-            - const: smi-common
++            - const: smi_common
+             - const: vdec
+-            - const: smi-larb1
+-            - const: vdec-sel
++            - const: smi_larb1
++            - const: vdec_sel
++            - const: vdec_sel_high
++            - const: vdec_sel_low
+       required:
+         - reg-names
++        - clock-names
+     else:
+       properties:
+         reg:
+@@ -129,9 +147,9 @@ allOf:
+             - description: vencsys SMI LARB3 clock
+         clock-names:
+           items:
+-            - const: smi-common
++            - const: smi_common
+             - const: venc
+-            - const: smi-larb3
++            - const: smi_larb3
+         resets: false
+         reset-names: false
+ 
+@@ -156,8 +174,11 @@ examples:
+         clocks = <&mmsys CLK_MM_SMI_COMMON>,
+                  <&vdecsys CLK_VDEC_VDEC>,
+                  <&vdecsys CLK_VDEC_SMI_LARB1>,
+-                 <&topckgen CLK_TOP_VDEC_SEL>;
+-        clock-names = "smi-common", "vdec", "smi-larb1", "vdec-sel";
++                 <&topckgen CLK_TOP_VDEC_SEL>,
++                 <&topckgen CLK_TOP_SYSPLL1_D2>,
++                 <&topckgen CLK_TOP_SYSPLL1_D4>;
++        clock-names = "smi_common", "vdec", "smi_larb1",
++                      "vdec_sel", "vdec_sel_high", "vdec_sel_low";
+         power-domains = <&spm MT6735_POWER_DOMAIN_DIS>,
+                         <&spm MT6735_POWER_DOMAIN_VDE>;
+         resets = <&vdecsys MT6735_VDEC_RST0_VDEC>;
+@@ -172,7 +193,7 @@ examples:
+         clocks = <&mmsys CLK_MM_SMI_COMMON>,
+                  <&vencsys CLK_VENC_VENC>,
+                  <&vencsys CLK_VENC_SMI_LARB3>;
+-        clock-names = "smi-common", "venc", "smi-larb3";
++        clock-names = "smi_common", "venc", "smi_larb3";
+         power-domains = <&spm MT6735_POWER_DOMAIN_DIS>,
+                         <&spm MT6735_POWER_DOMAIN_VEN>;
+     };
+diff --git a/drivers/misc/mediatek/vcodec/vcodec-core.c b/drivers/misc/mediatek/vcodec/vcodec-core.c
+index a21a49c15..8b0f75b9b 100644
+--- a/drivers/misc/mediatek/vcodec/vcodec-core.c
++++ b/drivers/misc/mediatek/vcodec/vcodec-core.c
+@@ -19,6 +19,7 @@
+ #define pr_fmt(fmt)	"vcodec: " fmt
+ 
+ #include <linux/compat.h>
++#include <linux/cpufreq.h>
+ #include <linux/fs.h>
+ #include <linux/init.h>
+ #include <linux/ioctl.h>
+@@ -31,6 +32,7 @@
+ #include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/pm_qos.h>
+ #include <linux/sched.h>
+ #include <linux/sched/clock.h>
+ #include <linux/sched/mm.h>
+@@ -139,6 +141,28 @@ static phys_addr_t vcodec_user_v2p(u64 uaddr)
+ 	return pa;
+ }
+ 
++/*
++ * Look up the registered engine with @id.  Returns NULL when there is none.
++ * The returned pointer stays valid because engines are only unregistered
++ * from their platform driver's ->remove, which cannot race an ioctl on a
++ * driver that is still in use.
++ */
++static struct vcodec_engine *vcodec_engine_by_id(enum vcodec_engine_id id)
++{
++	struct vcodec_engine *eng, *found = NULL;
++
++	mutex_lock(&vcodec_engines_lock);
++	list_for_each_entry(eng, &vcodec_engines, node) {
++		if (eng->id == id && eng->registered) {
++			found = eng;
++			break;
++		}
++	}
++	mutex_unlock(&vcodec_engines_lock);
++
++	return found;
++}
++
+ /*
+  * Look up the engine serving @driver_type.  Returns an ERR_PTR() for a
+  * driver type that no engine handles (-EINVAL) or an engine that is not
+@@ -147,7 +171,7 @@ static phys_addr_t vcodec_user_v2p(u64 uaddr)
+ static struct vcodec_engine *vcodec_lookup_engine(u32 driver_type)
+ {
+ 	enum vcodec_engine_id id;
+-	struct vcodec_engine *eng, *found = NULL;
++	struct vcodec_engine *eng;
+ 
+ 	if (vcodec_driver_type_is_dec(driver_type))
+ 		id = VCODEC_ENGINE_DEC;
+@@ -156,16 +180,26 @@ static struct vcodec_engine *vcodec_lookup_engine(u32 driver_type)
+ 	else
+ 		return ERR_PTR(-EINVAL);
+ 
+-	mutex_lock(&vcodec_engines_lock);
+-	list_for_each_entry(eng, &vcodec_engines, node) {
+-		if (eng->id == id && eng->registered) {
+-			found = eng;
+-			break;
+-		}
+-	}
+-	mutex_unlock(&vcodec_engines_lock);
++	eng = vcodec_engine_by_id(id);
++
++	return eng ? eng : ERR_PTR(-ENODEV);
++}
++
++/*
++ * Downstream videocodec_kernel_driver_D1.c:1291-1296 re-raises the decoder to
++ * its default level and restarts the DVFS monitor whenever a new decoder
++ * EMI user shows up.
++ */
++static void vcodec_dvfs_begin_dec(void)
++{
++	struct vcodec_engine *eng = vcodec_engine_by_id(VCODEC_ENGINE_DEC);
+ 
+-	return found ? found : ERR_PTR(-ENODEV);
++	if (!eng || !eng->ops->dvfs_begin)
++		return;
++
++	mutex_lock(&eng->lock);
++	eng->ops->dvfs_begin(eng);
++	mutex_unlock(&eng->lock);
+ }
+ 
+ static unsigned int vcodec_engine_inst_count(void)
+@@ -388,6 +422,14 @@ static long vcodec_ioc_lockhw(u64 handle, u32 timeout_ms, u32 driver_type,
+ 		eng->irq_enabled = true;
+ 	}
+ 
++	/*
++	 * Downstream videocodec_kernel_driver_D1.c:858-860 starts the VDEC
++	 * DVFS monitor here, after the power-on and the interrupt unmask, for
++	 * secure and non-secure instances alike.
++	 */
++	if (eng->ops->dvfs_monitor_start)
++		eng->ops->dvfs_monitor_start(eng);
++
+ 	mutex_unlock(&eng->lock);
+ 
+ 	dev_dbg(eng->dev, "engine locked by type %u (secure %d)\n",
+@@ -430,6 +472,14 @@ static long vcodec_ioc_unlockhw(u64 handle, u32 driver_type)
+ 		eng->powered = false;
+ 	}
+ 
++	/*
++	 * Downstream videocodec_kernel_driver_D1.c:1094-1096 evaluates the
++	 * DVFS monitor window once the device is powered off and before the
++	 * lock is released.
++	 */
++	if (eng->ops->dvfs_adjustment)
++		eng->ops->dvfs_adjustment(eng);
++
+ 	/* Publish the release after the engine is quiescent. */
+ 	smp_store_release(&eng->hw_locked, false);
+ 	eng->owner = 0;
+@@ -642,6 +692,237 @@ static long vcodec_ioc_thread_id(const struct vcodec_thread_id *tid)
+ 	return 0;
+ }
+ 
++/*
++ * VCODEC_SET_CPU_OPP_LIMIT.
++ *
++ * Port from Samsung/MTK downstream
++ * drivers/misc/mediatek/videocodec/mt6735/videocodec_kernel_driver_D1.c:
++ * 1533-1555, which copies VAL_VCODEC_CPU_OPP_LIMIT_T and then calls
++ * cpu_opp_limit(EVENT_VIDEO, limited_freq, limited_cpu, enable).  That helper
++ * exists neither in the downstream tree nor in the ROM, so the call is
++ * commented out there.  The semantics below follow the argument names and
++ * the downstream call site:
++ *
++ *   limited_freq  frequency ceiling in kHz
++ *   limited_cpu   bitmask of CPUs; 0 means every CPU
++ *   enable        1 applies the ceiling, 0 removes it
++ *
++ * They are [INFERENCE]: no available source defines cpu_opp_limit().  The
++ * ceiling is expressed with the frequency QoS API on each policy's maximum
++ * frequency constraint, which is what cpufreq-dt (CONFIG_CPUFREQ_DT, the
++ * provider Nura uses) honours for every CPU sharing the policy.
++ *
++ * Unlike downstream's fire-and-forget call, every active request is dropped
++ * when the last user closes /dev/Vcodec and at module exit, so a crashed
++ * caller cannot leave the CPU capped.  Enabling again replaces the previous
++ * ceiling set: policies the new mask does not select are released.  Those
++ * are deliberate deviations.
++ */
++#if IS_ENABLED(CONFIG_CPU_FREQ)
++struct vcodec_cpu_opp {
++	struct cpufreq_policy *policy;
++	struct freq_qos_request max_freq_req;
++	bool visited;
++};
++
++/*
++ * One entry per policy.  There can never be more policies than CPUs, so
++ * NR_CPUS bounds the array; nr_cpu_ids bounds the CPUs we look at below.
++ */
++static DEFINE_MUTEX(vcodec_cpu_opp_lock);
++static struct vcodec_cpu_opp vcodec_cpu_opps[NR_CPUS];
++
++static struct vcodec_cpu_opp *vcodec_cpu_opp_find(struct cpufreq_policy *policy)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(vcodec_cpu_opps); i++)
++		if (vcodec_cpu_opps[i].policy == policy)
++			return &vcodec_cpu_opps[i];
++
++	return NULL;
++}
++
++static struct vcodec_cpu_opp *vcodec_cpu_opp_free(void)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(vcodec_cpu_opps); i++)
++		if (!vcodec_cpu_opps[i].policy)
++			return &vcodec_cpu_opps[i];
++
++	return NULL;
++}
++
++/* Drop one ceiling.  Caller holds vcodec_cpu_opp_lock. */
++static void __vcodec_cpu_opp_release(struct vcodec_cpu_opp *opp)
++{
++	freq_qos_update_request(&opp->max_freq_req, FREQ_QOS_MAX_DEFAULT_VALUE);
++	freq_qos_remove_request(&opp->max_freq_req);
++	cpufreq_cpu_put(opp->policy);
++	opp->policy = NULL;
++	opp->visited = false;
++}
++
++/* Drop every active ceiling.  Caller holds vcodec_cpu_opp_lock. */
++static void __vcodec_cpu_opp_release_all(void)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(vcodec_cpu_opps); i++)
++		if (vcodec_cpu_opps[i].policy)
++			__vcodec_cpu_opp_release(&vcodec_cpu_opps[i]);
++}
++
++static void vcodec_cpu_opp_release_all(void)
++{
++	mutex_lock(&vcodec_cpu_opp_lock);
++	__vcodec_cpu_opp_release_all();
++	mutex_unlock(&vcodec_cpu_opp_lock);
++}
++
++static long vcodec_cpu_opp_enable(const struct vcodec_cpu_opp_limit *limit)
++{
++	u32 mask = (u32)limit->limited_cpu;
++	int matched = 0;
++	int applied = 0;
++	int err = 0;
++	int cpu, i;
++
++	mutex_lock(&vcodec_cpu_opp_lock);
++
++	for (i = 0; i < ARRAY_SIZE(vcodec_cpu_opps); i++)
++		vcodec_cpu_opps[i].visited = false;
++
++	for_each_possible_cpu(cpu) {
++		struct vcodec_cpu_opp *opp;
++		struct cpufreq_policy *policy;
++		int ret;
++
++		/*
++		 * limited_cpu == 0 applies to every CPU.  It is the 32-bit ABI
++		 * field, so CPUs at or above bit 31 can never be selected.
++		 */
++		if (mask && (cpu >= 32 || !((mask >> cpu) & 1)))
++			continue;
++
++		policy = cpufreq_cpu_get(cpu);
++		if (!policy)
++			continue;
++
++		matched++;
++
++		/*
++		 * Several CPUs share one policy and its constraint set, so
++		 * only one request per policy is added; later selections of
++		 * the same policy reuse (and update) that request.
++		 */
++		opp = vcodec_cpu_opp_find(policy);
++		if (opp) {
++			opp->visited = true;
++			ret = freq_qos_update_request(&opp->max_freq_req,
++						      limit->limited_freq);
++			cpufreq_cpu_put(policy);
++			if (ret < 0) {
++				pr_warn("cannot update cpu opp limit for cpu %d: %d\n",
++					cpu, ret);
++				if (!err)
++					err = ret;
++				continue;
++			}
++			applied++;
++			continue;
++		}
++
++		opp = vcodec_cpu_opp_free();
++		if (!opp) {
++			/* Cannot happen: at most NR_CPUS policies. */
++			pr_warn("cpu opp limit table is full\n");
++			cpufreq_cpu_put(policy);
++			if (!err)
++				err = -ENOSPC;
++			continue;
++		}
++
++		ret = freq_qos_add_request(&policy->constraints,
++					   &opp->max_freq_req, FREQ_QOS_MAX,
++					   limit->limited_freq);
++		if (ret < 0) {
++			pr_warn("cannot add cpu opp limit for cpu %d: %d\n",
++				cpu, ret);
++			cpufreq_cpu_put(policy);
++			if (!err)
++				err = ret;
++			continue;
++		}
++
++		opp->policy = policy;
++		opp->visited = true;
++		applied++;
++
++		pr_debug("cpu %d limited to %d kHz\n", cpu,
++			 limit->limited_freq);
++	}
++
++	/*
++	 * A re-issue replaces the previous ceiling set: policies that this
++	 * call did not select must not stay capped.
++	 */
++	for (i = 0; i < ARRAY_SIZE(vcodec_cpu_opps); i++) {
++		struct vcodec_cpu_opp *opp = &vcodec_cpu_opps[i];
++
++		if (opp->policy && !opp->visited)
++			__vcodec_cpu_opp_release(opp);
++	}
++
++	mutex_unlock(&vcodec_cpu_opp_lock);
++
++	if (!matched)
++		return -ENODEV;
++
++	if (!applied)
++		return err;
++
++	return 0;
++}
++
++static long vcodec_cpu_opp_disable(void)
++{
++	mutex_lock(&vcodec_cpu_opp_lock);
++	__vcodec_cpu_opp_release_all();
++	mutex_unlock(&vcodec_cpu_opp_lock);
++
++	return 0;
++}
++
++static long vcodec_ioc_cpu_opp_limit(const struct vcodec_cpu_opp_limit *limit)
++{
++	if (limit->enable != 0 && limit->enable != 1)
++		return -EINVAL;
++
++	if (limit->limited_cpu < 0)
++		return -EINVAL;
++
++	if (limit->enable && limit->limited_freq <= 0)
++		return -EINVAL;
++
++	if (limit->enable)
++		return vcodec_cpu_opp_enable(limit);
++
++	/*
++	 * Removing the ceiling drops every request this driver owns, whatever
++	 * the mask says: a stale cap is worse than an over-broad release, and
++	 * it is the same operation the last-close path performs.
++	 */
++	return vcodec_cpu_opp_disable();
++}
++#else /* !CONFIG_CPU_FREQ */
++static long vcodec_ioc_cpu_opp_limit(const struct vcodec_cpu_opp_limit *limit)
++{
++	return -EOPNOTSUPP;
++}
++#endif /* CONFIG_CPU_FREQ */
++
+ static int vcodec_open(struct inode *inode, struct file *file)
+ {
+ 	mutex_lock(&vcodec_open_lock);
+@@ -695,6 +976,13 @@ static void vcodec_cleanup_engines(void)
+ 		eng->owner = 0;
+ 		eng->driver_type = VCODEC_DRV_TYPE_NONE;
+ 		eng->irq_status = 0;
++		/*
++		 * Downstream videocodec_kernel_driver_D1.c:2121-2137 drops the
++		 * decoder back to its lowest level and clears the monitor
++		 * bookkeeping once the last user is gone.
++		 */
++		if (eng->ops->dvfs_idle)
++			eng->ops->dvfs_idle(eng);
+ 		mutex_unlock(&eng->lock);
+ 		wake_up_interruptible_all(&eng->hwlock_wq);
+ 	}
+@@ -719,6 +1007,13 @@ static int vcodec_release(struct inode *inode, struct file *file)
+ 	if (last) {
+ 		pr_debug("last user gone, forcing engines idle\n");
+ 		vcodec_cleanup_engines();
++#if IS_ENABLED(CONFIG_CPU_FREQ)
++		/*
++		 * The caller that set a CPU ceiling may be gone without
++		 * clearing it; drop it with the rest of the session state.
++		 */
++		vcodec_cpu_opp_release_all();
++#endif
+ 	}
+ 
+ 	return 0;
+@@ -806,7 +1101,6 @@ static const unsigned int vcodec_unsupported_cmds[] = {
+ 	VCODEC_GET_SYSRAM_INFO,
+ 	VCODEC_ALLOC_NON_CACHE_BUFFER,
+ 	VCODEC_FREE_NON_CACHE_BUFFER,
+-	VCODEC_SET_CPU_OPP_LIMIT,
+ };
+ 
+ static bool vcodec_cmd_is_unsupported(unsigned int cmd)
+@@ -828,6 +1122,7 @@ static long vcodec_unlocked_ioctl(struct file *file, unsigned int cmd,
+ 	struct vcodec_power power;
+ 	struct vcodec_isr isr;
+ 	struct vcodec_thread_id thread_id;
++	struct vcodec_cpu_opp_limit cpu_opp;
+ 	struct vcodec_core_loading loading;
+ 	struct vcodec_cpu_loading_info info;
+ 	u32 status = 0;
+@@ -865,7 +1160,10 @@ static long vcodec_unlocked_ioctl(struct file *file, unsigned int cmd,
+ 	case VCODEC_DEC_ENC_EMI_USER:
+ 		return vcodec_ioc_emi_user(true, false, uarg);
+ 	case VCODEC_INC_DEC_EMI_USER:
+-		return vcodec_ioc_emi_user(false, true, uarg);
++		ret = vcodec_ioc_emi_user(false, true, uarg);
++		if (!ret)
++			vcodec_dvfs_begin_dec();
++		return ret;
+ 	case VCODEC_DEC_DEC_EMI_USER:
+ 		return vcodec_ioc_emi_user(false, false, uarg);
+ 	case VCODEC_INC_PWR_USER:
+@@ -894,6 +1192,10 @@ static long vcodec_unlocked_ioctl(struct file *file, unsigned int cmd,
+ 		if (copy_from_user(&thread_id, uarg, sizeof(thread_id)))
+ 			return -EFAULT;
+ 		return vcodec_ioc_thread_id(&thread_id);
++	case VCODEC_SET_CPU_OPP_LIMIT:
++		if (copy_from_user(&cpu_opp, uarg, sizeof(cpu_opp)))
++			return -EFAULT;
++		return vcodec_ioc_cpu_opp_limit(&cpu_opp);
+ 	case VCODEC_INITHWLOCK:
+ 	case VCODEC_DEINITHWLOCK:
+ 		/* Downstream only logs these, the lock is owned by this file. */
+@@ -1017,6 +1319,7 @@ static long vcodec_compat_ioctl(struct file *file, unsigned int cmd,
+ 				unsigned long arg)
+ {
+ 	void __user *uarg = compat_ptr(arg);
++	struct vcodec_cpu_opp_limit cpu_opp;
+ 	struct vcodec_core_loading loading;
+ 	struct vcodec_cpu_loading_info info;
+ 	struct vcodec_thread_id thread_id;
+@@ -1044,7 +1347,10 @@ static long vcodec_compat_ioctl(struct file *file, unsigned int cmd,
+ 	case VCODEC_DEC_ENC_EMI_USER:
+ 		return vcodec_ioc_emi_user(true, false, uarg);
+ 	case VCODEC_INC_DEC_EMI_USER:
+-		return vcodec_ioc_emi_user(false, true, uarg);
++		ret = vcodec_ioc_emi_user(false, true, uarg);
++		if (!ret)
++			vcodec_dvfs_begin_dec();
++		return ret;
+ 	case VCODEC_DEC_DEC_EMI_USER:
+ 		return vcodec_ioc_emi_user(false, false, uarg);
+ 	case VCODEC_GET_CORE_NUMBER:
+@@ -1080,11 +1386,25 @@ static long vcodec_compat_ioctl(struct file *file, unsigned int cmd,
+ 		if (copy_from_user(&thread_id, uarg, sizeof(thread_id)))
+ 			return -EFAULT;
+ 		return vcodec_ioc_thread_id(&thread_id);
++	case VCODEC_SET_CPU_OPP_LIMIT:
++		/* Three s32 fields, identical on both word sizes. */
++		if (copy_from_user(&cpu_opp, uarg, sizeof(cpu_opp)))
++			return -EFAULT;
++		return vcodec_ioc_cpu_opp_limit(&cpu_opp);
+ 	case VCODEC_MB:
+ 		/* Downstream: full barrier, no other effect. */
+ 		mb();
+ 		return 0;
+ 	default:
++		/*
++		 * Same distinction as the native dispatcher: a command that
++		 * exists in the ABI but has no implementation is refused with
++		 * -EOPNOTSUPP, anything else is not our ioctl at all.  Without
++		 * this a 32-bit caller would get -ENOTTY for the very commands
++		 * a 64-bit caller sees as -EOPNOTSUPP.
++		 */
++		if (vcodec_cmd_is_unsupported(cmd))
++			return -EOPNOTSUPP;
+ 		return -ENOTTY;
+ 	}
+ }
+@@ -1146,6 +1466,9 @@ static int __init vcodec_core_init(void)
+ 
+ static void __exit vcodec_core_exit(void)
+ {
++#if IS_ENABLED(CONFIG_CPU_FREQ)
++	vcodec_cpu_opp_release_all();
++#endif
+ 	vcodec_venc_unregister();
+ 	vcodec_vdec_unregister();
+ 	misc_deregister(&vcodec_miscdev);
+diff --git a/drivers/misc/mediatek/vcodec/vcodec-vdec.c b/drivers/misc/mediatek/vcodec/vcodec-vdec.c
+index bf48b93c5..b5f9a504d 100644
+--- a/drivers/misc/mediatek/vcodec/vcodec-vdec.c
++++ b/drivers/misc/mediatek/vcodec/vcodec-vdec.c
+@@ -16,9 +16,13 @@
+ #include <linux/device.h>
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/ktime.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/pm.h>
+ #include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/reset.h>
+@@ -43,6 +47,38 @@
+  */
+ #define VCODEC_VDEC_MMAP_SIZE		0x29000
+ 
++/*
++ * VDEC dynamic frequency scaling, ported from the ENABLE_MMDVFS_VDEC block of
++ * videocodec_kernel_driver_D1.c:107-260 and SendDvfsRequest() at :122-162.
++ *
++ * The decoder is clocked from the TOP_VDEC_SEL mux.  Its parent 1 is
++ * SYSPLL1_D2 and parent 3 is SYSPLL1_D4, which the vendor clock tables
++ * document as 273 MHz and 136.5 MHz (mt_pm_init.c:300-320).  The monitor
++ * measures how much of every 4 s window the decoder was actually locked and
++ * moves the mux between the two parents.
++ */
++#define VCODEC_DVFS_MONITOR_DURATION_MS	4000
++#define VCODEC_DVFS_DROP_PERCENTAGE	50
++#define VCODEC_DVFS_RAISE_PERCENTAGE	90
++#define VCODEC_DVFS_SW_OVERHEAD_MS	1
++
++/*
++ * MMDVFS_VOLTAGE_LOW / _HIGH as used by downstream; the value is also
++ * visible in the ROM: SendDvfsRequest @ 0xc0396240 treats 0 as low and 1 as
++ * high (mov r0,#3 / mov r1,#0|#1 before mmdvfs_set_step @ 0xc04cacdc).
++ */
++enum vcodec_vdec_dvfs_level {
++	VCODEC_DVFS_LOW = 0,
++	VCODEC_DVFS_HIGH,
++};
++
++/* Clock gates driven by power_on(), in device-tree enable order. */
++static const char * const vcodec_vdec_clk_names[] = {
++	"smi_common",
++	"vdec",
++	"smi_larb1",
++};
++
+ struct vcodec_vdec {
+ 	struct device *dev;
+ 	void __iomem *vdec;
+@@ -53,9 +89,215 @@ struct vcodec_vdec {
+ 	struct reset_control *rst;
+ 	int irq;
+ 	bool registered;
++
++	/* TOP_VDEC_SEL mux and the two SYSPLL1 parents of the DVFS steps */
++	struct clk *clk_sel;
++	struct clk *clk_sel_high;
++	struct clk *clk_sel_low;
++	bool dvfs_enabled;
++	/* protects the monitor bookkeeping below */
++	struct mutex dvfs_lock;
++	bool monitor_active;
++	bool first_lock;
++	u32 monitor_counts;
++	ktime_t monitor_start;
++	ktime_t last_lock;
++	u32 hwlock_interval_ms;
++	s32 hwlock_max_duration_ms;
++
+ 	struct vcodec_engine engine;
+ };
+ 
++/*
++ * Downstream videocodec_kernel_driver_D1.c:122-162 (SendDvfsRequest): select
++ * the TOP_VDEC_SEL parent that corresponds to @level, with the mux prepared
++ * and enabled around clk_set_parent() exactly as downstream does.  The
++ * parents come from the device tree as clock handles, so no rate is ever
++ * computed here.
++ *
++ * Downstream additionally sends the matching SMI bandwidth / VCORE vote
++ * through mmdvfs_set_step(SMI_BWC_SCEN_VP, @level).  That half is not
++ * implemented: this kernel has no MMDVFS/vcorefs framework (see the report).
++ */
++static void vcodec_vdec_dvfs_request(struct vcodec_vdec *vdec, int level)
++{
++	struct clk *parent;
++	int ret;
++
++	if (!vdec->dvfs_enabled)
++		return;
++
++	parent = level == VCODEC_DVFS_LOW ? vdec->clk_sel_low :
++					    vdec->clk_sel_high;
++
++	ret = clk_prepare_enable(vdec->clk_sel);
++	if (ret) {
++		dev_err(vdec->dev, "failed to enable the VDEC DVFS mux: %d\n",
++			ret);
++		return;
++	}
++
++	ret = clk_set_parent(vdec->clk_sel, parent);
++	if (ret)
++		dev_err(vdec->dev,
++			"failed to select the VDEC clock parent: %d\n", ret);
++
++	clk_disable_unprepare(vdec->clk_sel);
++
++	dev_dbg(vdec->dev, "VDEC DVFS request: %s\n",
++		level == VCODEC_DVFS_LOW ? "LOW" : "HIGH");
++}
++
++/* Downstream videocodec_kernel_driver_D1.c:163-173 */
++static void vcodec_vdec_dvfs_begin(struct vcodec_vdec *vdec)
++{
++	vdec->monitor_active = true;
++	vdec->monitor_counts = 0;
++	vdec->hwlock_interval_ms = 0;
++	vdec->first_lock = true;
++	vdec->hwlock_max_duration_ms = 0;
++}
++
++/* Downstream videocodec_kernel_driver_D1.c:175-182 */
++static void vcodec_vdec_dvfs_end(struct vcodec_vdec *vdec, int level)
++{
++	dev_dbg(vdec->dev,
++		"VDEC DVFS monitor %u ms, %u locks, busy %u ms, max %d ms, level %d\n",
++		VCODEC_DVFS_MONITOR_DURATION_MS, vdec->monitor_counts,
++		vdec->hwlock_interval_ms, vdec->hwlock_max_duration_ms,
++		level);
++
++	vdec->monitor_active = false;
++	vdec->monitor_counts = 0;
++	vdec->hwlock_interval_ms = 0;
++	vdec->hwlock_max_duration_ms = 0;
++}
++
++/* Downstream videocodec_kernel_driver_D1.c:183-189 */
++static u32 vcodec_vdec_dvfs_monitor_duration(struct vcodec_vdec *vdec)
++{
++	return (u32)ktime_ms_delta(ktime_get(), vdec->monitor_start);
++}
++
++/* Downstream videocodec_kernel_driver_D1.c:191-205 */
++static u32 vcodec_vdec_dvfs_step(struct vcodec_vdec *vdec)
++{
++	u32 diff = (u32)ktime_ms_delta(ktime_get(), vdec->last_lock);
++
++	if (diff > vdec->hwlock_max_duration_ms)
++		vdec->hwlock_max_duration_ms = diff;
++	vdec->hwlock_interval_ms += diff + VCODEC_DVFS_SW_OVERHEAD_MS;
++
++	return diff;
++}
++
++/*
++ * Downstream videocodec_kernel_driver_D1.c:207-241 (VdecDvfsAdjustment):
++ * close the measurement window that started with the first lock after the
++ * previous evaluation and move the mux when the decoder was busy for less
++ * than 50% or more than 90% of it.
++ */
++static void vcodec_vdec_dvfs_adjustment(struct vcodec_vdec *vdec)
++{
++	u32 duration, busier;
++
++	mutex_lock(&vdec->dvfs_lock);
++	if (vdec->monitor_active && vdec->monitor_counts > 0) {
++		duration = vcodec_vdec_dvfs_monitor_duration(vdec);
++		if (duration < VCODEC_DVFS_MONITOR_DURATION_MS) {
++			vcodec_vdec_dvfs_step(vdec);
++		} else {
++			vcodec_vdec_dvfs_step(vdec);
++			busier = 100 * vdec->hwlock_interval_ms / duration;
++			dev_dbg(vdec->dev,
++				"VDEC DVFS window %u ms, busy %u%%\n",
++				duration, busier);
++
++			if (busier < VCODEC_DVFS_DROP_PERCENTAGE) {
++				vcodec_vdec_dvfs_request(vdec, VCODEC_DVFS_LOW);
++				vcodec_vdec_dvfs_end(vdec, VCODEC_DVFS_LOW);
++			} else if (busier > VCODEC_DVFS_RAISE_PERCENTAGE) {
++				vcodec_vdec_dvfs_request(vdec,
++							 VCODEC_DVFS_HIGH);
++				vcodec_vdec_dvfs_end(vdec, VCODEC_DVFS_HIGH);
++			} else {
++				vcodec_vdec_dvfs_end(vdec, -1);
++			}
++		}
++	}
++	vdec->monitor_counts++;
++	mutex_unlock(&vdec->dvfs_lock);
++}
++
++/* Downstream videocodec_kernel_driver_D1.c:243-260 */
++static void vcodec_vdec_dvfs_monitor_start(struct vcodec_vdec *vdec)
++{
++	mutex_lock(&vdec->dvfs_lock);
++	if (!vdec->monitor_active)
++		vcodec_vdec_dvfs_begin(vdec);
++
++	if (vdec->monitor_counts > 0) {
++		if (vdec->first_lock) {
++			vdec->first_lock = false;
++			vdec->monitor_start = ktime_get();
++		}
++		vdec->last_lock = ktime_get();
++	}
++	mutex_unlock(&vdec->dvfs_lock);
++}
++
++/* Downstream videocodec_kernel_driver_D1.c:2121-2137 */
++static void vcodec_vdec_dvfs_idle(struct vcodec_vdec *vdec)
++{
++	mutex_lock(&vdec->dvfs_lock);
++	if (vdec->monitor_active) {
++		vdec->monitor_active = false;
++		vdec->monitor_counts = 0;
++		vdec->hwlock_interval_ms = 0;
++		vdec->hwlock_max_duration_ms = 0;
++		vcodec_vdec_dvfs_request(vdec, VCODEC_DVFS_LOW);
++	}
++	mutex_unlock(&vdec->dvfs_lock);
++}
++
++/* Engine callbacks.  The core holds eng->lock and is in process context. */
++static void vcodec_vdec_dvfs_begin_op(struct vcodec_engine *eng)
++{
++	struct vcodec_vdec *vdec = eng->priv;
++
++	if (!vdec->dvfs_enabled)
++		return;
++
++	mutex_lock(&vdec->dvfs_lock);
++	vcodec_vdec_dvfs_request(vdec, VCODEC_DVFS_HIGH);
++	vcodec_vdec_dvfs_begin(vdec);
++	mutex_unlock(&vdec->dvfs_lock);
++}
++
++static void vcodec_vdec_dvfs_monitor_start_op(struct vcodec_engine *eng)
++{
++	struct vcodec_vdec *vdec = eng->priv;
++
++	if (vdec->dvfs_enabled)
++		vcodec_vdec_dvfs_monitor_start(vdec);
++}
++
++static void vcodec_vdec_dvfs_adjustment_op(struct vcodec_engine *eng)
++{
++	struct vcodec_vdec *vdec = eng->priv;
++
++	if (vdec->dvfs_enabled)
++		vcodec_vdec_dvfs_adjustment(vdec);
++}
++
++static void vcodec_vdec_dvfs_idle_op(struct vcodec_engine *eng)
++{
++	struct vcodec_vdec *vdec = eng->priv;
++
++	if (vdec->dvfs_enabled)
++		vcodec_vdec_dvfs_idle(vdec);
++}
++
+ static int vcodec_vdec_power_on(struct vcodec_engine *eng)
+ {
+ 	struct vcodec_vdec *vdec = eng->priv;
+@@ -145,6 +387,47 @@ static const struct vcodec_engine_ops vcodec_vdec_ops = {
+ 	.power_off = vcodec_vdec_power_off,
+ 	.enable_irq = vcodec_vdec_enable_irq,
+ 	.disable_irq = vcodec_vdec_disable_irq,
++	.dvfs_begin = vcodec_vdec_dvfs_begin_op,
++	.dvfs_monitor_start = vcodec_vdec_dvfs_monitor_start_op,
++	.dvfs_adjustment = vcodec_vdec_dvfs_adjustment_op,
++	.dvfs_idle = vcodec_vdec_dvfs_idle_op,
++};
++
++/*
++ * Hibernation restore: the boot loader or the kernel that loaded the image
++ * may have reset the MT6735 interrupt polarity registers, so re-apply the
++ * level-low trigger of the decoder line.  The irq core runs all
++ * ->restore_noirq callbacks before resume_device_irqs(), so the line is
++ * still masked here and cannot fire while it is being reconfigured.
++ *
++ * Port from Samsung/MTK downstream
++ * drivers/misc/mediatek/videocodec/mt6735/videocodec_kernel_driver_D1.c:2375-2390
++ * (vcodec_pm_restore_noirq), which issues
++ * mt_irq_set_sens(VDEC_IRQ_ID, MT_LEVEL_SENSITIVE) and
++ * mt_irq_set_polarity(VDEC_IRQ_ID, MT_POLARITY_LOW).
++ * IRQ_TYPE_LEVEL_LOW is the irq-core spelling of that pair: on the
++ * mediatek,mt6735-sysirq parent that the codec interrupt is routed through
++ * it sets the INTPOL bit and hands IRQ_TYPE_LEVEL_HIGH to the GIC, as the
++ * downstream MTK interrupt controller code does
++ * (drivers/irqchip/irq-mtk-sysirq.c: mtk_sysirq_set_type()).
++ *
++ * The ROM logs nothing and always returns 0; a failure is reported here for
++ * debuggability but, like the ROM, not propagated to abort the restore.
++ */
++static int __maybe_unused vcodec_vdec_restore_noirq(struct device *dev)
++{
++	struct vcodec_vdec *vdec = dev_get_drvdata(dev);
++	int ret;
++
++	ret = irq_set_irq_type(vdec->irq, IRQ_TYPE_LEVEL_LOW);
++	if (ret)
++		dev_err(dev, "failed to restore VDEC IRQ polarity: %d\n", ret);
++
++	return 0;
++}
++
++static const struct dev_pm_ops vcodec_vdec_pm_ops = {
++	.restore_noirq = pm_sleep_ptr(vcodec_vdec_restore_noirq),
+ };
+ 
+ /*
+@@ -190,6 +473,7 @@ static int vcodec_vdec_probe(struct platform_device *pdev)
+ 	struct dev_pm_domain_list *pd_list = NULL;
+ 	struct vcodec_vdec *vdec;
+ 	struct resource *res;
++	unsigned int i;
+ 	int ret;
+ 
+ 	vdec = devm_kzalloc(dev, sizeof(*vdec), GFP_KERNEL);
+@@ -197,6 +481,11 @@ static int vcodec_vdec_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 
+ 	vdec->dev = dev;
++	mutex_init(&vdec->dvfs_lock);
++	vdec->clks = devm_kcalloc(dev, ARRAY_SIZE(vcodec_vdec_clk_names),
++				  sizeof(*vdec->clks), GFP_KERNEL);
++	if (!vdec->clks)
++		return -ENOMEM;
+ 	platform_set_drvdata(pdev, vdec);
+ 
+ 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "vdec");
+@@ -220,15 +509,44 @@ static int vcodec_vdec_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, PTR_ERR(vdec->gcon),
+ 				     "failed to map \"gcon\" register window\n");
+ 
+-	/* Downstream videocodec_kernel_driver_D1.c:2290-2357 */
+-	ret = devm_clk_bulk_get_all(dev, &vdec->clks);
+-	if (ret < 0)
++	/*
++	 * Downstream videocodec_kernel_driver_D1.c:2290-2357 enables the SMI
++	 * common, VDEC and SMI LARB1 gates in its power-on path; only those
++	 * three are prepared here so that the DVFS parent clocks, which are
++	 * switched while the engine is off, stay out of power_on().
++	 */
++	for (i = 0; i < ARRAY_SIZE(vcodec_vdec_clk_names); i++)
++		vdec->clks[i].id = vcodec_vdec_clk_names[i];
++	vdec->nclks = ARRAY_SIZE(vcodec_vdec_clk_names);
++	ret = devm_clk_bulk_get(dev, vdec->nclks, vdec->clks);
++	if (ret)
+ 		return dev_err_probe(dev, ret, "failed to get VDEC clocks\n");
+-	if (!ret) {
+-		dev_err(dev, "no VDEC clocks described in device tree\n");
+-		return -ENODEV;
+-	}
+-	vdec->nclks = ret;
++
++	/*
++	 * Downstream videocodec_kernel_driver_D1.c:2321-2338 gets the
++	 * TOP_MUX_VDEC mux and its two SYSPLL1 parents last, after the gates.
++	 * They are optional here: without them the decoder keeps the parent
++	 * the boot loader selected and only the clock half of DVFS is lost.
++	 */
++	vdec->clk_sel = devm_clk_get_optional(dev, "vdec_sel");
++	if (IS_ERR(vdec->clk_sel))
++		return dev_err_probe(dev, PTR_ERR(vdec->clk_sel),
++				     "failed to get the VDEC clock mux\n");
++	vdec->clk_sel_high = devm_clk_get_optional(dev, "vdec_sel_high");
++	if (IS_ERR(vdec->clk_sel_high))
++		return dev_err_probe(dev, PTR_ERR(vdec->clk_sel_high),
++				     "failed to get the VDEC high clock parent\n");
++	vdec->clk_sel_low = devm_clk_get_optional(dev, "vdec_sel_low");
++	if (IS_ERR(vdec->clk_sel_low))
++		return dev_err_probe(dev, PTR_ERR(vdec->clk_sel_low),
++				     "failed to get the VDEC low clock parent\n");
++
++	vdec->dvfs_enabled = vdec->clk_sel && vdec->clk_sel_high &&
++			     vdec->clk_sel_low;
++	if (vdec->dvfs_enabled)
++		dev_info(dev, "VDEC DVFS enabled (136.5/273 MHz clock steps)\n");
++	else
++		dev_info(dev, "VDEC DVFS clock parents not described, DVFS disabled\n");
+ 
+ 	/*
+ 	 * The PM core only attaches a single power domain per device
+@@ -325,6 +643,7 @@ static struct platform_driver vcodec_vdec_driver = {
+ 	.driver = {
+ 		.name = "mtk-vcodec-vdec",
+ 		.of_match_table = vcodec_vdec_of_match,
++		.pm = &vcodec_vdec_pm_ops,
+ 		.suppress_bind_attrs = true,
+ 	},
+ };
+diff --git a/drivers/misc/mediatek/vcodec/vcodec-venc.c b/drivers/misc/mediatek/vcodec/vcodec-venc.c
+index 75cfd9291..eed217dc9 100644
+--- a/drivers/misc/mediatek/vcodec/vcodec-venc.c
++++ b/drivers/misc/mediatek/vcodec/vcodec-venc.c
+@@ -16,9 +16,11 @@
+ #include <linux/clk.h>
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
++#include <linux/irq.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/pm.h>
+ #include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
+ 
+@@ -188,6 +190,42 @@ static const struct vcodec_engine_ops vcodec_venc_ops = {
+ 	.disable_irq = vcodec_venc_disable_irq,
+ };
+ 
++/*
++ * Hibernation restore: re-apply the level-low trigger of the encoder line.
++ * The boot loader or the kernel that loaded the image may have reset the
++ * MT6735 interrupt polarity registers.  resume_device_irqs() runs after all
++ * ->restore_noirq callbacks, so the line is still masked here.
++ *
++ * Port from Samsung/MTK downstream
++ * drivers/misc/mediatek/videocodec/mt6735/videocodec_kernel_driver_D1.c:2375-2390
++ * (vcodec_pm_restore_noirq), which issues
++ * mt_irq_set_sens(VENC_IRQ_ID, MT_LEVEL_SENSITIVE) and
++ * mt_irq_set_polarity(VENC_IRQ_ID, MT_POLARITY_LOW).
++ * IRQ_TYPE_LEVEL_LOW is the irq-core spelling of that pair: on the
++ * mediatek,mt6735-sysirq parent that the codec interrupt is routed through
++ * it sets the INTPOL bit and hands IRQ_TYPE_LEVEL_HIGH to the GIC, as the
++ * downstream MTK interrupt controller code does
++ * (drivers/irqchip/irq-mtk-sysirq.c: mtk_sysirq_set_type()).
++ *
++ * The ROM logs nothing and always returns 0; a failure is reported here for
++ * debuggability but, like the ROM, not propagated to abort the restore.
++ */
++static int __maybe_unused vcodec_venc_restore_noirq(struct device *dev)
++{
++	struct vcodec_venc *venc = dev_get_drvdata(dev);
++	int ret;
++
++	ret = irq_set_irq_type(venc->irq, IRQ_TYPE_LEVEL_LOW);
++	if (ret)
++		dev_err(dev, "failed to restore VENC IRQ polarity: %d\n", ret);
++
++	return 0;
++}
++
++static const struct dev_pm_ops vcodec_venc_pm_ops = {
++	.restore_noirq = pm_sleep_ptr(vcodec_venc_restore_noirq),
++};
++
+ static int vcodec_venc_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -286,6 +324,7 @@ static struct platform_driver vcodec_venc_driver = {
+ 	.driver = {
+ 		.name = "mtk-vcodec-venc",
+ 		.of_match_table = vcodec_venc_of_match,
++		.pm = &vcodec_venc_pm_ops,
+ 	},
+ };
+ 
+diff --git a/drivers/misc/mediatek/vcodec/vcodec.h b/drivers/misc/mediatek/vcodec/vcodec.h
+index 8e44773c8..3cc478ffd 100644
+--- a/drivers/misc/mediatek/vcodec/vcodec.h
++++ b/drivers/misc/mediatek/vcodec/vcodec.h
+@@ -49,16 +49,38 @@ struct vcodec_engine;
+  * @power_off: undo @power_on.
+  * @enable_irq: unmask the engine interrupt.
+  * @disable_irq: mask the engine interrupt and wait for a running handler.
++ * @dvfs_begin: optional.  Start (or restart) the DVFS load monitor.  Called
++ *              from the INC_DEC_EMI_USER ioctl once the user count is
++ *              published, which is when downstream raises the decoder to
++ *              its default level and arms the monitor.
++ * @dvfs_monitor_start: optional.  Called after a successful LOCKHW, i.e.
++ *              once the engine is powered and (unless the instance is
++ *              secure) its interrupt is unmasked.
++ * @dvfs_adjustment: optional.  Called from UNLOCKHW after the engine has
++ *              been powered off; closes the current measurement window and
++ *              re-evaluates the operating point.
++ * @dvfs_idle: optional.  Called for the last close of /dev/Vcodec, after
++ *              the engine has been forced idle.
+  *
+- * All callbacks are mandatory.  They must be idempotent-safe in the sense
+- * that the core only calls them on a state transition (see the core's
+- * ->powered/->irq_enabled bookkeeping).
++ * The first four callbacks are mandatory.  They must be idempotent-safe in
++ * the sense that the core only calls them on a state transition (see the
++ * core's ->powered/->irq_enabled bookkeeping).
++ *
++ * The @dvfs_* callbacks are all invoked in process context with the core
++ * engine mutex (@eng->lock) already held.  They must not take @eng->lock
++ * again; state that needs serialisation belongs behind a driver-private
++ * mutex.  They must also be safe to call when the engine has no DVFS
++ * capability at all, in which case they simply do nothing.
+  */
+ struct vcodec_engine_ops {
+ 	int (*power_on)(struct vcodec_engine *eng);
+ 	void (*power_off)(struct vcodec_engine *eng);
+ 	int (*enable_irq)(struct vcodec_engine *eng);
+ 	void (*disable_irq)(struct vcodec_engine *eng);
++	void (*dvfs_begin)(struct vcodec_engine *eng);
++	void (*dvfs_monitor_start)(struct vcodec_engine *eng);
++	void (*dvfs_adjustment)(struct vcodec_engine *eng);
++	void (*dvfs_idle)(struct vcodec_engine *eng);
+ };
+ 
+ /**

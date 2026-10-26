@@ -1,0 +1,346 @@
+diff --git a/drivers/misc/mediatek/vcodec/vcodec-vdec.c b/drivers/misc/mediatek/vcodec/vcodec-vdec.c
+new file mode 100644
+index 000000000..bf48b93c5
+--- /dev/null
++++ b/drivers/misc/mediatek/vcodec/vcodec-vdec.c
+@@ -0,0 +1,340 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek MT6735 VDEC engine driver.
++ *
++ * The VDEC register windows are mapped into the vendor userspace codec
++ * libraries by the shared core; this driver only owns the clock tree, the
++ * power domains, the optional block reset, the IRQ line and the decoder
++ * ISR validation/acknowledgment sequence.
++ *
++ * Port from Samsung/MediaTek downstream
++ * drivers/misc/mediatek/videocodec/mt6735/videocodec_kernel_driver_D1.c
++ * (Android 6.0.1, kernel 3.18.19, SM-G532M).
++ */
++
++#include <linux/clk.h>
++#include <linux/device.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_domain.h>
++#include <linux/pm_runtime.h>
++#include <linux/reset.h>
++#include <linux/slab.h>
++
++#include "vcodec.h"
++
++/* Downstream videocodec_kernel_driver_D1.c:557 */
++#define VCODEC_VDEC_DEC_DONE		0xA4
++#define VCODEC_VDEC_DEC_DONE_BIT	BIT(16)
++/* Downstream videocodec_kernel_driver_D1.c:582-584 */
++#define VCODEC_VDEC_IRQ_ACK		(BIT(0) | BIT(4))
++#define VCODEC_VDEC_IRQ_CLR		BIT(4)
++/* Downstream videocodec_kernel_driver_D1.c:553 */
++#define VCODEC_VDEC_GCON_VDEC_ACTIVE	BIT(4)
++
++/*
++ * Downstream videocodec_kernel_driver_D1.c:337-338 (VDEC_BASE_PHY 0x16000000,
++ * VDEC_REGION 0x29000) and :2175-2176 (mmap accepts a start anywhere in that
++ * window).  The whole window is published to userspace, including the SMI
++ * LARB1 block at 0x16010000 that the vendor HAL is allowed to map.
++ */
++#define VCODEC_VDEC_MMAP_SIZE		0x29000
++
++struct vcodec_vdec {
++	struct device *dev;
++	void __iomem *vdec;
++	void __iomem *gcon;
++	phys_addr_t gcon_phys;
++	struct clk_bulk_data *clks;
++	int nclks;
++	struct reset_control *rst;
++	int irq;
++	bool registered;
++	struct vcodec_engine engine;
++};
++
++static int vcodec_vdec_power_on(struct vcodec_engine *eng)
++{
++	struct vcodec_vdec *vdec = eng->priv;
++	int ret;
++
++	/*
++	 * Resuming the device also resumes the power domains attached in
++	 * probe, in device-tree order (DIS, then VDE), through the PM
++	 * runtime device links.  Downstream
++	 * videocodec_kernel_driver_D1.c:402-431 powers SCP_SYS_DIS before
++	 * SCP_SYS_VDE.
++	 */
++	ret = pm_runtime_resume_and_get(vdec->dev);
++	if (ret) {
++		dev_err(vdec->dev, "failed to resume VDEC power domains: %d\n", ret);
++		return ret;
++	}
++
++	/*
++	 * Downstream videocodec_kernel_driver_D1.c:395-397,402-431 enables the
++	 * SCP_SYS_DIS, DISP0_SMI_COMMON, SCP_SYS_VDE, VDEC0_VDEC and
++	 * VDEC1_LARB clocks in this order.
++	 */
++	ret = clk_bulk_prepare_enable(vdec->nclks, vdec->clks);
++	if (ret) {
++		dev_err(vdec->dev, "failed to enable VDEC clocks: %d\n", ret);
++		pm_runtime_put_sync(vdec->dev);
++		return ret;
++	}
++
++	if (vdec->rst) {
++		ret = reset_control_deassert(vdec->rst);
++		if (ret) {
++			dev_err(vdec->dev, "failed to deassert VDEC reset: %d\n", ret);
++			clk_bulk_disable_unprepare(vdec->nclks, vdec->clks);
++			pm_runtime_put_sync(vdec->dev);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++static void vcodec_vdec_power_off(struct vcodec_engine *eng)
++{
++	struct vcodec_vdec *vdec = eng->priv;
++
++	/*
++	 * Downstream videocodec_kernel_driver_D1.c:444-455 disables the same
++	 * clocks in reverse order and never touches the block reset; the
++	 * reset is kept asserted here so that userspace always starts from
++	 * a defined block state on the next power_on.
++	 */
++	if (vdec->rst)
++		reset_control_assert(vdec->rst);
++
++	clk_bulk_disable_unprepare(vdec->nclks, vdec->clks);
++
++	/*
++	 * Drop the power domain references last, after the clock gates are
++	 * off, as downstream does at
++	 * videocodec_kernel_driver_D1.c:451-455.
++	 */
++	pm_runtime_put_sync(vdec->dev);
++}
++
++static int vcodec_vdec_enable_irq(struct vcodec_engine *eng)
++{
++	struct vcodec_vdec *vdec = eng->priv;
++
++	/* Downstream videocodec_kernel_driver_D1.c:855 */
++	enable_irq(vdec->irq);
++
++	return 0;
++}
++
++static void vcodec_vdec_disable_irq(struct vcodec_engine *eng)
++{
++	struct vcodec_vdec *vdec = eng->priv;
++
++	/* Downstream videocodec_kernel_driver_D1.c:848 */
++	disable_irq(vdec->irq);
++}
++
++static const struct vcodec_engine_ops vcodec_vdec_ops = {
++	.power_on = vcodec_vdec_power_on,
++	.power_off = vcodec_vdec_power_off,
++	.enable_irq = vcodec_vdec_enable_irq,
++	.disable_irq = vcodec_vdec_disable_irq,
++};
++
++/*
++ * Downstream videocodec_kernel_driver_D1.c:541-594 (dec_isr): a valid
++ * decoder interrupt requires the VDEC GCON "active" bit to be clear and the
++ * decode-done bit to be set; the status is cleared by first setting bit 0
++ * together with bit 4 and then clearing bit 4 again.
++ */
++static irqreturn_t vcodec_vdec_isr(int irq, void *data)
++{
++	struct vcodec_vdec *vdec = data;
++	u32 cg_status, dec_status;
++
++	cg_status = readl(vdec->gcon);
++	if (cg_status & VCODEC_VDEC_GCON_VDEC_ACTIVE) {
++		dev_err_ratelimited(vdec->dev,
++				    "DEC ISR, VDEC active is not 0x0 (0x%08x)\n",
++				    cg_status);
++		return IRQ_HANDLED;
++	}
++
++	dec_status = readl(vdec->vdec + VCODEC_VDEC_DEC_DONE);
++	if (!(dec_status & VCODEC_VDEC_DEC_DONE_BIT)) {
++		dev_err_ratelimited(vdec->dev,
++				    "DEC ISR, decode done status is not 0x1 (0x%08x)\n",
++				    dec_status);
++		return IRQ_HANDLED;
++	}
++
++	writel(readl(vdec->vdec + VCODEC_VDEC_DEC_DONE) | VCODEC_VDEC_IRQ_ACK,
++	       vdec->vdec + VCODEC_VDEC_DEC_DONE);
++	writel(readl(vdec->vdec + VCODEC_VDEC_DEC_DONE) & ~VCODEC_VDEC_IRQ_CLR,
++	       vdec->vdec + VCODEC_VDEC_DEC_DONE);
++
++	vcodec_engine_irq(&vdec->engine, 0);
++
++	return IRQ_HANDLED;
++}
++
++static int vcodec_vdec_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct dev_pm_domain_list *pd_list = NULL;
++	struct vcodec_vdec *vdec;
++	struct resource *res;
++	int ret;
++
++	vdec = devm_kzalloc(dev, sizeof(*vdec), GFP_KERNEL);
++	if (!vdec)
++		return -ENOMEM;
++
++	vdec->dev = dev;
++	platform_set_drvdata(pdev, vdec);
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "vdec");
++	if (!res) {
++		dev_err(dev, "missing \"vdec\" register window\n");
++		return -ENODEV;
++	}
++	vdec->vdec = devm_ioremap_resource(dev, res);
++	if (IS_ERR(vdec->vdec))
++		return dev_err_probe(dev, PTR_ERR(vdec->vdec),
++				     "failed to map \"vdec\" register window\n");
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "gcon");
++	if (!res) {
++		dev_err(dev, "missing \"gcon\" register window\n");
++		return -ENODEV;
++	}
++	vdec->gcon_phys = res->start;
++	vdec->gcon = devm_ioremap_resource(dev, res);
++	if (IS_ERR(vdec->gcon))
++		return dev_err_probe(dev, PTR_ERR(vdec->gcon),
++				     "failed to map \"gcon\" register window\n");
++
++	/* Downstream videocodec_kernel_driver_D1.c:2290-2357 */
++	ret = devm_clk_bulk_get_all(dev, &vdec->clks);
++	if (ret < 0)
++		return dev_err_probe(dev, ret, "failed to get VDEC clocks\n");
++	if (!ret) {
++		dev_err(dev, "no VDEC clocks described in device tree\n");
++		return -ENODEV;
++	}
++	vdec->nclks = ret;
++
++	/*
++	 * The PM core only attaches a single power domain per device
++	 * (drivers/pmdomain/core.c: genpd_dev_pm_attach() bails out when the
++	 * node has more than one), so attach the DIS and VDE domains of the
++	 * DT node here.  The device links created for them make the
++	 * pm_runtime calls in power_on/power_off drive both domains in DT
++	 * order.  Downstream videocodec_kernel_driver_D1.c:402-455 powers
++	 * and gates SCP_SYS_DIS and SCP_SYS_VDE around the VDEC clocks.
++	 *
++	 * -EEXIST means the node has a single domain, already attached to
++	 * @dev by the platform bus; the pm_runtime calls then drive it
++	 * directly.
++	 */
++	ret = devm_pm_domain_attach_list(dev, NULL, &pd_list);
++	if (ret < 0 && ret != -EEXIST)
++		return dev_err_probe(dev, ret, "failed to attach VDEC power domains\n");
++	if (!ret) {
++		dev_err(dev, "no VDEC power domains described in device tree\n");
++		return -ENODEV;
++	}
++
++	/*
++	 * Downstream has no block reset handling.  The MT6735 vdecsys clock
++	 * driver exports MT6735_VDEC_RST0_VDEC, so use it when the board
++	 * describes it and work without it otherwise.
++	 */
++	vdec->rst = devm_reset_control_get_optional_exclusive(dev, "vdec");
++	if (IS_ERR(vdec->rst))
++		return dev_err_probe(dev, PTR_ERR(vdec->rst),
++				     "failed to get VDEC reset\n");
++
++	vdec->irq = platform_get_irq(pdev, 0);
++	if (vdec->irq < 0)
++		return vdec->irq;
++
++	pm_runtime_enable(dev);
++
++	/* Downstream videocodec_kernel_driver_D1.c:2272-2286 */
++	ret = devm_request_irq(dev, vdec->irq, vcodec_vdec_isr, 0,
++			       dev_name(dev), vdec);
++	if (ret) {
++		dev_err(dev, "failed to request VDEC IRQ %d: %d\n", vdec->irq, ret);
++		goto err_pm;
++	}
++
++	/* The core unmasks the line from its LOCKHW ioctl. */
++	disable_irq(vdec->irq);
++
++	vdec->engine.name = "vdec";
++	vdec->engine.id = VCODEC_ENGINE_DEC;
++	vdec->engine.dev = dev;
++	vdec->engine.ops = &vcodec_vdec_ops;
++	vdec->engine.priv = vdec;
++	vdec->engine.regions[0].phys = vdec->gcon_phys;
++	vdec->engine.regions[0].size = VCODEC_VDEC_MMAP_SIZE;
++	vdec->engine.num_regions = 1;
++
++	ret = vcodec_engine_register(&vdec->engine);
++	if (ret) {
++		dev_err(dev, "failed to register VDEC engine: %d\n", ret);
++		goto err_pm;
++	}
++	vdec->registered = true;
++
++	return 0;
++
++err_pm:
++	pm_runtime_disable(dev);
++	return ret;
++}
++
++static void vcodec_vdec_remove(struct platform_device *pdev)
++{
++	struct vcodec_vdec *vdec = platform_get_drvdata(pdev);
++
++	if (vdec->registered) {
++		vcodec_engine_unregister(&vdec->engine);
++		vdec->registered = false;
++	}
++
++	pm_runtime_disable(vdec->dev);
++}
++
++static const struct of_device_id vcodec_vdec_of_match[] = {
++	{ .compatible = "mediatek,mt6735-vdec" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, vcodec_vdec_of_match);
++
++static struct platform_driver vcodec_vdec_driver = {
++	.probe = vcodec_vdec_probe,
++	.remove = vcodec_vdec_remove,
++	.driver = {
++		.name = "mtk-vcodec-vdec",
++		.of_match_table = vcodec_vdec_of_match,
++		.suppress_bind_attrs = true,
++	},
++};
++
++int vcodec_vdec_register(void)
++{
++	return platform_driver_register(&vcodec_vdec_driver);
++}
++
++void vcodec_vdec_unregister(void)
++{
++	platform_driver_unregister(&vcodec_vdec_driver);
++}

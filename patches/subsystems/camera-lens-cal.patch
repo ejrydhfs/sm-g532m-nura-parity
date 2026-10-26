@@ -1,0 +1,590 @@
+diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
+index 5eb1e0e0a..b870ba4b8 100644
+--- a/drivers/media/i2c/Kconfig
++++ b/drivers/media/i2c/Kconfig
+@@ -179,6 +179,18 @@ config VIDEO_IMX219
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called imx219.
+ 
++config VIDEO_IMX219_EEPROM
++	tristate "Samsung IMX219 module EEPROM support"
++	depends on I2C && NVMEM
++	help
++	  This is a driver for the calibration EEPROM of Samsung IMX219
++	  camera modules. It exposes the module manufacturer information,
++	  the Samsung module ID and the AF macro/pan calibration values as
++	  a read-only NVMEM device and as sysfs attributes.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called imx219-eeprom.
++
+ config VIDEO_IMX258
+ 	tristate "Sony IMX258 sensor support"
+ 	select V4L2_CCI_I2C
+diff --git a/drivers/media/i2c/Makefile b/drivers/media/i2c/Makefile
+index a3a6396df..401852478 100644
+--- a/drivers/media/i2c/Makefile
++++ b/drivers/media/i2c/Makefile
+@@ -50,6 +50,7 @@ obj-$(CONFIG_VIDEO_IMX111) += imx111.o
+ obj-$(CONFIG_VIDEO_IMX208) += imx208.o
+ obj-$(CONFIG_VIDEO_IMX214) += imx214.o
+ obj-$(CONFIG_VIDEO_IMX219) += imx219.o
++obj-$(CONFIG_VIDEO_IMX219_EEPROM) += imx219-eeprom.o
+ obj-$(CONFIG_VIDEO_IMX258) += imx258.o
+ obj-$(CONFIG_VIDEO_IMX274) += imx274.o
+ obj-$(CONFIG_VIDEO_IMX283) += imx283.o
+diff --git a/drivers/media/i2c/dw9807-vcm.c b/drivers/media/i2c/dw9807-vcm.c
+index 4148009e0..b05291f29 100644
+--- a/drivers/media/i2c/dw9807-vcm.c
++++ b/drivers/media/i2c/dw9807-vcm.c
+@@ -1,11 +1,31 @@
+ // SPDX-License-Identifier: GPL-2.0
+ // Copyright (C) 2018 Intel Corporation
++/*
++ * Port from Samsung/MTK downstream
++ * drivers/misc/mediatek/lens/common/dw9807af/DW9807AF.c
++ * (Copyright (C) 2015 MediaTek Inc., GPL-2.0).
++ *
++ * The downstream AF driver is an ioctl-based character driver attached to the
++ * "mediatek,camera_main_af" i2c node (7-bit address 0x0c).  This file keeps
++ * the upstream V4L2 subdev model and only adopts the downstream register
++ * programming: 10-bit DAC split over 0x03/0x04 (already identical upstream)
++ * and the "ring control mode" value written to 0x02 when the module is
++ * powered up.  The latter is gated on the "samsung,dw9807-vcm" compatible
++ * through OF match data, so "dongwoon,dw9807-vcm" / "dongwoon,dw9807" keep
++ * the upstream direct-mode power-up unchanged.
++ *
++ * The downstream eflash helpers s4DW9807AF_Eflash_ReadReg()/_WriteReg() poke a
++ * separate EEPROM slave on the same adapter; they are NOT implemented here.
++ * That calibration data is provided by the imx219-eeprom nvmem driver
++ * (drivers/media/i2c/imx219-eeprom.c).
++ */
+ 
+ #include <linux/acpi.h>
+ #include <linux/delay.h>
+ #include <linux/i2c.h>
+ #include <linux/iopoll.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/pm_runtime.h>
+ #include <media/v4l2-ctrls.h>
+ #include <media/v4l2-device.h>
+@@ -36,12 +56,32 @@
+ #define DW9807_MODE_ADDR	0x06
+ #define DW9807_RESONANCE_ADDR	0x07
+ 
++/*
++ * Control register 0x02 values.  The Samsung/MTK module needs "ring control
++ * mode" (bit 1) at power-up: DW9807AF.c:190-194 initdrv() writes 0x02 = 0x02.
++ * The generic (Dongwoon) path keeps the upstream value 0x00 (direct mode,
++ * power down cleared) so existing users see no change.
++ */
++#define DW9807_CTL_DIRECT	0x00
++#define DW9807_CTL_PD		0x01
++#define DW9807_CTL_RING		0x02
++
+ #define MAX_RETRY		10
+ 
++/**
++ * struct dw9807_match_data - per-compatible quirks
++ * @ring_mode: power up in ring control mode (0x02 = 0x02) instead of the
++ *             upstream direct mode (0x02 = 0x00)
++ */
++struct dw9807_match_data {
++	bool ring_mode;
++};
++
+ struct dw9807_device {
+ 	struct v4l2_ctrl_handler ctrls_vcm;
+ 	struct v4l2_subdev sd;
+ 	u16 current_val;
++	bool ring_mode;
+ };
+ 
+ static inline struct dw9807_device *sd_to_dw9807_vcm(
+@@ -75,6 +115,13 @@ static int dw9807_i2c_check(struct i2c_client *client)
+ 
+ static int dw9807_set_dac(struct i2c_client *client, u16 data)
+ {
++	/*
++	 * 10-bit DAC split over 0x03 (bits 1:0) and 0x04, identical to the
++	 * downstream driver's s4AF_WriteReg() (DW9807AF.c:128-161): MSB is
++	 * masked with 0x03 and LSB carries the low 8 bits.  The downstream
++	 * driver issues two 2-byte writes (0x03 then 0x04); the 3-byte
++	 * auto-increment write below lands on the same two registers.
++	 */
+ 	const char tx_data[3] = {
+ 		DW9807_MSB_ADDR, ((data >> 8) & 0x03), (data & 0xff)
+ 	};
+@@ -177,6 +224,7 @@ static int dw9807_init_controls(struct dw9807_device *dev_vcm)
+ 
+ static int dw9807_probe(struct i2c_client *client)
+ {
++	const struct dw9807_match_data *data;
+ 	struct dw9807_device *dw9807_dev;
+ 	int rval;
+ 
+@@ -185,6 +233,14 @@ static int dw9807_probe(struct i2c_client *client)
+ 	if (dw9807_dev == NULL)
+ 		return -ENOMEM;
+ 
++	/*
++	 * Only "samsung,dw9807-vcm" carries match data; any other compatible
++	 * (or a non-OF match) keeps ring_mode = false, i.e. the upstream
++	 * direct-mode power-up.
++	 */
++	data = of_device_get_match_data(&client->dev);
++	dw9807_dev->ring_mode = data ? data->ring_mode : false;
++
+ 	v4l2_i2c_subdev_init(&dw9807_dev->sd, client, &dw9807_ops);
+ 	dw9807_dev->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+ 	dw9807_dev->sd.internal_ops = &dw9807_int_ops;
+@@ -236,7 +292,7 @@ static int __maybe_unused dw9807_vcm_suspend(struct device *dev)
+ 	struct i2c_client *client = to_i2c_client(dev);
+ 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+ 	struct dw9807_device *dw9807_dev = sd_to_dw9807_vcm(sd);
+-	const char tx_data[2] = { DW9807_CTL_ADDR, 0x01 };
++	const char tx_data[2] = { DW9807_CTL_ADDR, DW9807_CTL_PD };
+ 	int ret, val;
+ 
+ 	for (val = dw9807_dev->current_val & ~(DW9807_CTRL_STEPS - 1);
+@@ -268,10 +324,18 @@ static int  __maybe_unused dw9807_vcm_resume(struct device *dev)
+ 	struct i2c_client *client = to_i2c_client(dev);
+ 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+ 	struct dw9807_device *dw9807_dev = sd_to_dw9807_vcm(sd);
+-	const char tx_data[2] = { DW9807_CTL_ADDR, 0x00 };
++	const char tx_data[2] = {
++		DW9807_CTL_ADDR,
++		dw9807_dev->ring_mode ? DW9807_CTL_RING : DW9807_CTL_DIRECT
++	};
+ 	int ret, val;
+ 
+-	/* Power on */
++	/*
++	 * Power on.  Samsung/MTK modules additionally need ring control mode,
++	 * written by the downstream driver at the first lens move
++	 * (DW9807AF.c:190-194, 209); every other compatible keeps the upstream
++	 * direct-mode value so their behaviour is unchanged.
++	 */
+ 	ret = i2c_master_send(client, tx_data, sizeof(tx_data));
+ 	if (ret < 0) {
+ 		dev_err(&client->dev, "I2C write CTL fail ret = %d\n", ret);
+@@ -291,7 +355,20 @@ static int  __maybe_unused dw9807_vcm_resume(struct device *dev)
+ 	return 0;
+ }
+ 
++static const struct dw9807_match_data dw9807_samsung_data = {
++	.ring_mode = true,
++};
++
+ static const struct of_device_id dw9807_of_table[] = {
++	/*
++	 * Samsung/MTK modules (downstream i2c node "camera_main_af@18",
++	 * i.e. 7-bit address 0x0c, DW9807AF.c:29 AF_I2C_SLAVE_ADDR 0x18).
++	 * These power up in ring control mode (DW9807AF.c:190-194).
++	 */
++	{
++		.compatible = "samsung,dw9807-vcm",
++		.data = &dw9807_samsung_data,
++	},
+ 	{ .compatible = "dongwoon,dw9807-vcm" },
+ 	/* Compatibility for older firmware, NEVER USE THIS IN FIRMWARE! */
+ 	{ .compatible = "dongwoon,dw9807" },
+diff --git a/drivers/media/i2c/imx219-eeprom.c b/drivers/media/i2c/imx219-eeprom.c
+new file mode 100644
+index 000000000..f3ccaea77
+--- /dev/null
++++ b/drivers/media/i2c/imx219-eeprom.c
+@@ -0,0 +1,392 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Samsung/MTK IMX219 module EEPROM (camera calibration data) provider
++ *
++ * Port from Samsung/MTK downstream
++ *   drivers/misc/mediatek/imgsensor/src/mt6735/imx219_mipi_raw/imx219_eeprom.c
++ *   drivers/misc/mediatek/cam_cal/src/mt6735/imx219_eeprom/imx219_eeprom.c
++ *   drivers/misc/mediatek/cam_cal/inc/cam_cal.h
++ * (Copyright (C) 2015 MediaTek Inc., GPL-2.0)
++ *
++ * Downstream exposes the calibration data in two ways:
++ *   - a character device ("CAM_CAL_DRV") with the CAM_CALIOC_G_READ ioctl
++ *     (cam_cal.h:40) which copies pre-parsed bytes to userspace, and
++ *   - Samsung LED class attributes in drivers/leds/leds_s2mu005.c
++ *     (rear_camfw/rear_afcal/rear_moduleid, lines 730-1080) backed by
++ *     get_imx219_mfr_info(), get_imx219_af_macro_cal(),
++ *     get_imx219_af_pan_cal() and get_imx219_moduleid().
++ *
++ * This driver keeps the data, drops the legacy ABI: the EEPROM is exported as
++ * a read-only nvmem device (consumers/cells resolve through the DT layout)
++ * plus sysfs attributes carrying the same fields the downstream getters
++ * returned.  The CAM_CALIOC_G_READ -> nvmem mapping is documented in
++ * $M/logs/camera-lens-cal.md.
++ *
++ * Layout, all offsets are EEPROM byte offsets:
++ *   0x0020..0x002a  manufacturer information string, 11 bytes
++ *                   (imx219_eeprom.c:413-416 get_imx219_mfr_info)
++ *   0x0050..0x0059  Samsung module ID, 10 bytes
++ *                   (imx219_eeprom.c:427-431, CONFIG_GET_REAR_MODULE_ID=y)
++ *   0x010c..0x010f  AF macro calibration, little endian u32
++ *                   (imx219_eeprom.c:366, 418-421)
++ *   0x0110..0x0113  AF pan/infinity calibration, little endian u32
++ *                   (imx219_eeprom.c:367, 422-426)
++ *   0x0300..0x0301  LSC block length (little endian u16), payload follows
++ *                   (imx219_eeprom.c:324-332)
++ *
++ * The legacy "mtk format" block read by read_imx219_eeprom_mtk_fmt() uses a
++ * different slave address (0xa0..0xa6, i.e. the 24C16 page aliases) and is
++ * only invoked by the mt6735m sensor variant
++ * (imgsensor/src/mt6735m/imx219_mipi_raw/imx219mipiraw_Sensor.c:1238); it is
++ * not registered here.
++ */
++
++#include <linux/device.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/nvmem-provider.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++
++/*
++ * Downstream read address for the sysfs block: IMX219_EEPROM_DEVICE_ID is
++ * 0xb0 (imx219_eeprom.h:40) and iReadRegI2C() stores "i2cId >> 1" into the
++ * i2c client (kd_sensorlist.c:454-462), so the 7-bit address is 0x58.  The
++ * DT node must use reg = <0x58>.
++ *
++ * read_cmos_sensor() always sends two address bytes, high byte first
++ * (imx219_eeprom.c:151-157), i.e. 16-bit register addressing.  Confirmed in
++ * the shipped ROM: read_imx219_eeprom() at 0xc04f4598 sends a 2-byte buffer
++ * with a_sizeSendData = 2.  Hence no SMBus byte/word register accessor can be
++ * used for the address phase; a raw 2-byte write plus a 1-byte read is
++ * required.
++ */
++#define IMX219_EEPROM_ADDR_LEN		2
++
++#define IMX219_EEPROM_MFR_INFO_OFFSET	0x0020
++#define IMX219_EEPROM_MFR_INFO_LEN	11
++#define IMX219_EEPROM_MODULE_ID_OFFSET	0x0050
++#define IMX219_EEPROM_MODULE_ID_LEN	10
++#define IMX219_EEPROM_AF_MACRO_OFFSET	0x010c
++#define IMX219_EEPROM_AF_PAN_OFFSET	0x0110
++#define IMX219_EEPROM_AF_CAL_LEN	4
++
++/*
++ * Downstream declares no total device size.  The highest fixed offset it
++ * reads is the LSC length prefix at 0x300 (imx219_eeprom.c:324-332); 0x400
++ * keeps every metadata field and the LSC header addressable without claiming
++ * a part size.  [INFERENCE]
++ */
++#define IMX219_EEPROM_SIZE		0x400
++
++/* Downstream sentinel: the calibration u32s start at -1 (imx219_eeprom.c:362). */
++#define IMX219_EEPROM_CAL_INVALID	0xffffffff
++
++/**
++ * struct imx219_eeprom - module EEPROM state
++ * @client: i2c client of the EEPROM
++ * @lock: serialises the byte accesses issued on the shared adapter
++ * @nvmem: registered nvmem device
++ */
++struct imx219_eeprom {
++	struct i2c_client *client;
++	struct mutex lock;
++	struct nvmem_device *nvmem;
++};
++
++/*
++ * Read one byte at @offset.  This is the same transfer the downstream helper
++ * performs: address write (2 bytes, big endian) followed by a 1-byte read
++ * (imx219_eeprom.c:151-157), expressed here as a single i2c_transfer so that
++ * the address phase uses a repeated start.
++ */
++static int imx219_eeprom_read_byte(struct imx219_eeprom *eeprom, u16 offset,
++				   u8 *val)
++{
++	struct i2c_client *client = eeprom->client;
++	u8 addr[IMX219_EEPROM_ADDR_LEN] = { offset >> 8, offset & 0xff };
++	struct i2c_msg msgs[2] = {
++		{
++			.addr = client->addr,
++			.flags = 0,
++			.len = sizeof(addr),
++			.buf = addr,
++		}, {
++			.addr = client->addr,
++			.flags = I2C_M_RD,
++			.len = 1,
++			.buf = val,
++		},
++	};
++	int ret;
++
++	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
++	if (ret < 0)
++		return ret;
++	if (ret != ARRAY_SIZE(msgs))
++		return -EIO;
++
++	return 0;
++}
++
++static int imx219_eeprom_nvmem_read(void *priv, unsigned int offset,
++				    void *val, size_t bytes)
++{
++	struct imx219_eeprom *eeprom = priv;
++	u8 *buf = val;
++	size_t i;
++	int ret;
++
++	if (offset > IMX219_EEPROM_SIZE || bytes > IMX219_EEPROM_SIZE - offset)
++		return -EINVAL;
++
++	mutex_lock(&eeprom->lock);
++	for (i = 0; i < bytes; i++) {
++		ret = imx219_eeprom_read_byte(eeprom, offset + i, &buf[i]);
++		if (ret)
++			goto out;
++	}
++	ret = 0;
++
++out:
++	mutex_unlock(&eeprom->lock);
++
++	return ret;
++}
++
++static int imx219_eeprom_read_block(struct imx219_eeprom *eeprom,
++				    u16 offset, void *buf, size_t len)
++{
++	return imx219_eeprom_nvmem_read(eeprom, offset, buf, len);
++}
++
++/*
++ * Unprogrammed modules read back all-0x00 or all-0xff.  Downstream did not
++ * check this and happily printed the raw bytes; returning -ENODATA keeps
++ * erased data from being presented as calibration.  [INFERENCE]
++ */
++static bool imx219_eeprom_block_is_blank(const u8 *buf, size_t len)
++{
++	size_t i;
++
++	for (i = 0; i < len; i++)
++		if (buf[i] != 0x00 && buf[i] != 0xff)
++			return false;
++
++	return true;
++}
++
++/*
++ * The downstream readers fill a u32 byte by byte from increasing offsets
++ * (imx219_eeprom.c:370-380) on a little endian CPU, hence little endian.
++ */
++static int imx219_eeprom_read_cal(struct imx219_eeprom *eeprom, u16 offset,
++				  u32 *val)
++{
++	u8 raw[IMX219_EEPROM_AF_CAL_LEN];
++	int ret;
++
++	ret = imx219_eeprom_read_block(eeprom, offset, raw, sizeof(raw));
++	if (ret)
++		return ret;
++
++	*val = (u32)raw[0] | ((u32)raw[1] << 8) |
++	       ((u32)raw[2] << 16) | ((u32)raw[3] << 24);
++
++	return 0;
++}
++
++static ssize_t mfr_info_show(struct device *dev, struct device_attribute *attr,
++			     char *buf)
++{
++	struct imx219_eeprom *eeprom = dev_get_drvdata(dev);
++	char info[IMX219_EEPROM_MFR_INFO_LEN + 1] = { 0 };
++	int ret;
++
++	ret = imx219_eeprom_read_block(eeprom, IMX219_EEPROM_MFR_INFO_OFFSET,
++				       info, IMX219_EEPROM_MFR_INFO_LEN);
++	if (ret)
++		return ret;
++
++	if (imx219_eeprom_block_is_blank(info, IMX219_EEPROM_MFR_INFO_LEN))
++		return -ENODATA;
++
++	return sysfs_emit(buf, "%s\n", info);
++}
++
++static ssize_t module_id_show(struct device *dev, struct device_attribute *attr,
++			      char *buf)
++{
++	struct imx219_eeprom *eeprom = dev_get_drvdata(dev);
++	u8 id[IMX219_EEPROM_MODULE_ID_LEN];
++	int ret;
++
++	ret = imx219_eeprom_read_block(eeprom, IMX219_EEPROM_MODULE_ID_OFFSET,
++				       id, sizeof(id));
++	if (ret)
++		return ret;
++
++	if (imx219_eeprom_block_is_blank(id, sizeof(id)))
++		return -ENODATA;
++
++	/* Same formatting as leds_s2mu005.c:1042-1057. */
++	return sysfs_emit(buf, "%c%c%c%c%c%02X%02X%02X%02X%02X\n",
++			  id[0], id[1], id[2], id[3], id[4],
++			  id[5], id[6], id[7], id[8], id[9]);
++}
++
++static ssize_t af_macro_cal_show(struct device *dev,
++				 struct device_attribute *attr, char *buf)
++{
++	struct imx219_eeprom *eeprom = dev_get_drvdata(dev);
++	u32 val;
++	int ret;
++
++	ret = imx219_eeprom_read_cal(eeprom, IMX219_EEPROM_AF_MACRO_OFFSET,
++				     &val);
++	if (ret)
++		return ret;
++	if (val == IMX219_EEPROM_CAL_INVALID)
++		return -ENODATA;
++
++	return sysfs_emit(buf, "%u\n", val);
++}
++
++static ssize_t af_pan_cal_show(struct device *dev,
++			       struct device_attribute *attr, char *buf)
++{
++	struct imx219_eeprom *eeprom = dev_get_drvdata(dev);
++	u32 val;
++	int ret;
++
++	ret = imx219_eeprom_read_cal(eeprom, IMX219_EEPROM_AF_PAN_OFFSET, &val);
++	if (ret)
++		return ret;
++	if (val == IMX219_EEPROM_CAL_INVALID)
++		return -ENODATA;
++
++	return sysfs_emit(buf, "%u\n", val);
++}
++
++/*
++ * Combined AF calibration, byte-for-byte compatible with the downstream
++ * "rear_afcal" attribute (leds_s2mu005.c:820-827): "1 <macro> <pan>".
++ */
++static ssize_t afcal_show(struct device *dev, struct device_attribute *attr,
++			  char *buf)
++{
++	struct imx219_eeprom *eeprom = dev_get_drvdata(dev);
++	u32 macro, pan;
++	int ret;
++
++	ret = imx219_eeprom_read_cal(eeprom, IMX219_EEPROM_AF_MACRO_OFFSET,
++				     &macro);
++	if (ret)
++		return ret;
++	ret = imx219_eeprom_read_cal(eeprom, IMX219_EEPROM_AF_PAN_OFFSET, &pan);
++	if (ret)
++		return ret;
++	if (macro == IMX219_EEPROM_CAL_INVALID || pan == IMX219_EEPROM_CAL_INVALID)
++		return -ENODATA;
++
++	return sysfs_emit(buf, "1 %u %u\n", macro, pan);
++}
++
++static DEVICE_ATTR_RO(mfr_info);
++static DEVICE_ATTR_RO(module_id);
++static DEVICE_ATTR_RO(af_macro_cal);
++static DEVICE_ATTR_RO(af_pan_cal);
++static DEVICE_ATTR_RO(afcal);
++
++static struct attribute *imx219_eeprom_attrs[] = {
++	&dev_attr_mfr_info.attr,
++	&dev_attr_module_id.attr,
++	&dev_attr_af_macro_cal.attr,
++	&dev_attr_af_pan_cal.attr,
++	&dev_attr_afcal.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(imx219_eeprom);
++
++static int imx219_eeprom_probe(struct i2c_client *client)
++{
++	struct imx219_eeprom *eeprom;
++	struct nvmem_config config = {
++		.name = "imx219-eeprom",
++		.id = NVMEM_DEVID_NONE,
++		.type = NVMEM_TYPE_EEPROM,
++		.read_only = true,
++		.size = IMX219_EEPROM_SIZE,
++		.word_size = 1,
++		.stride = 1,
++	};
++	int ret;
++
++	eeprom = devm_kzalloc(&client->dev, sizeof(*eeprom), GFP_KERNEL);
++	if (!eeprom)
++		return -ENOMEM;
++
++	mutex_init(&eeprom->lock);
++	eeprom->client = client;
++	dev_set_drvdata(&client->dev, eeprom);
++
++	config.dev = &client->dev;
++	config.of_node = client->dev.of_node;
++	config.priv = eeprom;
++	config.reg_read = imx219_eeprom_nvmem_read;
++
++	/*
++	 * No register access here: the EEPROM shares the module rails with the
++	 * sensor (vcamio/vcama/vcamaf, brought up by the sensor power
++	 * sequence), so it is not readable before the camera is powered.
++	 * Downstream behaves the same way: imx219_update_sysfs_information()
++	 * runs from imx219_open() after the module is powered
++	 * (imx219mipiraw_Sensor.c:1202).
++	 */
++	eeprom->nvmem = devm_nvmem_register(&client->dev, &config);
++	if (IS_ERR(eeprom->nvmem)) {
++		dev_err(&client->dev, "failed to register nvmem device\n");
++		return PTR_ERR(eeprom->nvmem);
++	}
++
++	ret = device_add_groups(&client->dev, imx219_eeprom_groups);
++	if (ret) {
++		dev_err(&client->dev, "failed to add sysfs attributes\n");
++		return ret;
++	}
++
++	return 0;
++}
++
++static void imx219_eeprom_remove(struct i2c_client *client)
++{
++	device_remove_groups(&client->dev, imx219_eeprom_groups);
++}
++
++static const struct of_device_id imx219_eeprom_of_table[] = {
++	{ .compatible = "samsung,imx219-eeprom" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, imx219_eeprom_of_table);
++
++static const struct i2c_device_id imx219_eeprom_id_table[] = {
++	{ "imx219-eeprom", 0 },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(i2c, imx219_eeprom_id_table);
++
++static struct i2c_driver imx219_eeprom_driver = {
++	.driver = {
++		.name = "imx219-eeprom",
++		.of_match_table = imx219_eeprom_of_table,
++	},
++	.probe = imx219_eeprom_probe,
++	.remove = imx219_eeprom_remove,
++	.id_table = imx219_eeprom_id_table,
++};
++
++module_i2c_driver(imx219_eeprom_driver);
++
++MODULE_DESCRIPTION("Samsung/MTK IMX219 module EEPROM calibration provider");
++MODULE_LICENSE("GPL");

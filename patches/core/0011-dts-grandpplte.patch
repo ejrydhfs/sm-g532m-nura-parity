@@ -1,0 +1,183 @@
+diff --git a/arch/arm64/boot/dts/mediatek/mt6735.dtsi b/arch/arm64/boot/dts/mediatek/mt6735.dtsi
+index d9fbf604d..3a1cb73f7 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6735.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6735.dtsi
+@@ -295,7 +295,7 @@ pio: pin-controller@10211000 {
+ 
+ 			gpio-controller;
+ 			#gpio-cells = <2>;
+-			gpio-ranges = <&pio 0 0 203>;
++			gpio-ranges = <&pio 0 0 204>;
+ 
+ 			interrupt-controller;
+ 			#interrupt-cells = <2>;
+diff --git a/arch/arm64/boot/dts/mediatek/mt6737t-samsung-grandpplte.dts b/arch/arm64/boot/dts/mediatek/mt6737t-samsung-grandpplte.dts
+index 77eb80566..e86a04db1 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6737t-samsung-grandpplte.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6737t-samsung-grandpplte.dts
+@@ -58,20 +58,7 @@ haptics {
+ 		haptic-supply = <&mt6328_vibr_reg>;
+ 		max-microvolt = <3300000>;
+ 		min-microvolt = <3300000>;
+-	};
+-
+-	backlight: pwm-backlight {
+-		compatible = "pwm-backlight";
+-
+-		pwms = <&disp_pwm 0 5000000>;
+-		enable-gpios = <&pio 7 GPIO_ACTIVE_HIGH>;
+-
+-		pinctrl-names = "default";
+-		pinctrl-0 = <&backlight_default>;
+-
+-		brightness-levels = <0 1023>;
+-		num-interpolated-steps = <1023>;
+-		default-brightness-level = <576>;
++		max-timeout-ms = <10000>;
+ 	};
+ 
+ 	reserved-memory {
+@@ -87,7 +74,7 @@ vdd_lcd_3p0: regulator-vdd-lcd-3p0 {
+ 		regulator-min-microvolt = <3000000>;
+ 		regulator-max-microvolt = <3000000>;
+ 		startup-delay-us = <80>;
+-		gpio = <&pio 184 0>;
++		gpio = <&pio 61 0>;
+ 		enable-active-high;
+ 	};
+ 
+@@ -143,7 +130,8 @@ panel: panel@0 {
+ 		vdd-supply = <&vdd_lcd_3p0>;
+ 		vddio-supply = <&mt6328_vio18_reg>;
+ 
+-		backlight = <&backlight>;
++		backlight-ctrl-gpios = <&pio 7 GPIO_ACTIVE_HIGH>;
++		backlight-en-gpios = <&pio 69 GPIO_ACTIVE_HIGH>;
+ 
+ 		pinctrl-names = "default";
+ 		pinctrl-0 = <&panel_default>;
+@@ -176,6 +164,19 @@ &i2c1 {
+ 	status = "okay";
+ 
+ 	vbus-supply = <&mt6328_vio18_reg>;
++
++	s2mu005-charger@3d {
++		compatible = "samsung,s2mu005-charger";
++		reg = <0x3d>;
++
++		interrupt-parent = <&pio>;
++		interrupts = <81 IRQ_TYPE_EDGE_FALLING>;
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&s2mu005_chg_default>;
++
++		wakeup-source;
++	};
+ };
+ 
+ &i2c2 {
+@@ -218,7 +219,7 @@ accelerometer@18 {
+ 		pinctrl-0 = <&accelerometer_default>;
+ 
+ 		mount-matrix = "0", "1", "0",
+-				"1", "0", "0",
++				"-1", "0", "0",
+ 				"0", "0", "1";
+ 	};
+ 
+@@ -231,6 +232,27 @@ touchscreen@20 {
+ 		touchscreen-size-x = <539>;
+ 		touchscreen-size-y = <959>;
+ 	};
++
++	proximity@48 {
++		compatible = "stk,stk3013";
++		reg = <0x48>;
++
++		interrupt-parent = <&pio>;
++		interrupts = <9 IRQ_TYPE_EDGE_FALLING>;
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&proximity_default>;
++
++		vled-gpios = <&pio 65 GPIO_ACTIVE_HIGH>;
++
++		stk,state-reg = <0x2d>;
++		stk,psctrl-reg = <0x70>;
++		stk,ledctrl-reg = <0xff>;
++		stk,wait-reg = <0x03>;
++		stk,ps-thd-h = <18>;
++		stk,ps-thd-l = <12>;
++		stk,ps-default-offset = <0>;
++	};
+ };
+ 
+ &mipi_tx {
+@@ -270,16 +292,6 @@ pins-sda-scl {
+ 		};
+ 	};
+ 
+-	backlight_default: backlight-default-pins {
+-		pins-pwm {
+-			pinmux = <PINMUX_GPIO69__FUNC_DISP_PWM>;
+-		};
+-
+-		pins-en {
+-			pinmux = <PINMUX_GPIO7__FUNC_GPIO7>;
+-		};
+-	};
+-
+ 	gpio_keys_default: gpio-keys-default-pins {
+ 		pins-vol-down {
+ 			pinmux = <PINMUX_GPIO85__FUNC_GPIO85>;
+@@ -294,6 +306,14 @@ panel_default: panel-default-pins {
+ 		pins-reset {
+ 			pinmux = <PINMUX_GPIO146__FUNC_GPIO146>;
+ 		};
++
++		pins-bl-ctrl {
++			pinmux = <PINMUX_GPIO7__FUNC_GPIO7>;
++		};
++
++		pins-bl-en {
++			pinmux = <PINMUX_GPIO69__FUNC_GPIO69>;
++		};
+ 	};
+ 
+ 	s2mu005_fg_default: s2mu005-fg-default-pins {
+@@ -303,6 +323,25 @@ pins-int {
+ 		};
+ 	};
+ 
++	s2mu005_chg_default: s2mu005-chg-default-pins {
++		pins-irq {
++			pinmux = <PINMUX_GPIO81__FUNC_GPIO81>;
++			input-enable;
++		};
++	};
++
++	proximity_default: proximity-default-pins {
++		pins-int {
++			pinmux = <PINMUX_GPIO9__FUNC_GPIO9>;
++			input-enable;
++		};
++
++		pins-en {
++			pinmux = <PINMUX_GPIO65__FUNC_GPIO65>;
++			output-low;
++		};
++	};
++
+ 	vdd_tflash_default: vdd-tflash-default-pins {
+ 		pins-ce {
+ 			pinmux = <PINMUX_GPIO19__FUNC_GPIO19>;
+@@ -374,3 +413,9 @@ usb_con: connector {
+ &usb2phy {
+ 	status = "okay";
+ };
++
++&mt6328 {
++	rtc {
++		compatible = "mediatek,mt6328-rtc";
++	};
++};

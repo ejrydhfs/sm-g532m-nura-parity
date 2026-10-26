@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# MediaTek CCCI utility driver
+#
+
+config MTK_CCCI_UTIL
+	bool "MediaTek CCCI utility driver"
+	help
+	  CCCI (Cross Chip Communication Interface) utility driver for
+	  MediaTek modems.  Provides the modem log/dump ring buffers,
+	  the /dev/ccci_log and /dev/ccci_dump character devices, the
+	  MD image check-header parser and the debugfs views used to
+	  diagnose the CCCI core, CLDMA engine and CCMNI network ports.
+
+	  The driver is selected by the CCCI core (MTK_CCCI).

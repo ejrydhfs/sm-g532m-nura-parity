@@ -1,0 +1,2000 @@
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 5cc79d151..be43098b5 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -660,4 +660,5 @@ source "drivers/misc/mchp_pci1xxxx/Kconfig"
+ source "drivers/misc/keba/Kconfig"
+ source "drivers/misc/amd-sbi/Kconfig"
+ source "drivers/misc/rp1/Kconfig"
++source "drivers/misc/mediatek/Kconfig"
+ endmenu
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index b32a2597d..18dc0a61e 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -75,3 +75,4 @@ obj-$(CONFIG_MCHP_LAN966X_PCI)	+= lan966x-pci.o
+ obj-y				+= keba/
+ obj-y				+= amd-sbi/
+ obj-$(CONFIG_MISC_RP1)		+= rp1/
++obj-y				+= mediatek/
+diff --git a/drivers/misc/mediatek/Kconfig b/drivers/misc/mediatek/Kconfig
+new file mode 100644
+index 000000000..1b19cd234
+--- /dev/null
++++ b/drivers/misc/mediatek/Kconfig
+@@ -0,0 +1,6 @@
++# SPDX-License-Identifier: GPL-2.0-only
++menu "MediaTek device drivers"
++
++source "drivers/misc/mediatek/ccci_c2k/Kconfig"
++
++endmenu
+diff --git a/drivers/misc/mediatek/Makefile b/drivers/misc/mediatek/Makefile
+new file mode 100644
+index 000000000..f04b7b392
+--- /dev/null
++++ b/drivers/misc/mediatek/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-y += ccci_c2k/
+diff --git a/drivers/misc/mediatek/ccci_c2k/Kconfig b/drivers/misc/mediatek/ccci_c2k/Kconfig
+new file mode 100644
+index 000000000..415ecd6e3
+--- /dev/null
++++ b/drivers/misc/mediatek/ccci_c2k/Kconfig
+@@ -0,0 +1,15 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# C2K (MD3) dual-modem support for the MT6735/MT6737T CCCI subsystem
++#
++
++config MTK_CCCI_C2K
++	bool "MediaTek C2K (MD3) dual-modem support"
++	help
++	  Support the second (C2K/CDMA) modem instance of the MediaTek
++	  MT6735/MT6737T CCCI subsystem.  On this platform MD3 is a CCIF modem
++	  driven through the CCCI core; the driver supplies the C2K hardware
++	  bring-up (boot slave, INFRA_AO C2K control, C2K sysreset, sleep clock
++	  selection), the C2K channel map, IRAT coordination with MD1 and the
++	  /sys/kernel/c2k interface.
++
+diff --git a/drivers/misc/mediatek/ccci_c2k/Makefile b/drivers/misc/mediatek/ccci_c2k/Makefile
+new file mode 100644
+index 000000000..43a59bbab
+--- /dev/null
++++ b/drivers/misc/mediatek/ccci_c2k/Makefile
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_MTK_CCCI_C2K)	+= ccci_c2k.o
++obj-$(CONFIG_MTK_CCCI_C2K)	+= ccci_c2k_hw.o
++obj-$(CONFIG_MTK_CCCI_C2K)	+= ccci_c2k_ch.o
++obj-$(CONFIG_MTK_CCCI_C2K)	+= ccci_c2k_sysfs.o
+diff --git a/drivers/misc/mediatek/ccci_c2k/ccci_c2k.c b/drivers/misc/mediatek/ccci_c2k/ccci_c2k.c
+new file mode 100644
+index 000000000..9477cc402
+--- /dev/null
++++ b/drivers/misc/mediatek/ccci_c2k/ccci_c2k.c
+@@ -0,0 +1,323 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * C2K (MD3) dual-modem platform driver for the MT6735/MT6737T CCCI subsystem.
++ *
++ * Port from Samsung/MTK downstream (SM-G532M, MT6737T, kernel 3.18):
++ *   drivers/misc/mediatek/eccci/modem_ccif_c2k.c (md_ccif_probe, md_ccif_ops)
++ *   drivers/misc/mediatek/eccci/mt6735/ccif_c2k_platform.c
++ *     (md_ccif_get_modem_hw_info, MD_SYS3 branch)
++ *   drivers/misc/mediatek/eccci/port_cfg.c (md3_ccci_ports)
++ *   Documentation/devicetree/bindings/ccci/eccci/mediatek,ap2c2k_ccif.txt
++ *
++ * On this platform MD3 is a second CCIF modem instance (no SDIO/CBP transport
++ * is built); the ROM only exports mtk_wdt_set_c2k_sysrst for "c2k".
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ * Copyright (C) 2026 The Nura project
++ */
++
++#include <linux/ccci.h>
++#include <linux/errno.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++
++#include "ccci_c2k.h"
++
++#define C2K_DRV_NAME	"ccci_c2k"
++
++/* The ROM device tree describes the MD3 CCIF instance as ap2c2k_ccif. */
++#define C2K_OF_COMPAT_ROM	"mediatek,ap2c2k_ccif"
++#define C2K_OF_COMPAT_NEW	"mediatek,mt6735-ccif-md3"
++
++/* MD_SYS3 is index 2 in the downstream device tree ("cell-index"). */
++#define C2K_MD_INDEX		2
++
++static struct ccci_c2k *c2k_instance;
++static DEFINE_MUTEX(c2k_instance_lock);
++
++/**
++ * ccci_c2k_get() - return the single MD3 instance
++ *
++ * The C2K subsystem has one MD3 (the ROM device tree has one ap2c2k_ccif
++ * node); hooks and sysfs attributes reach it through this accessor.  Returns
++ * NULL before probe and after remove.
++ */
++struct ccci_c2k *ccci_c2k_get(void)
++{
++	return READ_ONCE(c2k_instance);
++}
++
++static int c2k_check_md_index(struct ccci_c2k *c2k)
++{
++	struct device *dev = c2k->dev;
++	u32 index;
++
++	if (of_property_read_u32(dev->of_node, "cell-index", &index) &&
++	    of_property_read_u32(dev->of_node, "mediatek,md_id", &index))
++		return 0;
++
++	if (index != C2K_MD_INDEX)
++		return dev_err_probe(dev, -EINVAL,
++				     "wrong modem index %u, MD3 is %d\n",
++				     index, C2K_MD_INDEX);
++
++	return 0;
++}
++
++static int c2k_init_cfg(struct ccci_c2k *c2k)
++{
++	struct device *dev = c2k->dev;
++	struct platform_device *pdev = to_platform_device(dev);
++	struct ccci_md_cfg *cfg = &c2k->cfg;
++	struct resource *res;
++	u32 capability = 0;
++	int ret;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "ap-ccif");
++	if (!res)
++		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res)
++		return dev_err_probe(dev, -ENODEV, "no AP CCIF resource\n");
++
++	c2k->ccif = devm_ioremap_resource(dev, res);
++	if (IS_ERR(c2k->ccif))
++		return PTR_ERR(c2k->ccif);
++
++	/* CCIF interrupt, downstream irq_of_parse_and_map(dev, 0). */
++	ret = platform_get_irq_byname_optional(pdev, "ccif");
++	if (ret == -ENXIO)
++		ret = platform_get_irq(pdev, 0);
++	if (ret < 0)
++		return dev_err_probe(dev, ret, "no CCIF interrupt\n");
++	cfg->ccif_irq = ret;
++
++	/*
++	 * MD3 watchdog interrupt, downstream irq_of_parse_and_map(dev, 1).
++	 * It is reported for diagnostics only: struct ccci_md_cfg carries the
++	 * CCIF line, and MD exception handling belongs to the core.
++	 */
++	ret = platform_get_irq_byname_optional(pdev, "md-wdt");
++	if (ret == -ENXIO)
++		ret = platform_get_irq_optional(pdev, 1);
++	c2k->md_wdt_irq = ret < 0 ? 0 : ret;
++
++	/* Capability granted by the board, downstream "ccif,capability". */
++	of_property_read_u32(dev->of_node, "ccif,capability", &capability);
++
++	cfg->md_id = CCCI_MD_SYS3;
++	cfg->name = "md3";
++	cfg->firmware_name = C2K_MD_FIRMWARE_NAME;
++	cfg->ccif_phys = res->start;
++	cfg->ccif_size = resource_size(res);
++	cfg->md_boot_vector_phys = c2k->boot_vector_phys;
++	cfg->md_boot_vector_key_phys = c2k->boot_vector_key_phys;
++	cfg->md_boot_vector_en_phys = c2k->boot_vector_en_phys;
++	cfg->rgu_phys = c2k->md_rgu_phys;
++	cfg->sram_size = C2K_CCIF_SRAM_SIZE;
++	cfg->capability = C2K_MD_CAPABILITY_DEFAULT | capability;
++	cfg->irat_md_id = C2K_IRAT_MD_ID;
++
++	dev_info(dev,
++		 "MD3: ccif 0x%pa+0x%llx irq %u wdt irq %u capability 0x%x\n",
++		 &cfg->ccif_phys, (unsigned long long)cfg->ccif_size,
++		 cfg->ccif_irq, c2k->md_wdt_irq, cfg->capability);
++	return 0;
++}
++
++/*
++ * Modem hardware callbacks, invoked by the CCCI core around its start/stop
++ * sequence.  See include/linux/ccci.h and the report for the exact call
++ * sites (downstream md_ccif_op_start/power_on/let_md_go).
++ */
++static struct ccci_c2k *c2k_from_md(unsigned int md_id)
++{
++	struct ccci_c2k *c2k = ccci_c2k_get();
++
++	if (!c2k || md_id != CCCI_MD_SYS3)
++		return NULL;
++
++	return c2k;
++}
++
++static int c2k_md_power_on(unsigned int md_id)
++{
++	struct ccci_c2k *c2k = c2k_from_md(md_id);
++
++	if (!c2k)
++		return -ENODEV;
++
++	return ccci_c2k_hw_power_on(c2k);
++}
++
++static int c2k_md_let_md_go(unsigned int md_id)
++{
++	struct ccci_c2k *c2k = c2k_from_md(md_id);
++	int ret;
++
++	if (!c2k)
++		return -ENODEV;
++
++	ret = ccci_c2k_hw_let_md_go(c2k);
++	if (ret)
++		return ret;
++
++	c2k->boot_count++;
++	return 0;
++}
++
++static int c2k_md_power_off(unsigned int md_id)
++{
++	struct ccci_c2k *c2k = c2k_from_md(md_id);
++
++	if (!c2k)
++		return -ENODEV;
++
++	return ccci_c2k_hw_power_off(c2k);
++}
++
++static void c2k_md_reset(unsigned int md_id)
++{
++	struct ccci_c2k *c2k = c2k_from_md(md_id);
++
++	if (c2k)
++		ccci_c2k_hw_reset(c2k);
++}
++
++static const struct ccci_md_hw_ops c2k_md_hw_ops = {
++	.power_on = c2k_md_power_on,
++	.let_md_go = c2k_md_let_md_go,
++	.power_off = c2k_md_power_off,
++	.reset = c2k_md_reset,
++};
++
++static int ccci_c2k_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct ccci_c2k *c2k;
++	int ret;
++
++	c2k = devm_kzalloc(dev, sizeof(*c2k), GFP_KERNEL);
++	if (!c2k)
++		return -ENOMEM;
++
++	c2k->dev = dev;
++	mutex_init(&c2k->lock);
++
++	ret = c2k_check_md_index(c2k);
++	if (ret)
++		return ret;
++
++	ret = ccci_c2k_hw_init(c2k);
++	if (ret)
++		return ret;
++
++	ret = c2k_init_cfg(c2k);
++	if (ret)
++		return ret;
++
++	mutex_lock(&c2k_instance_lock);
++	if (c2k_instance) {
++		mutex_unlock(&c2k_instance_lock);
++		return dev_err_probe(dev, -EBUSY, "MD3 already registered\n");
++	}
++	WRITE_ONCE(c2k_instance, c2k);
++	mutex_unlock(&c2k_instance_lock);
++
++	ret = ccci_register_md_hw_ops(CCCI_MD_SYS3, &c2k_md_hw_ops);
++	if (ret) {
++		dev_err(dev, "register MD3 hardware ops failed %d\n", ret);
++		goto err_instance;
++	}
++
++	ret = ccci_register_modem(&c2k->cfg);
++	if (ret) {
++		dev_err(dev, "register MD3 modem failed %d\n", ret);
++		goto err_ops;
++	}
++
++	ret = ccci_c2k_sysfs_init(c2k);
++	if (ret) {
++		dev_err(dev, "C2K sysfs init failed %d\n", ret);
++		goto err_modem;
++	}
++
++	if (c2k->cfg.capability & CCCI_MD_CAP_CCMNI_IRAT) {
++		ret = ccci_c2k_set_irat(c2k->cfg.irat_md_id);
++		if (ret)
++			dev_warn(dev, "IRAT setup incomplete, %d\n", ret);
++	}
++
++	platform_set_drvdata(pdev, c2k);
++	dev_info(dev, "MD3 C2K modem registered\n");
++	return 0;
++
++err_modem:
++	ccci_unregister_modem(CCCI_MD_SYS3);
++err_ops:
++	ccci_unregister_md_hw_ops(CCCI_MD_SYS3);
++err_instance:
++	mutex_lock(&c2k_instance_lock);
++	WRITE_ONCE(c2k_instance, NULL);
++	mutex_unlock(&c2k_instance_lock);
++	return ret;
++}
++
++static void ccci_c2k_remove(struct platform_device *pdev)
++{
++	struct ccci_c2k *c2k = platform_get_drvdata(pdev);
++
++	if (!c2k)
++		return;
++
++	ccci_c2k_sysfs_exit(c2k);
++	ccci_unregister_modem(CCCI_MD_SYS3);
++	ccci_unregister_md_hw_ops(CCCI_MD_SYS3);
++	ccci_c2k_hw_power_off(c2k);
++
++	mutex_lock(&c2k_instance_lock);
++	WRITE_ONCE(c2k_instance, NULL);
++	mutex_unlock(&c2k_instance_lock);
++}
++
++static void ccci_c2k_shutdown(struct platform_device *pdev)
++{
++	struct ccci_c2k *c2k = platform_get_drvdata(pdev);
++
++	if (!c2k)
++		return;
++
++	ccci_c2k_sysfs_exit(c2k);
++	ccci_unregister_modem(CCCI_MD_SYS3);
++	ccci_unregister_md_hw_ops(CCCI_MD_SYS3);
++	ccci_c2k_hw_power_off(c2k);
++
++	mutex_lock(&c2k_instance_lock);
++	WRITE_ONCE(c2k_instance, NULL);
++	mutex_unlock(&c2k_instance_lock);
++
++	platform_set_drvdata(pdev, NULL);
++}
++
++static const struct of_device_id ccci_c2k_of_match[] = {
++	{ .compatible = C2K_OF_COMPAT_ROM },
++	{ .compatible = C2K_OF_COMPAT_NEW },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, ccci_c2k_of_match);
++
++static struct platform_driver ccci_c2k_driver = {
++	.probe = ccci_c2k_probe,
++	.remove = ccci_c2k_remove,
++	.shutdown = ccci_c2k_shutdown,
++	.driver = {
++		.name = C2K_DRV_NAME,
++		.of_match_table = ccci_c2k_of_match,
++	},
++};
++module_platform_driver(ccci_c2k_driver);
++
++MODULE_DESCRIPTION("MediaTek MT6735/MT6737T C2K (MD3) CCCI modem driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/mediatek/ccci_c2k/ccci_c2k.h b/drivers/misc/mediatek/ccci_c2k/ccci_c2k.h
+new file mode 100644
+index 000000000..9eebe07b9
+--- /dev/null
++++ b/drivers/misc/mediatek/ccci_c2k/ccci_c2k.h
+@@ -0,0 +1,196 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * C2K (MD3) dual-modem support for the MT6735/MT6737T CCCI subsystem.
++ *
++ * Port from Samsung/MTK downstream (SM-G532M, MT6737T, kernel 3.18):
++ *   drivers/misc/mediatek/eccci/modem_ccif_c2k.c
++ *   drivers/misc/mediatek/eccci/mt6735/ccif_c2k_platform.c
++ *   drivers/misc/mediatek/eccci/mt6735/ccif_c2k_platform.h
++ *   drivers/misc/mediatek/eccci/mt6735/modem_reg_base.h
++ *   drivers/misc/mediatek/eccci/port_cfg.c
++ *   drivers/misc/mediatek/c2k_ccci/mt6735/c2k_platform.c (chip id, boot)
++ *   drivers/watchdog/mediatek/wdt/mt6735/mtk_wdt.c (C2K sysreset)
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ * Copyright (C) 2026 The Nura project
++ */
++
++#ifndef __CCCI_C2K_H
++#define __CCCI_C2K_H
++
++#include <linux/ccci.h>
++#include <linux/clk.h>
++#include <linux/debugfs.h>
++#include <linux/device.h>
++#include <linux/kobject.h>
++#include <linux/mutex.h>
++#include <linux/regulator/consumer.h>
++#include <linux/seq_file.h>
++#include <linux/types.h>
++
++/* CCIF register map, downstream mt6735/ccif_c2k_platform.h:35-42 */
++#define C2K_APCCIF_CON		0x000
++#define C2K_APCCIF_BUSY		0x004
++#define C2K_APCCIF_START	0x008
++#define C2K_APCCIF_TCHNUM	0x00c
++#define C2K_APCCIF_RCHNUM	0x010
++#define C2K_APCCIF_ACK		0x014
++
++#define C2K_CCIF_SRAM_SIZE	512	/* mt6735/modem_reg_base.h:43 */
++
++/* INFRA_AO C2K block, downstream mt6735/ccif_c2k_platform.h:44-54 */
++#define C2K_INFRA_AO_C2K_CONFIG		0x330
++#define C2K_INFRA_AO_C2K_STATUS		0x334
++#define C2K_INFRA_AO_C2K_SPM_CTRL	0x338
++#define C2K_SLEEP_CLK_CON		0x400
++#define C2K_TOP_RGU_WDT_SWSYSRST	0x018
++
++/*
++ * INFRA_AO_C2K_CONFIG bits.
++ * Boot mode field [10:8], value 5 selects the C2K boot path: downstream
++ * eccci/mt6735/ccif_c2k_platform.c:269-275.
++ */
++#define C2K_CONFIG_BOOTMODE_MASK	GENMASK(10, 8)
++#define C2K_CONFIG_BOOTMODE_C2K		5
++/* ETS (trace) select, downstream mt6735/ccif_c2k_platform.h:54 */
++#define C2K_ETS_SEL_BIT			BIT(13)
++
++/* srcclkena selection mask, downstream ccif_c2k_platform.c:279-288 */
++#define C2K_SPM_SRCCLKENA_MASK		GENMASK(5, 4)
++#define C2K_SPM_SRCCLKENA_C2K		2
++/* C2K wake handshake, downstream ccif_c2k_platform.c:326-345 */
++#define C2K_SPM_WAKE_BIT		BIT(0)
++#define C2K_STATUS_AWAKE_BIT		BIT(1)
++
++/*
++ * SLEEP_CLK_CON programming, downstream ccif_c2k_platform.c:292-303:
++ * set bits 2,3,12,27 and clear bit 14.
++ */
++#define C2K_SLEEP_CLK_CON_SET		(BIT(2) | BIT(3) | BIT(12) | BIT(27))
++#define C2K_SLEEP_CLK_CON_CLR		BIT(14)
++
++/*
++ * TOP_RGU software sysreset.  Key and bit 15 (C2K domain) from
++ * drivers/watchdog/mediatek/wdt/mt6735/mt_wdt.h:78 and mtk_wdt.c:472-504
++ * (mtk_wdt_set_c2k_sysrst()); the same register/key/bit appear in the ROM
++ * disassembly of mtk_wdt_set_c2k_sysrst at 0xc0715d60 (register +0x18,
++ * key 0x88000000, bit 15).
++ */
++#define C2K_RGU_SWSYS_RST_KEY		0x88000000
++#define C2K_RGU_C2K_SYSRST_BIT		15
++
++/*
++ * MD3 RGU (modem watch dog), downstream mt6735/ccif_c2k_platform.h:27-33.
++ * The MD WD is deliberately left untouched for MD3: md_ccif_power_on() only
++ * writes the mode key when md->index != MD_SYS3 (ccif_c2k_platform.c:392-396).
++ */
++#define C2K_MD_WDT_MODE			0x00
++#define C2K_MD_WDT_STA			0x0c
++
++/*
++ * MD3 boot slave.  Downstream mt6735/modem_reg_base.h:64-70 declares the MD3
++ * boot vector block; its values are the MD2 block (lines 48-55), which is the
++ * same 0x30190000 window.
++ */
++#define C2K_MD_BOOT_VECTOR_VALUE	0x00000000
++#define C2K_MD_BOOT_VECTOR_KEY_VALUE	0x3567c766
++#define C2K_MD_BOOT_VECTOR_EN_VALUE	0xa3b66175
++
++#define C2K_MD_BOOT_VECTOR_PHYS		0x30190000
++#define C2K_MD_BOOT_VECTOR_KEY_PHYS	0x3019379c
++#define C2K_MD_BOOT_VECTOR_EN_PHYS	0x30195488
++#define C2K_MD_RGU_PHYS			0x30050000
++
++/*
++ * C2K chip id.  Downstream c2k_ccci/mt6735/c2k_platform.c:537 compares the
++ * chip id against 0x020AC000 (that poll loop is inside "#if 0", so only the
++ * read is kept here).
++ */
++#define C2K_CHIP_ID_EXPECTED		0x020ac000
++
++/* Downstream defaults for the MD3 CCIF instance; see the report. */
++#define C2K_MD_FIRMWARE_NAME		"md3img"
++
++/*
++ * Modem capabilities granted to MD3 by the downstream build:
++ * CCMNI_IRAT is set unconditionally, WORLD_PHONE is set for C2K slot2
++ * (downstream eccci/port_net.c:283-289).  The ROM device tree provides the
++ * "sim1_md3_sim2_md1" SIM switch mode, i.e. C2K on a second slot.
++ */
++#define C2K_MD_CAPABILITY_DEFAULT \
++	(CCCI_MD_CAP_CCMNI_IRAT | CCCI_MD_CAP_WORLD_PHONE)
++
++/* IRAT peer of MD3, downstream eccci/port_net.c:289 */
++#define C2K_IRAT_MD_ID			CCCI_MD_SYS1
++
++struct ccci_c2k {
++	struct device *dev;
++
++	/* MMIO windows (optional ones may stay NULL) */
++	void __iomem *ccif;		/* AP CCIF, MD3 instance */
++	void __iomem *md1_pccif;	/* INFRA_MD PCCIF window 1 */
++	void __iomem *md3_pccif;	/* INFRA_MD PCCIF window 2 */
++	void __iomem *chip_id;		/* C2K chip id register */
++	void __iomem *boot_vector;
++	void __iomem *boot_vector_key;
++	void __iomem *boot_vector_en;
++	void __iomem *md_rgu;		/* MD3 RGU / modem WDT */
++	void __iomem *infra_ao;		/* INFRA_AO C2K block */
++	void __iomem *sleep;		/* SLEEP_CLK_CON */
++	void __iomem *toprgu;		/* TOP_RGU WDT */
++
++	/* physical addresses handed to the core through struct ccci_md_cfg */
++	phys_addr_t boot_vector_phys;
++	phys_addr_t boot_vector_key_phys;
++	phys_addr_t boot_vector_en_phys;
++	phys_addr_t md_rgu_phys;
++
++	struct clk *clk_md_main;
++	struct regulator *vtcxo1;
++
++	struct ccci_md_cfg cfg;
++	unsigned int md_wdt_irq;
++	bool ets_sel;
++
++	unsigned int boot_count;
++	unsigned int chip_id_val;
++	bool chip_id_valid;
++
++	bool powered;
++	bool vtcxo_enabled;
++	bool clk_enabled;
++
++	int sim_switch_mode;
++	unsigned int irat_md_id;
++
++	struct mutex lock;		/* sim_switch_mode, dump consistency */
++	struct kobject *kobj;
++	struct dentry *debugfs_dir;
++};
++
++/* ccci_c2k.c */
++struct ccci_c2k *ccci_c2k_get(void);
++
++/* ccci_c2k_hw.c */
++int ccci_c2k_hw_init(struct ccci_c2k *c2k);
++int ccci_c2k_hw_power_on(struct ccci_c2k *c2k);
++int ccci_c2k_hw_power_off(struct ccci_c2k *c2k);
++int ccci_c2k_hw_let_md_go(struct ccci_c2k *c2k);
++void ccci_c2k_hw_reset(struct ccci_c2k *c2k);
++unsigned int ccci_c2k_hw_read_chip_id(struct ccci_c2k *c2k);
++int ccci_c2k_hw_format_regs(struct ccci_c2k *c2k, char *buf, size_t size);
++int ccci_c2k_hw_format_wdt(struct ccci_c2k *c2k, char *buf, size_t size);
++
++/* ccci_c2k_ch.c */
++int ccci_c2k_ch_to_ccci(int c2k_ch, bool tx);
++int ccci_c2k_ccci_to_ch(int ccci_ch, bool tx, bool md_exception);
++int ccci_c2k_ch_dump(struct seq_file *m);
++int ccci_c2k_set_irat(unsigned int irat_md_id);
++void ccci_c2k_sim_switch_mode_set(int mode);
++int ccci_c2k_sim_switch_mode_get(void);
++
++/* ccci_c2k_sysfs.c */
++int ccci_c2k_sysfs_init(struct ccci_c2k *c2k);
++void ccci_c2k_sysfs_exit(struct ccci_c2k *c2k);
++
++#endif /* __CCCI_C2K_H */
+diff --git a/drivers/misc/mediatek/ccci_c2k/ccci_c2k_ch.c b/drivers/misc/mediatek/ccci_c2k/ccci_c2k_ch.c
+new file mode 100644
+index 000000000..aafce5c84
+--- /dev/null
++++ b/drivers/misc/mediatek/ccci_c2k/ccci_c2k_ch.c
+@@ -0,0 +1,223 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * C2K (MD3) channel map, IRAT and dual-SIM switch state.
++ *
++ * Port from Samsung/MTK downstream (SM-G532M, MT6737T, kernel 3.18):
++ *   drivers/misc/mediatek/eccci/modem_ccif_c2k.c (c2k_ports[])
++ *   drivers/misc/mediatek/eccci/port_cfg.c (md3_ccci_ports[])
++ *   drivers/misc/mediatek/eccci/port_net.c (eccci_cc3mni_ops)
++ *   drivers/misc/mediatek/eccci/ccci_support.c (sim switch mode)
++ *   drivers/misc/mediatek/include/mt-plat/mt_ccci_common.h (enum c2k_channel)
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ * Copyright (C) 2026 The Nura project
++ */
++
++#include <linux/errno.h>
++#include <linux/module.h>
++#include <linux/seq_file.h>
++#include <linux/string.h>
++
++#include "ccci_c2k.h"
++
++/*
++ * Loopback channel ids that downstream defines next to enum c2k_channel
++ * (mt_ccci_common.h:502-503).  They are not part of the frozen shared enum,
++ * so they are kept local to the translation table.
++ */
++#define C2K_LOOPBACK_CH			255
++#define C2K_MD2AP_LOOPBACK_CH		256
++
++/*
++ * MD3 channel map, verbatim from modem_ccif_c2k.c:112-152.  The first entry
++ * of every C2K channel wins, which is what the downstream lookup loops do.
++ * "excp" is the C2K channel reported while MD3 is in exception; it carries a
++ * CCCI channel id for the control row, exactly like downstream.
++ */
++struct ccci_c2k_ch_map {
++	int c2k_ch;
++	int excp_ch;
++	int tx_ch;		/* enum ccci_ch */
++	int rx_ch;		/* enum ccci_ch */
++	const char *name;	/* MD3 port name, port_cfg.c:127-155 */
++};
++
++static const struct ccci_c2k_ch_map c2k_ch_map[] = {
++	{ CTRL_CH_C2K,		CCCI_CONTROL_TX,	CCCI_CONTROL_TX,
++	  CCCI_CONTROL_RX,	"ccci3_ctrl" },
++	{ CTRL_CH_C2K,		CTRL_CH_C2K,		CCCI_STATUS_TX,
++	  CCCI_STATUS_RX,	"ccci3_poll" },
++	{ AUDIO_CH_C2K,		AUDIO_CH_C2K,		CCCI_PCM_TX,
++	  CCCI_PCM_RX,		"ccci3_aud" },
++	{ NET1_CH_C2K,		NET1_CH_C2K,		CCCI_CCMNI1_TX,
++	  CCCI_CCMNI1_RX,	"cc3mni0" },
++	{ NET1_CH_C2K,		NET1_CH_C2K,		CCCI_CCMNI1_DL_ACK,
++	  CCCI_CCMNI1_DL_ACK,	"cc3mni0" },
++	{ NET2_CH_C2K,		NET2_CH_C2K,		CCCI_CCMNI2_TX,
++	  CCCI_CCMNI2_RX,	"cc3mni1" },
++	{ NET2_CH_C2K,		NET2_CH_C2K,		CCCI_CCMNI2_DL_ACK,
++	  CCCI_CCMNI2_DL_ACK,	"cc3mni1" },
++	{ NET3_CH_C2K,		NET3_CH_C2K,		CCCI_CCMNI3_TX,
++	  CCCI_CCMNI3_RX,	"cc3mni2" },
++	{ NET3_CH_C2K,		NET3_CH_C2K,		CCCI_CCMNI3_DL_ACK,
++	  CCCI_CCMNI3_DL_ACK,	"cc3mni2" },
++	{ MDLOG_CTRL_CH_C2K,	MDLOG_CTRL_CH_C2K,	CCCI_UART1_TX,
++	  CCCI_UART1_RX,	"ccci3_md_log_ctrl" },
++	{ MDLOG_CH_C2K,		MDLOG_CH_C2K,		CCCI_MD_LOG_TX,
++	  CCCI_MD_LOG_RX,	"ccci3_tty1" },
++	{ FS_CH_C2K,		FS_CH_C2K,		CCCI_FS_TX,
++	  CCCI_FS_RX,		"ccci3_fs" },
++	{ DATA_PPP_CH_C2K,	DATA_PPP_CH_C2K,	CCCI_C2K_PPP_DATA,
++	  CCCI_C2K_PPP_DATA,	"ccci3_data" },
++	{ AT_CH_C2K,		AT_CH_C2K,		CCCI_C2K_AT,
++	  CCCI_C2K_AT,		"ccci3_at" },
++	{ AT2_CH_C2K,		AT2_CH_C2K,		CCCI_C2K_AT2,
++	  CCCI_C2K_AT2,		"ccci3_at2" },
++	{ AT3_CH_C2K,		AT3_CH_C2K,		CCCI_C2K_AT3,
++	  CCCI_C2K_AT3,		"ccci3_at3" },
++	{ AGPS_CH_C2K,		AGPS_CH_C2K,		CCCI_IPC_UART_TX,
++	  CCCI_IPC_UART_RX,	"ccci3_tty2" },
++	{ C2K_MD2AP_LOOPBACK_CH, C2K_MD2AP_LOOPBACK_CH,	CCCI_C2K_LB_DL,
++	  CCCI_C2K_LB_DL,	"ccci3_lb_dl" },
++	{ C2K_LOOPBACK_CH,	C2K_LOOPBACK_CH,	CCCI_LB_IT_TX,
++	  CCCI_LB_IT_RX,	"ccci3_lb_it" },
++	{ STATUS_CH_C2K,	STATUS_CH_C2K,		CCCI_CONTROL_TX,
++	  CCCI_CONTROL_RX,	"ccci3_poll" },
++};
++
++/**
++ * ccci_c2k_ch_to_ccci() - translate a C2K channel to a CCCI channel
++ * @c2k_ch: enum c2k_channel value received from MD3
++ * @tx: true for the AP->MD direction, false for MD->AP
++ *
++ * Returns the enum ccci_ch value, or -ENOENT if the channel is unknown,
++ * mirroring c2k_ch_to_ccci_ch() in modem_ccif_c2k.c:215-238.
++ */
++int ccci_c2k_ch_to_ccci(int c2k_ch, bool tx)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(c2k_ch_map); i++) {
++		if (c2k_ch_map[i].c2k_ch == c2k_ch)
++			return tx ? c2k_ch_map[i].tx_ch : c2k_ch_map[i].rx_ch;
++	}
++
++	return -ENOENT;
++}
++EXPORT_SYMBOL_GPL(ccci_c2k_ch_to_ccci);
++
++/**
++ * ccci_c2k_ccci_to_ch() - translate a CCCI channel to a C2K channel
++ * @ccci_ch: enum ccci_ch value
++ * @tx: true for the AP->MD direction, false for MD->AP
++ * @md_exception: true while MD3 is in exception state
++ *
++ * Mirrors ccci_ch_to_c2k_ch() in modem_ccif_c2k.c:240-267: the exception
++ * channel is reported instead of the normal one while MD3 is down.
++ */
++int ccci_c2k_ccci_to_ch(int ccci_ch, bool tx, bool md_exception)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(c2k_ch_map); i++) {
++		int mapped = tx ? c2k_ch_map[i].tx_ch : c2k_ch_map[i].rx_ch;
++
++		if (mapped == ccci_ch)
++			return md_exception ? c2k_ch_map[i].excp_ch :
++					      c2k_ch_map[i].c2k_ch;
++	}
++
++	return -ENOENT;
++}
++EXPORT_SYMBOL_GPL(ccci_c2k_ccci_to_ch);
++
++/**
++ * ccci_c2k_ch_dump() - print the MD3 channel map
++ * @m: seq_file, e.g. the debugfs "channels" file
++ */
++int ccci_c2k_ch_dump(struct seq_file *m)
++{
++	int i;
++
++	seq_puts(m, "c2k_ch  ccci_tx  ccci_rx  excp_ch  port\n");
++
++	for (i = 0; i < ARRAY_SIZE(c2k_ch_map); i++)
++		seq_printf(m, "%6d  %7d  %7d  %7d  %s\n",
++			   c2k_ch_map[i].c2k_ch, c2k_ch_map[i].tx_ch,
++			   c2k_ch_map[i].rx_ch, c2k_ch_map[i].excp_ch,
++			   c2k_ch_map[i].name);
++
++	return 0;
++}
++
++/**
++ * ccci_c2k_set_irat() - point the MD3 IRAT peer at another modem
++ * @irat_md_id: enum ccci_md_id of the IRAT peer
++ *
++ * The downstream C2K CCMNI instance is registered with .irat_md_id =
++ * MD_SYS1 (port_net.c:289), so IRAT moves the packet interfaces between MD1
++ * and MD3.
++ */
++int ccci_c2k_set_irat(unsigned int irat_md_id)
++{
++	struct ccci_c2k *c2k = ccci_c2k_get();
++	int ret;
++
++	if (!c2k)
++		return -ENODEV;
++
++	ret = ccci_md_set_irat(CCCI_MD_SYS3, irat_md_id);
++	if (ret) {
++		dev_err(c2k->dev, "set IRAT peer MD%d failed %d\n",
++			irat_md_id + 1, ret);
++		return ret;
++	}
++
++	c2k->irat_md_id = irat_md_id;
++	dev_info(c2k->dev, "IRAT peer set to MD%d\n", irat_md_id + 1);
++	return 0;
++}
++
++/**
++ * ccci_c2k_sim_switch_mode_set() - store the dual-SIM switch mode
++ * @mode: mode written through CCCI_IOC_SIM_SWITCH
++ *
++ * Storage half of ccci_store_sim_switch_mode() (ccci_support.c:45-54).  The
++ * downstream implementation additionally sends CCCI_MD_MSG_CFG_UPDATE on the
++ * MONITOR channel; that virtual message belongs to the core and has no API in
++ * include/linux/ccci.h, see the report.
++ */
++void ccci_c2k_sim_switch_mode_set(int mode)
++{
++	struct ccci_c2k *c2k = ccci_c2k_get();
++
++	if (!c2k)
++		return;
++
++	mutex_lock(&c2k->lock);
++	if (c2k->sim_switch_mode != mode) {
++		c2k->sim_switch_mode = mode;
++		dev_info(c2k->dev, "sim switch mode 0x%x\n", mode);
++	}
++	mutex_unlock(&c2k->lock);
++}
++
++/**
++ * ccci_c2k_sim_switch_mode_get() - read the stored dual-SIM switch mode
++ *
++ * Equivalent of ccci_get_sim_switch_mode() (ccci_support.c:56-59).
++ */
++int ccci_c2k_sim_switch_mode_get(void)
++{
++	struct ccci_c2k *c2k = ccci_c2k_get();
++	int mode;
++
++	if (!c2k)
++		return 0;
++
++	mutex_lock(&c2k->lock);
++	mode = c2k->sim_switch_mode;
++	mutex_unlock(&c2k->lock);
++
++	return mode;
++}
+diff --git a/drivers/misc/mediatek/ccci_c2k/ccci_c2k_hw.c b/drivers/misc/mediatek/ccci_c2k/ccci_c2k_hw.c
+new file mode 100644
+index 000000000..8845ef0f5
+--- /dev/null
++++ b/drivers/misc/mediatek/ccci_c2k/ccci_c2k_hw.c
+@@ -0,0 +1,564 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * C2K (MD3) hardware sequencing for the MT6735/MT6737T CCCI subsystem.
++ *
++ * Port from Samsung/MTK downstream (SM-G532M, MT6737T, kernel 3.18):
++ *   drivers/misc/mediatek/eccci/mt6735/ccif_c2k_platform.c
++ *   drivers/misc/mediatek/eccci/mt6735/ccif_c2k_platform.h
++ *   drivers/misc/mediatek/eccci/mt6735/modem_reg_base.h
++ *   drivers/misc/mediatek/c2k_ccci/mt6735/c2k_platform.c
++ *   drivers/watchdog/mediatek/wdt/mt6735/mtk_wdt.c
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ * Copyright (C) 2026 The Nura project
++ *
++ * The register sequences below reproduce md_ccif_power_on()/power_off() and
++ * md_ccif_let_md_go() of the MD_SYS3 (C2K) path one to one; only the kernel
++ * API (ioremap, clk, regulator, polling helpers) is current.
++ */
++
++#include <linux/clk.h>
++#include <linux/device.h>
++#include <linux/errno.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/platform_device.h>
++#include <linux/regulator/consumer.h>
++
++#include "ccci_c2k.h"
++
++/* Wake-up handshake timeout; downstream busy-waits forever (c2k_status poll). */
++#define C2K_WAKE_POLL_US	100
++#define C2K_WAKE_TIMEOUT_US	1000000
++
++#define C2K_REG_BOOT_VECTOR	"boot-vector"
++#define C2K_REG_BOOT_VECTOR_KEY	"boot-vector-key"
++#define C2K_REG_BOOT_VECTOR_EN	"boot-vector-en"
++#define C2K_REG_MD_RGU		"md-rgu"
++#define C2K_REG_CHIP_ID		"chip-id"
++#define C2K_REG_MD1_PCCIF	"md1-pccif"
++#define C2K_REG_MD3_PCCIF	"md3-pccif"
++
++/**
++ * c2k_map_resource() - map one named MMIO resource of the C2K node
++ * @dev: C2K platform device
++ * @name: resource name in the device tree
++ *
++ * Returns the mapping, NULL if the resource is absent, or an ERR_PTR().
++ */
++static void __iomem *c2k_map_resource(struct device *dev, const char *name)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct resource *res;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++	if (!res)
++		return NULL;
++
++	return devm_ioremap_resource(dev, res);
++}
++
++/**
++ * c2k_map_default() - map a resource, falling back to a downstream address
++ * @dev: C2K platform device
++ * @name: resource name in the device tree
++ * @phys: downstream physical address (see ccci_c2k.h for the citation)
++ * @size: window size in bytes
++ *
++ * The MD3 boot slave and RGU windows are fixed SoC registers that the
++ * downstream kernel never described in the device tree; they are only mapped
++ * from the built-in address when the board does not provide them.
++ */
++static void __iomem *c2k_map_default(struct device *dev, const char *name,
++				     phys_addr_t phys, resource_size_t size)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct resource *res;
++	void __iomem *base;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++	if (res)
++		return devm_ioremap_resource(dev, res);
++
++	base = devm_ioremap(dev, phys, size);
++	if (!base)
++		return ERR_PTR(-ENOMEM);
++
++	dev_info(dev, "%s: no DT resource, using 0x%pa\n", name, &phys);
++	return base;
++}
++
++/**
++ * c2k_phys() - physical address of a resource, or a downstream fallback
++ * @dev: C2K platform device
++ * @name: resource name in the device tree
++ * @fallback: downstream address used when the board does not describe it
++ */
++static phys_addr_t c2k_phys(struct device *dev, const char *name,
++			    phys_addr_t fallback)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct resource *res;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++	return res ? res->start : fallback;
++}
++
++/* devres action for windows taken with of_iomap() */
++static void c2k_iounmap_action(void *addr)
++{
++	iounmap(addr);
++}
++
++/**
++ * c2k_map_syscon() - map the first reg window of a phandle referenced node
++ * @dev: C2K platform device
++ * @propname: property holding the phandle
++ *
++ * Covers the three shared blocks the downstream code grabs with
++ * of_find_compatible_node(): INFRA_AO (C2K config/status/SPM control),
++ * SLEEP (clock gating) and TOP_RGU (C2K sysreset).
++ */
++static void __iomem *c2k_map_syscon(struct device *dev, const char *propname)
++{
++	struct device_node *np;
++	void __iomem *base;
++
++	np = of_parse_phandle(dev->of_node, propname, 0);
++	if (!np)
++		return NULL;
++
++	base = of_iomap(np, 0);
++	of_node_put(np);
++	if (!base)
++		return ERR_PTR(-ENOMEM);
++
++	if (devm_add_action_or_reset(dev, c2k_iounmap_action, base))
++		return ERR_PTR(-ENOMEM);
++
++	return base;
++}
++
++/* Read-modify-write helper for the C2K control registers. */
++static void c2k_rmw(void __iomem *base, unsigned int reg, u32 mask, u32 val)
++{
++	u32 tmp = readl(base + reg);
++
++	tmp = (tmp & ~mask) | (val & mask);
++	writel(tmp, base + reg);
++}
++
++/*
++ * C2K sysreset, equivalent of mtk_wdt_set_c2k_sysrst() in the downstream
++ * watchdog driver (mtk_wdt.c:472-504).  Bit 15 of TOP_RGU_WDT_SWSYSRST holds
++ * the C2K domain in reset; every write must carry the 0x88000000 key.
++ */
++static void c2k_sysrst_set(struct ccci_c2k *c2k, bool asserted)
++{
++	u32 val;
++
++	if (!c2k->toprgu)
++		return;
++
++	val = readl(c2k->toprgu + C2K_TOP_RGU_WDT_SWSYSRST);
++	if (asserted)
++		val |= BIT(C2K_RGU_C2K_SYSRST_BIT);
++	else
++		val &= ~BIT(C2K_RGU_C2K_SYSRST_BIT);
++	writel(val | C2K_RGU_SWSYS_RST_KEY,
++	       c2k->toprgu + C2K_TOP_RGU_WDT_SWSYSRST);
++}
++
++/*
++ * Wake the C2K subsystem: pulse INFRA_AO_C2K_SPM_CTRL[0] and wait for
++ * INFRA_AO_C2K_STATUS[1], then drop the request again.  Downstream
++ * ccif_c2k_platform.c:326-345.
++ */
++static int c2k_wake(struct ccci_c2k *c2k)
++{
++	u32 val;
++	int ret;
++
++	if (!c2k->infra_ao)
++		return 0;
++
++	c2k_rmw(c2k->infra_ao, C2K_INFRA_AO_C2K_SPM_CTRL,
++		C2K_SPM_WAKE_BIT, C2K_SPM_WAKE_BIT);
++
++	ret = readl_poll_timeout(c2k->infra_ao + C2K_INFRA_AO_C2K_STATUS, val,
++				 val & C2K_STATUS_AWAKE_BIT, C2K_WAKE_POLL_US,
++				 C2K_WAKE_TIMEOUT_US);
++	if (ret) {
++		dev_err(c2k->dev, "[C2K] wake timeout, C2K_STATUS=0x%x\n", val);
++		return ret;
++	}
++
++	c2k_rmw(c2k->infra_ao, C2K_INFRA_AO_C2K_SPM_CTRL,
++		C2K_SPM_WAKE_BIT, 0);
++	return 0;
++}
++
++/**
++ * ccci_c2k_hw_read_chip_id() - read the C2K chip id register
++ * @c2k: C2K instance
++ *
++ * Downstream reads this register through c2k_chip_id_base (ROM DTS node
++ * mdc2k@3a00b01c) and expects 0x020AC000; the wait loop around it is compiled
++ * out downstream (c2k_platform.c:536-543), so the value is only read and
++ * reported.
++ */
++unsigned int ccci_c2k_hw_read_chip_id(struct ccci_c2k *c2k)
++{
++	if (!c2k->chip_id)
++		return 0;
++
++	c2k->chip_id_val = readl(c2k->chip_id);
++	c2k->chip_id_valid = c2k->chip_id_val == C2K_CHIP_ID_EXPECTED;
++	return c2k->chip_id_val;
++}
++
++/**
++ * ccci_c2k_hw_init() - map the C2K hardware and acquire its supplies
++ * @c2k: C2K instance
++ *
++ * Everything is devres managed, so there is no teardown counterpart.
++ */
++int ccci_c2k_hw_init(struct ccci_c2k *c2k)
++{
++	struct device *dev = c2k->dev;
++
++	c2k->md1_pccif = c2k_map_resource(dev, C2K_REG_MD1_PCCIF);
++	if (IS_ERR(c2k->md1_pccif))
++		return PTR_ERR(c2k->md1_pccif);
++
++	c2k->md3_pccif = c2k_map_resource(dev, C2K_REG_MD3_PCCIF);
++	if (IS_ERR(c2k->md3_pccif))
++		return PTR_ERR(c2k->md3_pccif);
++
++	c2k->chip_id = c2k_map_resource(dev, C2K_REG_CHIP_ID);
++	if (IS_ERR(c2k->chip_id))
++		return PTR_ERR(c2k->chip_id);
++
++	c2k->boot_vector = c2k_map_default(dev, C2K_REG_BOOT_VECTOR,
++					   C2K_MD_BOOT_VECTOR_PHYS, 4);
++	if (IS_ERR(c2k->boot_vector))
++		return PTR_ERR(c2k->boot_vector);
++
++	c2k->boot_vector_key = c2k_map_default(dev, C2K_REG_BOOT_VECTOR_KEY,
++					       C2K_MD_BOOT_VECTOR_KEY_PHYS, 4);
++	if (IS_ERR(c2k->boot_vector_key))
++		return PTR_ERR(c2k->boot_vector_key);
++
++	c2k->boot_vector_en = c2k_map_default(dev, C2K_REG_BOOT_VECTOR_EN,
++					      C2K_MD_BOOT_VECTOR_EN_PHYS, 4);
++	if (IS_ERR(c2k->boot_vector_en))
++		return PTR_ERR(c2k->boot_vector_en);
++
++	c2k->md_rgu = c2k_map_default(dev, C2K_REG_MD_RGU, C2K_MD_RGU_PHYS,
++				      0x40);
++	if (IS_ERR(c2k->md_rgu))
++		return PTR_ERR(c2k->md_rgu);
++
++	c2k->boot_vector_phys = c2k_phys(dev, C2K_REG_BOOT_VECTOR,
++					 C2K_MD_BOOT_VECTOR_PHYS);
++	c2k->boot_vector_key_phys = c2k_phys(dev, C2K_REG_BOOT_VECTOR_KEY,
++					     C2K_MD_BOOT_VECTOR_KEY_PHYS);
++	c2k->boot_vector_en_phys = c2k_phys(dev, C2K_REG_BOOT_VECTOR_EN,
++					    C2K_MD_BOOT_VECTOR_EN_PHYS);
++	c2k->md_rgu_phys = c2k_phys(dev, C2K_REG_MD_RGU, C2K_MD_RGU_PHYS);
++
++	c2k->infra_ao = c2k_map_syscon(dev, "mediatek,infracfg");
++	if (IS_ERR(c2k->infra_ao))
++		return PTR_ERR(c2k->infra_ao);
++	if (!c2k->infra_ao)
++		return dev_err_probe(dev, -EINVAL,
++				     "missing mediatek,infracfg phandle\n");
++
++	c2k->sleep = c2k_map_syscon(dev, "mediatek,spm");
++	if (IS_ERR(c2k->sleep))
++		return PTR_ERR(c2k->sleep);
++	if (!c2k->sleep)
++		return dev_err_probe(dev, -EINVAL,
++				     "missing mediatek,spm phandle\n");
++
++	c2k->toprgu = c2k_map_syscon(dev, "mediatek,toprgu");
++	if (IS_ERR(c2k->toprgu))
++		return PTR_ERR(c2k->toprgu);
++	if (!c2k->toprgu)
++		return dev_err_probe(dev, -EINVAL,
++				     "missing mediatek,toprgu phandle\n");
++
++	c2k->clk_md_main = devm_clk_get_optional(dev, "scp-sys-md2-main");
++	if (IS_ERR(c2k->clk_md_main))
++		return PTR_ERR(c2k->clk_md_main);
++	if (!c2k->clk_md_main)
++		dev_warn(dev,
++			 "no scp-sys-md2-main clock, relying on the boot loader\n");
++
++	c2k->vtcxo1 = devm_regulator_get_optional(dev, "vtcxo1");
++	if (IS_ERR(c2k->vtcxo1))
++		return PTR_ERR(c2k->vtcxo1);
++	if (!c2k->vtcxo1)
++		dev_warn(dev,
++			 "no vtcxo1 supply, C2K VTCXO must be enabled elsewhere\n");
++
++	c2k->ets_sel = of_property_read_bool(dev->of_node, "mediatek,ets-sel");
++
++	ccci_c2k_hw_read_chip_id(c2k);
++	dev_info(dev, "chip id 0x%08x%s\n", c2k->chip_id_val,
++		 c2k->chip_id_valid ? "" : " (unexpected)");
++	return 0;
++}
++
++/**
++ * ccci_c2k_hw_power_on() - release C2K clocks and VTCXO
++ * @c2k: C2K instance
++ *
++ * Downstream md_ccif_power_on() MD_SYS3 branch (ccif_c2k_platform.c:376-389)
++ * enables "scp-sys-md2-main"; the VTCXO_1 PMIC write of the same bring-up
++ * (step 3, PMIC register 0x0A02 == MT6328_VTCXO_1_CON0) is done through the
++ * regulator framework here.
++ */
++int ccci_c2k_hw_power_on(struct ccci_c2k *c2k)
++{
++	int ret;
++
++	if (c2k->powered)
++		return 0;
++
++	if (c2k->clk_md_main) {
++		ret = clk_prepare_enable(c2k->clk_md_main);
++		if (ret) {
++			dev_err(c2k->dev, "scp-sys-md2-main enable failed %d\n",
++				ret);
++			return ret;
++		}
++		c2k->clk_enabled = true;
++	}
++
++	if (c2k->vtcxo1) {
++		ret = regulator_enable(c2k->vtcxo1);
++		if (ret) {
++			dev_err(c2k->dev, "vtcxo1 enable failed %d\n", ret);
++			if (c2k->clk_enabled) {
++				clk_disable_unprepare(c2k->clk_md_main);
++				c2k->clk_enabled = false;
++			}
++			return ret;
++		}
++		c2k->vtcxo_enabled = true;
++	}
++
++	c2k->powered = true;
++	dev_info(c2k->dev, "[C2K] powered on\n");
++	return 0;
++}
++
++/**
++ * ccci_c2k_hw_power_off() - gate C2K clocks and VTCXO again
++ * @c2k: C2K instance
++ *
++ * Downstream md_ccif_power_off() MD_SYS3 branch (ccif_c2k_platform.c:412-418).
++ */
++int ccci_c2k_hw_power_off(struct ccci_c2k *c2k)
++{
++	if (!c2k->powered)
++		return 0;
++
++	if (c2k->vtcxo_enabled) {
++		regulator_disable(c2k->vtcxo1);
++		c2k->vtcxo_enabled = false;
++	}
++
++	if (c2k->clk_enabled) {
++		clk_disable_unprepare(c2k->clk_md_main);
++		c2k->clk_enabled = false;
++	}
++
++	c2k->powered = false;
++	dev_info(c2k->dev, "[C2K] powered off\n");
++	return 0;
++}
++
++/**
++ * ccci_c2k_hw_let_md_go() - start MD3
++ * @c2k: C2K instance
++ *
++ * Equivalent of md_ccif_let_md_go() for MD_SYS3 (ccif_c2k_platform.c:241-355):
++ * program the boot slave, put C2K in its boot mode, select the sleep clock
++ * sources, release the C2K sysreset and complete the wake handshake.  Must run
++ * after ccci_c2k_hw_power_on() and after the firmware has been staged.
++ */
++int ccci_c2k_hw_let_md_go(struct ccci_c2k *c2k)
++{
++	u32 val;
++	int ret;
++
++	if (!c2k->powered)
++		return -EPERM;
++
++	/* Boot slave: key, vector, enable (modem_reg_base.h:52-54). */
++	writel(C2K_MD_BOOT_VECTOR_KEY_VALUE, c2k->boot_vector_key);
++	writel(C2K_MD_BOOT_VECTOR_VALUE, c2k->boot_vector);
++	writel(C2K_MD_BOOT_VECTOR_EN_VALUE, c2k->boot_vector_en);
++
++	/*
++	 * Step 1: boot mode.  ETS select first when the board boots in
++	 * meta/factory mode (ccif_c2k_platform.c:261-268), then field [10:8]=5
++	 * (ccif_c2k_platform.c:269-275).
++	 */
++	if (c2k->ets_sel)
++		c2k_rmw(c2k->infra_ao, C2K_INFRA_AO_C2K_CONFIG,
++			C2K_ETS_SEL_BIT, C2K_ETS_SEL_BIT);
++	c2k_rmw(c2k->infra_ao, C2K_INFRA_AO_C2K_CONFIG,
++		C2K_CONFIG_BOOTMODE_MASK,
++		C2K_CONFIG_BOOTMODE_C2K << 8);
++
++	/* Step 2: srcclkena selection mask (ccif_c2k_platform.c:279-288). */
++	c2k_rmw(c2k->infra_ao, C2K_INFRA_AO_C2K_SPM_CTRL,
++		C2K_SPM_SRCCLKENA_MASK, C2K_SPM_SRCCLKENA_C2K << 4);
++	val = readl(c2k->infra_ao + C2K_INFRA_AO_C2K_SPM_CTRL);
++
++	/* Sleep clock configuration (ccif_c2k_platform.c:292-303). */
++	c2k_rmw(c2k->sleep, C2K_SLEEP_CLK_CON, C2K_SLEEP_CLK_CON_SET,
++		C2K_SLEEP_CLK_CON_SET);
++	c2k_rmw(c2k->sleep, C2K_SLEEP_CLK_CON, C2K_SLEEP_CLK_CON_CLR, 0);
++
++	/*
++	 * Step 4: release the C2K domain reset.  The PMIC VTCXO_1 write that
++	 * downstream performs as step 3 is done in ccci_c2k_hw_power_on().
++	 */
++	c2k_sysrst_set(c2k, false);
++
++	/* Step 6: wake up C2K and wait for the hardware handshake. */
++	ret = c2k_wake(c2k);
++	if (ret)
++		return ret;
++
++	dev_info(c2k->dev,
++		 "[C2K] C2K_CONFIG=0x%x C2K_SPM_CTRL=0x%x C2K_STATUS=0x%x SLEEP_CLK_CON=0x%x SWSYSRST=0x%x\n",
++		 readl(c2k->infra_ao + C2K_INFRA_AO_C2K_CONFIG), val,
++		 readl(c2k->infra_ao + C2K_INFRA_AO_C2K_STATUS),
++		 readl(c2k->sleep + C2K_SLEEP_CLK_CON),
++		 readl(c2k->toprgu + C2K_TOP_RGU_WDT_SWSYSRST));
++
++	ccci_c2k_hw_read_chip_id(c2k);
++	return 0;
++}
++
++/**
++ * ccci_c2k_hw_reset() - assert and release the C2K domain reset
++ * @c2k: C2K instance
++ *
++ * Exception recovery path, equivalent of c2k_modem_reset_platform()
++ * (c2k_ccci/mt6735/c2k_platform.c:599-650): hold C2K in reset, release it and
++ * redo the wake handshake.
++ */
++void ccci_c2k_hw_reset(struct ccci_c2k *c2k)
++{
++	if (!c2k->powered)
++		return;
++
++	dev_info(c2k->dev, "[C2K] reset\n");
++	c2k_sysrst_set(c2k, true);
++	c2k_sysrst_set(c2k, false);
++
++	if (c2k_wake(c2k))
++		dev_err(c2k->dev, "[C2K] reset wake handshake failed\n");
++}
++
++/**
++ * ccci_c2k_hw_format_regs() - format the C2K register dump
++ * @c2k: C2K instance
++ * @buf: destination buffer
++ * @size: buffer size
++ */
++int ccci_c2k_hw_format_regs(struct ccci_c2k *c2k, char *buf, size_t size)
++{
++	int len = 0;
++	int n;
++
++	n = scnprintf(buf + len, size - len,
++		      "ap_ccif: CON=%08x BUSY=%08x START=%08x TCHNUM=%08x RCHNUM=%08x ACK=%08x\n",
++		      readl(c2k->ccif + C2K_APCCIF_CON),
++		      readl(c2k->ccif + C2K_APCCIF_BUSY),
++		      readl(c2k->ccif + C2K_APCCIF_START),
++		      readl(c2k->ccif + C2K_APCCIF_TCHNUM),
++		      readl(c2k->ccif + C2K_APCCIF_RCHNUM),
++		      readl(c2k->ccif + C2K_APCCIF_ACK));
++	len += n;
++	if (len >= size)
++		return len;
++
++	n = scnprintf(buf + len, size - len,
++		      "infra_ao: C2K_CONFIG=%08x C2K_STATUS=%08x C2K_SPM_CTRL=%08x\n",
++		      readl(c2k->infra_ao + C2K_INFRA_AO_C2K_CONFIG),
++		      readl(c2k->infra_ao + C2K_INFRA_AO_C2K_STATUS),
++		      readl(c2k->infra_ao + C2K_INFRA_AO_C2K_SPM_CTRL));
++	len += n;
++	if (len >= size)
++		return len;
++
++	n = scnprintf(buf + len, size - len,
++		      "sleep: SLEEP_CLK_CON=%08x toprgu: SWSYSRST=%08x\n",
++		      readl(c2k->sleep + C2K_SLEEP_CLK_CON),
++		      readl(c2k->toprgu + C2K_TOP_RGU_WDT_SWSYSRST));
++	len += n;
++	if (len >= size)
++		return len;
++
++	n = scnprintf(buf + len, size - len,
++		      "md_rgu: WDT_MODE=%08x WDT_STA=%08x\n",
++		      readl(c2k->md_rgu + C2K_MD_WDT_MODE),
++		      readl(c2k->md_rgu + C2K_MD_WDT_STA));
++	len += n;
++	if (len >= size)
++		return len;
++
++	if (c2k->md1_pccif && c2k->md3_pccif) {
++		n = scnprintf(buf + len, size - len,
++			      "pccif: md1_BUSY=%08x md3_BUSY=%08x\n",
++			      readl(c2k->md1_pccif + C2K_APCCIF_BUSY),
++			      readl(c2k->md3_pccif + C2K_APCCIF_BUSY));
++		len += n;
++		if (len >= size)
++			return len;
++	}
++
++	if (c2k->chip_id) {
++		n = scnprintf(buf + len, size - len,
++			      "chip_id=%08x%s\n", c2k->chip_id_val,
++			      c2k->chip_id_valid ? "" : " (unexpected)");
++		len += n;
++	}
++
++	return len;
++}
++
++/**
++ * ccci_c2k_hw_format_wdt() - format the C2K watchdog/reset status
++ * @c2k: C2K instance
++ * @buf: destination buffer
++ * @size: buffer size
++ */
++int ccci_c2k_hw_format_wdt(struct ccci_c2k *c2k, char *buf, size_t size)
++{
++	u32 sysrst = readl(c2k->toprgu + C2K_TOP_RGU_WDT_SWSYSRST);
++	u32 status = readl(c2k->infra_ao + C2K_INFRA_AO_C2K_STATUS);
++	u32 spm = readl(c2k->infra_ao + C2K_INFRA_AO_C2K_SPM_CTRL);
++	int len = 0;
++
++	len += scnprintf(buf + len, size - len, "c2k_sysrst=%s\n",
++			 sysrst & BIT(C2K_RGU_C2K_SYSRST_BIT) ? "asserted" :
++								 "released");
++	len += scnprintf(buf + len, size - len, "top_rgu_swsysrst=0x%08x\n",
++			 sysrst);
++	len += scnprintf(buf + len, size - len, "c2k_status=0x%08x awake=%u\n",
++			 status, !!(status & C2K_STATUS_AWAKE_BIT));
++	len += scnprintf(buf + len, size - len, "c2k_spm_ctrl=0x%08x wake=%u\n",
++			 spm, !!(spm & C2K_SPM_WAKE_BIT));
++
++	return len;
++}
+diff --git a/drivers/misc/mediatek/ccci_c2k/ccci_c2k_sysfs.c b/drivers/misc/mediatek/ccci_c2k/ccci_c2k_sysfs.c
+new file mode 100644
+index 000000000..1e6922ecc
+--- /dev/null
++++ b/drivers/misc/mediatek/ccci_c2k/ccci_c2k_sysfs.c
+@@ -0,0 +1,286 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * C2K (MD3) sysfs and debugfs interface.
++ *
++ * Port from Samsung/MTK downstream (SM-G532M, MT6737T, kernel 3.18):
++ *   drivers/misc/mediatek/eccci/ccci_core.c (state, boot count)
++ *   drivers/misc/mediatek/eccci/ccci_support.c (sim switch mode)
++ *   drivers/misc/mediatek/eccci/port_net.c (IRAT peer)
++ *   drivers/misc/mediatek/eccci/modem_ccif_c2k.c (register dump)
++ *
++ * Nothing in the 3.18 C2K path exposed these files; the values are the ones
++ * the downstream debug prints and sysfs attributes of the CCCI core report.
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ * Copyright (C) 2026 The Nura project
++ */
++
++#include <linux/ccci.h>
++#include <linux/debugfs.h>
++#include <linux/errno.h>
++#include <linux/kobject.h>
++#include <linux/seq_file.h>
++#include <linux/sysfs.h>
++
++#include "ccci_c2k.h"
++
++static const char *c2k_md_state_name(int state)
++{
++	switch (state) {
++	case CCCI_MD_INVALID:
++		return "invalid";
++	case CCCI_MD_BOOTING:
++		return "booting";
++	case CCCI_MD_READY:
++		return "ready";
++	case CCCI_MD_EXCEPTION:
++		return "exception";
++	case CCCI_MD_STOPPED:
++		return "stopped";
++	default:
++		return "unknown";
++	}
++}
++
++static ssize_t md3_state_show(struct kobject *kobj,
++			      struct kobj_attribute *attr, char *buf)
++{
++	struct ccci_c2k *c2k = ccci_c2k_get();
++
++	if (!c2k)
++		return -ENODEV;
++
++	return sysfs_emit(buf, "%s\n",
++			  c2k_md_state_name(ccci_md_get_state(CCCI_MD_SYS3)));
++}
++static struct kobj_attribute c2k_md3_state_attr =
++	__ATTR_RO(md3_state);
++
++static ssize_t boot_count_show(struct kobject *kobj,
++			       struct kobj_attribute *attr, char *buf)
++{
++	struct ccci_c2k *c2k = ccci_c2k_get();
++
++	if (!c2k)
++		return -ENODEV;
++
++	return sysfs_emit(buf, "%u\n", READ_ONCE(c2k->boot_count));
++}
++static struct kobj_attribute c2k_boot_count_attr =
++	__ATTR_RO(boot_count);
++
++static ssize_t irat_state_show(struct kobject *kobj,
++			       struct kobj_attribute *attr, char *buf)
++{
++	struct ccci_c2k *c2k = ccci_c2k_get();
++
++	if (!c2k)
++		return -ENODEV;
++
++	return sysfs_emit(buf, "md3_irat_md_id=MD%u capability=0x%08x\n",
++			  c2k->irat_md_id + 1, c2k->cfg.capability);
++}
++static struct kobj_attribute c2k_irat_state_attr =
++	__ATTR_RO(irat_state);
++
++static ssize_t sim_switch_mode_show(struct kobject *kobj,
++				    struct kobj_attribute *attr, char *buf)
++{
++	if (!ccci_c2k_get())
++		return -ENODEV;
++
++	return sysfs_emit(buf, "0x%x\n", ccci_c2k_sim_switch_mode_get());
++}
++
++static ssize_t sim_switch_mode_store(struct kobject *kobj,
++				     struct kobj_attribute *attr,
++				     const char *buf, size_t count)
++{
++	int mode;
++	int ret;
++
++	if (!ccci_c2k_get())
++		return -ENODEV;
++
++	ret = kstrtoint(buf, 0, &mode);
++	if (ret)
++		return ret;
++
++	ccci_c2k_sim_switch_mode_set(mode);
++	return count;
++}
++static struct kobj_attribute c2k_sim_switch_mode_attr =
++	__ATTR_RW(sim_switch_mode);
++
++static ssize_t chip_id_show(struct kobject *kobj,
++			    struct kobj_attribute *attr, char *buf)
++{
++	struct ccci_c2k *c2k = ccci_c2k_get();
++
++	if (!c2k)
++		return -ENODEV;
++
++	return sysfs_emit(buf, "0x%08x%s\n", ccci_c2k_hw_read_chip_id(c2k),
++			  c2k->chip_id_valid ? "" : " (unexpected)");
++}
++static struct kobj_attribute c2k_chip_id_attr =
++	__ATTR_RO(chip_id);
++
++static ssize_t md_wdt_irq_show(struct kobject *kobj,
++			       struct kobj_attribute *attr, char *buf)
++{
++	struct ccci_c2k *c2k = ccci_c2k_get();
++
++	if (!c2k)
++		return -ENODEV;
++
++	return sysfs_emit(buf, "%u\n", c2k->md_wdt_irq);
++}
++static struct kobj_attribute c2k_md_wdt_irq_attr =
++	__ATTR_RO(md_wdt_irq);
++
++static ssize_t regs_show(struct kobject *kobj, struct kobj_attribute *attr,
++			 char *buf)
++{
++	struct ccci_c2k *c2k = ccci_c2k_get();
++
++	if (!c2k)
++		return -ENODEV;
++
++	return ccci_c2k_hw_format_regs(c2k, buf, PAGE_SIZE);
++}
++static struct kobj_attribute c2k_regs_attr =
++	__ATTR_RO(regs);
++
++static ssize_t c2k_wdt_status_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	struct ccci_c2k *c2k = ccci_c2k_get();
++
++	if (!c2k)
++		return -ENODEV;
++
++	return ccci_c2k_hw_format_wdt(c2k, buf, PAGE_SIZE);
++}
++static struct kobj_attribute c2k_wdt_status_attr =
++	__ATTR_RO(c2k_wdt_status);
++
++static struct attribute *c2k_attrs[] = {
++	&c2k_md3_state_attr.attr,
++	&c2k_boot_count_attr.attr,
++	&c2k_irat_state_attr.attr,
++	&c2k_sim_switch_mode_attr.attr,
++	&c2k_chip_id_attr.attr,
++	&c2k_md_wdt_irq_attr.attr,
++	&c2k_regs_attr.attr,
++	&c2k_wdt_status_attr.attr,
++	NULL,
++};
++
++static const struct attribute_group c2k_attr_group = {
++	.attrs = c2k_attrs,
++};
++
++static int c2k_debugfs_regs_show(struct seq_file *m, void *unused)
++{
++	struct ccci_c2k *c2k = m->private;
++	char buf[512];
++	int len;
++
++	if (!c2k) {
++		seq_puts(m, "MD3 not probed\n");
++		return 0;
++	}
++
++	len = ccci_c2k_hw_format_regs(c2k, buf, sizeof(buf));
++	seq_write(m, buf, len);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(c2k_debugfs_regs);
++
++static int c2k_debugfs_wdt_show(struct seq_file *m, void *unused)
++{
++	struct ccci_c2k *c2k = m->private;
++	char buf[256];
++	int len;
++
++	if (!c2k) {
++		seq_puts(m, "MD3 not probed\n");
++		return 0;
++	}
++
++	len = ccci_c2k_hw_format_wdt(c2k, buf, sizeof(buf));
++	seq_write(m, buf, len);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(c2k_debugfs_wdt);
++
++static int c2k_debugfs_channels_show(struct seq_file *m, void *unused)
++{
++	return ccci_c2k_ch_dump(m);
++}
++DEFINE_SHOW_ATTRIBUTE(c2k_debugfs_channels);
++
++static int c2k_debugfs_state_show(struct seq_file *m, void *unused)
++{
++	struct ccci_c2k *c2k = m->private;
++
++	if (!c2k) {
++		seq_puts(m, "MD3 not probed\n");
++		return 0;
++	}
++
++	seq_printf(m, "state=%s boot_count=%u irat_md_id=MD%u\n",
++		   c2k_md_state_name(ccci_md_get_state(CCCI_MD_SYS3)),
++		   c2k->boot_count, c2k->irat_md_id + 1);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(c2k_debugfs_state);
++
++/**
++ * ccci_c2k_sysfs_init() - create /sys/kernel/c2k and the debugfs directory
++ * @c2k: C2K instance
++ */
++int ccci_c2k_sysfs_init(struct ccci_c2k *c2k)
++{
++	int ret;
++
++	c2k->kobj = kobject_create_and_add("c2k", kernel_kobj);
++	if (!c2k->kobj)
++		return -ENOMEM;
++
++	ret = sysfs_create_group(c2k->kobj, &c2k_attr_group);
++	if (ret) {
++		kobject_put(c2k->kobj);
++		c2k->kobj = NULL;
++		return ret;
++	}
++
++	c2k->debugfs_dir = debugfs_create_dir("ccci_c2k", NULL);
++	debugfs_create_file("state", 0444, c2k->debugfs_dir, c2k,
++			    &c2k_debugfs_state_fops);
++	debugfs_create_file("regs", 0444, c2k->debugfs_dir, c2k,
++			    &c2k_debugfs_regs_fops);
++	debugfs_create_file("wdt", 0444, c2k->debugfs_dir, c2k,
++			    &c2k_debugfs_wdt_fops);
++	debugfs_create_file("channels", 0444, c2k->debugfs_dir, c2k,
++			    &c2k_debugfs_channels_fops);
++
++	return 0;
++}
++
++/**
++ * ccci_c2k_sysfs_exit() - remove the sysfs and debugfs interface
++ * @c2k: C2K instance
++ */
++void ccci_c2k_sysfs_exit(struct ccci_c2k *c2k)
++{
++	debugfs_remove_recursive(c2k->debugfs_dir);
++	c2k->debugfs_dir = NULL;
++
++	if (c2k->kobj) {
++		sysfs_remove_group(c2k->kobj, &c2k_attr_group);
++		kobject_put(c2k->kobj);
++		c2k->kobj = NULL;
++	}
++}
+diff --git a/include/linux/ccci.h b/include/linux/ccci.h
+new file mode 100644
+index 000000000..f8f7ce2fb
+--- /dev/null
++++ b/include/linux/ccci.h
+@@ -0,0 +1,301 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * CCCI (Cross Chip Communication Interface) public kernel API.
++ *
++ * Ported from the Samsung/MTK 3.18 downstream kernel:
++ *   drivers/misc/mediatek/include/mt-plat/mt_ccci_common.h
++ *   drivers/misc/mediatek/eccci/ccci_core.h
++ *   drivers/misc/mediatek/ccmni/ccmni.h
++ *
++ * This file is the frozen contract between the CCCI core, the CLDMA engine,
++ * the CCMNI netdev driver, the CCCI util driver and the C2K/dual-modem driver.
++ * Do not change existing declarations; append only if unavoidable.
++ */
++#ifndef __LINUX_CCCI_H
++#define __LINUX_CCCI_H
++
++#include <linux/types.h>
++#include <linux/skbuff.h>
++#include <linux/netdevice.h>
++#include <linux/device.h>
++
++/* Modem ids. Downstream md_id is 0-based (MD_SYS1 == 0). */
++enum ccci_md_id {
++	CCCI_MD_SYS1 = 0,
++	CCCI_MD_SYS2,
++	CCCI_MD_SYS3,
++	CCCI_MD_SYS4,
++	CCCI_MD_SYS5,
++	CCCI_MAX_MD_NUM,
++};
++
++/* Modem states, mirror downstream MD_STATE (eccci/ccci_core.h). */
++enum ccci_md_state {
++	CCCI_MD_INVALID = 0,
++	CCCI_MD_BOOTING,
++	CCCI_MD_READY,
++	CCCI_MD_EXCEPTION,
++	CCCI_MD_STOPPED,
++};
++
++/* Logical channel ids, verbatim from downstream mt_ccci_common.h. */
++enum ccci_ch {
++	CCCI_CONTROL_RX = 0,
++	CCCI_CONTROL_TX = 1,
++	CCCI_SYSTEM_RX = 2,
++	CCCI_SYSTEM_TX = 3,
++	CCCI_PCM_RX = 4,
++	CCCI_PCM_TX = 5,
++	CCCI_UART1_RX = 6,
++	CCCI_UART1_RX_ACK = 7,
++	CCCI_UART1_TX = 8,
++	CCCI_UART1_TX_ACK = 9,
++	CCCI_UART2_RX = 10,
++	CCCI_UART2_RX_ACK = 11,
++	CCCI_UART2_TX = 12,
++	CCCI_UART2_TX_ACK = 13,
++	CCCI_FS_RX = 14,
++	CCCI_FS_TX = 15,
++	CCCI_PMIC_RX = 16,
++	CCCI_PMIC_TX = 17,
++	CCCI_UEM_RX = 18,
++	CCCI_UEM_TX = 19,
++	CCCI_CCMNI1_RX = 20,
++	CCCI_CCMNI1_RX_ACK = 21,
++	CCCI_CCMNI1_TX = 22,
++	CCCI_CCMNI1_TX_ACK = 23,
++	CCCI_CCMNI2_RX = 24,
++	CCCI_CCMNI2_RX_ACK = 25,
++	CCCI_CCMNI2_TX = 26,
++	CCCI_CCMNI2_TX_ACK = 27,
++	CCCI_CCMNI3_RX = 28,
++	CCCI_CCMNI3_RX_ACK = 29,
++	CCCI_CCMNI3_TX = 30,
++	CCCI_CCMNI3_TX_ACK = 31,
++	CCCI_RPC_RX = 32,
++	CCCI_RPC_TX = 33,
++	CCCI_IPC_RX = 34,
++	CCCI_IPC_RX_ACK = 35,
++	CCCI_IPC_TX = 36,
++	CCCI_IPC_TX_ACK = 37,
++	CCCI_IPC_UART_RX = 38,
++	CCCI_IPC_UART_RX_ACK = 39,
++	CCCI_IPC_UART_TX = 40,
++	CCCI_IPC_UART_TX_ACK = 41,
++	CCCI_MD_LOG_RX = 42,
++	CCCI_MD_LOG_TX = 43,
++	CCCI_IT_RX = 50,
++	CCCI_IT_TX = 51,
++	CCCI_IMSV_UL = 52,
++	CCCI_IMSV_DL = 53,
++	CCCI_IMSC_UL = 54,
++	CCCI_IMSC_DL = 55,
++	CCCI_IMSA_UL = 56,
++	CCCI_IMSA_DL = 57,
++	CCCI_IMSDC_UL = 58,
++	CCCI_IMSDC_DL = 59,
++	CCCI_ICUSB_RX = 60,
++	CCCI_ICUSB_TX = 61,
++	CCCI_LB_IT_RX = 62,
++	CCCI_LB_IT_TX = 63,
++	CCCI_CCMNI1_DL_ACK = 64,
++	CCCI_CCMNI2_DL_ACK = 65,
++	CCCI_CCMNI3_DL_ACK = 66,
++	CCCI_STATUS_RX = 67,
++	CCCI_STATUS_TX = 68,
++	CCCI_CCMNI4_RX = 69,
++	CCCI_CCMNI4_RX_ACK = 70,
++	CCCI_CCMNI4_TX = 71,
++	CCCI_CCMNI4_TX_ACK = 72,
++	CCCI_CCMNI4_DLACK_RX = 73,
++	CCCI_CCMNI5_RX = 74,
++	CCCI_CCMNI5_RX_ACK = 75,
++	CCCI_CCMNI5_TX = 76,
++	CCCI_CCMNI5_TX_ACK = 77,
++	CCCI_CCMNI5_DLACK_RX = 78,
++	CCCI_CCMNI6_RX = 79,
++	CCCI_CCMNI6_RX_ACK = 80,
++	CCCI_CCMNI6_TX = 81,
++	CCCI_CCMNI6_TX_ACK = 82,
++	CCCI_CCMNI6_DLACK_RX = 83,
++	CCCI_CCMNI7_RX = 84,
++	CCCI_CCMNI7_RX_ACK = 85,
++	CCCI_CCMNI7_TX = 86,
++	CCCI_CCMNI7_TX_ACK = 87,
++	CCCI_CCMNI7_DLACK_RX = 88,
++	CCCI_CCMNI8_RX = 89,
++	CCCI_CCMNI8_RX_ACK = 90,
++	CCCI_CCMNI8_TX = 91,
++	CCCI_CCMNI8_TX_ACK = 92,
++	CCCI_CCMNI8_DLACK_RX = 93,
++	CCCI_MDL_MONITOR_DL = 94,
++	CCCI_MDL_MONITOR_UL = 95,
++	CCCI_RIL_IPC0_RX = 148,
++	CCCI_RIL_IPC0_TX = 149,
++	CCCI_RIL_IPC1_RX = 150,
++	CCCI_RIL_IPC1_TX = 151,
++	CCCI_VT_CTL_RX = 152,
++	CCCI_VT_CTL_TX = 153,
++	CCCI_C2K_PPP_DATA,
++	CCCI_C2K_AT,
++	CCCI_C2K_AT2,
++	CCCI_C2K_AT3,
++	CCCI_C2K_LB_DL,
++	CCCI_MONITOR_CH,
++	CCCI_DUMMY_CH,
++	CCCI_MAX_CH_NUM,
++	CCCI_MONITOR_CH_ID = 0xf0000000,
++	CCCI_FORCE_ASSERT_CH = 20090215,
++	CCCI_INVALID_CH_ID = 0xffffffff,
++};
++
++/* C2K channel ids, verbatim from downstream mt_ccci_common.h. */
++enum c2k_channel {
++	CTRL_CH_C2K = 0,
++	AUDIO_CH_C2K = 1,
++	DATA_PPP_CH_C2K = 2,
++	MDLOG_CTRL_CH_C2K = 3,
++	FS_CH_C2K = 4,
++	AT_CH_C2K = 5,
++	AGPS_CH_C2K = 6,
++	AT2_CH_C2K = 7,
++	AT3_CH_C2K = 8,
++	MDLOG_CH_C2K = 9,
++	STATUS_CH_C2K = 11,
++	NET1_CH_C2K = 12,
++	NET2_CH_C2K = 13,
++	NET3_CH_C2K = 14,
++	NET4_CH_C2K = 15,
++	NET5_CH_C2K = 16,
++	C2K_MAX_CH_NUM,
++};
++
++/* Downstream struct ccci_header (16 bytes, little endian). */
++struct ccci_header {
++	__le32 data[2];
++	u16 channel;
++	u16 seq_num:15;
++	u16 assert_bit:1;
++	__le32 reserved;
++} __packed;
++
++/* Modem capabilities, verbatim downstream MODEM_CAP_*. */
++#define CCCI_MD_CAP_NAPI		(1 << 0)
++#define CCCI_MD_CAP_TXBUSY_STOP		(1 << 1)
++#define CCCI_MD_CAP_SGIO		(1 << 2)
++#define CCCI_MD_CAP_CCMNI_DISABLE	(1 << 16)
++#define CCCI_MD_CAP_DATA_ACK_DVD	(1 << 17)
++#define CCCI_MD_CAP_CCMNI_SEQNO		(1 << 18)
++#define CCCI_MD_CAP_CCMNI_IRAT		(1 << 19)
++#define CCCI_MD_CAP_WORLD_PHONE		(1 << 20)
++#define CCCI_MD_CAP_CCMNI_MQ		(1 << 21)
++
++/* ------------------------------------------------------------------ */
++/* CCMNI <-> CCCI core binding (implemented by ccmni, used by core)    */
++/* ------------------------------------------------------------------ */
++struct ccmni_ch {
++	int rx;
++	int rx_ack;
++	int tx;
++	int tx_ack;
++	int dl_ack;
++	int multiq;
++};
++
++#define CCMNI_DRV_V0	0
++#define CCMNI_DRV_V1	1
++#define CCMNI_DRV_V2	2
++
++struct ccmni_ccci_ops {
++	int ccmni_ver;
++	int ccmni_num;
++	unsigned char name[16];
++	unsigned int md_ability;
++	unsigned int irat_md_id;
++	unsigned int napi_poll_weigh;
++	int (*send_pkt)(int md_id, int tx_ch, void *data);
++	int (*napi_poll)(int md_id, int rx_ch, struct napi_struct *napi, int weight);
++	int (*get_ccmni_ch)(int md_id, int ccmni_idx, struct ccmni_ch *channel);
++};
++
++int ccmni_init(int md_id, struct ccmni_ccci_ops *ccci_info);
++void ccmni_exit(int md_id);
++int ccmni_rx_callback(int md_id, int ccmni_idx, struct sk_buff *skb);
++void ccmni_md_state_callback(int md_id, int ccmni_idx, enum ccci_md_state state);
++
++/* ------------------------------------------------------------------ */
++/* Modem instantiation (implemented by the core, used by platform/C2K) */
++/* ------------------------------------------------------------------ */
++struct ccci_md_cfg {
++	unsigned int md_id;			/* enum ccci_md_id */
++	const char *name;			/* "md1", "md3" */
++	const char *firmware_name;		/* request_firmware() name */
++	phys_addr_t ccif_phys;			/* AP CCIF register block */
++	resource_size_t ccif_size;
++	unsigned int ccif_irq;
++	phys_addr_t md_boot_vector_phys;	/* 0 if unused */
++	phys_addr_t md_boot_vector_key_phys;
++	phys_addr_t md_boot_vector_en_phys;
++	phys_addr_t rgu_phys;
++	unsigned int sram_size;			/* CCIF SRAM bytes */
++	unsigned int capability;		/* CCCI_MD_CAP_* */
++	unsigned int irat_md_id;		/* CCCI_MAX_MD_NUM if none */
++};
++
++int ccci_register_modem(const struct ccci_md_cfg *cfg);
++void ccci_unregister_modem(unsigned int md_id);
++int ccci_md_get_state(unsigned int md_id);
++int ccci_md_set_irat(unsigned int md_id, unsigned int irat_md_id);
++
++/* ------------------------------------------------------------------ */
++/* CLDMA engine (implemented by ccci_cldma, used by the core)          */
++/* ------------------------------------------------------------------ */
++#define CCCI_CLDMA_Q_BASIC	0
++#define CCCI_CLDMA_Q_NET	1
++
++struct ccci_cldma;
++struct ccci_cldma_cfg {
++	struct device *dev;
++	void __iomem *ap_base;		/* AP_CLDMA_AO */
++	void __iomem *ap_pdn_base;	/* AP_CLDMA_PDN */
++	unsigned int irq;
++	phys_addr_t smem_phys;
++	size_t smem_size;
++};
++
++struct ccci_cldma *ccci_cldma_create(const struct ccci_cldma_cfg *cfg);
++void ccci_cldma_destroy(struct ccci_cldma *cd);
++int ccci_cldma_start(struct ccci_cldma *cd);
++void ccci_cldma_stop(struct ccci_cldma *cd);
++int ccci_cldma_send(struct ccci_cldma *cd, unsigned int qno, struct sk_buff *skb);
++void ccci_cldma_set_rx_cb(struct ccci_cldma *cd,
++			  void (*cb)(void *ctx, unsigned int qno, struct sk_buff *skb),
++			  void *ctx);
++
++/* ------------------------------------------------------------------ */
++/* CCCI util (implemented by ccci_util, used by core)                  */
++/* ------------------------------------------------------------------ */
++int ccci_util_init(void);
++void ccci_util_exit(void);
++int ccci_util_log_init(unsigned int md_id, struct device *dev);
++void ccci_util_log_exit(unsigned int md_id);
++void ccci_util_log(unsigned int md_id, const char *fmt, ...) __printf(2, 3);
++void ccci_util_dump_mem(unsigned int md_id, const void *buf, size_t len);
++
++/* ------------------------------------------------------------------ */
++/* Appended by the C2K (MD3) driver: platform hardware callbacks.      */
++/* The core calls these around its own start/stop sequence for modems  */
++/* that register them (MD1 registers none); every member is NULL       */
++/* checked, all return 0 on success or a negative errno.               */
++/* ------------------------------------------------------------------ */
++struct ccci_md_hw_ops {
++	int (*power_on)(unsigned int md_id);	/* release power/clocks */
++	int (*let_md_go)(unsigned int md_id);	/* after boot vector write */
++	int (*power_off)(unsigned int md_id);	/* modem stop */
++	void (*reset)(unsigned int md_id);	/* exception recovery */
++};
++
++int ccci_register_md_hw_ops(unsigned int md_id, const struct ccci_md_hw_ops *ops);
++void ccci_unregister_md_hw_ops(unsigned int md_id);
++
++#endif /* __LINUX_CCCI_H */

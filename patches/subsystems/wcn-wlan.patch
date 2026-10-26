@@ -1,0 +1,1858 @@
+diff --git a/drivers/misc/mediatek/connectivity/wlan/Kconfig b/drivers/misc/mediatek/connectivity/wlan/Kconfig
+index 7dbbde223..062d69668 100644
+--- a/drivers/misc/mediatek/connectivity/wlan/Kconfig
++++ b/drivers/misc/mediatek/connectivity/wlan/Kconfig
+@@ -6,6 +6,8 @@ config MTK_WCN_WLAN
+ 	tristate "MediaTek WCN WLAN driver"
+ 	depends on MTK_WCN_WMT
+ 	depends on ARCH_MEDIATEK || COMPILE_TEST
++	select CRC32
++	select RFKILL
+ 	select FW_LOADER
+ 	help
+ 	  Host driver for the MediaTek WLAN function embedded in the
+diff --git a/drivers/misc/mediatek/connectivity/wlan/Makefile b/drivers/misc/mediatek/connectivity/wlan/Makefile
+index bb3b1afab..b634cbf6a 100644
+--- a/drivers/misc/mediatek/connectivity/wlan/Makefile
++++ b/drivers/misc/mediatek/connectivity/wlan/Makefile
+@@ -3,3 +3,7 @@
+ # The object list is maintained by the WLAN driver.
+ #
+ ccflags-y += -I$(srctree)/drivers/misc/mediatek/connectivity/include
++
++obj-$(CONFIG_MTK_WCN_WLAN) += mtk_wcn_wlan.o
++
++mtk_wcn_wlan-y := wlan_main.o wlan_ahb.o wlan_fw.o
+diff --git a/drivers/misc/mediatek/connectivity/wlan/wlan_ahb.c b/drivers/misc/mediatek/connectivity/wlan/wlan_ahb.c
+new file mode 100644
+index 000000000..565201551
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wlan/wlan_ahb.c
+@@ -0,0 +1,758 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WLAN gen2 AHB host interface driver.
++ *
++ * Ported from Samsung/MTK downstream:
++ *   drivers/misc/mediatek/connectivity/wlan/gen2/os/linux/hif/ahb/ahb.c
++ *   drivers/misc/mediatek/connectivity/wlan/gen2/os/linux/hif/ahb/mt6735/ahb_pdma.c
++ *   drivers/misc/mediatek/connectivity/wlan/gen2/os/linux/hif/ahb/include/hif_pdma.h
++ *   drivers/misc/mediatek/connectivity/wlan/gen2/include/nic/mtreg.h
++ *
++ * Copyright (C) 2013 MediaTek Inc.
++ *
++ * The block implements the register/PIO/PDMA half of the gen2 HIF only.
++ * The gen2 802.11 MAC layer (nic/, mgmt/) is not part of this driver, so
++ * received frames are drained and counted instead of being dispatched.
++ */
++
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/jiffies.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/pm.h>
++#include <linux/slab.h>
++
++#include "mtk_wcn_wmt.h"
++#include "wlan_hif.h"
++
++/* HIF register window is 0x5c bytes long (hif.h:217-218). */
++#define MTK_WLAN_HIF_MIN_SIZE		(MCR_HSTCR + 4)
++
++/* PDMA completion poll budget (ahb.c:953,1128). */
++#define MTK_WLAN_HIF_DMA_TIMEOUT	(5 * HZ)
++#define MTK_WLAN_HIF_DMA_POLL_MAX	100000
++
++/* IST loop count, CFG_IST_LOOP_COUNT config.h:1296. */
++#define MTK_WLAN_HIF_RX_DRAIN_MAX	8
++
++static int mtk_wlan_ahb_probe(struct platform_device *pdev);
++static void mtk_wlan_ahb_remove(struct platform_device *pdev);
++
++static const struct of_device_id mtk_wlan_of_match[] = {
++	{ .compatible = "mediatek,wifi" },
++	{ .compatible = "mediatek,WIFI" },	/* ROM carries this spelling */
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mtk_wlan_of_match);
++
++/*
++ * HIF register access helpers.
++ */
++
++/* PIO/PDMA burst and transaction setup, ahb.c:1451-1468. */
++static void mtk_wlan_hif_dma_enhance(struct mtk_wlan_hif *hif, u32 burst,
++				     u32 target, u32 trans)
++{
++	u32 val;
++
++	val = FIELD_PREP(HSTCR_AFF_BURST_LEN, burst) |
++	      FIELD_PREP(HSTCR_TRANS_TARGET, target) |
++	      (((trans & 0x3) == 0) ? (trans & HSTCR_HSIF_TRANS_CNT) :
++	       ((trans + 4) & HSTCR_HSIF_TRANS_CNT));
++	mtk_wlan_hif_writel(hif, MCR_HSTCR, val);
++}
++
++void mtk_wlan_hif_set_int_enable(struct mtk_wlan_hif *hif, bool enable)
++{
++	mtk_wlan_hif_writel(hif, MCR_WHLPCR,
++			    enable ? WHLPCR_INT_EN_SET : WHLPCR_INT_EN_CLR);
++	hif->int_enabled = enable;
++}
++
++/*
++ * AP-DMA (PDMA) primitives, ahb_pdma.c:225-592.
++ */
++
++static u32 mtk_wlan_pdma_readl(struct mtk_wlan_hif *hif, u32 off)
++{
++	return readl(hif->dma_base + off);
++}
++
++static void mtk_wlan_pdma_writel(struct mtk_wlan_hif *hif, u32 off, u32 val)
++{
++	writel(val, hif->dma_base + off);
++}
++
++/* ahb_pdma.c:225-258. */
++static void mtk_wlan_pdma_config(struct mtk_wlan_hif *hif, bool tx, u32 count,
++				 phys_addr_t src, phys_addr_t dst)
++{
++	u32 val;
++
++	/* Burst is fixed to 4/4 and address fix-up is disabled (ahb_pdma.c:231-233). */
++	val = mtk_wlan_pdma_readl(hif, AP_DMA_HIF_CON);
++	val &= ~(ADH_CR_BURST_LEN | ADH_CR_FIX_EN | ADH_CR_DIR);
++	val |= FIELD_PREP(ADH_CR_BURST_LEN, HIF_PDMA_BURST_4_4) |
++	       (tx ? 0 : ADH_CR_DIR);
++	mtk_wlan_pdma_writel(hif, AP_DMA_HIF_CON, val);
++
++	mtk_wlan_pdma_writel(hif, AP_DMA_HIF_SRC_ADDR, lower_32_bits(src));
++	mtk_wlan_pdma_writel(hif, AP_DMA_HIF_DST_ADDR, lower_32_bits(dst));
++	mtk_wlan_pdma_writel(hif, AP_DMA_HIF_LEN, count & ADH_CR_LEN);
++}
++
++/* ahb_pdma.c:269-289. */
++static void mtk_wlan_pdma_start(struct mtk_wlan_hif *hif)
++{
++	u32 val;
++
++	val = mtk_wlan_pdma_readl(hif, AP_DMA_HIF_INT_EN);
++	mtk_wlan_pdma_writel(hif, AP_DMA_HIF_INT_EN, val | ADH_CR_INTEN_FLAG_0);
++
++	val = mtk_wlan_pdma_readl(hif, AP_DMA_HIF_EN);
++	mtk_wlan_pdma_writel(hif, AP_DMA_HIF_EN, val | ADH_CR_EN);
++}
++
++/* ahb_pdma.c:300-324. */
++static void mtk_wlan_pdma_stop(struct mtk_wlan_hif *hif)
++{
++	u32 val;
++
++	val = mtk_wlan_pdma_readl(hif, AP_DMA_HIF_INT_EN);
++	mtk_wlan_pdma_writel(hif, AP_DMA_HIF_INT_EN, val & ~ADH_CR_INTEN_FLAG_0);
++}
++
++/* ahb_pdma.c:354-362. */
++static bool mtk_wlan_pdma_poll_intr(struct mtk_wlan_hif *hif)
++{
++	return mtk_wlan_pdma_readl(hif, AP_DMA_HIF_INT_FLAG) & ADH_CR_FLAG_0;
++}
++
++/* ahb_pdma.c:373-382. */
++static void mtk_wlan_pdma_ack_intr(struct mtk_wlan_hif *hif)
++{
++	u32 val;
++
++	val = mtk_wlan_pdma_readl(hif, AP_DMA_HIF_INT_FLAG);
++	mtk_wlan_pdma_writel(hif, AP_DMA_HIF_INT_FLAG, val & ~ADH_CR_FLAG_0);
++}
++
++/* ahb_pdma.c:335-343. */
++static bool mtk_wlan_pdma_poll_start(struct mtk_wlan_hif *hif)
++{
++	return mtk_wlan_pdma_readl(hif, AP_DMA_HIF_EN) & ADH_CR_EN;
++}
++
++/* ahb_pdma.c:568-592. */
++static void mtk_wlan_pdma_reset(struct mtk_wlan_hif *hif)
++{
++	unsigned int i;
++
++	mtk_wlan_pdma_writel(hif, AP_DMA_HIF_RST, ADH_CR_WARM_RST);
++	for (i = 0; i < 10000; i++) {
++		if (!mtk_wlan_pdma_poll_start(hif))
++			return;
++	}
++
++	dev_info(hif->dev, "PDMA warm reset failed, using hard reset\n");
++	mtk_wlan_pdma_writel(hif, AP_DMA_HIF_RST, ADH_CR_HARD_RST);
++	mdelay(1);
++	mtk_wlan_pdma_writel(hif, AP_DMA_HIF_RST, 0);
++}
++
++static int mtk_wlan_clk_enable(struct mtk_wlan_hif *hif)
++{
++	int ret;
++
++	if (!hif->clk)
++		return 0;
++
++	ret = clk_prepare_enable(hif->clk);
++	if (ret)
++		dev_err(hif->dev, "cannot enable wifi-dma clock: %d\n", ret);
++	return ret;
++}
++
++static void mtk_wlan_clk_disable(struct mtk_wlan_hif *hif)
++{
++	if (hif->clk)
++		clk_disable_unprepare(hif->clk);
++}
++
++static void mtk_wlan_pdma_dump(struct mtk_wlan_hif *hif)
++{
++	dev_err(hif->dev,
++		"PDMA timeout: WCIR=0x%08x WHLPCR=0x%08x CON=0x%08x EN=0x%08x INT_FLAG=0x%08x\n",
++		mtk_wlan_hif_readl(hif, MCR_WCIR),
++		mtk_wlan_hif_readl(hif, MCR_WHLPCR),
++		mtk_wlan_pdma_readl(hif, AP_DMA_HIF_CON),
++		mtk_wlan_pdma_readl(hif, AP_DMA_HIF_EN),
++		mtk_wlan_pdma_readl(hif, AP_DMA_HIF_INT_FLAG));
++}
++
++/*
++ * Run one PDMA transaction over @size bytes.  @src/@dst are physical
++ * addresses; the HIF side is always one of the data ports.
++ */
++static int mtk_wlan_pdma_transfer(struct mtk_wlan_hif *hif, bool tx, u8 *buf,
++				  u32 size, phys_addr_t port_phys)
++{
++	enum dma_data_direction dir = tx ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
++	unsigned long timeout;
++	dma_addr_t phys;
++	u32 i;
++	int ret = 0;
++
++	phys = dma_map_single(hif->dev, buf, size, dir);
++	if (dma_mapping_error(hif->dev, phys)) {
++		dev_err(hif->dev, "cannot map %u bytes for PDMA\n", size);
++		return -EIO;
++	}
++
++	if (tx)
++		mtk_wlan_pdma_config(hif, true, size, phys, port_phys);
++	else
++		mtk_wlan_pdma_config(hif, false, size, port_phys, phys);
++
++	mtk_wlan_pdma_start(hif);
++
++	timeout = jiffies + MTK_WLAN_HIF_DMA_TIMEOUT;
++	while (!mtk_wlan_pdma_poll_intr(hif)) {
++		if (time_after(jiffies, timeout)) {
++			mtk_wlan_pdma_dump(hif);
++			ret = -ETIMEDOUT;
++			goto unmap;
++		}
++		udelay(1);
++	}
++
++	mtk_wlan_pdma_ack_intr(hif);
++	mtk_wlan_pdma_stop(hif);
++
++	/* Wait for the channel to release EN before the next user (ahb.c:1042-1052). */
++	for (i = 0; i < MTK_WLAN_HIF_DMA_POLL_MAX; i++) {
++		if (!mtk_wlan_pdma_poll_start(hif))
++			break;
++		cpu_relax();
++	}
++	if (i == MTK_WLAN_HIF_DMA_POLL_MAX)
++		dev_warn(hif->dev, "PDMA still enabled after completion\n");
++
++unmap:
++	dma_unmap_single(hif->dev, phys, size, dir);
++	return ret;
++}
++
++/*
++ * Read @size bytes from a HIF port.  @buf must have three bytes of slack
++ * because the hardware is accessed in 32-bit words (ahb.c:1005-1012).
++ */
++int mtk_wlan_hif_port_read(struct mtk_wlan_hif *hif, u16 port, u32 size,
++			   u8 *buf, u32 max)
++{
++	u32 whlpcr, words, i;
++	int ret = 0;
++
++	if (!size)
++		return 0;
++	if (size > max) {
++		dev_err(hif->dev, "port %#x read of %u exceeds buffer %u\n",
++			port, size, max);
++		return -EINVAL;
++	}
++
++	/* Burst length must match the one used by PDMA (ahb.c:877-883). */
++	if (port == MCR_WRDR0)
++		mtk_wlan_hif_dma_enhance(hif, HIF_BURST_4DW, HIF_TARGET_RXD0, size);
++	else if (port == MCR_WRDR1)
++		mtk_wlan_hif_dma_enhance(hif, HIF_BURST_4DW, HIF_TARGET_RXD1, size);
++	else if (port == MCR_WHISR)
++		mtk_wlan_hif_dma_enhance(hif, HIF_BURST_4DW, HIF_TARGET_WHISR, size);
++
++	/* Keep the HIF from raising an interrupt while its data port is busy. */
++	whlpcr = mtk_wlan_hif_readl(hif, MCR_WHLPCR);
++	if (whlpcr & WHLPCR_INT_EN_SET)
++		mtk_wlan_hif_writel(hif, MCR_WHLPCR, WHLPCR_INT_EN_CLR);
++
++	if (hif->dma_enabled && (port == MCR_WRDR0 || port == MCR_WRDR1)) {
++		mutex_lock(&hif->io_lock);
++		ret = mtk_wlan_clk_enable(hif);
++		if (!ret) {
++			ret = mtk_wlan_pdma_transfer(hif, false, buf, size,
++						     hif->hif_phys + port);
++			mtk_wlan_clk_disable(hif);
++		}
++		mutex_unlock(&hif->io_lock);
++	} else {
++		words = DIV_ROUND_UP(size, 4);
++		for (i = 0; i < words; i++)
++			((u32 *)buf)[i] =
++				mtk_wlan_hif_readl(hif, port);
++	}
++
++	if (whlpcr & WHLPCR_INT_EN_SET)
++		mtk_wlan_hif_writel(hif, MCR_WHLPCR, WHLPCR_INT_EN_SET);
++
++	return ret;
++}
++
++/*
++ * Write @size bytes to a HIF port.  @buf must be padded with zeroes to a
++ * 4-byte boundary (ahb.c:1177-1186).
++ */
++int mtk_wlan_hif_port_write(struct mtk_wlan_hif *hif, u16 port, u32 size,
++			    const u8 *buf, u32 max)
++{
++	u32 whlpcr, words, i;
++	int ret = 0;
++
++	if (!size)
++		return 0;
++	if (size > max) {
++		dev_err(hif->dev, "port %#x write of %u exceeds buffer %u\n",
++			port, size, max);
++		return -EINVAL;
++	}
++
++	atomic_inc(&hif->tx_count);
++
++	if (port == MCR_WTDR0)
++		mtk_wlan_hif_dma_enhance(hif, HIF_BURST_4DW, HIF_TARGET_TXD0, size);
++	else if (port == MCR_WTDR1)
++		mtk_wlan_hif_dma_enhance(hif, HIF_BURST_4DW, HIF_TARGET_TXD1, size);
++
++	whlpcr = mtk_wlan_hif_readl(hif, MCR_WHLPCR);
++	if (whlpcr & WHLPCR_INT_EN_SET)
++		mtk_wlan_hif_writel(hif, MCR_WHLPCR, WHLPCR_INT_EN_CLR);
++
++	if (hif->dma_enabled && (port == MCR_WTDR0 || port == MCR_WTDR1)) {
++		mutex_lock(&hif->io_lock);
++		ret = mtk_wlan_clk_enable(hif);
++		if (!ret) {
++			ret = mtk_wlan_pdma_transfer(hif, true, (u8 *)buf, size,
++						     hif->hif_phys + port);
++			mtk_wlan_clk_disable(hif);
++		}
++		mutex_unlock(&hif->io_lock);
++	} else {
++		words = size >> 2;
++		if (size & 0x3)
++			words++;
++		for (i = 0; i < words; i++)
++			mtk_wlan_hif_writel(hif, port, ((const u32 *)buf)[i]);
++	}
++
++	if (whlpcr & WHLPCR_INT_EN_SET)
++		mtk_wlan_hif_writel(hif, MCR_WHLPCR, WHLPCR_INT_EN_SET);
++
++	return ret;
++}
++
++/*
++ * Claim HIF ownership from the firmware, nic_pwr_mgt.c:311-406.
++ * WHLPCR bit 8 reads back set once the host owns the interface.
++ */
++int mtk_wlan_hif_claim_driver_own(struct mtk_wlan_hif *hif)
++{
++	unsigned long deadline = jiffies + msecs_to_jiffies(WLAN_FW_OWN_TOTAL_MS);
++	u32 i = 0, val;
++
++	for (;;) {
++		val = mtk_wlan_hif_readl(hif, MCR_WHLPCR);
++		if (val & WHLPCR_FW_OWN_REQ_SET)
++			return 0;
++
++		if (time_after(jiffies, deadline)) {
++			dev_err(hif->dev,
++				"driver own failed: WHLPCR=0x%08x D2HRM2R=0x%08x\n",
++				val, mtk_wlan_hif_readl(hif, MCR_D2HRM2R));
++			return -ETIMEDOUT;
++		}
++
++		/* Keep asking the firmware to hand the interface over. */
++		if ((i & (WLAN_FW_OWN_CLR_ITERATION - 1)) == 0)
++			mtk_wlan_hif_writel(hif, MCR_WHLPCR,
++					    WHLPCR_FW_OWN_REQ_CLR);
++
++		msleep(WLAN_FW_OWN_LOOP_MS);
++		i++;
++	}
++}
++
++/*
++ * Chip identification and HIF interrupt setup, ahb.c:455-458 and
++ * nic.c:1172-1258.  Only reachable while the connectivity subsystem is
++ * powered, i.e. from the WMT WIFI function callback.
++ */
++void mtk_wlan_hif_hw_init(struct mtk_wlan_hif *hif)
++{
++	u32 val;
++
++	val = mtk_wlan_hif_readl(hif, MCR_WCIR);
++	hif->chip_id = FIELD_GET(WCIR_CHIP_ID, val);
++	switch (hif->chip_id) {
++	case 0x0321:
++	case 0x0335:
++	case 0x0337:
++		hif->chip_id = 0x6735;	/* Denali chip id transition */
++		break;
++	case 0x0326:
++		hif->chip_id = 0x6755;
++		break;
++	default:
++		break;
++	}
++
++	dev_info(hif->dev, "HIF chip id 0x%04x revision %u\n",
++		 hif->chip_id, (u32)FIELD_GET(WCIR_REVISION_ID, val));
++
++	/* Firmware download runs with interrupts masked (wlan_lib.c:1306-1307). */
++	mtk_wlan_hif_set_int_enable(hif, false);
++
++	/* nicInitializeAdapter(): WHIER default mask (nic.c:1251). */
++	mtk_wlan_hif_writel(hif, MCR_WHIER, WHIER_DEFAULT);
++}
++
++/*
++ * Bottom half of the HIF interrupt.  The hard handler only masks the source
++ * and defers, exactly like HifAhbISR() waking the IST (ahb.c:1215-1249).
++ * There is no 802.11 stack to deliver frames to yet, so RX is drained.
++ */
++static void mtk_wlan_hif_rx_drain(struct mtk_wlan_hif *hif, u32 port)
++{
++	unsigned int i;
++
++	for (i = 0; i < MTK_WLAN_HIF_RX_DRAIN_MAX; i++) {
++		u32 len, val;
++
++		val = mtk_wlan_hif_readl(hif, MCR_WRPLR);
++		if (port == MCR_WRDR1)
++			len = FIELD_GET(WRPLR_RX1_PACKET_LENGTH, val);
++		else
++			len = FIELD_GET(WRPLR_RX0_PACKET_LENGTH, val);
++		if (!len)
++			break;
++
++		if (len > MTK_WLAN_RX_MAX_PKT_SIZE) {
++			dev_warn(hif->dev,
++				 "RX port %#x frame of %u bytes dropped\n",
++				 port, len);
++			break;
++		}
++
++		if (mtk_wlan_hif_port_read(hif, port, len, hif->rx_buf,
++					   MTK_WLAN_RX_MAX_PKT_SIZE)) {
++			atomic_inc(&hif->rx_dropped);
++			break;
++		}
++		atomic_inc(&hif->rx_dropped);
++	}
++
++	if (i)
++		dev_dbg_ratelimited(hif->dev, "drained %u RX frame(s) on port %#x\n",
++				    i, port);
++}
++
++static void mtk_wlan_hif_fatal_work(struct work_struct *work)
++{
++	struct mtk_wlan_hif *hif = container_of(to_delayed_work(work),
++						struct mtk_wlan_hif, fatal_work);
++
++	if (!READ_ONCE(hif->up))
++		return;
++
++	dev_err(hif->dev, "fatal HIF error, asserting connectivity chip\n");
++	/* Same reason code as glDoChipReset(), gl_rst.h:80-89. */
++	mtk_wcn_wmt_assert(WMTDRV_WIFI, 0x40);
++}
++
++static void mtk_wlan_hif_irq_work(struct work_struct *work)
++{
++	struct mtk_wlan_hif *hif = container_of(work, struct mtk_wlan_hif,
++						irq_work);
++	u32 hisr = 0;
++	int ret;
++
++	if (!READ_ONCE(hif->up))
++		return;
++
++	ret = mtk_wlan_hif_port_read(hif, MCR_WHISR, sizeof(hisr),
++				     (u8 *)&hisr, sizeof(hisr));
++	if (ret) {
++		dev_err(hif->dev, "cannot read HIF interrupt status: %d\n", ret);
++		/* Let this work return before WMT may cancel it from teardown. */
++		schedule_delayed_work(&hif->fatal_work, msecs_to_jiffies(100));
++		return;
++	}
++
++	if (hisr & (WHISR_RX0_DONE_INT | WHISR_RX1_DONE_INT)) {
++		if (hisr & WHISR_RX0_DONE_INT)
++			mtk_wlan_hif_rx_drain(hif, MCR_WRDR0);
++		if (hisr & WHISR_RX1_DONE_INT)
++			mtk_wlan_hif_rx_drain(hif, MCR_WRDR1);
++	}
++
++	if (hisr & WHISR_ABNORMAL_INT)
++		dev_warn(hif->dev, "HIF abnormal interrupt, WASR=0x%08x\n",
++			 mtk_wlan_hif_readl(hif, MCR_WASR));
++
++	if (hisr & WHISR_TX_DONE_INT)
++		dev_dbg(hif->dev, "TX done, WTSR0=0x%08x WTSR1=0x%08x\n",
++			mtk_wlan_hif_readl(hif, MCR_WTSR0),
++			mtk_wlan_hif_readl(hif, MCR_WTSR1));
++
++	/* Re-enable unconditionally, like nicEnableInterrupt() at the end of
++	 * wlanIST() (wlan_lib.c:1846-1847).
++	 */
++	mtk_wlan_hif_set_int_enable(hif, true);
++}
++
++static irqreturn_t mtk_wlan_hif_isr(int irq, void *data)
++{
++	struct mtk_wlan_hif *hif = data;
++
++	/* Mask the source before waking the bottom half (ahb.c:1226-1249). */
++	mtk_wlan_hif_writel(hif, MCR_WHLPCR, WHLPCR_INT_EN_CLR);
++
++	if (READ_ONCE(hif->up))
++		schedule_work(&hif->irq_work);
++
++	return IRQ_HANDLED;
++}
++
++int mtk_wlan_hif_request_irq(struct mtk_wlan_hif *hif)
++{
++	int ret;
++
++	if (hif->irq_requested)
++		return 0;
++
++	ret = request_irq(hif->irq, mtk_wlan_hif_isr, 0, "WLAN AHB ISR", hif);
++	if (ret) {
++		dev_err(hif->dev, "cannot request IRQ %d: %d\n", hif->irq, ret);
++		return ret;
++	}
++	hif->irq_requested = true;
++	return 0;
++}
++
++void mtk_wlan_hif_free_irq(struct mtk_wlan_hif *hif)
++{
++	if (!hif->irq_requested)
++		return;
++
++	free_irq(hif->irq, hif);
++	hif->irq_requested = false;
++}
++
++/*
++ * Quiesce the HIF.  Called from the WMT WIFI function off callback, while
++ * the connectivity subsystem is still powered.
++ */
++void mtk_wlan_hif_stop(struct mtk_wlan_hif *hif)
++{
++	WRITE_ONCE(hif->up, false);
++
++	if (hif->int_enabled)
++		mtk_wlan_hif_set_int_enable(hif, false);
++
++	mtk_wlan_hif_free_irq(hif);
++	cancel_work_sync(&hif->irq_work);
++}
++
++int mtk_wlan_hif_start(struct mtk_wlan_hif *hif)
++{
++	bool reenable_irq = false;
++	int ret;
++
++	/*
++	 * On a re-start after a whole-chip reset the IRQ is still installed.
++	 * Park it while the HIF is re-initialised so the bottom half cannot
++	 * touch a half-programmed interface.
++	 */
++	if (hif->irq_requested) {
++		disable_irq(hif->irq);
++		reenable_irq = true;
++	}
++
++	ret = mtk_wlan_hif_request_irq(hif);
++	if (ret)
++		goto out;
++
++	if (hif->dma_base) {
++		mutex_lock(&hif->io_lock);
++		if (!mtk_wlan_clk_enable(hif)) {
++			mtk_wlan_pdma_reset(hif);
++			mtk_wlan_clk_disable(hif);
++		}
++		mutex_unlock(&hif->io_lock);
++	}
++
++out:
++	if (reenable_irq)
++		enable_irq(hif->irq);
++	return ret;
++}
++
++/*
++ * Platform driver.
++ */
++
++static struct device_node *mtk_wlan_consys_node(void)
++{
++	return of_find_compatible_node(NULL, NULL, "mediatek,mt6735-consys");
++}
++
++static int mtk_wlan_ahb_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct mtk_wlan_hif *hif;
++	struct resource *res;
++	struct device_node *np;
++	struct platform_device *consys;
++	int ret;
++
++	hif = devm_kzalloc(dev, sizeof(*hif), GFP_KERNEL);
++	if (!hif)
++		return -ENOMEM;
++
++	hif->dev = dev;
++	hif->irq = platform_get_irq(pdev, 0);
++	if (hif->irq < 0)
++		return hif->irq;
++
++	hif->hif_base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
++	if (IS_ERR(hif->hif_base))
++		return PTR_ERR(hif->hif_base);
++	if (resource_size(res) < MTK_WLAN_HIF_MIN_SIZE)
++		dev_warn(dev, "HIF window is only %#llx bytes\n",
++			 (u64)resource_size(res));
++	hif->hif_phys = res->start;
++
++	/*
++	 * The AP-DMA channel is optional: without it the HIF falls back to
++	 * PIO, which is slow but functional (hif.h:71).
++	 */
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++	if (res) {
++		hif->dma_base = devm_ioremap_resource(dev, res);
++		if (IS_ERR(hif->dma_base))
++			return PTR_ERR(hif->dma_base);
++		if (resource_size(res) < AP_DMA_HIF_LENGTH) {
++			dev_warn(dev, "AP-DMA window too small, using PIO\n");
++			hif->dma_base = NULL;
++		}
++	} else {
++		dev_warn(dev, "no AP-DMA window in DT, using PIO\n");
++	}
++	hif->dma_enabled = !!hif->dma_base;
++
++	hif->clk = devm_clk_get(dev, "wifi-dma");
++	if (IS_ERR(hif->clk))
++		return dev_err_probe(dev, PTR_ERR(hif->clk),
++				     "cannot get wifi-dma clock\n");
++
++	hif->rx_buf = devm_kmalloc(dev, MTK_WLAN_RX_MAX_PKT_SIZE, GFP_KERNEL);
++	if (!hif->rx_buf)
++		return -ENOMEM;
++
++	mutex_init(&hif->io_lock);
++	mutex_init(&hif->state_lock);
++	atomic_set(&hif->tx_count, 0);
++	atomic_set(&hif->rx_dropped, 0);
++	INIT_WORK(&hif->irq_work, mtk_wlan_hif_irq_work);
++	INIT_DELAYED_WORK(&hif->fatal_work, mtk_wlan_hif_fatal_work);
++
++	/*
++	 * The connectivity subsystem must be resumed before this device; the
++	 * link is informational when the CONSYS node is present.
++	 */
++	np = mtk_wlan_consys_node();
++	if (np) {
++		consys = of_find_device_by_node(np);
++		if (consys) {
++			if (!device_link_add(dev, &consys->dev,
++					     DL_FLAG_STATELESS |
++					     DL_FLAG_AUTOREMOVE_CONSUMER))
++				dev_dbg(dev, "cannot link to the consys device\n");
++			put_device(&consys->dev);
++		} else {
++			dev_dbg(dev, "consys device not available yet\n");
++		}
++		of_node_put(np);
++	}
++
++	platform_set_drvdata(pdev, hif);
++
++	ret = mtk_wlan_main_attach(hif);
++	if (ret)
++		return ret;
++
++	dev_info(dev, "MediaTek WLAN AHB HIF ready (%s)\n",
++		 hif->dma_enabled ? "PDMA" : "PIO");
++	return 0;
++}
++
++static void mtk_wlan_ahb_remove(struct platform_device *pdev)
++{
++	struct mtk_wlan_hif *hif = platform_get_drvdata(pdev);
++
++	if (!hif)
++		return;
++
++	mtk_wlan_main_detach(hif);
++	cancel_delayed_work_sync(&hif->fatal_work);
++	mtk_wlan_hif_stop(hif);
++}
++
++static int mtk_wlan_ahb_suspend(struct device *dev)
++{
++	struct mtk_wlan_hif *hif = dev_get_drvdata(dev);
++
++	if (hif && READ_ONCE(hif->up) && hif->int_enabled) {
++		mtk_wlan_hif_set_int_enable(hif, false);
++		hif->suspended = true;
++	}
++	return 0;
++}
++
++static int mtk_wlan_ahb_resume(struct device *dev)
++{
++	struct mtk_wlan_hif *hif = dev_get_drvdata(dev);
++
++	if (hif && hif->suspended) {
++		hif->suspended = false;
++		if (READ_ONCE(hif->up))
++			mtk_wlan_hif_set_int_enable(hif, true);
++	}
++	return 0;
++}
++
++static const struct dev_pm_ops mtk_wlan_pm_ops = {
++	.suspend = mtk_wlan_ahb_suspend,
++	.resume = mtk_wlan_ahb_resume,
++};
++
++static struct platform_driver mtk_wlan_ahb_driver = {
++	.probe = mtk_wlan_ahb_probe,
++	.remove = mtk_wlan_ahb_remove,
++	.driver = {
++		.name = "mt-wifi",
++		.of_match_table = mtk_wlan_of_match,
++		.pm = &mtk_wlan_pm_ops,
++	},
++};
++
++int mtk_wlan_ahb_driver_register(void)
++{
++	return platform_driver_register(&mtk_wlan_ahb_driver);
++}
++
++void mtk_wlan_ahb_driver_unregister(void)
++{
++	platform_driver_unregister(&mtk_wlan_ahb_driver);
++}
+diff --git a/drivers/misc/mediatek/connectivity/wlan/wlan_fw.c b/drivers/misc/mediatek/connectivity/wlan/wlan_fw.c
+new file mode 100644
+index 000000000..b5a6cc095
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wlan/wlan_fw.c
+@@ -0,0 +1,390 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WLAN gen2 firmware bring-up.
++ *
++ * Ported from Samsung/MTK downstream:
++ *   drivers/misc/mediatek/connectivity/wlan/gen2/os/linux/gl_kal.c
++ *     (kalFirmwareOpen / kalFirmwareSize / kalFirmwareLoad)
++ *   drivers/misc/mediatek/connectivity/wlan/gen2/common/wlan_lib.c
++ *     (wlanAdapterStart, wlanImageSectionDownload, wlanConfigWifiFunc)
++ *   drivers/misc/mediatek/connectivity/wlan/gen2/nic/nic_pwr_mgt.c
++ *     (nicpmSetDriverOwn, nicpmSetAcpiPowerD0)
++ *   drivers/misc/mediatek/connectivity/wlan/gen2/os/linux/hif/ahb/ahb.c
++ *     (glGetChipInfo)
++ *
++ * Copyright (C) 2011 MediaTek Inc.
++ */
++
++#include <linux/crc32.h>
++#include <linux/delay.h>
++#include <linux/firmware.h>
++#include <linux/jiffies.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++
++#include "wlan_fw.h"
++#include "wlan_hif.h"
++
++/* Standard reflected CRC-32, wlanCRC32() wlan_lib.c:3288-3297. */
++static u32 mtk_wlan_fw_crc32(const u8 *data, u32 len)
++{
++	return ~crc32_le(~0, data, len);
++}
++
++/*
++ * Chip suffix for the firmware file name, glGetChipInfo() ahb.c:534-548.
++ */
++static void mtk_wlan_fw_name(struct mtk_wlan_hif *hif, char *buf, size_t len)
++{
++	switch (hif->chip_id) {
++	case 0x6571:
++	case 0x8127:
++	case 0x6752:
++	case 0x8163:
++	case 0x6735:
++	case 0x6580:
++	case 0x6755:
++		snprintf(buf, len, WLAN_FW_PATH_PREFIX "%04x", hif->chip_id);
++		break;
++	default:
++		snprintf(buf, len, WLAN_FW_PATH_PREFIX "SOC");
++		break;
++	}
++}
++
++/*
++ * Hand one init command to the HIF.  @cmd is the command payload, @data an
++ * optional trailing payload (firmware chunk).
++ */
++static int mtk_wlan_fw_xmit(struct mtk_wlan_hif *hif, u8 cid,
++			    const void *cmd, u32 cmd_len,
++			    const void *data, u32 data_len, u8 *seq)
++{
++	struct wlan_init_hif_tx_header *hdr;
++	u32 payload_len = cmd_len + data_len;
++	u32 aligned = ALIGN(sizeof(*hdr) + payload_len, 4);
++	u8 *buf;
++	int ret;
++
++	buf = kzalloc(aligned, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	hdr = (struct wlan_init_hif_tx_header *)buf;
++	hdr->tx_byte_count = cpu_to_le16((u16)aligned);
++	hdr->ether_type_offset = 0;
++	hdr->cs_flags = 0;
++
++	hif->cmd_seq++;
++	hdr->cmd.cid = cid;
++	hdr->cmd.seq = hif->cmd_seq;
++	*seq = hif->cmd_seq;
++
++	if (cmd_len)
++		memcpy(hdr->cmd.buffer, cmd, cmd_len);
++	if (data_len)
++		memcpy(hdr->cmd.buffer + cmd_len, data, data_len);
++
++	/* Only TC0, i.e. TX data port 0, is used for init commands
++	 * (wlan_lib.c:2905-2908, nic_tx.c:2132-2148).
++	 */
++	ret = mtk_wlan_hif_port_write(hif, MCR_WTDR0, aligned, buf, aligned);
++	kfree(buf);
++	return ret;
++}
++
++/*
++ * Wait for INIT_EVENT_ID_CMD_RESULT, wlanImageSectionDownloadStatus()
++ * wlan_lib.c:3059-3145, and nicRxWaitResponse() nic_rx.c:3619-3704.
++ */
++static int mtk_wlan_fw_wait_result(struct mtk_wlan_hif *hif, u8 seq)
++{
++	u32 max_len = sizeof(struct wlan_init_hif_rx_header) + 4;
++	struct wlan_init_hif_rx_header *rx;
++	unsigned long deadline;
++	u8 *buf;
++	u32 pkt_len;
++	int ret;
++
++	buf = kzalloc(max_len, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	deadline = jiffies + msecs_to_jiffies(WLAN_FW_RESPONSE_TIMEOUT_MS);
++	for (;;) {
++		pkt_len = FIELD_GET(WRPLR_RX0_PACKET_LENGTH,
++				    mtk_wlan_hif_readl(hif, MCR_WRPLR));
++		if (pkt_len)
++			break;
++		if (time_after(jiffies, deadline)) {
++			dev_err(hif->dev, "no download response for seq %u\n",
++				seq);
++			ret = -ETIMEDOUT;
++			goto out;
++		}
++		/* kalUdelay(50), nic_rx.c:3655. */
++		usleep_range(50, 100);
++	}
++
++	if (pkt_len > max_len) {
++		dev_err(hif->dev, "download response of %u bytes is too long\n",
++			pkt_len);
++		ret = -EMSGSIZE;
++		goto out;
++	}
++
++	ret = mtk_wlan_hif_port_read(hif, MCR_WRDR0, pkt_len, buf, max_len);
++	if (ret)
++		goto out;
++
++	rx = (struct wlan_init_hif_rx_header *)buf;
++	if (rx->eid != WLAN_INIT_EVENT_ID_CMD_RESULT) {
++		dev_err(hif->dev, "unexpected event id %u for seq %u\n",
++			rx->eid, seq);
++		ret = -EIO;
++		goto out;
++	}
++	if (rx->seq != seq) {
++		dev_err(hif->dev, "event seq %u does not match command %u\n",
++			rx->seq, seq);
++		ret = -EIO;
++		goto out;
++	}
++
++	ret = rx->buffer[0];
++	if (ret) {
++		dev_err(hif->dev, "download command rejected, status %d\n", ret);
++		ret = -EIO;
++	}
++out:
++	kfree(buf);
++	return ret;
++}
++
++/* Download @len bytes to @dest, wlan_lib.c:2865-2965. */
++static int mtk_wlan_fw_download_chunk(struct mtk_wlan_hif *hif, u32 dest,
++				      const u8 *data, u32 len)
++{
++	struct wlan_init_cmd_download_buf dl;
++	u8 seq;
++	int ret;
++
++	dl.address = cpu_to_le32(dest);
++	dl.length = cpu_to_le32(len);
++	dl.crc32 = cpu_to_le32(mtk_wlan_fw_crc32(data, len));
++	/*
++	 * CFG_ENABLE_FW_DOWNLOAD_ACK and CFG_ENABLE_FW_ENCRYPTION are both 1
++	 * in this build (config.h:1329-1330), see wlan_lib.c:2914-2927.
++	 */
++	dl.data_mode = cpu_to_le32(WLAN_DOWNLOAD_BUF_ACK_OPTION |
++				   WLAN_DOWNLOAD_BUF_ENCRYPTION_MODE);
++
++	ret = mtk_wlan_fw_xmit(hif, WLAN_INIT_CMD_ID_DOWNLOAD_BUF,
++			       &dl, sizeof(dl), data, len, &seq);
++	if (ret)
++		return ret;
++
++	return mtk_wlan_fw_wait_result(hif, seq);
++}
++
++static int mtk_wlan_fw_download_section(struct mtk_wlan_hif *hif, u32 dest,
++					const u8 *data, u32 len)
++{
++	u32 done = 0;
++	int ret;
++
++	while (done < len) {
++		u32 chunk = min_t(u32, len - done, WLAN_FW_CHUNK_SIZE);
++
++		ret = mtk_wlan_fw_download_chunk(hif, dest + done,
++						 data + done, chunk);
++		if (ret)
++			return ret;
++		done += chunk;
++	}
++
++	return 0;
++}
++
++/* Send INIT_CMD_ID_WIFI_START, wlanConfigWifiFunc() wlan_lib.c:3156-3221. */
++static int mtk_wlan_fw_kick(struct mtk_wlan_hif *hif, u32 start_addr)
++{
++	struct wlan_init_cmd_wifi_start cmd;
++	u8 seq;
++
++	/* CFG_OVERRIDE_FW_START_ADDRESS is 1 for MT6628, config.h:1353. */
++	cmd.override = cpu_to_le32(1);
++	cmd.address = cpu_to_le32(start_addr);
++
++	return mtk_wlan_fw_xmit(hif, WLAN_INIT_CMD_ID_WIFI_START,
++				&cmd, sizeof(cmd), NULL, 0, &seq);
++}
++
++/*
++ * Download the image.  A file with a valid MTKW header is downloaded
++ * section by section (CFG_ENABLE_FW_DIVIDED_DOWNLOAD, config.h:1334);
++ * otherwise it is a flat image loaded at CFG_FW_LOAD_ADDRESS.
++ */
++static int mtk_wlan_fw_download(struct mtk_wlan_hif *hif,
++				const struct firmware *fw)
++{
++	const struct wlan_fw_divided_header *head;
++	u32 num, i, start_addr;
++	int ret;
++
++	head = (const struct wlan_fw_divided_header *)fw->data;
++	if (fw->size >= sizeof(*head) &&
++	    le32_to_cpu(head->signature) == WLAN_FW_DIVIDED_SIGNATURE &&
++	    le32_to_cpu(head->crc) ==
++		mtk_wlan_fw_crc32(fw->data + WLAN_FW_CRC_OFFSET,
++				  fw->size - WLAN_FW_CRC_OFFSET)) {
++		num = le32_to_cpu(head->num_of_entries);
++		if (!num ||
++		    sizeof(*head) + num * sizeof(struct wlan_fw_section) >
++			fw->size) {
++			dev_err(hif->dev, "invalid section table (%u entries)\n",
++				num);
++			return -EINVAL;
++		}
++
++		for (i = 0; i < num; i++) {
++			u32 off = le32_to_cpu(head->sections[i].offset);
++			u32 len = le32_to_cpu(head->sections[i].length);
++			u32 dest = le32_to_cpu(head->sections[i].dest_addr);
++
++			if (!len || (u64)off + len > fw->size) {
++				dev_err(hif->dev, "invalid section %u\n", i);
++				return -EINVAL;
++			}
++
++			ret = mtk_wlan_fw_download_section(hif, dest,
++							   fw->data + off, len);
++			if (ret)
++				return ret;
++		}
++
++		/* CFG_START_ADDRESS_IS_1ST_SECTION_ADDR, config.h:1355. */
++		start_addr = le32_to_cpu(head->sections[0].dest_addr);
++		dev_info(hif->dev, "divided image: %u sections, start %#x\n",
++			 num, start_addr);
++	} else {
++		dev_warn(hif->dev, "no MTKW header, flat load at %#x\n",
++			 WLAN_FW_LOAD_ADDRESS);
++		ret = mtk_wlan_fw_download_section(hif, WLAN_FW_LOAD_ADDRESS,
++						   fw->data, fw->size);
++		if (ret)
++			return ret;
++		start_addr = WLAN_FW_START_ADDRESS;
++	}
++
++	return mtk_wlan_fw_kick(hif, start_addr);
++}
++
++/* Wait for WCIR.WLAN_READY, wlan_lib.c:1428-1452. */
++static int mtk_wlan_fw_wait_ready(struct mtk_wlan_hif *hif)
++{
++	unsigned int i;
++	u32 val;
++
++	for (i = 0; i < WLAN_FW_READY_POLL_COUNT; i++) {
++		val = mtk_wlan_hif_readl(hif, MCR_WCIR);
++		if (val & WCIR_WLAN_READY) {
++			dev_info(hif->dev, "firmware ready after %u ms\n",
++				 i * WLAN_FW_READY_POLL_MS);
++			return 0;
++		}
++		msleep(WLAN_FW_READY_POLL_MS);
++	}
++
++	val = mtk_wlan_hif_readl(hif, MCR_D2HRM0R);
++	dev_err(hif->dev, "firmware ready timeout, mailbox id %u\n",
++		val & 0xffff);
++	return -ETIMEDOUT;
++}
++
++/*
++ * Reset the interrupt status left over by the download and restore the
++ * hardware clear mode, nic_pwr_mgt.c:598-602 and wlan_lib.c:1649-1653.
++ */
++static void mtk_wlan_fw_clear_state(struct mtk_wlan_hif *hif)
++{
++	u32 hisr = 0, val;
++
++	mtk_wlan_hif_port_read(hif, MCR_WHISR, sizeof(hisr), (u8 *)&hisr,
++			       sizeof(hisr));
++	if (hisr & WHISR_TX_DONE_INT)
++		dev_dbg(hif->dev, "stale TX status: WTSR0=0x%08x WTSR1=0x%08x\n",
++			mtk_wlan_hif_readl(hif, MCR_WTSR0),
++			mtk_wlan_hif_readl(hif, MCR_WTSR1));
++
++	val = mtk_wlan_hif_readl(hif, MCR_WHCR);
++	val &= ~(WHCR_W_INT_CLR_CTRL | WHCR_W_MAILBOX_RD_CLR_EN);
++	mtk_wlan_hif_writel(hif, MCR_WHCR, val);
++}
++
++/**
++ * mtk_wlan_fw_bringup() - power the WLAN firmware up
++ * @hif: host interface instance
++ *
++ * Called from the WMT WIFI function on callback, i.e. after the connectivity
++ * subsystem has been powered and its MCU reset released by
++ * mtk_wcn_consys_hw_pwr_on() (mtk_wcn_consys_hw.c:498-501).  The caller
++ * holds &hif->state_lock.
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++int mtk_wlan_fw_bringup(struct mtk_wlan_hif *hif)
++{
++	const struct firmware *fw = NULL;
++	char name[32];
++	int ret;
++
++	lockdep_assert_held(&hif->state_lock);
++
++	ret = mtk_wlan_hif_start(hif);
++	if (ret)
++		return ret;
++
++	mtk_wlan_hif_hw_init(hif);
++
++	mtk_wlan_fw_name(hif, name, sizeof(name));
++	ret = request_firmware(&fw, name, hif->dev);
++	if (ret) {
++		dev_err(hif->dev, "firmware %s not available: %d\n", name, ret);
++		goto err;
++	}
++	if (!fw->size) {
++		dev_err(hif->dev, "firmware %s is empty\n", name);
++		ret = -EINVAL;
++		goto out_free;
++	}
++
++	ret = mtk_wlan_hif_claim_driver_own(hif);
++	if (ret)
++		goto out_free;
++
++	ret = mtk_wlan_fw_download(hif, fw);
++	if (ret)
++		goto out_free;
++
++	ret = mtk_wlan_fw_wait_ready(hif);
++	if (ret)
++		goto out_free;
++
++	mtk_wlan_fw_clear_state(hif);
++
++	WRITE_ONCE(hif->up, true);
++	mtk_wlan_hif_set_int_enable(hif, true);
++	dev_info(hif->dev, "%s running, chip id 0x%04x\n", name, hif->chip_id);
++
++out_free:
++	release_firmware(fw);
++err:
++	if (ret) {
++		mtk_wlan_hif_set_int_enable(hif, false);
++		dev_err(hif->dev, "firmware bring-up failed: %d\n", ret);
++	}
++	return ret;
++}
++
++MODULE_FIRMWARE(WLAN_FW_BASENAME "_6735");
+diff --git a/drivers/misc/mediatek/connectivity/wlan/wlan_fw.h b/drivers/misc/mediatek/connectivity/wlan/wlan_fw.h
+new file mode 100644
+index 000000000..d494a8fa1
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wlan/wlan_fw.h
+@@ -0,0 +1,124 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * MediaTek WLAN gen2 firmware download definitions.
++ *
++ * Ported from Samsung/MTK downstream:
++ *   drivers/misc/mediatek/connectivity/wlan/gen2/include/nic_init_cmd_event.h
++ *   drivers/misc/mediatek/connectivity/wlan/gen2/include/wlan_lib.h
++ *   drivers/misc/mediatek/connectivity/wlan/gen2/include/config.h
++ *
++ * Copyright (C) 2011 MediaTek Inc.
++ */
++
++#ifndef _MTK_WLAN_FW_H
++#define _MTK_WLAN_FW_H
++
++#include <linux/bits.h>
++#include <linux/types.h>
++
++/*
++ * "/etc/firmware/" CFG_FW_FILENAME "_" <chip> as built by kalFirmwareOpen()
++ * (gl_kal.c:851-856) with the chip suffix from glGetChipInfo()
++ * (ahb.c:534-548).  The ROM carries the same prefix (vmlinux.strings:41764).
++ */
++#define WLAN_FW_PATH_PREFIX		"WIFI_RAM_CODE_"
++
++/* CFG_FW_FILENAME, config.h:923-926. */
++#define WLAN_FW_BASENAME		"WIFI_RAM_CODE"
++
++/* CFG_FW_LOAD_ADDRESS / CFG_FW_START_ADDRESS for MT6628, config.h:1352-1355. */
++#define WLAN_FW_LOAD_ADDRESS		0x00060000
++#define WLAN_FW_START_ADDRESS		0x00060000
++
++/* CMD_PKT_SIZE_FOR_IMAGE, hif_tx.h:100. */
++#define WLAN_FW_CHUNK_SIZE		2048
++
++/* CFG_RESPONSE_POLLING_TIMEOUT, config.h:1204 (x 10 ms). */
++#define WLAN_FW_READY_POLL_COUNT	512
++#define WLAN_FW_READY_POLL_MS		10
++
++/* RX_RESPONSE_TIMEOUT, nic_rx.c:834. */
++#define WLAN_FW_RESPONSE_TIMEOUT_MS	1000
++
++/* BUILD_SIGN('M', 'T', 'K', 'W'), wlan_lib.h:733-737. */
++#define WLAN_FW_DIVIDED_SIGNATURE	0x574b544d
++
++/* Offset of u4NumOfEntries, i.e. the start of the CRC-covered area. */
++#define WLAN_FW_CRC_OFFSET		8
++
++/* INIT_CMD_ID_*, nic_init_cmd_event.h:69-74. */
++#define WLAN_INIT_CMD_ID_DOWNLOAD_BUF	1
++#define WLAN_INIT_CMD_ID_WIFI_START	2
++#define WLAN_INIT_CMD_ID_QUERY_ERROR	4
++
++/* INIT_EVENT_ID_*, nic_init_cmd_event.h:76-81. */
++#define WLAN_INIT_EVENT_ID_CMD_RESULT	1
++#define WLAN_INIT_EVENT_ID_PENDING_ERROR 3
++
++/* DOWNLOAD_BUF_*, nic_init_cmd_event.h:103-105. */
++#define WLAN_DOWNLOAD_BUF_ENCRYPTION_MODE	BIT(0)
++#define WLAN_DOWNLOAD_BUF_NO_CRC_CHECKING	BIT(30)
++#define WLAN_DOWNLOAD_BUF_ACK_OPTION		BIT(31)
++
++/* INIT_CMD_STATUS_*, nic_init_cmd_event.h:61-65. */
++#define WLAN_INIT_CMD_STATUS_SUCCESS		0
++#define WLAN_INIT_CMD_STATUS_INVALID_PARAMS	1
++#define WLAN_INIT_CMD_STATUS_CRC_ERROR		2
++#define WLAN_INIT_CMD_STATUS_DECRYPT_FAIL	3
++#define WLAN_INIT_CMD_STATUS_UNKNOWN		4
++
++/* INIT_WIFI_CMD_T / INIT_HIF_TX_HEADER_T, nic_init_cmd_event.h:89-102. */
++struct wlan_init_wifi_cmd {
++	u8 cid;
++	u8 seq;
++	__le16 reserved;
++	u8 buffer[];
++} __packed;
++
++struct wlan_init_hif_tx_header {
++	__le16 tx_byte_count;
++	u8 ether_type_offset;
++	u8 cs_flags;
++	struct wlan_init_wifi_cmd cmd;
++} __packed;
++
++/* INIT_CMD_DOWNLOAD_BUF, nic_init_cmd_event.h:106-112. */
++struct wlan_init_cmd_download_buf {
++	__le32 address;
++	__le32 length;
++	__le32 crc32;
++	__le32 data_mode;
++	u8 buffer[];
++} __packed;
++
++/* INIT_CMD_WIFI_START, nic_init_cmd_event.h:114-117. */
++struct wlan_init_cmd_wifi_start {
++	__le32 override;
++	__le32 address;
++} __packed;
++
++/* INIT_HIF_RX_HEADER_T, nic_init_cmd_event.h:127-141. */
++struct wlan_init_hif_rx_header {
++	__le16 rx_byte_count;
++	u8 eid;
++	u8 seq;
++	u8 buffer[];
++} __packed;
++
++/* FWDL_SECTION_INFO_T / FIRMWARE_DIVIDED_DOWNLOAD_T, wlan_lib.h:598-611. */
++struct wlan_fw_section {
++	__le32 offset;
++	__le32 reserved;
++	__le32 length;
++	__le32 dest_addr;
++} __packed;
++
++struct wlan_fw_divided_header {
++	__le32 signature;
++	__le32 crc;
++	__le32 num_of_entries;
++	__le32 reserved;
++	struct wlan_fw_section sections[];
++} __packed;
++
++#endif /* _MTK_WLAN_FW_H */
+diff --git a/drivers/misc/mediatek/connectivity/wlan/wlan_hif.h b/drivers/misc/mediatek/connectivity/wlan/wlan_hif.h
+new file mode 100644
+index 000000000..f906698dd
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wlan/wlan_hif.h
+@@ -0,0 +1,248 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * MediaTek WLAN gen2 AHB host interface - private definitions.
++ *
++ * Ported from Samsung/MTK downstream:
++ *   drivers/misc/mediatek/connectivity/wlan/gen2/os/linux/hif/ahb/include/hif.h
++ *   drivers/misc/mediatek/connectivity/wlan/gen2/os/linux/hif/ahb/include/hif_pdma.h
++ *   drivers/misc/mediatek/connectivity/wlan/gen2/include/nic/mtreg.h
++ *
++ * Copyright (C) 2013 MediaTek Inc.
++ */
++
++#ifndef _MTK_WLAN_HIF_H
++#define _MTK_WLAN_HIF_H
++
++#include <linux/bitfield.h>
++#include <linux/bits.h>
++#include <linux/clk.h>
++#include <linux/device.h>
++#include <linux/io.h>
++#include <linux/mutex.h>
++#include <linux/rfkill.h>
++#include <linux/types.h>
++#include <linux/workqueue.h>
++
++/*
++ * HIF host registers.  Offsets and field layouts are copied verbatim from
++ * mtreg.h:81-143 ("1 MT6628 MCR Definition" / "2 Host Interface").
++ * The HIF block lives at the first "reg" of the DT node and is 0x5c bytes
++ * long (hif.h:217-218).
++ */
++#define MCR_WCIR			0x0000	/* chip id / revision */
++#define MCR_WHLPCR			0x0004	/* HIF low power control */
++#define MCR_WHCR			0x000c	/* HIF control */
++#define MCR_WHISR			0x0010	/* HIF interrupt status */
++#define MCR_WHIER			0x0014	/* HIF interrupt enable */
++#define MCR_WASR			0x0018	/* abnormal status */
++#define MCR_WTSR0			0x0020	/* WLAN TX status 0 */
++#define MCR_WTSR1			0x0024	/* WLAN TX status 1 */
++#define MCR_WTDR0			0x0028	/* WLAN TX data 0 */
++#define MCR_WTDR1			0x002c	/* WLAN TX data 1 */
++#define MCR_WRDR0			0x0030	/* WLAN RX data 0 */
++#define MCR_WRDR1			0x0034	/* WLAN RX data 1 */
++#define MCR_D2HRM0R			0x0040	/* device to host mailbox 0 */
++#define MCR_D2HRM2R			0x0048	/* device to host mailbox 2 */
++#define MCR_WRPLR			0x0050	/* RX packet length */
++#define MCR_HSTCR			0x0058	/* HSIF transaction count */
++
++/* WCIR (mtreg.h:175-178). */
++#define WCIR_CHIP_ID			GENMASK(15, 0)
++#define WCIR_REVISION_ID		GENMASK(19, 16)
++#define WCIR_WLAN_READY			BIT(21)
++
++/* WHLPCR (mtreg.h:187-190). */
++#define WHLPCR_INT_EN_SET		BIT(0)
++#define WHLPCR_INT_EN_CLR		BIT(1)
++#define WHLPCR_FW_OWN_REQ_SET		BIT(8)
++#define WHLPCR_FW_OWN_REQ_CLR		BIT(9)
++
++/* WHCR (mtreg.h:204-205). */
++#define WHCR_W_INT_CLR_CTRL		BIT(1)
++#define WHCR_W_MAILBOX_RD_CLR_EN	BIT(2)
++
++/* WHISR / WHIER (mtreg.h:213-225). */
++#define WHISR_TX_DONE_INT		BIT(0)
++#define WHISR_RX0_DONE_INT		BIT(1)
++#define WHISR_RX1_DONE_INT		BIT(2)
++#define WHISR_ABNORMAL_INT		BIT(3)
++
++#define WHIER_TX_DONE_INT_EN		BIT(0)
++#define WHIER_RX0_DONE_INT_EN		BIT(1)
++#define WHIER_RX1_DONE_INT_EN		BIT(2)
++#define WHIER_ABNORMAL_INT_EN		BIT(3)
++
++/* Driver-own acquisition, nicpmSetDriverOwn() nic_pwr_mgt.c:313-315. */
++#define WLAN_FW_OWN_TOTAL_MS		2000
++#define WLAN_FW_OWN_LOOP_MS		1
++#define WLAN_FW_OWN_CLR_ITERATION	256
++
++/* Value programmed by nicInitializeAdapter() (hal.h:231-238, nic.c:1251). */
++#define WHIER_DEFAULT			(WHIER_RX0_DONE_INT_EN | \
++					 WHIER_RX1_DONE_INT_EN | \
++					 WHIER_TX_DONE_INT_EN | \
++					 WHIER_ABNORMAL_INT_EN | \
++					 GENMASK(31, 8))
++
++/* WRPLR (mtreg.h:243-244). */
++#define WRPLR_RX0_PACKET_LENGTH		GENMASK(15, 0)
++#define WRPLR_RX1_PACKET_LENGTH		GENMASK(31, 16)
++
++/* HSTCR (mtreg.h:246-260). */
++#define HSTCR_HSIF_TRANS_CNT		GENMASK(19, 2)
++#define HSTCR_TRANS_TARGET		GENMASK(22, 20)
++#define HSTCR_TRANS_TARGET_OFFSET	20
++#define HSTCR_AFF_BURST_LEN		GENMASK(25, 24)
++#define HSTCR_AFF_BURST_LEN_OFFSET	24
++
++/* Burst length / transfer target (hif.h:220-232). */
++enum mtk_wlan_hif_burst {
++	HIF_BURST_1DW = 0,
++	HIF_BURST_4DW,
++	HIF_BURST_8DW,
++};
++
++enum mtk_wlan_hif_target {
++	HIF_TARGET_TXD0 = 0,
++	HIF_TARGET_TXD1,
++	HIF_TARGET_RXD0,
++	HIF_TARGET_RXD1,
++	HIF_TARGET_WHISR,
++};
++
++/*
++ * AP-DMA (PDMA) channel 1 register window, hif_pdma.h:61-106.  The window
++ * itself is the second "reg" of the DT node; the driver never ioremaps a
++ * hard-coded address.
++ */
++#define AP_DMA_HIF_INT_FLAG		0x0000
++#define AP_DMA_HIF_INT_EN		0x0004
++#define AP_DMA_HIF_EN			0x0008
++#define AP_DMA_HIF_RST			0x000c
++#define AP_DMA_HIF_CON			0x0018
++#define AP_DMA_HIF_SRC_ADDR		0x001c
++#define AP_DMA_HIF_DST_ADDR		0x0020
++#define AP_DMA_HIF_LEN			0x0024
++#define AP_DMA_HIF_LENGTH		0x0054
++
++#define ADH_CR_FLAG_0			BIT(0)
++#define ADH_CR_INTEN_FLAG_0		BIT(0)
++#define ADH_CR_EN			BIT(0)
++#define ADH_CR_WARM_RST			BIT(0)
++#define ADH_CR_HARD_RST			BIT(1)
++#define ADH_CR_DIR			BIT(0)
++#define ADH_CR_FIX_EN			BIT(1)
++#define ADH_CR_BURST_LEN		GENMASK(17, 16)
++#define ADH_CR_BURST_LEN_OFFSET		16
++#define ADH_CR_LEN			GENMASK(19, 0)
++
++/* hif_pdma.h:45-50. */
++enum mtk_wlan_pdma_burst {
++	HIF_PDMA_BURST_1_4 = 0,
++	HIF_PDMA_BURST_2_4,
++	HIF_PDMA_BURST_3_4,
++	HIF_PDMA_BURST_4_4,
++};
++
++/*
++ * Largest frame the firmware can hand up: CFG_RX_MAX_PKT_SIZE,
++ * config.h:1179 (28 + 2312 + 12).
++ */
++#define MTK_WLAN_RX_MAX_PKT_SIZE	2352
++
++/**
++ * struct mtk_wlan_hif - WLAN AHB host interface instance
++ * @dev: platform device
++ * @hif_base: HIF register window (DT reg 0)
++ * @dma_base: AP-DMA channel window (DT reg 1), %NULL for PIO-only
++ * @hif_phys: physical address of @hif_base, used for the PDMA source/dest
++ * @irq: BGF_EINT line (DT interrupt 0)
++ * @clk: "wifi-dma" AP-DMA gate
++ * @chip_id: WLAN chip id read from WCIR, after the Denali remap
++ * @dma_enabled: PDMA is available and selected
++ * @int_enabled: HIF interrupt enable is currently asserted
++ * @irq_requested: @irq is installed
++ * @up: firmware is downloaded and running
++ * @resetting: a whole-chip reset is in progress
++ * @suspended: system suspend masked the HIF interrupt
++ * @tx_count: frames handed to the HIF TX data port (WMT bus counter)
++ * @rx_dropped: RX frames drained without an 802.11 stack to deliver to
++ * @cmd_seq: command sequence number used by the firmware download
++ * @io_lock: serializes port/DMA transactions
++ * @state_lock: serializes bring-up and teardown
++ * @rx_buf: bounce buffer for the RX drain in &irq_work
++ * @irq_work: HIF interrupt bottom half
++ * @fatal_work: deferred chip assert after a fatal HIF error
++ * @reset_work: deferred re-open after a whole-chip reset
++ * @reset_failed: last whole-chip reset failed
++ * @was_up: WLAN was running when the reset started
++ * @rfkill: WLAN rfkill switch
++ * @wmt_registered: WMT WLAN callbacks are installed
++ */
++struct mtk_wlan_hif {
++	struct device *dev;
++	void __iomem *hif_base;
++	void __iomem *dma_base;
++	phys_addr_t hif_phys;
++	int irq;
++	struct clk *clk;
++	u32 chip_id;
++	bool dma_enabled;
++	bool int_enabled;
++	bool irq_requested;
++	bool up;
++	bool resetting;
++	bool suspended;
++	atomic_t tx_count;
++	atomic_t rx_dropped;
++	u8 cmd_seq;
++	struct mutex io_lock;		/* serializes port/DMA transactions */
++	struct mutex state_lock;	/* serializes bring-up and teardown */
++	u8 *rx_buf;
++	struct work_struct irq_work;
++	struct delayed_work fatal_work;
++	struct work_struct reset_work;
++	bool reset_failed;
++	bool was_up;
++	struct rfkill *rfkill;
++	bool wmt_registered;
++	bool msgcb_registered;
++};
++
++static inline u32 mtk_wlan_hif_readl(struct mtk_wlan_hif *hif, u32 off)
++{
++	return readl(hif->hif_base + off);
++}
++
++static inline void mtk_wlan_hif_writel(struct mtk_wlan_hif *hif, u32 off,
++				       u32 val)
++{
++	writel(val, hif->hif_base + off);
++}
++
++/* wlan_ahb.c */
++int mtk_wlan_ahb_driver_register(void);
++void mtk_wlan_ahb_driver_unregister(void);
++
++void mtk_wlan_hif_hw_init(struct mtk_wlan_hif *hif);
++int mtk_wlan_hif_claim_driver_own(struct mtk_wlan_hif *hif);
++int mtk_wlan_hif_port_read(struct mtk_wlan_hif *hif, u16 port, u32 size,
++			   u8 *buf, u32 max);
++int mtk_wlan_hif_port_write(struct mtk_wlan_hif *hif, u16 port, u32 size,
++			    const u8 *buf, u32 max);
++void mtk_wlan_hif_set_int_enable(struct mtk_wlan_hif *hif, bool enable);
++int mtk_wlan_hif_request_irq(struct mtk_wlan_hif *hif);
++void mtk_wlan_hif_free_irq(struct mtk_wlan_hif *hif);
++int mtk_wlan_hif_start(struct mtk_wlan_hif *hif);
++void mtk_wlan_hif_stop(struct mtk_wlan_hif *hif);
++
++/* wlan_fw.c */
++int mtk_wlan_fw_bringup(struct mtk_wlan_hif *hif);
++
++/* wlan_main.c */
++int mtk_wlan_main_attach(struct mtk_wlan_hif *hif);
++void mtk_wlan_main_detach(struct mtk_wlan_hif *hif);
++int mtk_wcn_wlan_gen2_init(void);
++void mtk_wcn_wlan_gen2_exit(void);
++
++#endif /* _MTK_WLAN_HIF_H */
+diff --git a/drivers/misc/mediatek/connectivity/wlan/wlan_main.c b/drivers/misc/mediatek/connectivity/wlan/wlan_main.c
+new file mode 100644
+index 000000000..ab5cac557
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/wlan/wlan_main.c
+@@ -0,0 +1,283 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WLAN gen2 module lifecycle and WMT glue.
++ *
++ * Ported from Samsung/MTK downstream:
++ *   drivers/misc/mediatek/connectivity/wlan/gen2/os/linux/gl_init.c
++ *     (initWlan / exitWlan, wlanProbe / wlanRemove)
++ *   drivers/misc/mediatek/connectivity/wlan/gen2/os/linux/hif/ahb/ahb.c
++ *     (HifAhbProbe / HifAhbRemove / HifAhbBusCntGet / mtk_wcn_wmt_wlan_reg)
++ *   drivers/misc/mediatek/connectivity/wlan/gen2/os/linux/gl_rst.c
++ *     (whole-chip reset callback)
++ *
++ * Copyright (C) 2013 MediaTek Inc.
++ */
++
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/rfkill.h>
++#include <linux/workqueue.h>
++
++#include "mtk_wcn_wmt.h"
++#include "wlan_hif.h"
++
++/* Exactly one connectivity subsystem instance. */
++static struct mtk_wlan_hif *mtk_wlan_hif;
++
++/* WMTRSTMSG_*, gl_rst.h:60-66. */
++enum mtk_wlan_reset_msg {
++	MTK_WLAN_RESET_START = 0,
++	MTK_WLAN_RESET_END = 1,
++	MTK_WLAN_RESET_END_FAIL = 2,
++};
++
++static void mtk_wlan_reset_work(struct work_struct *work)
++{
++	struct mtk_wlan_hif *hif = container_of(work, struct mtk_wlan_hif,
++						reset_work);
++
++	if (hif->reset_failed) {
++		dev_err(hif->dev, "chip reset failed, WLAN stays down\n");
++		return;
++	}
++
++	/*
++	 * Same recovery as wifi_reset_end(): let WMT power the connectivity
++	 * subsystem again, which calls the probe callback below.
++	 */
++	if (!hif->was_up)
++		return;
++
++	if (!mtk_wcn_wmt_func_on(WMTDRV_WIFI))
++		dev_err(hif->dev, "cannot re-open WLAN after chip reset\n");
++}
++
++/*
++ * Whole-chip reset notifier, ABI of glResetCallback() gl_rst.c:148-189.
++ * WMT sends WMTRSTMSG_RESET_START before pulling the subsystem reset and
++ * RESET_END once it is powered again; the re-open is deferred because it
++ * would re-enter the WMT operation thread.
++ */
++static void mtk_wlan_reset_cb(enum mtk_wcn_wmt_drv src,
++			      enum mtk_wcn_wmt_drv dst,
++			      enum mtk_wcn_wmt_msg msg, void *data, u32 len)
++{
++	struct mtk_wlan_hif *hif = READ_ONCE(mtk_wlan_hif);
++	u32 rst;
++
++	if (!hif || msg != WMTMSG_RESET || !data || len < sizeof(rst))
++		return;
++
++	rst = *(u32 *)data;
++	switch (rst) {
++	case MTK_WLAN_RESET_START:
++		dev_warn(hif->dev, "whole chip reset start\n");
++		hif->was_up = READ_ONCE(hif->up);
++		WRITE_ONCE(hif->up, false);
++		WRITE_ONCE(hif->resetting, true);
++		if (hif->was_up)
++			mtk_wlan_hif_set_int_enable(hif, false);
++		break;
++	case MTK_WLAN_RESET_END:
++	case MTK_WLAN_RESET_END_FAIL:
++		dev_warn(hif->dev, "whole chip reset %s\n",
++			 rst == MTK_WLAN_RESET_END ? "done" : "failed");
++		hif->reset_failed = rst == MTK_WLAN_RESET_END_FAIL;
++		WRITE_ONCE(hif->resetting, false);
++		schedule_work(&hif->reset_work);
++		break;
++	default:
++		break;
++	}
++}
++
++/* WMT WIFI function on callback: power up the firmware. */
++static int mtk_wlan_wmt_probe(void)
++{
++	struct mtk_wlan_hif *hif = READ_ONCE(mtk_wlan_hif);
++	int ret;
++
++	if (!hif)
++		return -ENODEV;
++
++	mutex_lock(&hif->state_lock);
++	if (READ_ONCE(hif->up)) {
++		/* Duplicate function-on, firmware is already running. */
++		ret = 0;
++	} else {
++		ret = mtk_wlan_fw_bringup(hif);
++	}
++	mutex_unlock(&hif->state_lock);
++
++	return ret;
++}
++
++/* WMT WIFI function off callback: quiesce the HIF. */
++static int mtk_wlan_wmt_remove(void)
++{
++	struct mtk_wlan_hif *hif = READ_ONCE(mtk_wlan_hif);
++
++	if (!hif)
++		return 0;
++
++	mutex_lock(&hif->state_lock);
++	mtk_wlan_hif_stop(hif);
++	mutex_unlock(&hif->state_lock);
++
++	return 0;
++}
++
++/* Frames handed to the HIF, reported to WMT (ahb.c:1418-1438). */
++static int mtk_wlan_wmt_bus_tx_cnt(void)
++{
++	struct mtk_wlan_hif *hif = READ_ONCE(mtk_wlan_hif);
++
++	return hif ? atomic_read(&hif->tx_count) : 0;
++}
++
++static int mtk_wlan_wmt_bus_tx_cnt_clr(void)
++{
++	struct mtk_wlan_hif *hif = READ_ONCE(mtk_wlan_hif);
++
++	if (hif)
++		atomic_set(&hif->tx_count, 0);
++	return 0;
++}
++
++static const struct mtk_wcn_wmt_wlan_cb mtk_wlan_wmt_cb = {
++	.probe = mtk_wlan_wmt_probe,
++	.remove = mtk_wlan_wmt_remove,
++	.bus_tx_cnt = mtk_wlan_wmt_bus_tx_cnt,
++	.bus_tx_cnt_clr = mtk_wlan_wmt_bus_tx_cnt_clr,
++};
++
++/*
++ * rfkill only drives the WMT WIFI function; the 802.11 interface this switch
++ * describes is not implemented yet.  The ROM has no rfkill integration
++ * (neither gl_init.c nor gl_kal.c register one); the control channel is
++ * /dev/wmtWifi (wmt_chrdev_wifi.c).
++ */
++static int mtk_wlan_rfkill_set_block(void *data, bool blocked)
++{
++	struct mtk_wlan_hif *hif = data;
++
++	if (READ_ONCE(hif->resetting))
++		return 0;
++
++	if (blocked) {
++		if (READ_ONCE(hif->up))
++			mtk_wcn_wmt_func_off(WMTDRV_WIFI);
++	} else if (!READ_ONCE(hif->up)) {
++		if (!mtk_wcn_wmt_func_on(WMTDRV_WIFI)) {
++			dev_err(hif->dev, "cannot power WLAN on\n");
++			return -EIO;
++		}
++	}
++
++	return 0;
++}
++
++static const struct rfkill_ops mtk_wlan_rfkill_ops = {
++	.set_block = mtk_wlan_rfkill_set_block,
++};
++
++int mtk_wlan_main_attach(struct mtk_wlan_hif *hif)
++{
++	int ret;
++
++	WRITE_ONCE(mtk_wlan_hif, hif);
++
++	INIT_WORK(&hif->reset_work, mtk_wlan_reset_work);
++
++	/* Register the reset notifier first so it covers bring-up failures. */
++	ret = mtk_wcn_wmt_msgcb_reg(WMTDRV_WIFI, mtk_wlan_reset_cb);
++	if (ret)
++		dev_err(hif->dev, "cannot register reset callback: %d\n", ret);
++	else
++		hif->msgcb_registered = true;
++
++	hif->rfkill = rfkill_alloc("mtk-wlan", hif->dev, RFKILL_TYPE_WLAN,
++				   &mtk_wlan_rfkill_ops, hif);
++	if (hif->rfkill) {
++		ret = rfkill_register(hif->rfkill);
++		if (ret) {
++			dev_err(hif->dev, "cannot register rfkill: %d\n", ret);
++			rfkill_destroy(hif->rfkill);
++			hif->rfkill = NULL;
++		}
++	} else {
++		dev_warn(hif->dev, "cannot allocate rfkill\n");
++	}
++
++	if (mtk_wcn_wmt_wlan_reg(&mtk_wlan_wmt_cb)) {
++		dev_err(hif->dev, "cannot register with WMT\n");
++		if (hif->rfkill) {
++			rfkill_unregister(hif->rfkill);
++			rfkill_destroy(hif->rfkill);
++			hif->rfkill = NULL;
++		}
++		if (hif->msgcb_registered) {
++			mtk_wcn_wmt_msgcb_unreg(WMTDRV_WIFI);
++			hif->msgcb_registered = false;
++		}
++		WRITE_ONCE(mtk_wlan_hif, NULL);
++		return -EIO;
++	}
++
++	hif->wmt_registered = true;
++	return 0;
++}
++
++void mtk_wlan_main_detach(struct mtk_wlan_hif *hif)
++{
++	/* Stop reset recovery before the callbacks it would use go away. */
++	if (hif->msgcb_registered) {
++		mtk_wcn_wmt_msgcb_unreg(WMTDRV_WIFI);
++		hif->msgcb_registered = false;
++	}
++	cancel_work_sync(&hif->reset_work);
++
++	if (hif->wmt_registered) {
++		/* Drop the function while the connectivity subsystem is alive. */
++		if (READ_ONCE(hif->up))
++			mtk_wcn_wmt_func_off(WMTDRV_WIFI);
++		mtk_wcn_wmt_wlan_unreg();
++		hif->wmt_registered = false;
++	}
++
++	if (hif->rfkill) {
++		rfkill_unregister(hif->rfkill);
++		rfkill_destroy(hif->rfkill);
++		hif->rfkill = NULL;
++	}
++
++	WRITE_ONCE(mtk_wlan_hif, NULL);
++}
++
++/**
++ * mtk_wcn_wlan_gen2_init() - load the MediaTek WLAN driver
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++int mtk_wcn_wlan_gen2_init(void)
++{
++	int ret = mtk_wlan_ahb_driver_register();
++
++	if (ret)
++		pr_err("mtk_wcn_wlan: cannot register AHB driver: %d\n", ret);
++
++	return ret;
++}
++EXPORT_SYMBOL(mtk_wcn_wlan_gen2_init);
++
++void mtk_wcn_wlan_gen2_exit(void)
++{
++	mtk_wlan_ahb_driver_unregister();
++}
++EXPORT_SYMBOL(mtk_wcn_wlan_gen2_exit);
++
++module_init(mtk_wcn_wlan_gen2_init);
++module_exit(mtk_wcn_wlan_gen2_exit);
++
++MODULE_DESCRIPTION("MediaTek WLAN (CONSYS gen2) AHB host interface");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,844 @@
+diff --git a/drivers/mfd/mt6397-core.c b/drivers/mfd/mt6397-core.c
+index 5bc7a2f99..ec80ef362 100644
+--- a/drivers/mfd/mt6397-core.c
++++ b/drivers/mfd/mt6397-core.c
+@@ -106,6 +106,14 @@ static const struct resource mt6328_accdet_resources[] = {
+ 	DEFINE_RES_IRQ_NAMED(MT6328_IRQ_STATUS_ACCDET, "accdet"),
+ };
+ 
++/* Speaker over-current interrupts of the MT6328 codec cell; INT_STATUS2
++ * bits 13/14 (include/linux/mfd/mt6328/core.h:49-50).
++ */
++static const struct resource mt6328_codec_resources[] = {
++	DEFINE_RES_IRQ_NAMED(MT6328_IRQ_STATUS_SPKL_D, "spkl_d"),
++	DEFINE_RES_IRQ_NAMED(MT6328_IRQ_STATUS_SPKL_AB, "spkl_ab"),
++};
++
+ static const struct resource mt6357_keys_resources[] = {
+ 	DEFINE_RES_IRQ_NAMED(MT6357_IRQ_PWRKEY, "powerkey"),
+ 	DEFINE_RES_IRQ_NAMED(MT6357_IRQ_HOMEKEY, "homekey"),
+@@ -163,6 +171,8 @@ static const struct mfd_cell mt6328_devs[] = {
+ 		.of_compatible = "mediatek,mt6328-keys"
+ 	}, {
+ 		.name = "mt6328-codec",
++		.num_resources = ARRAY_SIZE(mt6328_codec_resources),
++		.resources = mt6328_codec_resources,
+ 		.of_compatible = "mediatek,mt6328-codec"
+ 	}, {
+ 		.name = "mt6328-accdet",
+diff --git a/include/linux/mfd/mt6397/core.h b/include/linux/mfd/mt6397/core.h
+index b774c3a4b..9b005c8fc 100644
+--- a/include/linux/mfd/mt6397/core.h
++++ b/include/linux/mfd/mt6397/core.h
+@@ -56,7 +56,14 @@ enum mt6397_irq_numbers {
+ 	MT6397_IRQ_VPCA7,
+ 	MT6397_IRQ_VSRMCA7,
+ 	MT6397_IRQ_VDRM,
+-	MT6397_IRQ_NR,
++	/*
++	 * The MT6328 has a third interrupt status register, dispatched with a
++	 * hwirq base of 32 (drivers/mfd/mt6397-irq.c:114) and reaching
++	 * MT6328_IRQ_STATUS_SPKL_AB (46, include/linux/mfd/mt6328/core.h).
++	 * The shared linear domain must cover all 48 hwirqs; the enumerators
++	 * above keep their values.
++	 */
++	MT6397_IRQ_NR = 48,
+ };
+ 
+ struct mt6397_chip {
+diff --git a/sound/soc/codecs/mt6331.c b/sound/soc/codecs/mt6331.c
+index 825b2fb60..1c6ff433c 100644
+--- a/sound/soc/codecs/mt6331.c
++++ b/sound/soc/codecs/mt6331.c
+@@ -79,6 +79,30 @@
+ #define MT6331_ST_OUTPUTS		(MT6331_ST_HP | MT6331_ST_EARPIECE | \
+ 					 MT6331_ST_SPEAKER)
+ 
++/* Vendor speaker class modes (mt_soc_analog_type.h:205-207), selected by
++ * the "Audio_Speaker_class_Switch" control (vendor:2687-2699).
++ */
++#define MT6331_SPK_MODE_CLASSD		0	/* vendor text "CALSSD" */
++#define MT6331_SPK_MODE_CLASSAB		1
++#define MT6331_SPK_MODE_RECEIVER	2
++
++/* Vendor DAC DC-offset trim (mt_soc_codec_63xx.c:621-643, 1085-1230) */
++#define MT6331_DC_OFFSET_TRIM_DEFAULT	2048
++#define MT6331_DC_OFFSET_TRIM_MIN	1844
++#define MT6331_DC_OFFSET_TRIM_MAX	2252
++#define MT6331_DC_OFFSET_RAMP_STEP_HPL	3	/* DCOFFSET_RAMP_STEP_HPL */
++#define MT6331_DC_OFFSET_RAMP_STEP	3	/* DCOFFSET_RAMP_STEP */
++
++struct mt6331_priv;
++
++/* One SPKL PMIC interrupt line (32-bit INT_STATUS2 window). */
++struct mt6331_spkl_irq {
++	struct mt6331_priv *priv;
++	const char *name;
++	unsigned int mask;	/* RG_INT_STATUS_SPKL_* */
++	bool *latched;
++};
++
+ struct mt6331_priv {
+ 	struct device *dev;
+ 	struct regmap *regmap;
+@@ -104,6 +128,18 @@ struct mt6331_priv {
+ 	bool headset_mic;		/* jack reports a headset microphone */
+ 	unsigned int mic_gain;		/* vendor mAudio_Ana_Volume[MICAMPx] */
+ 
++	/* Vendor Speaker_mode / Speaker_pga_gain (vendor:149-150). */
++	unsigned int speaker_mode;
++	unsigned int speaker_pga_gain;
++	/* Vendor mHplTrimOffset / mHprTrimOffset (vendor:621-624). */
++	unsigned int hpl_trim_offset;
++	unsigned int hpr_trim_offset;
++	/* SPKL over-current events seen by the PMIC interrupt. */
++	bool spk_d_oc;
++	bool spk_ab_oc;
++	struct mt6331_spkl_irq spkl_d;
++	struct mt6331_spkl_irq spkl_ab;
++
+ 	struct snd_soc_jack *jack;
+ 	struct notifier_block jack_nb;
+ };
+@@ -414,6 +450,120 @@ static void mt6331_hp_depop(struct mt6331_priv *priv, bool switch_to_ground)
+ 	usleep_range(10000, 11000);	/* vendor:404 / vendor:414 */
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* DAC DC-offset compensation (software trim path, EFUSE_HP_TRIM off)  */
++/* ------------------------------------------------------------------ */
++/*
++ * The vendor selects between the efuse trim and the DAC DC-compensation
++ * block with EFUSE_HP_TRIM; it is not defined for MT6735/MT6328, so
++ * SetDcCompenSation()/SetDcCompenSation_SPKHP() always take the
++ * #ifndef EFUSE_HP_TRIM branch (vendor:1200-1223).
++ */
++
++/* vendor:1085-1123 SetHplOffset */
++static void mt6331_set_hpl_offset(struct mt6331_priv *priv,
++				  int offset_trimming, bool enable_ramp)
++{
++	unsigned int reg, offset;
++
++	reg = (u16)((offset_trimming * 10589 + 2048) / 4096);
++
++	if (enable_ramp) {
++		/* The left channel needs to ramp because the speaker uses it. */
++		if (!(reg & 0x8000)) {
++			offset = 0;
++			while (reg - offset > MT6331_DC_OFFSET_RAMP_STEP_HPL) {
++				mt6331_ana_write(priv,
++						 MT6328_AFE_DL_DC_COMP_CFG0,
++						 offset +
++						 MT6331_DC_OFFSET_RAMP_STEP_HPL,
++						 0xffff);
++				offset += MT6331_DC_OFFSET_RAMP_STEP_HPL;
++				usleep_range(100, 200);
++			}
++		} else {
++			offset = 0xffff;
++			while (offset - reg > MT6331_DC_OFFSET_RAMP_STEP_HPL) {
++				mt6331_ana_write(priv,
++						 MT6328_AFE_DL_DC_COMP_CFG0,
++						 offset -
++						 MT6331_DC_OFFSET_RAMP_STEP_HPL,
++						 0xffff);
++				offset -= MT6331_DC_OFFSET_RAMP_STEP_HPL;
++				usleep_range(100, 200);
++			}
++		}
++	}
++
++	mt6331_ana_write(priv, MT6328_AFE_DL_DC_COMP_CFG0, reg, 0xffff);
++}
++
++/* vendor:1071-1083 SetHprOffset */
++static void mt6331_set_hpr_offset(struct mt6331_priv *priv,
++				  int offset_trimming)
++{
++	unsigned int reg = (u16)((offset_trimming * 10589 + 2048) / 4096);
++
++	mt6331_ana_write(priv, MT6328_AFE_DL_DC_COMP_CFG1, reg, 0xffff);
++}
++
++/* vendor:1125-1131 EnableDcCompensation */
++static void mt6331_dc_compensation_enable(struct mt6331_priv *priv, bool on)
++{
++	mt6331_ana_write(priv, MT6328_AFE_DL_DC_COMP_CFG2,
++			 on ? RG_DC_COMP_EN : 0, RG_DC_COMP_EN);
++}
++
++/* vendor:1166-1180 SetHprOffsetTrim / SetHpLOffsetTrim and
++ * vendor:1200-1207 SetDcCompenSation.
++ */
++static void mt6331_dc_compensation_apply(struct mt6331_priv *priv)
++{
++	int hpr = (int)priv->hpr_trim_offset - MT6331_DC_OFFSET_TRIM_DEFAULT;
++	int hpl = (int)priv->hpl_trim_offset - MT6331_DC_OFFSET_TRIM_DEFAULT;
++
++	mt6331_set_hpr_offset(priv, hpr);
++	mt6331_set_hpl_offset(priv, hpl, false);
++	mt6331_dc_compensation_enable(priv, true);
++}
++
++/* vendor:1133-1163 RestoreDcOffsetToZero */
++static void mt6331_dc_offset_restore_zero(struct mt6331_priv *priv)
++{
++	unsigned int lch = 0, rch = 0, offset;
++
++	/* The vendor only logs the right channel value, the ramp is done on
++	 * the left one.  A read error leaves both at zero, which the writes
++	 * below would produce anyway.
++	 */
++	regmap_read(priv->regmap, MT6328_AFE_DL_DC_COMP_CFG0, &lch);
++	regmap_read(priv->regmap, MT6328_AFE_DL_DC_COMP_CFG1, &rch);
++	dev_dbg(priv->dev, "restore DC offset L=0x%04x R=0x%04x\n",
++		lch, rch);
++
++	offset = lch;
++	if (!(offset & 0x8000)) {
++		while (offset > MT6331_DC_OFFSET_RAMP_STEP) {
++			mt6331_ana_write(priv, MT6328_AFE_DL_DC_COMP_CFG0,
++					 offset - MT6331_DC_OFFSET_RAMP_STEP,
++					 0xffff);
++			offset -= MT6331_DC_OFFSET_RAMP_STEP;
++			usleep_range(100, 200);
++		}
++	} else {
++		while (offset < 0xffff - MT6331_DC_OFFSET_RAMP_STEP) {
++			mt6331_ana_write(priv, MT6328_AFE_DL_DC_COMP_CFG0,
++					 offset + MT6331_DC_OFFSET_RAMP_STEP,
++					 0xffff);
++			offset += MT6331_DC_OFFSET_RAMP_STEP;
++			usleep_range(100, 200);
++		}
++	}
++
++	mt6331_ana_write(priv, MT6328_AFE_DL_DC_COMP_CFG0, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_AFE_DL_DC_COMP_CFG1, 0x0000, 0xffff);
++}
++
+ /* vendor:1734-1826 Audio_Amp_Change(..., true) */
+ static int mt6331_hp_power_up(struct mt6331_priv *priv)
+ {
+@@ -454,6 +604,11 @@ static int mt6331_hp_power_up(struct mt6331_priv *priv)
+ 	/* vendor:1818-1824: DAC gain, HP mux to the audio DAC, drivers on */
+ 	mt6331_hp_volume_ramp(priv, MT6331_HP_TRIM_INDEX,
+ 			      MT6331_HP_TRIM_INDEX);
++	/* vendor:1800-1803: apply the digital DC compensation before the
++	 * HPL/HPR output mux is closed, exactly where the vendor
++	 * Audio_Amp_Change() path calls SetDcCompenSation().
++	 */
++	mt6331_dc_compensation_apply(priv);
+ 	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xf49f, 0xffff);
+ 	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xf4ff, 0xffff);
+ 	udelay(50);
+@@ -481,6 +636,11 @@ static int mt6331_hp_power_down(struct mt6331_priv *priv)
+ 			      MT6331_HP_TRIM_INDEX);
+ 	/* vendor:1837 disable HPR/HPL */
+ 	mt6331_ana_write(priv, MT6328_AUDDEC_ANA_CON0, 0xf40f, 0xffff);
++	/* vendor:1133-1163 / vendor:1838: ramp the DAC DC offset back to
++	 * zero, then turn the compensation block off.
++	 */
++	mt6331_dc_offset_restore_zero(priv);
++	mt6331_dc_compensation_enable(priv, false);
+ 
+ 	if (!(priv->state & MT6331_ST_OUTPUTS))
+ 		mt6331_dl_analog_down(priv);
+@@ -615,20 +775,83 @@ static int mt6331_speaker_classd_down(struct mt6331_priv *priv)
+ 	return 0;
+ }
+ 
+-/* vendor:2030-2126 Speaker_Amp_Change (internal class-D speaker) */
+-static int mt6331_speaker_power_up(struct mt6331_priv *priv)
++/* spk:133-168 Speaker_ClassAB_Open */
++static int mt6331_speaker_classab_up(struct mt6331_priv *priv)
+ {
+-	unsigned int val, gain;
++	unsigned int val;
+ 
+-	/* Keep the user speaker gain: Speaker_ClassD_Open() below rewrites
+-	 * SPK_ANA_CON0 with the trim level (spk:85).
+-	 */
+-	if (regmap_read(priv->regmap, MT6328_SPK_ANA_CON0, &val))
+-		return -EIO;
+-	gain = (val & (RG_SPKPGA_GAIN_MASK << RG_SPKPGA_GAIN_SHIFT)) >>
+-		RG_SPKPGA_GAIN_SHIFT;
+-	if (!gain)
+-		gain = MT6331_SPK_TRIM_INDEX;
++	/* spk:138-148 trim window and -6 dB class-AB amplifier */
++	mt6331_ana_write(priv, MT6328_SPK_CON7, 0x4531, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x1008, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON13, 0x1800, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON2, 0x02a4, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON0, 0x0800, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON9, 0x2000, 0xffff);
++	/* spk:147-148 speaker on, Vcm high-PSRR mode */
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x1009, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON9, 0x0100, 0xffff);
++
++	msleep(10);		/* spk:150-151 trim settling time */
++
++	/* spk:153-157 trim off, amp off, class AB, amp on, triangular wave */
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x1001, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x1000, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x1004, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x1005, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON13, 0x0000, 0xffff);
++
++	/* spk:159-164 the vendor only logs the trim result */
++	if (!regmap_read(priv->regmap, MT6328_SPK_CON1, &val))
++		dev_dbg(priv->dev, "speaker trim raw 0x%04x%s\n", val,
++			(val & 0x8000) ? "" : " (trim failed)");
++
++	/* spk:166-167 0 dB amplifier gain */
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x3005, 0xffff);
++
++	return 0;
++}
++
++/* spk:170-177 Speaker_ClassAB_close */
++static int mt6331_speaker_classab_down(struct mt6331_priv *priv)
++{
++	mt6331_ana_write(priv, MT6328_SPK_CON9, 0x2100, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON0, 0x0800, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x1005, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x1004, 0xffff);
++
++	return 0;
++}
++
++/* spk:179-190 Speaker_ReveiverMode_Open */
++static int mt6331_speaker_receiver_up(struct mt6331_priv *priv)
++{
++	/* spk:182-187 class AB, -6 dB, thermal/OC shutdown, +6 dB PGA */
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x1304, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON2, 0x02a4, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON0, 0x2000, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x1305, 0xffff);
++	udelay(2000);		/* spk:188 */
++
++	return 0;
++}
++
++/* spk:192-198 Speaker_ReveiverMode_close */
++static int mt6331_speaker_receiver_down(struct mt6331_priv *priv)
++{
++	mt6331_ana_write(priv, MT6328_SPK_CON2, 0x0014, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON0, 0x0000, 0xffff);
++	mt6331_ana_write(priv, MT6328_SPK_CON0, 0x0000, 0xffff);
++
++	return 0;
++}
++
++/* vendor:2030-2126 Speaker_Amp_Change: the selected speaker class
++ * (vendor:2079-2084 open, vendor:2091-2096 close) is applied here.
++ */
++static int mt6331_speaker_power_up(struct mt6331_priv *priv)
++{
++	unsigned int gain = priv->speaker_pga_gain;
++	int ret;
+ 
+ 	mt6331_dl_analog_up(priv, true, 0x0000);
+ 	/* vendor:2085-2100 */
+@@ -646,7 +869,23 @@ static int mt6331_speaker_power_up(struct mt6331_priv *priv)
+ 	mt6331_ana_write(priv, MT6328_TOP_CKPDN_CON2_CLR, RG_SPK_CK_GRP,
+ 			 RG_SPK_CK_GRP);
+ 
+-	mt6331_speaker_classd_up(priv);
++	/* vendor:2079-2084: run the sequence of the selected class */
++	switch (priv->speaker_mode) {
++	case MT6331_SPK_MODE_CLASSAB:
++		ret = mt6331_speaker_classab_up(priv);
++		break;
++	case MT6331_SPK_MODE_RECEIVER:
++		ret = mt6331_speaker_receiver_up(priv);
++		break;
++	case MT6331_SPK_MODE_CLASSD:
++	default:
++		ret = mt6331_speaker_classd_up(priv);
++		break;
++	}
++	if (ret)
++		return ret;
++
++	/* vendor:2086 Apply_Speaker_Gain() */
+ 	mt6331_speaker_gain_apply(priv, gain);
+ 
+ 	priv->state |= MT6331_ST_SPEAKER;
+@@ -660,7 +899,20 @@ static int mt6331_speaker_power_down(struct mt6331_priv *priv)
+ 
+ 	/* vendor:2128-2136: the vendor grounds the de-pop switch first */
+ 	mt6331_hp_depop(priv, true);
+-	mt6331_speaker_classd_down(priv);
++
++	/* vendor:2091-2096: close with the sequence of the selected class */
++	switch (priv->speaker_mode) {
++	case MT6331_SPK_MODE_CLASSAB:
++		mt6331_speaker_classab_down(priv);
++		break;
++	case MT6331_SPK_MODE_RECEIVER:
++		mt6331_speaker_receiver_down(priv);
++		break;
++	case MT6331_SPK_MODE_CLASSD:
++	default:
++		mt6331_speaker_classd_down(priv);
++		break;
++	}
+ 
+ 	mt6331_ana_write(priv, MT6328_TOP_CKPDN_CON2_SET, RG_SPK_CK_GRP,
+ 			 RG_SPK_CK_GRP);
+@@ -1170,6 +1422,260 @@ static const char *const mt6331_spk_pga_texts[] = {
+ static SOC_ENUM_SINGLE_DECL(mt6331_spk_pga_enum, MT6328_SPK_ANA_CON0,
+ 			    RG_SPKPGA_GAIN_SHIFT, mt6331_spk_pga_texts);
+ 
++/* ------------------------------------------------------------------ */
++/* Speaker protection controls (vendor:2678-2796)                    */
++/* ------------------------------------------------------------------ */
++/* vendor:2678 speaker_amp_function[]: the vendor spelling "CALSSD" is
++ * kept because the Android HAL matches it.
++ */
++static const char *const mt6331_spk_class_texts[] = {
++	"CALSSD", "CLASSAB", "RECEIVER",
++};
++static const struct soc_enum mt6331_spk_class_enum =
++	SOC_ENUM_SINGLE_EXT(ARRAY_SIZE(mt6331_spk_class_texts),
++			    mt6331_spk_class_texts);
++
++/* vendor:2683-2685 speaker_OC_function[]/speaker_CS_function[] */
++static const char *const mt6331_spk_switch_texts[] = { "Off", "On" };
++static const struct soc_enum mt6331_spk_switch_enum =
++	SOC_ENUM_SINGLE_EXT(ARRAY_SIZE(mt6331_spk_switch_texts),
++			    mt6331_spk_switch_texts);
++
++/* vendor:2703-2711, 2728-2733 Audio_Speaker_Pga_Gain_{Get,Set}: the vendor
++ * keeps the gain in software (Speaker_pga_gain, vendor:150) because every
++ * speaker open sequence rewrites SPK_ANA_CON0 with its own trim level.
++ */
++static int mt6331_spk_pga_get(struct snd_kcontrol *kcontrol,
++			      struct snd_ctl_elem_value *ucontrol)
++{
++	struct mt6331_priv *priv =
++		snd_soc_component_get_drvdata(snd_kcontrol_chip(kcontrol));
++
++	ucontrol->value.integer.value[0] = priv->speaker_pga_gain;
++
++	return 0;
++}
++
++static int mt6331_spk_pga_set(struct snd_kcontrol *kcontrol,
++			      struct snd_ctl_elem_value *ucontrol)
++{
++	struct mt6331_priv *priv =
++		snd_soc_component_get_drvdata(snd_kcontrol_chip(kcontrol));
++	unsigned int gain = ucontrol->value.integer.value[0];
++
++	if (gain >= ARRAY_SIZE(mt6331_spk_pga_texts))
++		return -EINVAL;
++
++	mutex_lock(&priv->ana_lock);
++	priv->speaker_pga_gain = gain;
++	/* vendor:2709 writes the new level immediately, without ramping */
++	mt6331_ana_write(priv, MT6328_SPK_ANA_CON0,
++			 gain << RG_SPKPGA_GAIN_SHIFT,
++			 RG_SPKPGA_GAIN_MASK << RG_SPKPGA_GAIN_SHIFT);
++	mutex_unlock(&priv->ana_lock);
++
++	return 0;
++}
++
++/* vendor:2687-2700 Audio_Speaker_Class_Get/Set */
++static int mt6331_spk_class_get(struct snd_kcontrol *kcontrol,
++				struct snd_ctl_elem_value *ucontrol)
++{
++	struct mt6331_priv *priv =
++		snd_soc_component_get_drvdata(snd_kcontrol_chip(kcontrol));
++
++	ucontrol->value.integer.value[0] = priv->speaker_mode;
++
++	return 0;
++}
++
++static int mt6331_spk_class_set(struct snd_kcontrol *kcontrol,
++				struct snd_ctl_elem_value *ucontrol)
++{
++	struct mt6331_priv *priv =
++		snd_soc_component_get_drvdata(snd_kcontrol_chip(kcontrol));
++	unsigned int mode = ucontrol->value.integer.value[0];
++
++	if (mode >= ARRAY_SIZE(mt6331_spk_class_texts))
++		return -EINVAL;
++
++	mutex_lock(&priv->ana_lock);
++	priv->speaker_mode = mode;
++	mutex_unlock(&priv->ana_lock);
++
++	return 0;
++}
++
++/* spk:200-215 GetSpeakerOcFlag: enable the speaker clock group before
++ * reading the deglitch status bits of SPK_CON6.
++ */
++static int mt6331_spk_oc_get(struct snd_kcontrol *kcontrol,
++			     struct snd_ctl_elem_value *ucontrol)
++{
++	struct mt6331_priv *priv =
++		snd_soc_component_get_drvdata(snd_kcontrol_chip(kcontrol));
++	unsigned int val;
++	int ret;
++
++	mutex_lock(&priv->ana_lock);
++	mt6331_ana_write(priv, MT6328_TOP_CKPDN_CON2_CLR, RG_SPK_CK_GRP,
++			 0xffff);
++	ret = regmap_read(priv->regmap, MT6328_SPK_CON6, &val);
++	mutex_unlock(&priv->ana_lock);
++	if (ret)
++		return ret;
++
++	ucontrol->value.integer.value[0] =
++		!!(val & (RG_SPK_D_OC_L_DEG | RG_SPK_AB_OC_L_DEG));
++	dev_dbg(priv->dev,
++		"speaker OC: status 0x%04x, latched D=%d AB=%d\n",
++		val, priv->spk_d_oc, priv->spk_ab_oc);
++
++	return 0;
++}
++
++static int mt6331_spk_oc_set(struct snd_kcontrol *kcontrol,
++			     struct snd_ctl_elem_value *ucontrol)
++{
++	/* vendor:2721-2726: setting is not supported. */
++	return 0;
++}
++
++/* vendor:2735-2751 Audio_Speaker_Current_Sensing_{Get,Set} */
++static int mt6331_spk_cs_get(struct snd_kcontrol *kcontrol,
++			     struct snd_ctl_elem_value *ucontrol)
++{
++	struct mt6331_priv *priv =
++		snd_soc_component_get_drvdata(snd_kcontrol_chip(kcontrol));
++	unsigned int val;
++	int ret;
++
++	ret = regmap_read(priv->regmap, MT6328_SPK_CON12, &val);
++	if (ret)
++		return ret;
++
++	ucontrol->value.integer.value[0] = !!(val & RG_SPK_ISENSE_EN);
++
++	return 0;
++}
++
++static int mt6331_spk_cs_set(struct snd_kcontrol *kcontrol,
++			     struct snd_ctl_elem_value *ucontrol)
++{
++	struct mt6331_priv *priv =
++		snd_soc_component_get_drvdata(snd_kcontrol_chip(kcontrol));
++
++	mutex_lock(&priv->ana_lock);
++	mt6331_ana_write(priv, MT6328_SPK_CON12,
++			 ucontrol->value.integer.value[0] ? 0x9300 : 0x1300,
++			 0xff00);
++	mutex_unlock(&priv->ana_lock);
++
++	return 0;
++}
++
++/* vendor:2754-2775 Audio_Speaker_Current_Sensing_Peak_Detector_{Get,Set} */
++static int mt6331_spk_cspeak_get(struct snd_kcontrol *kcontrol,
++				 struct snd_ctl_elem_value *ucontrol)
++{
++	struct mt6331_priv *priv =
++		snd_soc_component_get_drvdata(snd_kcontrol_chip(kcontrol));
++	unsigned int val;
++	int ret;
++
++	ret = regmap_read(priv->regmap, MT6328_SPK_CON12, &val);
++	if (ret)
++		return ret;
++
++	ucontrol->value.integer.value[0] =
++		!!(val & RG_SPK_ISENSE_PDRESET);
++
++	return 0;
++}
++
++static int mt6331_spk_cspeak_set(struct snd_kcontrol *kcontrol,
++				 struct snd_ctl_elem_value *ucontrol)
++{
++	struct mt6331_priv *priv =
++		snd_soc_component_get_drvdata(snd_kcontrol_chip(kcontrol));
++
++	mutex_lock(&priv->ana_lock);
++	mt6331_ana_write(priv, MT6328_SPK_CON12,
++			 ucontrol->value.integer.value[0] ?
++			 RG_SPK_ISENSE_PDRESET : 0,
++			 RG_SPK_ISENSE_PDRESET);
++	mutex_unlock(&priv->ana_lock);
++
++	return 0;
++}
++
++/* vendor:626-644 SetHplTrimOffset/SetHprTrimOffset range check */
++static unsigned int mt6331_dc_trim_value(struct mt6331_priv *priv,
++					 unsigned int offset)
++{
++	if (offset > MT6331_DC_OFFSET_TRIM_MAX ||
++	    offset < MT6331_DC_OFFSET_TRIM_MIN) {
++		dev_err(priv->dev,
++			"HP DC offset %u out of range, using %u\n",
++			offset, MT6331_DC_OFFSET_TRIM_DEFAULT);
++		return MT6331_DC_OFFSET_TRIM_DEFAULT;
++	}
++
++	return offset;
++}
++
++/* mt_soc_pcm_routing.c:864-896 Audio_HpSpkl_Offset_{Get,Set} */
++static int mt6331_hpl_spk_offset_get(struct snd_kcontrol *kcontrol,
++				     struct snd_ctl_elem_value *ucontrol)
++{
++	struct mt6331_priv *priv =
++		snd_soc_component_get_drvdata(snd_kcontrol_chip(kcontrol));
++
++	ucontrol->value.integer.value[0] = priv->hpl_trim_offset;
++
++	return 0;
++}
++
++static int mt6331_hpl_spk_offset_set(struct snd_kcontrol *kcontrol,
++				     struct snd_ctl_elem_value *ucontrol)
++{
++	struct mt6331_priv *priv =
++		snd_soc_component_get_drvdata(snd_kcontrol_chip(kcontrol));
++
++	mutex_lock(&priv->ana_lock);
++	priv->hpl_trim_offset =
++		mt6331_dc_trim_value(priv, ucontrol->value.integer.value[0]);
++	mutex_unlock(&priv->ana_lock);
++
++	return 0;
++}
++
++/* mt_soc_pcm_routing.c:898-921 Audio_HpSpkr_Offset_{Get,Set} */
++static int mt6331_hpr_spk_offset_get(struct snd_kcontrol *kcontrol,
++				     struct snd_ctl_elem_value *ucontrol)
++{
++	struct mt6331_priv *priv =
++		snd_soc_component_get_drvdata(snd_kcontrol_chip(kcontrol));
++
++	ucontrol->value.integer.value[0] = priv->hpr_trim_offset;
++
++	return 0;
++}
++
++static int mt6331_hpr_spk_offset_set(struct snd_kcontrol *kcontrol,
++				     struct snd_ctl_elem_value *ucontrol)
++{
++	struct mt6331_priv *priv =
++		snd_soc_component_get_drvdata(snd_kcontrol_chip(kcontrol));
++
++	mutex_lock(&priv->ana_lock);
++	priv->hpr_trim_offset =
++		mt6331_dc_trim_value(priv, ucontrol->value.integer.value[0]);
++	mutex_unlock(&priv->ana_lock);
++
++	return 0;
++}
++
+ /* vendor:1234-1267 SetDCcoupleNP + vendor:3930-3931 mode names */
+ static const char *const mt6331_micbias_mode_texts[] = {
+ 	"ACC/DCC", "DCC ECM Single", "DCC ECM Diff",
+@@ -1191,7 +1697,24 @@ static const struct snd_kcontrol_new mt6331_snd_controls[] = {
+ 		       mt6331_hp_vol_tlv),
+ 	SOC_SINGLE_TLV("Earpiece Volume", MT6328_ZCD_CON3,
+ 		       RG_AUDHSGAIN_SHIFT, 18, 0, mt6331_hp_vol_tlv),
+-	SOC_ENUM("Speaker PGA Gain", mt6331_spk_pga_enum),
++	/* vendor:2703-2711, 2728-2733: software-backed, vendor name/items */
++	SOC_ENUM_EXT("Speaker PGA Gain", mt6331_spk_pga_enum,
++		     mt6331_spk_pga_get, mt6331_spk_pga_set),
++	/* Speaker protection, vendor control names (vendor:2785-2796) */
++	SOC_ENUM_EXT("Audio_Speaker_class_Switch", mt6331_spk_class_enum,
++		     mt6331_spk_class_get, mt6331_spk_class_set),
++	SOC_ENUM_EXT("Audio_Speaker_OC_Falg", mt6331_spk_switch_enum,
++		     mt6331_spk_oc_get, mt6331_spk_oc_set),
++	SOC_ENUM_EXT("Audio_Speaker_CurrentSensing", mt6331_spk_switch_enum,
++		     mt6331_spk_cs_get, mt6331_spk_cs_set),
++	SOC_ENUM_EXT("Audio_Speaker_CurrentPeakDetector",
++		     mt6331_spk_switch_enum, mt6331_spk_cspeak_get,
++		     mt6331_spk_cspeak_set),
++	/* mt_soc_pcm_routing.c:1023-1026 Audio HPL_SPK/HPR_SPK Offset */
++	SOC_SINGLE_EXT("Audio HPL_SPK Offset", SND_SOC_NOPM, 0, 0x20000, 0,
++		       mt6331_hpl_spk_offset_get, mt6331_hpl_spk_offset_set),
++	SOC_SINGLE_EXT("Audio HPR_SPK Offset", SND_SOC_NOPM, 0, 0x20000, 0,
++		       mt6331_hpr_spk_offset_get, mt6331_hpr_spk_offset_set),
+ 	SOC_SINGLE_TLV("Mic Amp 1 Volume", MT6328_AUDENC_ANA_CON10,
+ 		       RG_AUDPREAMPLGAIN_SHIFT, 5, 0, mt6331_mic_amp_tlv),
+ 	SOC_SINGLE_TLV("Mic Amp 2 Volume", MT6328_AUDENC_ANA_CON10,
+@@ -1648,6 +2171,77 @@ static const struct snd_soc_component_driver mt6331_soc_component_driver = {
+ /* ------------------------------------------------------------------ */
+ /* Platform driver                                                    */
+ /* ------------------------------------------------------------------ */
++/*
++ * Speaker over-current interrupt (upmu_hw.h:2747-2752).  INT_STATUS2 is
++ * write-1-to-clear and mt6397_irq_handle_reg() (drivers/mfd/mt6397-irq.c:
++ * 85-102) runs the nested handler while the status is still set, then
++ * writes the status back.  Only our own source is cleared here so that the
++ * other pending sources keep their status for the PMIC irq thread.
++ */
++static irqreturn_t mt6331_spkl_irq(int irq, void *data)
++{
++	struct mt6331_spkl_irq *spkl = data;
++	struct mt6331_priv *priv = spkl->priv;
++	unsigned int status;
++	int ret;
++
++	ret = regmap_read(priv->regmap, MT6328_INT_STATUS2, &status);
++	if (ret)
++		return IRQ_NONE;
++
++	if (status & spkl->mask) {
++		WRITE_ONCE(*spkl->latched, true);
++		dev_warn(priv->dev,
++			 "speaker over-current on %s (INT_STATUS2=0x%04x)\n",
++			 spkl->name, status);
++		/* Write-1-to-clear only the source of this interrupt. */
++		regmap_write(priv->regmap, MT6328_INT_STATUS2, spkl->mask);
++	} else {
++		dev_dbg(priv->dev, "%s: no status bit (INT_STATUS2=0x%04x)\n",
++			spkl->name, status);
++	}
++
++	return IRQ_HANDLED;
++}
++
++/* Optional SPKL interrupts: boards or PMIC revisions without them must
++ * still probe, over-current is then only visible through the
++ * "Audio_Speaker_OC_Falg" control, like the vendor polling path.
++ */
++static int mt6331_request_spkl_irq(struct mt6331_priv *priv,
++				   struct mt6331_spkl_irq *spkl,
++				   const char *name, unsigned int mask,
++				   bool *latched)
++{
++	struct platform_device *pdev = to_platform_device(priv->dev);
++	int irq, ret;
++
++	spkl->priv = priv;
++	spkl->name = name;
++	spkl->mask = mask;
++	spkl->latched = latched;
++
++	irq = platform_get_irq_byname_optional(pdev, name);
++	if (irq < 0) {
++		if (irq == -EPROBE_DEFER)
++			return irq;
++		dev_warn(&pdev->dev, "%s interrupt unavailable: %d\n",
++			 name, irq);
++		return 0;
++	}
++
++	ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
++					mt6331_spkl_irq, IRQF_ONESHOT,
++					name, spkl);
++	if (ret) {
++		dev_warn(&pdev->dev, "cannot request %s interrupt: %d\n",
++			 name, ret);
++		return 0;
++	}
++
++	return 0;
++}
++
+ static int mt6331_platform_probe(struct platform_device *pdev)
+ {
+ 	struct mt6397_chip *pmic = dev_get_drvdata(pdev->dev.parent);
+@@ -1665,6 +2259,11 @@ static int mt6331_platform_probe(struct platform_device *pdev)
+ 	priv->regmap = pmic->regmap;
+ 	priv->dl_rate = 48000;	/* vendor:118 mBlockSampleRate[] */
+ 	priv->ul_rate = 48000;
++	/* vendor:149-150 defaults: class D, trim gain, 2048 trims (vendor:621-624) */
++	priv->speaker_mode = MT6331_SPK_MODE_CLASSD;
++	priv->speaker_pga_gain = MT6331_SPK_TRIM_INDEX;
++	priv->hpl_trim_offset = MT6331_DC_OFFSET_TRIM_DEFAULT;
++	priv->hpr_trim_offset = MT6331_DC_OFFSET_TRIM_DEFAULT;
+ 
+ 	mutex_init(&priv->ana_lock);
+ 	mutex_init(&priv->clk_lock);
+@@ -1684,6 +2283,16 @@ static int mt6331_platform_probe(struct platform_device *pdev)
+ 
+ 	dev_info(priv->dev, "MT6328 PMIC codec (MT6331 register map naming)\n");
+ 
++	/* Speaker protection interrupts (PMIC INT_STATUS2 bits 13/14). */
++	ret = mt6331_request_spkl_irq(priv, &priv->spkl_d, "spkl_d",
++				      RG_INT_STATUS_SPKL_D, &priv->spk_d_oc);
++	if (ret)
++		return ret;
++	ret = mt6331_request_spkl_irq(priv, &priv->spkl_ab, "spkl_ab",
++				      RG_INT_STATUS_SPKL_AB, &priv->spk_ab_oc);
++	if (ret)
++		return ret;
++
+ 	ret = devm_snd_soc_register_component(&pdev->dev,
+ 					      &mt6331_soc_component_driver,
+ 					      mt6331_dai_driver,
+diff --git a/sound/soc/codecs/mt6331.h b/sound/soc/codecs/mt6331.h
+index e786f9770..99931448d 100644
+--- a/sound/soc/codecs/mt6331.h
++++ b/sound/soc/codecs/mt6331.h
+@@ -35,6 +35,11 @@
+ #define MT6328_TOP_CLKSQ_SET		0x028c	/* upmu_hw.h:123 */
+ #define MT6328_TOP_CLKSQ_CLR		0x028e	/* upmu_hw.h:124 */
+ 
++/* PMIC interrupt status 2 (include/linux/mfd/mt6328/registers.h:143);
++ * write-1-to-clear, mirrored by mt6397_irq_handle_reg().
++ */
++#define MT6328_INT_STATUS2		0x02c8
++
+ /* AUDNCP / AUDIF / AUD 26M engine clocks (upmu_hw.h:1784-1793) */
+ #define RG_AUDNCP_CK_PDN		BIT(12)
+ #define RG_AUDIF_CK_PDN			BIT(13)
+@@ -78,8 +83,10 @@
+ #define MT6328_SPK_CON0			0x0a90
+ #define MT6328_SPK_CON1			0x0a92
+ #define MT6328_SPK_CON2			0x0a94
++#define MT6328_SPK_CON6			0x0a9c
+ #define MT6328_SPK_CON7			0x0a9e
+ #define MT6328_SPK_CON9			0x0aa2
++#define MT6328_SPK_CON12			0x0aa8
+ #define MT6328_SPK_CON13			0x0aaa
+ #define MT6328_SPK_ANA_CON0		0x0ab2
+ #define MT6328_SPK_ANA_CON3		0x0ab6
+@@ -88,6 +95,18 @@
+ #define RG_SPKPGA_GAIN_MASK		0xf
+ #define RG_SPKPGA_GAIN_SHIFT		11
+ 
++/* Speaker over-current status, SPK_CON6 (upmu_hw.h:5981-5986) */
++#define RG_SPK_D_OC_L_DEG		BIT(14)	/* SPK_D_OC_L_DEG */
++#define RG_SPK_AB_OC_L_DEG		BIT(15)	/* SPK_AB_OC_L_DEG */
++
++/* Speaker current sense, SPK_CON12 (upmu_hw.h:6107-6112) */
++#define RG_SPK_ISENSE_PDRESET		BIT(14)	/* peak detector reset */
++#define RG_SPK_ISENSE_EN		BIT(15)	/* current sense enable */
++
++/* Speaker left/right over-current PMIC interrupts (upmu_hw.h:2747-2752) */
++#define RG_INT_STATUS_SPKL_D		BIT(13)	/* INT_STATUS2 / INT_CON2 */
++#define RG_INT_STATUS_SPKL_AB		BIT(14)
++
+ /* ------------------------------------------------------------------ */
+ /* Audio LDO (upmu_hw.h has no symbolic name; AudDrv_Ana.h:383)       */
+ /* ------------------------------------------------------------------ */
+@@ -168,6 +187,13 @@
+ #define MT6328_AFE_AUDIO_TOP_CON0	0x2014	/* AudDrv_Ana.h:80 */
+ #define MT6328_AFUNC_AUD_CON0		0x201c	/* AudDrv_Ana.h:84 */
+ #define MT6328_AFUNC_AUD_CON2		0x2020	/* AudDrv_Ana.h:86 */
++#define MT6328_AFE_DL_DC_COMP_CFG0	0x2032	/* AudDrv_Ana.h:95 */
++#define MT6328_AFE_DL_DC_COMP_CFG1	0x2034	/* AudDrv_Ana.h:96 */
++#define MT6328_AFE_DL_DC_COMP_CFG2	0x2036	/* AudDrv_Ana.h:97 */
++/* CFG2 bit 0 enables the DAC DC compensation
++ * (mt_soc_codec_63xx.c:1125-1131 EnableDcCompensation).
++ */
++#define RG_DC_COMP_EN			BIT(0)
+ #define MT6328_AFE_PMIC_NEWIF_CFG0	0x2038	/* AudDrv_Ana.h:98 */
+ #define MT6328_AFE_PMIC_NEWIF_CFG2	0x203c	/* AudDrv_Ana.h:100 */
+ 

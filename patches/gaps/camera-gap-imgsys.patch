@@ -1,0 +1,102 @@
+diff --git a/drivers/clk/mediatek/clk-mt6735-imgsys.c b/drivers/clk/mediatek/clk-mt6735-imgsys.c
+index c564f8f72..e9c76973e 100644
+--- a/drivers/clk/mediatek/clk-mt6735-imgsys.c
++++ b/drivers/clk/mediatek/clk-mt6735-imgsys.c
+@@ -26,7 +26,12 @@ static const struct mtk_gate imgsys_gates[] = {
+ 	GATE_MTK(CLK_IMG_CAM_SMI, "cam_smi", "mm_sel", &imgsys_cg_regs, 5, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(CLK_IMG_CAM_CAM, "cam_cam", "mm_sel", &imgsys_cg_regs, 6, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(CLK_IMG_SEN_TG, "sen_tg", "mm_sel", &imgsys_cg_regs, 7, &mtk_clk_gate_ops_setclr),
+-	GATE_MTK(CLK_IMG_SEN_CAM, "sen_cam", "mm_sel", &imgsys_cg_regs, 8, &mtk_clk_gate_ops_setclr),
++	/*
++	 * Downstream feeds IMG_IMAGE_SEN_CAM from the camtg mux, not mm_sel:
++	 * "GATE(IMG_IMAGE_SEN_CAM, img_image_sen_cam, camtg_sel, img_cg_regs, 8, 0)"
++	 * in drivers/clk/mediatek/clk-mt6735.c:896.
++	 */
++	GATE_MTK(CLK_IMG_SEN_CAM, "sen_cam", "camtg_sel", &imgsys_cg_regs, 8, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(CLK_IMG_CAM_SV, "cam_sv", "mm_sel", &imgsys_cg_regs, 9, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(CLK_IMG_SUFOD, "sufod", "mm_sel", &imgsys_cg_regs, 10, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(CLK_IMG_FD, "fd", "mm_sel", &imgsys_cg_regs, 11, &mtk_clk_gate_ops_setclr),
+diff --git a/drivers/memory/mtk-smi.c b/drivers/memory/mtk-smi.c
+index 43f050769..22edc0394 100644
+--- a/drivers/memory/mtk-smi.c
++++ b/drivers/memory/mtk-smi.c
+@@ -71,7 +71,13 @@
+ #define SMI_SECUR_CON_VAL_DOMAIN(id)	(0x3 << ((((id) & 0x7) << 2) + 1))
+ 
+ /* gen2: */
+-/* mt8167 */
++/*
++ * mt8167. mt6735/mt6737t use the same offset: the downstream M4U consumer
++ * programs SMI_LARB_MMU_EN at 0xfc0 (m4u/mt6735/mt6735/m4u_reg.h:314) and the
++ * display driver at 0xfc0 (video/mt6735/dispsys/mt6735/ddp_reg.h:1866); the
++ * ROM's m4u_config_port writes larb_base + 0xfc0/0xfc4 as well. The 0xf00
++ * value in smi/smi_reg.h:388 is a stale define that no downstream code uses.
++ */
+ #define MT8167_SMI_LARB_MMU_EN		0xfc0
+ 
+ /* mt8173 */
+@@ -548,6 +554,14 @@ static const struct mtk_smi_larb_gen mtk_smi_larb_mt8195 = {
+ static const struct of_device_id mtk_smi_larb_of_ids[] = {
+ 	{.compatible = "mediatek,mt2701-smi-larb", .data = &mtk_smi_larb_mt2701},
+ 	{.compatible = "mediatek,mt2712-smi-larb", .data = &mtk_smi_larb_mt2712},
++	/*
++	 * mt6735/mt6737t also keep the per-larb MMU-enable bitmap at 0xfc0 and
++	 * do not use the later per-port SMI_LARB_NONSEC_CON scheme, so the
++	 * mt8167/gen2 bitmap writer is the matching implementation. LARB2
++	 * (imgsys, 0x15001000) has 21 ports (IMGO..WR); the bitmap therefore
++	 * uses bits 0..20 (downstream smi/smi_reg.h:304-308; the per-port bit
++	 * layout is F_SMI_MMU_EN(port, en) = en << port, smi_reg.h:389).
++	 */
+ 	{.compatible = "mediatek,mt6735-smi-larb", .data = &mtk_smi_larb_mt8167},
+ 	{.compatible = "mediatek,mt6779-smi-larb", .data = &mtk_smi_larb_mt6779},
+ 	{.compatible = "mediatek,mt6795-smi-larb", .data = &mtk_smi_larb_mt8173},
+@@ -756,6 +770,28 @@ static const struct mtk_smi_reg_pair mtk_smi_common_mt8195_init[SMI_COMMON_INIT_
+ 	{SMI_DUMMY, 0x1},
+ };
+ 
++/*
++ * mt6735/mt6737t. Downstream applies these on every "normal" SMI profile
++ * setting, and at boot after saving the L1 arbitration defaults
++ * (smi_common.c:1249-1255 -> smi_configuration.c:123-133). The exact table is
++ * present in the ROM image (.rodata, file offset 0xe808b0):
++ *	0x100 (L1LEN)	= 0x1b
++ *	0x234 (M4U_TH)	= 0xf7e19085
++ *	0x230 (FIFO_TH1)= 0x00000e9f
++ * The SMI common lives in the DIS power domain, so its registers lose these
++ * values whenever DIS powers down; mtk_smi_common_gen2 does not restore them.
++ * Downstream also configures the per-LARB L1 arbitration registers
++ * 0x104-0x114 (0x104 restored from the boot value, 0x108/0x10c = 0x1000); the
++ * field layout is undocumented and the downstream loop indexes past the
++ * 3-entry smi_common_l1arb_offset array (SMI_LARB_NR is 4), so those are left
++ * at their hardware values.
++ */
++static const struct mtk_smi_reg_pair mtk_smi_common_mt6735_init[SMI_COMMON_INIT_REGS_NR] = {
++	{SMI_L1LEN, 0x1b},
++	{SMI_M4U_TH, 0xf7e19085},
++	{SMI_READ_FIFO_TH, 0x0e9f},
++};
++
+ static const struct mtk_smi_common_plat mtk_smi_common_gen1 = {
+ 	.type     = MTK_SMI_GEN1,
+ };
+@@ -764,6 +800,11 @@ static const struct mtk_smi_common_plat mtk_smi_common_gen2 = {
+ 	.type	  = MTK_SMI_GEN2,
+ };
+ 
++static const struct mtk_smi_common_plat mtk_smi_common_mt6735 = {
++	.type	  = MTK_SMI_GEN2,
++	.init	  = mtk_smi_common_mt6735_init,
++};
++
+ static const struct mtk_smi_common_plat mtk_smi_common_mt6779 = {
+ 	.type	  = MTK_SMI_GEN2,
+ 	.has_gals = true,
+@@ -844,7 +885,7 @@ static const struct mtk_smi_common_plat mtk_smi_common_mt8365 = {
+ static const struct of_device_id mtk_smi_common_of_ids[] = {
+ 	{.compatible = "mediatek,mt2701-smi-common", .data = &mtk_smi_common_gen1},
+ 	{.compatible = "mediatek,mt2712-smi-common", .data = &mtk_smi_common_gen2},
+-	{.compatible = "mediatek,mt6735-smi-common", .data = &mtk_smi_common_gen2},
++	{.compatible = "mediatek,mt6735-smi-common", .data = &mtk_smi_common_mt6735},
+ 	{.compatible = "mediatek,mt6779-smi-common", .data = &mtk_smi_common_mt6779},
+ 	{.compatible = "mediatek,mt6795-smi-common", .data = &mtk_smi_common_mt6795},
+ 	{.compatible = "mediatek,mt6893-smi-common", .data = &mtk_smi_common_mt6893},

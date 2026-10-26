@@ -1,0 +1,353 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * MediaTek MT6735 VENC (video encoder) platform driver.
+ *
+ * Port from Samsung/MediaTek downstream
+ * drivers/misc/mediatek/videocodec/mt6735/videocodec_kernel_driver_D1.c
+ *
+ * The MT6735 encoder register file is programmed by the vendor userspace
+ * codec libraries through the register window that vcodec-core.c exports
+ * through mmap(2).  The kernel side only owns the encoder clocks, the VENC
+ * power domains and the encoder interrupt; there is no codec firmware and
+ * no bitstream/frame register programming here.  See
+ * videocodec_kernel_driver_D1.c:461-540 (power) and :596-681 (enc_isr).
+ */
+
+#include <linux/clk.h>
+#include <linux/interrupt.h>
+#include <linux/io.h>
+#include <linux/irq.h>
+#include <linux/module.h>
+#include <linux/of.h>
+#include <linux/platform_device.h>
+#include <linux/pm.h>
+#include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
+
+#include "vcodec.h"
+
+/*
+ * Register offsets inside the 4 KiB VENC window at 0x17002000.
+ * videocodec_kernel_driver_D1.c:333-334,347-348
+ */
+#define VENC_IRQ_STATUS_OFS	0x05c
+#define VENC_IRQ_ACK_OFS	0x060
+
+/* videocodec_kernel_driver_D1.c:360-365 */
+#define VENC_IRQ_STAT_SPS	0x1
+#define VENC_IRQ_STAT_PPS	0x2
+#define VENC_IRQ_STAT_FRM	0x4
+#define VENC_IRQ_STAT_DRAM	0x8
+#define VENC_IRQ_STAT_PAUSE	0x10
+#define VENC_IRQ_STAT_SWITCH	0x20
+
+/**
+ * struct vcodec_venc - MT6735 encoder engine instance
+ * @dev: platform device of the "mediatek,mt6735-venc" node
+ * @base: mapped VENC register window
+ * @clks: clocks described by the "clocks" property
+ * @nclks: number of entries in @clks
+ * @irq: VENC interrupt number
+ * @engine: engine handed to the shared codec core
+ */
+struct vcodec_venc {
+	struct device *dev;
+	void __iomem *base;
+	struct clk_bulk_data *clks;
+	int nclks;
+	int irq;
+	struct vcodec_engine engine;
+};
+
+static int vcodec_venc_power_on(struct vcodec_engine *eng)
+{
+	struct vcodec_venc *venc = eng->priv;
+	int ret;
+
+	ret = pm_runtime_resume_and_get(venc->dev);
+	if (ret) {
+		dev_err(venc->dev, "failed to power on VENC domains: %d\n", ret);
+		return ret;
+	}
+
+	ret = clk_bulk_prepare_enable(venc->nclks, venc->clks);
+	if (ret) {
+		dev_err(venc->dev, "failed to enable VENC clocks: %d\n", ret);
+		pm_runtime_put_sync(venc->dev);
+		return ret;
+	}
+
+	return 0;
+}
+
+static void vcodec_venc_power_off(struct vcodec_engine *eng)
+{
+	struct vcodec_venc *venc = eng->priv;
+
+	clk_bulk_disable_unprepare(venc->nclks, venc->clks);
+	pm_runtime_put_sync(venc->dev);
+}
+
+static int vcodec_venc_enable_irq(struct vcodec_engine *eng)
+{
+	struct vcodec_venc *venc = eng->priv;
+
+	enable_irq(venc->irq);
+
+	return 0;
+}
+
+static void vcodec_venc_disable_irq(struct vcodec_engine *eng)
+{
+	struct vcodec_venc *venc = eng->priv;
+
+	disable_irq(venc->irq);
+}
+
+/*
+ * Acknowledge one status bit.  The downstream driver writes a single bit
+ * per access (videocodec_kernel_driver_D1.c:640-661), so the write is not
+ * merged into one register update here either.
+ */
+static void vcodec_venc_ack(struct vcodec_venc *venc, u32 status)
+{
+	writel(status, venc->base + VENC_IRQ_ACK_OFS);
+}
+
+static irqreturn_t vcodec_venc_isr(int irq, void *data)
+{
+	struct vcodec_venc *venc = data;
+	struct vcodec_engine *eng = &venc->engine;
+	u32 status;
+
+	/* videocodec_kernel_driver_D1.c:637 */
+	status = readl(venc->base + VENC_IRQ_STATUS_OFS);
+
+	if (!vcodec_engine_is_locked(eng)) {
+		/*
+		 * Nobody owns the encoder: the interrupt is spurious.  Clear
+		 * every status bit so the level-triggered line drops, exactly
+		 * as videocodec_kernel_driver_D1.c:621-633 does, and do not
+		 * wake any waiter because there is none.
+		 */
+		dev_err_ratelimited(venc->dev,
+				    "VENC interrupt without a hardware owner, status 0x%08x\n",
+				    status);
+		vcodec_venc_ack(venc, VENC_IRQ_STAT_PAUSE);
+		vcodec_venc_ack(venc, VENC_IRQ_STAT_SWITCH);
+		vcodec_venc_ack(venc, VENC_IRQ_STAT_DRAM);
+		vcodec_venc_ack(venc, VENC_IRQ_STAT_SPS);
+		vcodec_venc_ack(venc, VENC_IRQ_STAT_PPS);
+		vcodec_venc_ack(venc, VENC_IRQ_STAT_FRM);
+
+		return IRQ_HANDLED;
+	}
+
+	switch (vcodec_engine_get_driver_type(eng)) {
+	case VCODEC_DRIVER_TYPE_H264_ENC:
+		/* videocodec_kernel_driver_D1.c:637-662 */
+		if (status & VENC_IRQ_STAT_PAUSE)
+			vcodec_venc_ack(venc, VENC_IRQ_STAT_PAUSE);
+		if (status & VENC_IRQ_STAT_SWITCH)
+			vcodec_venc_ack(venc, VENC_IRQ_STAT_SWITCH);
+		if (status & VENC_IRQ_STAT_DRAM)
+			vcodec_venc_ack(venc, VENC_IRQ_STAT_DRAM);
+		if (status & VENC_IRQ_STAT_SPS)
+			vcodec_venc_ack(venc, VENC_IRQ_STAT_SPS);
+		if (status & VENC_IRQ_STAT_PPS)
+			vcodec_venc_ack(venc, VENC_IRQ_STAT_PPS);
+		if (status & VENC_IRQ_STAT_FRM)
+			vcodec_venc_ack(venc, VENC_IRQ_STAT_FRM);
+		break;
+	case VCODEC_DRIVER_TYPE_HEVC_ENC:
+		/*
+		 * videocodec_kernel_driver_D1.c:663-665 keeps the status
+		 * untouched for HEVC and only logs.  The vendor HEVC library
+		 * acknowledges the encoder through its mmap'ed window.
+		 */
+		dev_err_ratelimited(venc->dev,
+				    "VENC HEVC interrupt not acknowledged by the kernel, status 0x%08x\n",
+				    status);
+		break;
+	default:
+		/* videocodec_kernel_driver_D1.c:666-669 */
+		dev_err_ratelimited(venc->dev,
+				    "VENC interrupt from invalid lock holder type %u, status 0x%08x\n",
+				    vcodec_engine_get_driver_type(eng), status);
+		break;
+	}
+
+	/* videocodec_kernel_driver_D1.c:671 */
+	vcodec_engine_irq(eng, status);
+
+	return IRQ_HANDLED;
+}
+
+static const struct vcodec_engine_ops vcodec_venc_ops = {
+	.power_on = vcodec_venc_power_on,
+	.power_off = vcodec_venc_power_off,
+	.enable_irq = vcodec_venc_enable_irq,
+	.disable_irq = vcodec_venc_disable_irq,
+};
+
+/*
+ * Hibernation restore: re-apply the level-low trigger of the encoder line.
+ * The boot loader or the kernel that loaded the image may have reset the
+ * MT6735 interrupt polarity registers.  resume_device_irqs() runs after all
+ * ->restore_noirq callbacks, so the line is still masked here.
+ *
+ * Port from Samsung/MTK downstream
+ * drivers/misc/mediatek/videocodec/mt6735/videocodec_kernel_driver_D1.c:2375-2390
+ * (vcodec_pm_restore_noirq), which issues
+ * mt_irq_set_sens(VENC_IRQ_ID, MT_LEVEL_SENSITIVE) and
+ * mt_irq_set_polarity(VENC_IRQ_ID, MT_POLARITY_LOW).
+ * IRQ_TYPE_LEVEL_LOW is the irq-core spelling of that pair: on the
+ * mediatek,mt6735-sysirq parent that the codec interrupt is routed through
+ * it sets the INTPOL bit and hands IRQ_TYPE_LEVEL_HIGH to the GIC, as the
+ * downstream MTK interrupt controller code does
+ * (drivers/irqchip/irq-mtk-sysirq.c: mtk_sysirq_set_type()).
+ *
+ * The ROM logs nothing and always returns 0; a failure is reported here for
+ * debuggability but, like the ROM, not propagated to abort the restore.
+ */
+static int __maybe_unused vcodec_venc_restore_noirq(struct device *dev)
+{
+	struct vcodec_venc *venc = dev_get_drvdata(dev);
+	int ret;
+
+	ret = irq_set_irq_type(venc->irq, IRQ_TYPE_LEVEL_LOW);
+	if (ret)
+		dev_err(dev, "failed to restore VENC IRQ polarity: %d\n", ret);
+
+	return 0;
+}
+
+static const struct dev_pm_ops vcodec_venc_pm_ops = {
+	.restore_noirq = pm_sleep_ptr(vcodec_venc_restore_noirq),
+};
+
+static int vcodec_venc_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct dev_pm_domain_list *pd_list = NULL;
+	struct vcodec_venc *venc;
+	struct resource *res;
+	int ret;
+
+	venc = devm_kzalloc(dev, sizeof(*venc), GFP_KERNEL);
+	if (!venc)
+		return -ENOMEM;
+
+	venc->dev = dev;
+	platform_set_drvdata(pdev, venc);
+
+	venc->base = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(venc->base))
+		return dev_err_probe(dev, PTR_ERR(venc->base),
+				     "failed to map VENC registers\n");
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res)
+		return dev_err_probe(dev, -ENODEV, "missing VENC register resource\n");
+
+	venc->nclks = devm_clk_bulk_get_all(dev, &venc->clks);
+	if (venc->nclks < 0)
+		return dev_err_probe(dev, venc->nclks, "failed to get VENC clocks\n");
+
+	/*
+	 * The node describes two power domains (DIS then VEN).  The bus only
+	 * attaches a single domain, so attach the list explicitly: the device
+	 * links created here make the pm_runtime_get/put calls in
+	 * vcodec_venc_power_on()/vcodec_venc_power_off() drive both MTCMOS
+	 * domains.  -EEXIST means the bus already attached the sole domain.
+	 */
+	ret = devm_pm_domain_attach_list(dev, NULL, &pd_list);
+	if (ret < 0 && ret != -EEXIST)
+		return dev_err_probe(dev, ret, "failed to attach VENC power domains\n");
+	if (!ret)
+		return dev_err_probe(dev, -ENODEV,
+				     "no VENC power domains described in device tree\n");
+
+	venc->irq = platform_get_irq(pdev, 0);
+	if (venc->irq < 0)
+		return venc->irq;
+
+	ret = devm_request_irq(dev, venc->irq, vcodec_venc_isr, 0,
+			       dev_name(dev), venc);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to request VENC irq\n");
+
+	/*
+	 * videocodec_kernel_driver_D1.c:2279-2287 requests the encoder IRQ at
+	 * probe time and masks it straight away; LOCKHW enables it on demand.
+	 */
+	disable_irq(venc->irq);
+
+	pm_runtime_enable(dev);
+
+	venc->engine.name = "venc";
+	venc->engine.id = VCODEC_ENGINE_ENC;
+	venc->engine.dev = dev;
+	venc->engine.ops = &vcodec_venc_ops;
+	venc->engine.priv = venc;
+	venc->engine.regions[0].phys = res->start;
+	venc->engine.regions[0].size = resource_size(res);
+	venc->engine.num_regions = 1;
+
+	ret = vcodec_engine_register(&venc->engine);
+	if (ret) {
+		dev_err_probe(dev, ret, "failed to register VENC engine\n");
+		pm_runtime_disable(dev);
+		return ret;
+	}
+
+	return 0;
+}
+
+static void vcodec_venc_remove(struct platform_device *pdev)
+{
+	struct vcodec_venc *venc = platform_get_drvdata(pdev);
+
+	vcodec_engine_unregister(&venc->engine);
+	pm_runtime_disable(&pdev->dev);
+}
+
+static const struct of_device_id vcodec_venc_of_match[] = {
+	{ .compatible = "mediatek,mt6735-venc" },
+	{ /* sentinel */ }
+};
+MODULE_DEVICE_TABLE(of, vcodec_venc_of_match);
+
+static struct platform_driver vcodec_venc_driver = {
+	.probe = vcodec_venc_probe,
+	.remove = vcodec_venc_remove,
+	.driver = {
+		.name = "mtk-vcodec-venc",
+		.of_match_table = vcodec_venc_of_match,
+		.pm = &vcodec_venc_pm_ops,
+	},
+};
+
+static bool vcodec_venc_registered;
+
+int vcodec_venc_register(void)
+{
+	int ret;
+
+	ret = platform_driver_register(&vcodec_venc_driver);
+	if (ret)
+		return ret;
+
+	vcodec_venc_registered = true;
+
+	return 0;
+}
+
+void vcodec_venc_unregister(void)
+{
+	if (!vcodec_venc_registered)
+		return;
+
+	platform_driver_unregister(&vcodec_venc_driver);
+	vcodec_venc_registered = false;
+}

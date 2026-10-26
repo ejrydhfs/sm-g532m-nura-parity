@@ -1,0 +1,1156 @@
+diff --git a/drivers/media/i2c/imx219.c b/drivers/media/i2c/imx219.c
+index 7da02ce5d..e3dcabac9 100644
+--- a/drivers/media/i2c/imx219.c
++++ b/drivers/media/i2c/imx219.c
+@@ -12,6 +12,12 @@
+  * Flip handling taken from the Sony IMX319 driver.
+  * Copyright (C) 2018 Intel Corporation
+  *
++ * Port from Samsung/MTK downstream driver for the Samsung grandpplte
++ * (SM-G532M) IMX219 module. Register, timing and power sequencing data:
++ *   drivers/misc/mediatek/imgsensor/src/mt6735/imx219_mipi_raw/imx219mipiraw_Sensor.c
++ *   drivers/misc/mediatek/imgsensor/src/mt6735/camera_hw/kd_camera_hw.c
++ * Copyright (C) 2015 MediaTek Inc.
++ *
+  */
+ 
+ #include <linux/clk.h>
+@@ -88,6 +94,14 @@
+ #define IMX219_REG_X_ODD_INC_A		CCI_REG8(0x0170)
+ #define IMX219_REG_Y_ODD_INC_A		CCI_REG8(0x0171)
+ #define IMX219_REG_ORIENTATION		CCI_REG8(0x0172)
++/*
++ * The Samsung module is mounted such that the downstream driver programs
++ * 0x03 for IMAGE_NORMAL and 0x00 for IMAGE_HV_MIRROR
++ * (imx219mipiraw_Sensor.c:600-612), i.e. the register value is the complement
++ * of the mainline "no flip" value. The V4L2 flip controls keep their mainline
++ * meaning and the value is inverted for this module only.
++ */
++#define IMX219_SAMSUNG_ORIENTATION_NORMAL	0x03
+ 
+ /* Binning  Mode */
+ #define IMX219_REG_BINNING_MODE_H	CCI_REG8(0x0174)
+@@ -156,6 +170,27 @@ struct imx219_mode {
+ 
+ 	/* V-timing */
+ 	unsigned int fll_def;
++
++	/*
++	 * Samsung grandpplte module data. All fields are zero for the generic
++	 * modes, in which case the register layout is derived from the active
++	 * format like upstream does.
++	 */
++
++	/* Default line length in pixels (0: IMX219_LLP_MIN) */
++	unsigned int llp_def;
++	/* Sensor pixel clock for this mode (0: generic pixel rate) */
++	unsigned int pixel_rate;
++	/* MIPI link frequency for this mode (0: first menu entry) */
++	s64 link_freq;
++	/* Sensor readout window programmed by this mode */
++	unsigned int crop_left;
++	unsigned int crop_top;
++	unsigned int crop_width;
++	unsigned int crop_height;
++	/* Full register setup, NULL for the generic modes */
++	const struct cci_reg_sequence *regs;
++	unsigned int nr_regs;
+ };
+ 
+ static const struct cci_reg_sequence imx219_common_regs[] = {
+@@ -220,6 +255,184 @@ static const struct cci_reg_sequence imx219_4lane_regs[] = {
+ 	{ IMX219_REG_CSI_LANE_MODE, IMX219_CSI_4_LANE_MODE },
+ };
+ 
++/*
++ * Samsung grandpplte module register setups.
++ *
++ * Every value below is copied verbatim from the downstream mode setting
++ * functions (16-bit register pairs are combined into one CCI_REG16 write):
++ *   3264x2456 @30fps	imx219mipiraw_Sensor.c:640-696  (preview_setting)
++ *			imx219mipiraw_Sensor.c:824-885  (normal_video_setting, same data)
++ *			imx219mipiraw_Sensor.c:733-783  (capture_setting, 30fps branch)
++ *   3280x2464 @24fps	imx219mipiraw_Sensor.c:697-732  (capture_setting, 240 branch)
++ *   816x460   @120fps	imx219mipiraw_Sensor.c:887-948  (hs_video_setting)
++ *   1640x1228 @15fps	imx219mipiraw_Sensor.c:950-1009 (slim_video_setting)
++ *
++ * The downstream trailing "0x0100 = 0x01" (stream on) write is performed by
++ * imx219_enable_streams() after the V4L2 controls have been applied, exactly
++ * like the generic path does, so it is not part of these tables.
++ */
++
++/* 3264x2456 @30fps - preview / capture / normal video */
++static const struct cci_reg_sequence imx219_samsung_3264x2456_regs[] = {
++	{ IMX219_REG_MODE_SELECT, 0x00 },
++	{ CCI_REG8(0x30eb), 0x05 },
++	{ CCI_REG8(0x30eb), 0x0c },
++	{ CCI_REG8(0x300a), 0xff },
++	{ CCI_REG8(0x300b), 0xff },
++	{ CCI_REG8(0x30eb), 0x05 },
++	{ CCI_REG8(0x30eb), 0x09 },
++	{ IMX219_REG_CSI_LANE_MODE, IMX219_CSI_4_LANE_MODE },
++	{ IMX219_REG_DPHY_CTRL, IMX219_DPHY_CTRL_TIMING_AUTO },
++	{ IMX219_REG_EXCK_FREQ, IMX219_EXCK_FREQ(IMX219_XCLK_FREQ / 1000000) },
++	{ IMX219_REG_FRM_LENGTH_A, 0x0a83 },	/* 2691 lines */
++	{ IMX219_REG_LINE_LENGTH_A, 0x0d78 },	/* 3448 pixels */
++	{ IMX219_REG_X_ADD_STA_A, 0x0000 },
++	{ IMX219_REG_X_ADD_END_A, 0x0ccf },
++	{ IMX219_REG_Y_ADD_STA_A, 0x0004 },
++	{ IMX219_REG_Y_ADD_END_A, 0x099b },
++	{ IMX219_REG_X_OUTPUT_SIZE, 0x0cd0 },	/* 3280 */
++	{ IMX219_REG_Y_OUTPUT_SIZE, 0x0998 },	/* 2456 */
++	{ IMX219_REG_X_ODD_INC_A, 0x01 },
++	{ IMX219_REG_Y_ODD_INC_A, 0x01 },
++	{ IMX219_REG_BINNING_MODE_H, 0x00 },
++	{ IMX219_REG_BINNING_MODE_V, 0x00 },
++	{ IMX219_REG_CSI_DATA_FORMAT_A, 0x0a0a },
++	{ IMX219_REG_VTPXCK_DIV, 0x05 },
++	{ IMX219_REG_VTSYCK_DIV, 0x01 },
++	{ IMX219_REG_PREPLLCK_VT_DIV, 0x03 },
++	{ IMX219_REG_PREPLLCK_OP_DIV, 0x03 },
++	{ IMX219_REG_PLL_VT_MPY, 0x0057 },
++	{ IMX219_REG_OPPXCK_DIV, 0x0a },
++	{ IMX219_REG_OPSYCK_DIV, 0x01 },
++	{ IMX219_REG_PLL_OP_MPY, 0x0068 },
++	{ CCI_REG8(0x4767), 0x0f },
++	{ CCI_REG8(0x4750), 0x14 },
++	{ CCI_REG8(0x47b4), 0x14 },
++};
++
++/* 3280x2464 @24fps - PIP capture (downstream cap1) */
++static const struct cci_reg_sequence imx219_samsung_3280x2464_regs[] = {
++	{ IMX219_REG_MODE_SELECT, 0x00 },
++	{ CCI_REG8(0x30eb), 0x05 },
++	{ CCI_REG8(0x30eb), 0x0c },
++	{ CCI_REG8(0x300a), 0xff },
++	{ CCI_REG8(0x300b), 0xff },
++	{ CCI_REG8(0x30eb), 0x05 },
++	{ CCI_REG8(0x30eb), 0x09 },
++	{ IMX219_REG_CSI_LANE_MODE, IMX219_CSI_4_LANE_MODE },
++	{ IMX219_REG_DPHY_CTRL, IMX219_DPHY_CTRL_TIMING_AUTO },
++	{ IMX219_REG_EXCK_FREQ, IMX219_EXCK_FREQ(IMX219_XCLK_FREQ / 1000000) },
++	{ IMX219_REG_FRM_LENGTH_A, 0x0a83 },	/* 2691 lines */
++	{ IMX219_REG_LINE_LENGTH_A, 0x0d78 },	/* 3448 pixels */
++	{ IMX219_REG_X_ADD_STA_A, 0x0000 },
++	{ IMX219_REG_X_ADD_END_A, 0x0ccf },
++	{ IMX219_REG_Y_ADD_STA_A, 0x0000 },
++	{ IMX219_REG_Y_ADD_END_A, 0x099f },
++	{ IMX219_REG_X_OUTPUT_SIZE, 0x0cd0 },	/* 3280 */
++	{ IMX219_REG_Y_OUTPUT_SIZE, 0x09a0 },	/* 2464 */
++	{ IMX219_REG_X_ODD_INC_A, 0x01 },
++	{ IMX219_REG_Y_ODD_INC_A, 0x01 },
++	{ IMX219_REG_BINNING_MODE_H, 0x00 },
++	{ IMX219_REG_BINNING_MODE_V, 0x00 },
++	{ IMX219_REG_CSI_DATA_FORMAT_A, 0x0a0a },
++	{ IMX219_REG_VTPXCK_DIV, 0x05 },
++	{ IMX219_REG_VTSYCK_DIV, 0x01 },
++	{ IMX219_REG_PREPLLCK_VT_DIV, 0x03 },
++	{ IMX219_REG_PREPLLCK_OP_DIV, 0x03 },
++	{ IMX219_REG_PLL_VT_MPY, 0x0053 },
++	{ IMX219_REG_OPPXCK_DIV, 0x0a },
++	{ IMX219_REG_OPSYCK_DIV, 0x01 },
++	{ IMX219_REG_PLL_OP_MPY, 0x0056 },
++	{ CCI_REG8(0x455e), 0x00 },
++	{ CCI_REG8(0x471e), 0x4b },
++	{ CCI_REG8(0x4767), 0x0f },
++	{ CCI_REG8(0x4750), 0x14 },
++	{ CCI_REG8(0x4540), 0x00 },
++	{ CCI_REG8(0x47b4), 0x14 },
++	{ CCI_REG8(0x4713), 0x30 },
++	{ CCI_REG8(0x478b), 0x10 },
++	{ CCI_REG8(0x478f), 0x10 },
++	{ CCI_REG8(0x4793), 0x10 },
++	{ CCI_REG8(0x4797), 0x0e },
++	{ CCI_REG8(0x479b), 0x0e },
++};
++
++/* 816x460 @120fps - high speed video */
++static const struct cci_reg_sequence imx219_samsung_816x460_regs[] = {
++	{ IMX219_REG_MODE_SELECT, 0x00 },
++	{ CCI_REG8(0x30eb), 0x05 },
++	{ CCI_REG8(0x30eb), 0x0c },
++	{ CCI_REG8(0x300a), 0xff },
++	{ CCI_REG8(0x300b), 0xff },
++	{ CCI_REG8(0x30eb), 0x05 },
++	{ CCI_REG8(0x30eb), 0x09 },
++	{ IMX219_REG_CSI_LANE_MODE, IMX219_CSI_4_LANE_MODE },
++	{ IMX219_REG_DPHY_CTRL, IMX219_DPHY_CTRL_TIMING_AUTO },
++	{ IMX219_REG_EXCK_FREQ, IMX219_EXCK_FREQ(IMX219_XCLK_FREQ / 1000000) },
++	{ IMX219_REG_FRM_LENGTH_A, 0x02a1 },	/* 673 lines */
++	{ IMX219_REG_LINE_LENGTH_A, 0x0d78 },	/* 3448 pixels */
++	{ IMX219_REG_X_ADD_STA_A, 0x0008 },
++	{ IMX219_REG_X_ADD_END_A, 0x0cc7 },
++	{ IMX219_REG_Y_ADD_STA_A, 0x0138 },
++	{ IMX219_REG_Y_ADD_END_A, 0x0867 },
++	{ IMX219_REG_X_OUTPUT_SIZE, 0x0330 },	/* 816 */
++	{ IMX219_REG_Y_OUTPUT_SIZE, 0x01cc },	/* 460 */
++	{ IMX219_REG_X_ODD_INC_A, 0x01 },
++	{ IMX219_REG_Y_ODD_INC_A, 0x01 },
++	{ IMX219_REG_BINNING_MODE_H, 0x02 },
++	{ IMX219_REG_BINNING_MODE_V, 0x02 },
++	{ IMX219_REG_CSI_DATA_FORMAT_A, 0x0a0a },
++	{ IMX219_REG_VTPXCK_DIV, 0x05 },
++	{ IMX219_REG_VTSYCK_DIV, 0x01 },
++	{ IMX219_REG_PREPLLCK_VT_DIV, 0x03 },
++	{ IMX219_REG_PREPLLCK_OP_DIV, 0x03 },
++	{ IMX219_REG_PLL_VT_MPY, 0x0057 },
++	{ IMX219_REG_OPPXCK_DIV, 0x0a },
++	{ IMX219_REG_OPSYCK_DIV, 0x01 },
++	{ IMX219_REG_PLL_OP_MPY, 0x0055 },
++	{ CCI_REG8(0x4767), 0x0f },
++	{ CCI_REG8(0x4750), 0x14 },
++	{ CCI_REG8(0x47b4), 0x14 },
++};
++
++/* 1640x1228 @15fps - slim video */
++static const struct cci_reg_sequence imx219_samsung_1640x1228_regs[] = {
++	{ IMX219_REG_MODE_SELECT, 0x00 },
++	{ CCI_REG8(0x30eb), 0x05 },
++	{ CCI_REG8(0x30eb), 0x0c },
++	{ CCI_REG8(0x300a), 0xff },
++	{ CCI_REG8(0x300b), 0xff },
++	{ CCI_REG8(0x30eb), 0x05 },
++	{ CCI_REG8(0x30eb), 0x09 },
++	{ IMX219_REG_CSI_LANE_MODE, IMX219_CSI_4_LANE_MODE },
++	{ IMX219_REG_DPHY_CTRL, IMX219_DPHY_CTRL_TIMING_AUTO },
++	{ IMX219_REG_EXCK_FREQ, IMX219_EXCK_FREQ(IMX219_XCLK_FREQ / 1000000) },
++	{ IMX219_REG_FRM_LENGTH_A, 0x1502 },	/* 5378 lines */
++	{ IMX219_REG_LINE_LENGTH_A, 0x0d78 },	/* 3448 pixels */
++	{ IMX219_REG_X_ADD_STA_A, 0x0000 },
++	{ IMX219_REG_X_ADD_END_A, 0x0ccf },
++	{ IMX219_REG_Y_ADD_STA_A, 0x0004 },
++	{ IMX219_REG_Y_ADD_END_A, 0x099b },
++	{ IMX219_REG_X_OUTPUT_SIZE, 0x0668 },	/* 1640 */
++	{ IMX219_REG_Y_OUTPUT_SIZE, 0x04cc },	/* 1228 */
++	{ IMX219_REG_X_ODD_INC_A, 0x01 },
++	{ IMX219_REG_Y_ODD_INC_A, 0x01 },
++	{ IMX219_REG_BINNING_MODE_H, 0x01 },
++	{ IMX219_REG_BINNING_MODE_V, 0x01 },
++	{ IMX219_REG_CSI_DATA_FORMAT_A, 0x0a0a },
++	{ IMX219_REG_VTPXCK_DIV, 0x05 },
++	{ IMX219_REG_VTSYCK_DIV, 0x01 },
++	{ IMX219_REG_PREPLLCK_VT_DIV, 0x03 },
++	{ IMX219_REG_PREPLLCK_OP_DIV, 0x03 },
++	{ IMX219_REG_PLL_VT_MPY, 0x0057 },
++	{ IMX219_REG_OPPXCK_DIV, 0x0a },
++	{ IMX219_REG_OPSYCK_DIV, 0x01 },
++	{ IMX219_REG_PLL_OP_MPY, 0x0055 },
++	{ CCI_REG8(0x4767), 0x0f },
++	{ CCI_REG8(0x4750), 0x14 },
++	{ CCI_REG8(0x47b4), 0x14 },
++};
++
+ static const s64 imx219_link_freq_menu[] = {
+ 	IMX219_DEFAULT_LINK_FREQ,
+ };
+@@ -233,6 +446,28 @@ static const s64 imx219_link_freq_4lane_menu[] = {
+ 	IMX219_DEFAULT_LINK_FREQ_4LANE_UNSUPPORTED,
+ };
+ 
++/*
++ * Samsung grandpplte module link frequencies.
++ *
++ * [INFERENCE] The rates are not stated directly downstream; they are derived
++ * from the output PLL programmed by each mode. The CSI-2 link frequency is
++ *
++ *	link_freq = INCK * PLL_OP_MPY / (2 * PREPLLCK_OP_DIV)
++ *
++ * with INCK = 24 MHz (imgsensor_info.mclk, imx219mipiraw_Sensor.c:159) and
++ * PREPLLCK_OP_DIV = 3 (register 0x0305, the "AUTO" value also used by the
++ * generic tables above). The formula reproduces both rates of the generic
++ * driver exactly: PLL_OP_MPY 114 -> 456 MHz (2-lane default) and
++ * PLL_OP_MPY 91 -> 364 MHz (4-lane default). The Samsung modes program
++ * 0x030c/0x030d = 0x0068, 0x0056 and 0x0055 respectively, giving
++ * 416 MHz, 344 MHz and 340 MHz.
++ */
++static const s64 imx219_samsung_link_freq_menu[] = {
++	416000000,
++	344000000,
++	340000000,
++};
++
+ static const char * const imx219_test_pattern_menu[] = {
+ 	"Disabled",
+ 	"Color Bars",
+@@ -259,6 +494,53 @@ static const char * const imx219_supply_name[] = {
+ 
+ #define IMX219_NUM_SUPPLIES ARRAY_SIZE(imx219_supply_name)
+ 
++/*
++ * Samsung grandpplte module supplies. Downstream drives vcama, vcamd, vcamaf
++ * and vcamio as separate rails (kd_camera_hw.c:494-517); they are backed by
++ * the PMIC LDOs of the same name (mt6737t_grandpplte_ltn_dtv_gpio_04.dtsi:
++ * 681-698, rom_dtb_0.dts:3719-3735).
++ */
++static const char * const imx219_samsung_supply_name[] = {
++	"vcama",	/* VCAM_A, 2.8 V */
++	"vcamd",	/* VCAM_D, 1.2 V */
++	"vcamaf",	/* VCAM_AF, 2.8 V */
++	"vcamio",	/* VCAM_IO, 1.8 V */
++};
++
++#define IMX219_SAMSUNG_NUM_SUPPLIES ARRAY_SIZE(imx219_samsung_supply_name)
++#define IMX219_MAX_SUPPLIES	4
++
++/*
++ * Power up order, voltage and post-enable delay of the Samsung module,
++ * transcribed from kd_camera_hw.c:494-525:
++ *   VCAM_A 2.8 V, VCAM_D 1.2 V, VCAM_AF 2.8 V, mdelay(2),
++ *   VCAM_IO 1.8 V, mdelay(3), MCLK on, mdelay(1), PDN high, RESET high.
++ */
++struct imx219_power_rail {
++	unsigned int supply;
++	unsigned int uV;
++	unsigned int delay_ms;
++};
++
++static const struct imx219_power_rail imx219_samsung_power_on_seq[] = {
++	{ 0, 2800000, 0 },	/* VCAM_A, kd_camera_hw.c:495 */
++	{ 1, 1200000, 0 },	/* VCAM_D, kd_camera_hw.c:500 */
++	{ 2, 2800000, 2 },	/* VCAM_AF, kd_camera_hw.c:506 + mdelay(2) :511 */
++	{ 3, 1800000, 3 },	/* VCAM_IO, kd_camera_hw.c:514 + mdelay(3) :519 */
++};
++
++/*
++ * Power down sequence: VCAM_AF, MCLK, PDN/RESET low, VCAM_IO, VCAM_D, VCAM_A
++ * with a 1 ms delay after each step (kd_camera_hw.c:767-808).
++ */
++#define IMX219_SAMSUNG_POWER_OFF_RAILS { 2, 3, 1, 0 }
++
++/* Sleep at least @ms milliseconds, downstream uses mdelay() here. */
++static void imx219_samsung_delay_ms(unsigned int ms)
++{
++	usleep_range(ms * 1000, ms * 1000 + 100);
++}
++
+ /*
+  * The supported formats.
+  * This table MUST contain 4 entries per format, to cover the various flip
+@@ -335,6 +617,107 @@ static const struct imx219_mode supported_modes[] = {
+ 	},
+ };
+ 
++/*
++ * Samsung grandpplte mode set.
++ *
++ * Source of every number: imgsensor_info in imx219mipiraw_Sensor.c:65-152 and
++ * the per-mode register tables above.
++ *
++ * The sizes are the module's grabwindow sizes (what the downstream ISP hands
++ * to userspace). The sensor readout window programmed by the matching
++ * register table is slightly larger and is reported through the crop
++ * selection, exactly like downstream's SENSOR_WINSIZE_INFO_STRUCT
++ * (imx219mipiraw_Sensor.c:184-191): e.g. 3280x2456 readout cropped to
++ * 3264x2456 by the ISP (startx = 8).
++ *
++ * pixel_rate is the mode's pclk from imgsensor_info; the downstream driver
++ * writes frame length and shutter directly in lines for all of these modes,
++ * so no binning rate factor is applied to the controls.
++ */
++static const struct imx219_mode imx219_samsung_modes[] = {
++	{
++		/* preview / capture / normal video, 30fps */
++		.width = 3264,
++		.height = 2456,
++		.fll_def = 2691,
++		.llp_def = 3448,
++		.pixel_rate = 278400000,
++		.link_freq = 416000000,
++		.crop_left = 0,
++		.crop_top = 4,
++		.crop_width = 3280,
++		.crop_height = 2456,
++		.regs = imx219_samsung_3264x2456_regs,
++		.nr_regs = ARRAY_SIZE(imx219_samsung_3264x2456_regs),
++	},
++	{
++		/* PIP capture, 24fps */
++		.width = 3280,
++		.height = 2456,
++		.fll_def = 2691,
++		.llp_def = 3448,
++		.pixel_rate = 224000000,
++		.link_freq = 344000000,
++		.crop_left = 0,
++		.crop_top = 0,
++		.crop_width = 3280,
++		.crop_height = 2464,
++		.regs = imx219_samsung_3280x2464_regs,
++		.nr_regs = ARRAY_SIZE(imx219_samsung_3280x2464_regs),
++	},
++	{
++		/* high speed video, 120fps */
++		.width = 816,
++		.height = 460,
++		.fll_def = 673,
++		.llp_def = 3448,
++		.pixel_rate = 278400000,
++		.link_freq = 340000000,
++		.crop_left = 8,
++		.crop_top = 312,
++		.crop_width = 3264,
++		.crop_height = 1840,
++		.regs = imx219_samsung_816x460_regs,
++		.nr_regs = ARRAY_SIZE(imx219_samsung_816x460_regs),
++	},
++	{
++		/* slim video, 15fps */
++		.width = 1640,
++		.height = 1228,
++		.fll_def = 5378,
++		.llp_def = 3448,
++		.pixel_rate = 278400000,
++		.link_freq = 340000000,
++		.crop_left = 0,
++		.crop_top = 4,
++		.crop_width = 3280,
++		.crop_height = 2456,
++		.regs = imx219_samsung_1640x1228_regs,
++		.nr_regs = ARRAY_SIZE(imx219_samsung_1640x1228_regs),
++	},
++};
++
++struct imx219_variant {
++	const char *name;
++	/* Samsung grandpplte module: fixed register layouts and rail control */
++	bool samsung;
++	const struct imx219_mode *modes;
++	unsigned int num_modes;
++};
++
++static const struct imx219_variant imx219_generic_variant = {
++	.name = "sony,imx219",
++	.modes = supported_modes,
++	.num_modes = ARRAY_SIZE(supported_modes),
++};
++
++static const struct imx219_variant imx219_samsung_variant = {
++	.name = "samsung,grandpplte-imx219",
++	.samsung = true,
++	.modes = imx219_samsung_modes,
++	.num_modes = ARRAY_SIZE(imx219_samsung_modes),
++};
++
+ struct imx219 {
+ 	struct v4l2_subdev sd;
+ 	struct media_pad pad;
+@@ -344,7 +727,13 @@ struct imx219 {
+ 	u32 xclk_freq;
+ 
+ 	struct gpio_desc *reset_gpio;
+-	struct regulator_bulk_data supplies[IMX219_NUM_SUPPLIES];
++	struct gpio_desc *powerdown_gpio;
++	struct regulator_bulk_data supplies[IMX219_MAX_SUPPLIES];
++	unsigned int num_supplies;
++
++	const struct imx219_variant *variant;
++	/* Link frequencies advertised by firmware (Samsung variant only) */
++	unsigned long link_freq_bitmap;
+ 
+ 	struct v4l2_ctrl_handler ctrl_handler;
+ 	/* V4L2 Controls */
+@@ -365,6 +754,34 @@ static inline struct imx219 *to_imx219(struct v4l2_subdev *_sd)
+ 	return container_of(_sd, struct imx219, sd);
+ }
+ 
++static const struct imx219_mode *imx219_get_modes(struct imx219 *imx219,
++						  unsigned int *num_modes)
++{
++	*num_modes = imx219->variant->num_modes;
++
++	return imx219->variant->modes;
++}
++
++static const struct imx219_mode *imx219_find_mode(struct imx219 *imx219,
++						  unsigned int width,
++						  unsigned int height)
++{
++	const struct imx219_mode *modes;
++	unsigned int i, num_modes;
++
++	modes = imx219_get_modes(imx219, &num_modes);
++	for (i = 0; i < num_modes; i++)
++		if (modes[i].width == width && modes[i].height == height)
++			return &modes[i];
++
++	return NULL;
++}
++
++static unsigned int imx219_mode_llp(const struct imx219_mode *mode)
++{
++	return mode->llp_def ? mode->llp_def : IMX219_LLP_MIN;
++}
++
+ /* Get bayer order based on flip setting. */
+ static u32 imx219_get_format_code(struct imx219 *imx219, u32 code)
+ {
+@@ -445,7 +862,12 @@ static int imx219_set_ctrl(struct v4l2_ctrl *ctrl)
+ 
+ 	state = v4l2_subdev_get_locked_active_state(&imx219->sd);
+ 	format = v4l2_subdev_state_get_format(state, 0);
+-	rate_factor = imx219_get_rate_factor(state);
++	/*
++	 * The Samsung module writes frame length and shutter in lines for all
++	 * of its modes (imx219mipiraw_Sensor.c:356-475), so the generic analog
++	 * binning rate factor must not be applied to it.
++	 */
++	rate_factor = imx219->variant->samsung ? 1 : imx219_get_rate_factor(state);
+ 
+ 	if (ctrl->id == V4L2_CID_VBLANK) {
+ 		int exposure_max, exposure_def;
+@@ -489,10 +911,19 @@ static int imx219_set_ctrl(struct v4l2_ctrl *ctrl)
+ 			  imx219_test_pattern_val[ctrl->val], &ret);
+ 		break;
+ 	case V4L2_CID_HFLIP:
+-	case V4L2_CID_VFLIP:
+-		cci_write(imx219->regmap, IMX219_REG_ORIENTATION,
+-			  imx219->hflip->val | imx219->vflip->val << 1, &ret);
++	case V4L2_CID_VFLIP: {
++		u32 val = imx219->hflip->val | imx219->vflip->val << 1;
++
++		/*
++		 * The Samsung module is mounted upside down and uses the
++		 * inverted register value (imx219mipiraw_Sensor.c:600-612).
++		 */
++		if (imx219->variant->samsung)
++			val ^= IMX219_SAMSUNG_ORIENTATION_NORMAL;
++
++		cci_write(imx219->regmap, IMX219_REG_ORIENTATION, val, &ret);
+ 		break;
++	}
+ 	case V4L2_CID_VBLANK:
+ 		cci_write(imx219->regmap, IMX219_REG_FRM_LENGTH_A,
+ 			  (format->height + ctrl->val) / rate_factor, &ret);
+@@ -543,9 +974,10 @@ static unsigned long imx219_get_pixel_rate(struct imx219 *imx219)
+ static int imx219_init_controls(struct imx219 *imx219)
+ {
+ 	struct i2c_client *client = v4l2_get_subdevdata(&imx219->sd);
+-	const struct imx219_mode *mode = &supported_modes[0];
++	const struct imx219_mode *mode = &imx219->variant->modes[0];
+ 	struct v4l2_ctrl_handler *ctrl_hdlr;
+ 	struct v4l2_fwnode_device_properties props;
++	u32 pixel_rate, llp;
+ 	int exposure_max, exposure_def;
+ 	int i, ret;
+ 
+@@ -554,19 +986,28 @@ static int imx219_init_controls(struct imx219 *imx219)
+ 	if (ret)
+ 		return ret;
+ 
++	pixel_rate = mode->pixel_rate ? mode->pixel_rate :
++		     imx219_get_pixel_rate(imx219);
++
+ 	/* By default, PIXEL_RATE is read only */
+ 	imx219->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &imx219_ctrl_ops,
+ 					       V4L2_CID_PIXEL_RATE,
+-					       imx219_get_pixel_rate(imx219),
+-					       imx219_get_pixel_rate(imx219), 1,
+-					       imx219_get_pixel_rate(imx219));
+-
+-	imx219->link_freq =
+-		v4l2_ctrl_new_int_menu(ctrl_hdlr, &imx219_ctrl_ops,
+-				       V4L2_CID_LINK_FREQ,
+-				       ARRAY_SIZE(imx219_link_freq_menu) - 1, 0,
+-				       (imx219->lanes == 2) ? imx219_link_freq_menu :
+-				       imx219_link_freq_4lane_menu);
++					       pixel_rate, pixel_rate, 1,
++					       pixel_rate);
++
++	if (imx219->variant->samsung)
++		imx219->link_freq =
++			v4l2_ctrl_new_int_menu(ctrl_hdlr, &imx219_ctrl_ops,
++					       V4L2_CID_LINK_FREQ,
++					       ARRAY_SIZE(imx219_samsung_link_freq_menu) - 1,
++					       0, imx219_samsung_link_freq_menu);
++	else
++		imx219->link_freq =
++			v4l2_ctrl_new_int_menu(ctrl_hdlr, &imx219_ctrl_ops,
++					       V4L2_CID_LINK_FREQ,
++					       ARRAY_SIZE(imx219_link_freq_menu) - 1, 0,
++					       (imx219->lanes == 2) ? imx219_link_freq_menu :
++					       imx219_link_freq_4lane_menu);
+ 	if (imx219->link_freq)
+ 		imx219->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+ 
+@@ -575,11 +1016,12 @@ static int imx219_init_controls(struct imx219 *imx219)
+ 					   V4L2_CID_VBLANK, IMX219_VBLANK_MIN,
+ 					   IMX219_FLL_MAX - mode->height, 1,
+ 					   mode->fll_def - mode->height);
++	llp = imx219_mode_llp(mode);
+ 	imx219->hblank = v4l2_ctrl_new_std(ctrl_hdlr, &imx219_ctrl_ops,
+ 					   V4L2_CID_HBLANK,
+-					   IMX219_LLP_MIN - mode->width,
++					   llp - mode->width,
+ 					   IMX219_LLP_MAX - mode->width, 1,
+-					   IMX219_LLP_MIN - mode->width);
++					   llp - mode->width);
+ 	exposure_max = mode->fll_def - IMX219_EXPOSURE_OFFSET;
+ 	exposure_def = (exposure_max < IMX219_EXPOSURE_DEFAULT) ?
+ 			exposure_max : IMX219_EXPOSURE_DEFAULT;
+@@ -719,33 +1161,64 @@ static int imx219_enable_streams(struct v4l2_subdev *sd,
+ {
+ 	struct imx219 *imx219 = to_imx219(sd);
+ 	struct i2c_client *client = v4l2_get_subdevdata(&imx219->sd);
++	const struct imx219_mode *mode;
++	const struct v4l2_mbus_framefmt *format;
+ 	int ret;
+ 
+ 	ret = pm_runtime_resume_and_get(&client->dev);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	/* Send all registers that are common to all modes */
+-	ret = cci_multi_reg_write(imx219->regmap, imx219_common_regs,
+-				  ARRAY_SIZE(imx219_common_regs), NULL);
+-	if (ret) {
+-		dev_err(&client->dev, "%s failed to send mfg header\n", __func__);
+-		goto err_rpm_put;
+-	}
++	if (imx219->variant->samsung) {
++		format = v4l2_subdev_state_get_format(state, 0);
++		mode = imx219_find_mode(imx219, format->width, format->height);
++		if (!mode) {
++			dev_err(&client->dev,
++				"%s: no Samsung mode for %ux%u\n", __func__,
++				format->width, format->height);
++			ret = -EINVAL;
++			goto err_rpm_put;
++		}
+ 
+-	/* Configure two or four Lane mode */
+-	ret = imx219_configure_lanes(imx219);
+-	if (ret) {
+-		dev_err(&client->dev, "%s failed to configure lanes\n", __func__);
+-		goto err_rpm_put;
+-	}
++		if (!(imx219->link_freq_bitmap & BIT(imx219->link_freq->val))) {
++			dev_err(&client->dev,
++				"%s: link frequency %lld not advertised by firmware\n",
++				__func__,
++				imx219_samsung_link_freq_menu[imx219->link_freq->val]);
++			ret = -EINVAL;
++			goto err_rpm_put;
++		}
+ 
+-	/* Apply format and crop settings. */
+-	ret = imx219_set_framefmt(imx219, state);
+-	if (ret) {
+-		dev_err(&client->dev, "%s failed to set frame format: %d\n",
+-			__func__, ret);
+-		goto err_rpm_put;
++		/* Full mode setup, ported from the downstream mode functions */
++		ret = cci_multi_reg_write(imx219->regmap, mode->regs,
++					  mode->nr_regs, NULL);
++		if (ret) {
++			dev_err(&client->dev, "%s failed to set mode\n", __func__);
++			goto err_rpm_put;
++		}
++	} else {
++		/* Send all registers that are common to all modes */
++		ret = cci_multi_reg_write(imx219->regmap, imx219_common_regs,
++					  ARRAY_SIZE(imx219_common_regs), NULL);
++		if (ret) {
++			dev_err(&client->dev, "%s failed to send mfg header\n", __func__);
++			goto err_rpm_put;
++		}
++
++		/* Configure two or four Lane mode */
++		ret = imx219_configure_lanes(imx219);
++		if (ret) {
++			dev_err(&client->dev, "%s failed to configure lanes\n", __func__);
++			goto err_rpm_put;
++		}
++
++		/* Apply format and crop settings. */
++		ret = imx219_set_framefmt(imx219, state);
++		if (ret) {
++			dev_err(&client->dev, "%s failed to set frame format: %d\n",
++				__func__, ret);
++			goto err_rpm_put;
++		}
+ 	}
+ 
+ 	/* Apply customized values from user */
+@@ -811,18 +1284,21 @@ static int imx219_enum_frame_size(struct v4l2_subdev *sd,
+ 				  struct v4l2_subdev_frame_size_enum *fse)
+ {
+ 	struct imx219 *imx219 = to_imx219(sd);
++	const struct imx219_mode *modes;
++	unsigned int num_modes;
+ 	u32 code;
+ 
+-	if (fse->index >= ARRAY_SIZE(supported_modes))
++	modes = imx219_get_modes(imx219, &num_modes);
++	if (fse->index >= num_modes)
+ 		return -EINVAL;
+ 
+ 	code = imx219_get_format_code(imx219, fse->code);
+ 	if (fse->code != code)
+ 		return -EINVAL;
+ 
+-	fse->min_width = supported_modes[fse->index].width;
++	fse->min_width = modes[fse->index].width;
+ 	fse->max_width = fse->min_width;
+-	fse->min_height = supported_modes[fse->index].height;
++	fse->min_height = modes[fse->index].height;
+ 	fse->max_height = fse->min_height;
+ 
+ 	return 0;
+@@ -833,13 +1309,16 @@ static int imx219_set_pad_format(struct v4l2_subdev *sd,
+ 				 struct v4l2_subdev_format *fmt)
+ {
+ 	struct imx219 *imx219 = to_imx219(sd);
+-	const struct imx219_mode *mode;
++	const struct imx219_mode *modes, *mode;
+ 	struct v4l2_mbus_framefmt *format;
+ 	struct v4l2_rect *crop;
+ 	u8 bin_h, bin_v, binning;
+-	u32 prev_line_len;
++	u32 prev_line_len, llp;
++	unsigned int i, num_modes;
+ 	int ret;
+ 
++	modes = imx219_get_modes(imx219, &num_modes);
++
+ 	format = v4l2_subdev_state_get_format(state, 0);
+ 	prev_line_len = format->width + imx219->hblank->val;
+ 
+@@ -847,10 +1326,10 @@ static int imx219_set_pad_format(struct v4l2_subdev *sd,
+ 	 * Adjust the requested format to match the closest mode. The Bayer
+ 	 * order varies with flips.
+ 	 */
+-	mode = v4l2_find_nearest_size(supported_modes,
+-				      ARRAY_SIZE(supported_modes),
+-				      width, height,
++	mode = v4l2_find_nearest_size(modes, num_modes, width, height,
+ 				      fmt->format.width, fmt->format.height);
++	if (!mode)
++		return -EINVAL;
+ 
+ 	fmt->format.code = imx219_get_format_code(imx219, fmt->format.code);
+ 	fmt->format.width = mode->width;
+@@ -863,21 +1342,35 @@ static int imx219_set_pad_format(struct v4l2_subdev *sd,
+ 
+ 	*format = fmt->format;
+ 
+-	/*
+-	 * Use binning to maximize the crop rectangle size, and centre it in the
+-	 * sensor.
+-	 */
+-	bin_h = min(IMX219_PIXEL_ARRAY_WIDTH / format->width, 2U);
+-	bin_v = min(IMX219_PIXEL_ARRAY_HEIGHT / format->height, 2U);
++	if (imx219->variant->samsung) {
++		/*
++		 * The readout window is fixed by the mode's register table
++		 * (see the mode table comments); publish it unchanged so that
++		 * the crop selection describes what the sensor really puts on
++		 * the CSI-2 bus.
++		 */
++		crop = v4l2_subdev_state_get_crop(state, 0);
++		crop->left = mode->crop_left;
++		crop->top = mode->crop_top;
++		crop->width = mode->crop_width;
++		crop->height = mode->crop_height;
++	} else {
++		/*
++		 * Use binning to maximize the crop rectangle size, and centre
++		 * it in the sensor.
++		 */
++		bin_h = min(IMX219_PIXEL_ARRAY_WIDTH / format->width, 2U);
++		bin_v = min(IMX219_PIXEL_ARRAY_HEIGHT / format->height, 2U);
+ 
+-	/* Ensure bin_h and bin_v are same to avoid 1:2 or 2:1 stretching */
+-	binning = min(bin_h, bin_v);
++		/* Ensure bin_h and bin_v are same to avoid 1:2 or 2:1 stretching */
++		binning = min(bin_h, bin_v);
+ 
+-	crop = v4l2_subdev_state_get_crop(state, 0);
+-	crop->width = format->width * binning;
+-	crop->height = format->height * binning;
+-	crop->left = (IMX219_NATIVE_WIDTH - crop->width) / 2;
+-	crop->top = (IMX219_NATIVE_HEIGHT - crop->height) / 2;
++		crop = v4l2_subdev_state_get_crop(state, 0);
++		crop->width = format->width * binning;
++		crop->height = format->height * binning;
++		crop->left = (IMX219_NATIVE_WIDTH - crop->width) / 2;
++		crop->top = (IMX219_NATIVE_HEIGHT - crop->height) / 2;
++	}
+ 
+ 	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
+ 		int exposure_max;
+@@ -909,40 +1402,80 @@ static int imx219_set_pad_format(struct v4l2_subdev *sd,
+ 		if (ret)
+ 			return ret;
+ 
+-		/*
+-		 * With analog binning the default minimum line length of 3448
+-		 * can cause artefacts with RAW10 formats, because the ADC
+-		 * operates on two lines together. So we switch to a higher
+-		 * minimum of 3560.
+-		 */
+-		imx219_get_binning(state, &bin_h, &bin_v);
+-		llp_min = (bin_h & bin_v) == IMX219_BINNING_X2_ANALOG ?
+-				  IMX219_BINNED_LLP_MIN : IMX219_LLP_MIN;
+-		ret = __v4l2_ctrl_modify_range(imx219->hblank,
+-					       llp_min - mode->width,
+-					       IMX219_LLP_MAX - mode->width, 1,
+-					       llp_min - mode->width);
+-		if (ret)
+-			return ret;
+-		/*
+-		 * Retain PPL setting from previous mode so that the
+-		 * line time does not change on a mode change.
+-		 * Limits have to be recomputed as the controls define
+-		 * the blanking only, so PPL values need to have the
+-		 * mode width subtracted.
+-		 */
+-		hblank = prev_line_len - mode->width;
+-		ret = __v4l2_ctrl_s_ctrl(imx219->hblank, hblank);
+-		if (ret)
+-			return ret;
+-
+-		/* Scale the pixel rate based on the mode specific factor */
+-		pixel_rate = imx219_get_pixel_rate(imx219) *
+-			     imx219_get_rate_factor(state);
+-		ret = __v4l2_ctrl_modify_range(imx219->pixel_rate, pixel_rate,
+-					       pixel_rate, 1, pixel_rate);
+-		if (ret)
+-			return ret;
++		if (imx219->variant->samsung) {
++			/*
++			 * Downstream never changes the line length of these
++			 * modes, it only extends the frame length, so always
++			 * program the mode's fixed line length.
++			 */
++			llp = mode->llp_def;
++			ret = __v4l2_ctrl_modify_range(imx219->hblank,
++						       llp - mode->width,
++						       IMX219_LLP_MAX - mode->width,
++						       1, llp - mode->width);
++			if (ret)
++				return ret;
++
++			ret = __v4l2_ctrl_s_ctrl(imx219->hblank,
++						 llp - mode->width);
++			if (ret)
++				return ret;
++
++			/* Pixel clock and link frequency are mode specific */
++			ret = __v4l2_ctrl_modify_range(imx219->pixel_rate,
++						       mode->pixel_rate,
++						       mode->pixel_rate, 1,
++						       mode->pixel_rate);
++			if (ret)
++				return ret;
++
++			for (i = 0; i < ARRAY_SIZE(imx219_samsung_link_freq_menu); i++)
++				if (imx219_samsung_link_freq_menu[i] ==
++				    mode->link_freq)
++					break;
++			if (i == ARRAY_SIZE(imx219_samsung_link_freq_menu))
++				return -EINVAL;
++
++			ret = __v4l2_ctrl_s_ctrl(imx219->link_freq, i);
++			if (ret)
++				return ret;
++		} else {
++			/*
++			 * With analog binning the default minimum line length
++			 * of 3448 can cause artefacts with RAW10 formats,
++			 * because the ADC operates on two lines together. So we
++			 * switch to a higher minimum of 3560.
++			 */
++			imx219_get_binning(state, &bin_h, &bin_v);
++			llp_min = (bin_h & bin_v) == IMX219_BINNING_X2_ANALOG ?
++					  IMX219_BINNED_LLP_MIN : IMX219_LLP_MIN;
++			ret = __v4l2_ctrl_modify_range(imx219->hblank,
++						       llp_min - mode->width,
++						       IMX219_LLP_MAX - mode->width,
++						       1, llp_min - mode->width);
++			if (ret)
++				return ret;
++			/*
++			 * Retain PPL setting from previous mode so that the
++			 * line time does not change on a mode change.
++			 * Limits have to be recomputed as the controls define
++			 * the blanking only, so PPL values need to have the
++			 * mode width subtracted.
++			 */
++			hblank = prev_line_len - mode->width;
++			ret = __v4l2_ctrl_s_ctrl(imx219->hblank, hblank);
++			if (ret)
++				return ret;
++
++			/* Scale the pixel rate based on the mode specific factor */
++			pixel_rate = imx219_get_pixel_rate(imx219) *
++				     imx219_get_rate_factor(state);
++			ret = __v4l2_ctrl_modify_range(imx219->pixel_rate,
++						       pixel_rate, pixel_rate, 1,
++						       pixel_rate);
++			if (ret)
++				return ret;
++		}
+ 	}
+ 
+ 	return 0;
+@@ -981,13 +1514,15 @@ static int imx219_get_selection(struct v4l2_subdev *sd,
+ static int imx219_init_state(struct v4l2_subdev *sd,
+ 			     struct v4l2_subdev_state *state)
+ {
++	struct imx219 *imx219 = to_imx219(sd);
++	const struct imx219_mode *mode = &imx219->variant->modes[0];
+ 	struct v4l2_subdev_format fmt = {
+ 		.which = V4L2_SUBDEV_FORMAT_TRY,
+ 		.pad = 0,
+ 		.format = {
+ 			.code = MEDIA_BUS_FMT_SRGGB10_1X10,
+-			.width = supported_modes[0].width,
+-			.height = supported_modes[0].height,
++			.width = mode->width,
++			.height = mode->height,
+ 		},
+ 	};
+ 
+@@ -1021,12 +1556,83 @@ static const struct v4l2_subdev_internal_ops imx219_internal_ops = {
+  * Power management
+  */
+ 
++/*
++ * Samsung grandpplte power on sequence, transcribed from
++ * kd_camera_hw.c:487-530:
++ *   - powerdown and reset low,
++ *   - VCAM_A 2.8 V, VCAM_D 1.2 V, VCAM_AF 2.8 V, mdelay(2),
++ *   - VCAM_IO 1.8 V, mdelay(3) (host to MCLK interval),
++ *   - MCLK on, mdelay(1) (MCLK leads RESET by 500 us),
++ *   - powerdown high, then reset high.
++ */
++static int imx219_samsung_power_on(struct device *dev)
++{
++	struct imx219 *imx219 = to_imx219(dev_get_drvdata(dev));
++	unsigned int i;
++	int ret;
++
++	gpiod_set_value_cansleep(imx219->powerdown_gpio, 0);
++	gpiod_set_value_cansleep(imx219->reset_gpio, 0);
++
++	for (i = 0; i < ARRAY_SIZE(imx219_samsung_power_on_seq); i++) {
++		const struct imx219_power_rail *rail = &imx219_samsung_power_on_seq[i];
++		struct regulator *reg = imx219->supplies[rail->supply].consumer;
++
++		ret = regulator_set_voltage(reg, rail->uV, rail->uV);
++		if (ret) {
++			dev_err(dev, "%s: failed to set %s to %u uV\n",
++				__func__, imx219->supplies[rail->supply].supply,
++				rail->uV);
++			goto err_off;
++		}
++
++		ret = regulator_enable(reg);
++		if (ret) {
++			dev_err(dev, "%s: failed to enable %s\n", __func__,
++				imx219->supplies[rail->supply].supply);
++			goto err_off;
++		}
++
++		if (rail->delay_ms)
++			imx219_samsung_delay_ms(rail->delay_ms);
++	}
++
++	ret = clk_prepare_enable(imx219->xclk);
++	if (ret) {
++		dev_err(dev, "%s: failed to enable clock\n", __func__);
++		goto err_off;
++	}
++
++	/* MCLK must lead the reset release (kd_camera_hw.c:525) */
++	imx219_samsung_delay_ms(1);
++
++	gpiod_set_value_cansleep(imx219->powerdown_gpio, 1);
++	gpiod_set_value_cansleep(imx219->reset_gpio, 1);
++
++	/* Sensor needs this long before it leaves software standby */
++	usleep_range(IMX219_XCLR_MIN_DELAY_US,
++		     IMX219_XCLR_MIN_DELAY_US + IMX219_XCLR_DELAY_RANGE_US);
++
++	return 0;
++
++err_off:
++	while (i--) {
++		regulator_disable(imx219->supplies
++				  [imx219_samsung_power_on_seq[i].supply].consumer);
++	}
++
++	return ret;
++}
++
+ static int imx219_power_on(struct device *dev)
+ {
+ 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+ 	struct imx219 *imx219 = to_imx219(sd);
+ 	int ret;
+ 
++	if (imx219->variant->samsung)
++		return imx219_samsung_power_on(dev);
++
+ 	ret = regulator_bulk_enable(IMX219_NUM_SUPPLIES,
+ 				    imx219->supplies);
+ 	if (ret) {
+@@ -1062,6 +1668,32 @@ static int imx219_power_off(struct device *dev)
+ {
+ 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+ 	struct imx219 *imx219 = to_imx219(sd);
++	static const unsigned int off_rails[] = IMX219_SAMSUNG_POWER_OFF_RAILS;
++	unsigned int i;
++
++	if (imx219->variant->samsung) {
++		/*
++		 * kd_camera_hw.c:766-808: VCAM_AF off, MCLK off, powerdown and
++		 * reset low, then VCAM_IO, VCAM_D and VCAM_A off, with a 1 ms
++		 * delay after every step.
++		 */
++		regulator_disable(imx219->supplies[off_rails[0]].consumer);
++		imx219_samsung_delay_ms(1);
++
++		clk_disable_unprepare(imx219->xclk);
++		imx219_samsung_delay_ms(1);
++
++		gpiod_set_value_cansleep(imx219->powerdown_gpio, 0);
++		gpiod_set_value_cansleep(imx219->reset_gpio, 0);
++		imx219_samsung_delay_ms(1);
++
++		for (i = 1; i < ARRAY_SIZE(off_rails); i++) {
++			regulator_disable(imx219->supplies[off_rails[i]].consumer);
++			imx219_samsung_delay_ms(1);
++		}
++
++		return 0;
++	}
+ 
+ 	gpiod_set_value_cansleep(imx219->reset_gpio, 0);
+ 	regulator_bulk_disable(IMX219_NUM_SUPPLIES, imx219->supplies);
+@@ -1077,13 +1709,16 @@ static int imx219_power_off(struct device *dev)
+ static int imx219_get_regulators(struct imx219 *imx219)
+ {
+ 	struct i2c_client *client = v4l2_get_subdevdata(&imx219->sd);
++	const char * const *names = imx219->variant->samsung ?
++				    imx219_samsung_supply_name :
++				    imx219_supply_name;
+ 	unsigned int i;
+ 
+-	for (i = 0; i < IMX219_NUM_SUPPLIES; i++)
+-		imx219->supplies[i].supply = imx219_supply_name[i];
++	for (i = 0; i < imx219->num_supplies; i++)
++		imx219->supplies[i].supply = names[i];
+ 
+ 	return devm_regulator_bulk_get(&client->dev,
+-				       IMX219_NUM_SUPPLIES,
++				       imx219->num_supplies,
+ 				       imx219->supplies);
+ }
+ 
+@@ -1127,14 +1762,44 @@ static int imx219_check_hwcfg(struct device *dev, struct imx219 *imx219)
+ 	}
+ 
+ 	/* Check the number of MIPI CSI2 data lanes */
+-	if (ep_cfg.bus.mipi_csi2.num_data_lanes != 2 &&
+-	    ep_cfg.bus.mipi_csi2.num_data_lanes != 4) {
++	if (imx219->variant->samsung) {
++		/*
++		 * The Samsung module is wired for four lanes only
++		 * (imgsensor_info.mipi_lane_num, imx219mipiraw_Sensor.c:161).
++		 */
++		if (ep_cfg.bus.mipi_csi2.num_data_lanes != 4) {
++			dev_err_probe(dev, -EINVAL,
++				      "the Samsung module requires 4 data lanes\n");
++			goto error_out;
++		}
++	} else if (ep_cfg.bus.mipi_csi2.num_data_lanes != 2 &&
++		   ep_cfg.bus.mipi_csi2.num_data_lanes != 4) {
+ 		dev_err_probe(dev, -EINVAL,
+ 			      "only 2 or 4 data lanes are currently supported\n");
+ 		goto error_out;
+ 	}
+ 	imx219->lanes = ep_cfg.bus.mipi_csi2.num_data_lanes;
+ 
++	if (imx219->variant->samsung) {
++		ret = v4l2_link_freq_to_bitmap(dev,
++					       ep_cfg.link_frequencies,
++					       ep_cfg.nr_of_link_frequencies,
++					       imx219_samsung_link_freq_menu,
++					       ARRAY_SIZE(imx219_samsung_link_freq_menu),
++					       &link_freq_bitmap);
++		if (ret || !(link_freq_bitmap & BIT(0))) {
++			ret = -EINVAL;
++			dev_err_probe(dev, -EINVAL,
++				      "Link frequency not supported: %lld\n",
++				      ep_cfg.link_frequencies[0]);
++			goto error_out;
++		}
++
++		/* Every Samsung mode needs its own rate advertised */
++		imx219->link_freq_bitmap = link_freq_bitmap;
++		goto error_out;
++	}
++
+ 	/* Check the link frequency set in device tree */
+ 	switch (imx219->lanes) {
+ 	case 2:
+@@ -1190,6 +1855,12 @@ static int imx219_probe(struct i2c_client *client)
+ 	v4l2_i2c_subdev_init(&imx219->sd, client, &imx219_subdev_ops);
+ 	imx219->sd.internal_ops = &imx219_internal_ops;
+ 
++	imx219->variant = of_device_get_match_data(dev);
++	if (!imx219->variant)
++		imx219->variant = &imx219_generic_variant;
++	imx219->num_supplies = imx219->variant->samsung ?
++			       IMX219_SAMSUNG_NUM_SUPPLIES : IMX219_NUM_SUPPLIES;
++
+ 	/* Check the hardware configuration in device tree */
+ 	if (imx219_check_hwcfg(dev, imx219))
+ 		return -EINVAL;
+@@ -1215,13 +1886,33 @@ static int imx219_probe(struct i2c_client *client)
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "failed to get regulators\n");
+ 
+-	/* Request optional enable pin */
++	/*
++	 * Request optional enable pin. The Samsung module is held in reset
++	 * (CAM_RST_N low, mt6737t_grandpplte_ltn_dtv_03.dts:606-613) until
++	 * imx219_power_on() releases it.
++	 */
+ 	imx219->reset_gpio = devm_gpiod_get_optional(dev, "reset",
++						     imx219->variant->samsung ?
++						     GPIOD_OUT_LOW :
+ 						     GPIOD_OUT_HIGH);
+ 	if (IS_ERR(imx219->reset_gpio))
+ 		return dev_err_probe(dev, PTR_ERR(imx219->reset_gpio),
+ 				     "failed to get reset gpio\n");
+ 
++	if (imx219->variant->samsung) {
++		/*
++		 * The module has a separate powerdown line in the downstream
++		 * pin table (kd_camera_hw.c:489-492). On grandpplte both the
++		 * reset and powerdown pinctrl states mux the same pin, so this
++		 * is optional.
++		 */
++		imx219->powerdown_gpio = devm_gpiod_get_optional(dev, "powerdown",
++								 GPIOD_OUT_LOW);
++		if (IS_ERR(imx219->powerdown_gpio))
++			return dev_err_probe(dev, PTR_ERR(imx219->powerdown_gpio),
++					     "failed to get powerdown gpio\n");
++	}
++
+ 	/*
+ 	 * The sensor must be powered for imx219_identify_module()
+ 	 * to be able to read the CHIP_ID register
+@@ -1329,7 +2020,9 @@ static void imx219_remove(struct i2c_client *client)
+ }
+ 
+ static const struct of_device_id imx219_dt_ids[] = {
+-	{ .compatible = "sony,imx219" },
++	{ .compatible = "samsung,grandpplte-imx219",
++	  .data = &imx219_samsung_variant },
++	{ .compatible = "sony,imx219", .data = &imx219_generic_variant },
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, imx219_dt_ids);

@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# MediaTek Bluetooth: BTIF transport glue and HCI over STP.
+
+config MTK_WCN_BT
+	tristate "MediaTek WCN Bluetooth (STP/HCI) driver"
+	depends on MTK_WCN_WMT
+	depends on BT
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	help
+	  Bluetooth host driver for the MediaTek connectivity subsystem.
+	  HCI packets are carried over the STP Bluetooth channel which runs
+	  on the BTIF interface.
+
+	  The module is called mtk_wcn_bt.

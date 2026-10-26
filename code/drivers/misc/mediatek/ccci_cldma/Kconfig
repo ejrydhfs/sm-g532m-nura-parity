@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0
+config MTK_CCCI_CLDMA
+	bool "MediaTek CCCI CLDMA modem data transport"
+	help
+	  CLDMA is the scatter/gather DMA engine used to carry MD1 packet data
+	  between the application processor and the MediaTek modem on
+	  MT6735/MT6737T SoCs. It implements the CCCI CLDMA API declared in
+	  include/linux/ccci.h and is driven by the CCCI core driver.
+
+	  Say Y here to support the MediaTek CLDMA transport.

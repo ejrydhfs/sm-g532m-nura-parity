@@ -1,0 +1,194 @@
+diff --git a/sound/soc/codecs/mt6331.c b/sound/soc/codecs/mt6331.c
+index 825b2fb60..70c08b883 100644
+--- a/sound/soc/codecs/mt6331.c
++++ b/sound/soc/codecs/mt6331.c
+@@ -83,6 +83,7 @@ struct mt6331_priv {
+ 	struct device *dev;
+ 	struct regmap *regmap;
+ 	struct gpio_desc *hp_depop;
++	struct gpio_desc *ext_amp;	/* vendor pin_extspkamp (GPIO117) */
+ 
+ 	/* Serializes the analog sequences (vendor Ana_Ctrl_Mutex). */
+ 	struct mutex ana_lock;
+@@ -1150,6 +1151,135 @@ static int mt6331_micbias2_event(struct snd_soc_dapm_widget *w,
+ 	return ret;
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* External speaker amplifier                                         */
++/* ------------------------------------------------------------------ */
++/*
++ * The external (AW8736 class) speaker amplifier is enabled by a single
++ * GPIO level, vendor pin_extspkamp, programmed as a plain GPIO output by
++ * Ext_Speaker_Amp_Change() (vendor:2175-2265):
++ *
++ *   on : pin low (vendor:2198/2206) -> 1..20 ms settle (vendor:2211) ->
++ *        pin high (vendor:2220/2225) -> 25 ms warm-up (vendor:2228)
++ *   off: pin low (vendor:2245/2252) -> 500 us settle (vendor:2255)
++ *
++ * On grandpplte the pin is GPIO117, mode 0, pull enabled, output, idle low
++ * (vendor:2195-2198, rom_dtb_0.dts:3561 "extspkamp-gpio = <117 0>").
++ * Nothing else about the amplifier is software visible; there is no
++ * register or I2C interface in any of the available sources.
++ */
++static int mt6331_ext_amp_enable(struct mt6331_priv *priv)
++{
++	if (!priv->ext_amp)
++		return -ENODEV;
++
++	/* vendor:2206 pin low, vendor:2211 settle before the rising edge */
++	gpiod_set_value_cansleep(priv->ext_amp, 0);
++	usleep_range(1000, 20000);
++
++	/* vendor:2225 pin high enables the amplifier, vendor:2228 warm-up */
++	gpiod_set_value_cansleep(priv->ext_amp, 1);
++	msleep(25);
++
++	return 0;
++}
++
++static void mt6331_ext_amp_disable(struct mt6331_priv *priv)
++{
++	if (!priv->ext_amp)
++		return;
++
++	/* vendor:2252 pin low, vendor:2255 settle */
++	gpiod_set_value_cansleep(priv->ext_amp, 0);
++	udelay(500);
++}
++
++/*
++ * The vendor driver never changes this pin on its own: the only call site
++ * of Ext_Speaker_Amp_Change() is the userspace "Ext_Speaker_Amp_Switch"
++ * control (vendor:3165-3166, vendor:2365-2389), so the order relative to
++ * "Speaker_Amp_Switch" (vendor:3156) lives in the audio HAL and cannot be
++ * checked from the kernel tree.
++ *
++ * Here the pin follows the codec graph instead.  The endpoint is an
++ * snd_soc_dapm_spk widget fed by "Speaker Amp", so DAPM powers it up in a
++ * later slot than the internal amplifier (snd_soc_dapm_spk is up_seq 13,
++ * snd_soc_dapm_out_drv up_seq 12, sound/soc/soc-dapm.c:74-112) and powers
++ * it down in an earlier slot (spk down_seq 4, out_drv down_seq 5,
++ * sound/soc/soc-dapm.c:114-152).  POST_PMU therefore asserts the enable
++ * after the internal speaker amplifier is running and PRE_PMD deasserts it
++ * before that amplifier is shut down, i.e. the amplifier is muted first
++ * and only then is the supplies ramp removed.  [INFERENCE] This is the
++ * anti-pop order for the pin ("enable last, disable first"); it is also
++ * the only order that keeps the amplifier from amplifying the PMIC's
++ * power-up/down ramps.  A snd_soc_dapm_supply widget cannot express it:
++ * supplies are up_seq 3 and down_seq 14, so they come up before the DAC
++ * (up_seq 8) and go down after the output driver (down_seq 5).
++ */
++static int mt6331_ext_amp_event(struct snd_soc_dapm_widget *w,
++				struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++
++	switch (event) {
++	case SND_SOC_DAPM_POST_PMU:
++		mt6331_ext_amp_enable(priv);
++		break;
++	case SND_SOC_DAPM_PRE_PMD:
++		mt6331_ext_amp_disable(priv);
++		break;
++	}
++
++	return 0;
++}
++
++/*
++ * Vendor control equivalent: "Ext_Speaker_Amp_Switch" (vendor:3165),
++ * Ext_Speaker_Amp_Get()/Set() (vendor:2365-2387).  The vendor get reports
++ * its own bookkeeping bit; the real pin level is reported here instead so
++ * the control cannot claim the amplifier is on when it is not.
++ */
++static int mt6331_ext_amp_get(struct snd_kcontrol *kcontrol,
++			      struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *cmpnt = snd_kcontrol_chip(kcontrol);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	int value;
++
++	if (!priv->ext_amp) {
++		/* No pin on this board: report disabled, never fake "on". */
++		ucontrol->value.integer.value[0] = 0;
++		return 0;
++	}
++
++	value = gpiod_get_value_cansleep(priv->ext_amp);
++	if (value < 0)
++		return value;
++
++	ucontrol->value.integer.value[0] = value;
++
++	return 0;
++}
++
++static int mt6331_ext_amp_put(struct snd_kcontrol *kcontrol,
++			      struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *cmpnt = snd_kcontrol_chip(kcontrol);
++	struct mt6331_priv *priv = snd_soc_component_get_drvdata(cmpnt);
++	bool on = !!ucontrol->value.integer.value[0];
++
++	if (!priv->ext_amp)
++		return on ? -ENODEV : 0;
++
++	if (on)
++		return mt6331_ext_amp_enable(priv);
++
++	mt6331_ext_amp_disable(priv);
++
++	return 0;
++}
++
+ /* ------------------------------------------------------------------ */
+ /* Controls                                                           */
+ /* ------------------------------------------------------------------ */
+@@ -1203,6 +1333,9 @@ static const struct snd_kcontrol_new mt6331_snd_controls[] = {
+ 		   RG_AUDMICBIASVREF_SHIFT, 7, 0),
+ 	SOC_ENUM("MICBIAS1 Mode", mt6331_micbias1_mode_enum),
+ 	SOC_ENUM("MICBIAS2 Mode", mt6331_micbias2_mode_enum),
++	/* vendor:3165 "Ext_Speaker_Amp_Switch" */
++	SOC_SINGLE_BOOL_EXT("Ext Speaker Amp", 0, mt6331_ext_amp_get,
++			    mt6331_ext_amp_put),
+ };
+ 
+ /* ------------------------------------------------------------------ */
+@@ -1229,6 +1362,10 @@ static const struct snd_soc_dapm_widget mt6331_dapm_widgets[] = {
+ 	SND_SOC_DAPM_OUTPUT("EARPIECE"),
+ 	SND_SOC_DAPM_OUTPUT("HEADSET"),
+ 	SND_SOC_DAPM_OUTPUT("SPEAKER"),
++	/* External speaker amplifier enable pin (vendor pin_extspkamp);
++	 * see the ordering note above mt6331_ext_amp_event().
++	 */
++	SND_SOC_DAPM_SPK("Ext Spk Amp", mt6331_ext_amp_event),
+ 
+ 	/* Uplink */
+ 	SND_SOC_DAPM_INPUT("MIC1"),
+@@ -1266,6 +1403,7 @@ static const struct snd_soc_dapm_route mt6331_dapm_routes[] = {
+ 	{ "HEADSET", NULL, "Headphone Amp" },
+ 	{ "EARPIECE", NULL, "Earpiece Amp" },
+ 	{ "SPEAKER", NULL, "Speaker Amp" },
++	{ "Ext Spk Amp", NULL, "Speaker Amp" },
+ 
+ 	/* Uplink: MICBIAS -> MIC -> PGA -> ADC */
+ 	{ "MIC1", NULL, "MICBIAS1" },
+@@ -1680,6 +1818,16 @@ static int mt6331_platform_probe(struct platform_device *pdev)
+ 		return dev_err_probe(&pdev->dev, PTR_ERR(priv->hp_depop),
+ 				     "failed to get the headphone de-pop GPIO\n");
+ 
++	/* External speaker amplifier enable, vendor pin_extspkamp.  Boards
++	 * without the amplifier simply omit the property; the vendor idles
++	 * the pin low, i.e. amplifier disabled (vendor:2198).
++	 */
++	priv->ext_amp = devm_gpiod_get_optional(&pdev->dev, "ext-amp",
++						GPIOD_OUT_LOW);
++	if (IS_ERR(priv->ext_amp))
++		return dev_err_probe(&pdev->dev, PTR_ERR(priv->ext_amp),
++				     "failed to get the external speaker amp GPIO\n");
++
+ 	dev_set_drvdata(&pdev->dev, priv);
+ 
+ 	dev_info(priv->dev, "MT6328 PMIC codec (MT6331 register map naming)\n");

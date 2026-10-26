@@ -1,0 +1,1672 @@
+diff --git a/drivers/misc/mediatek/connectivity/fm/Makefile b/drivers/misc/mediatek/connectivity/fm/Makefile
+index 80c9a20a5..1b1fd05f4 100644
+--- a/drivers/misc/mediatek/connectivity/fm/Makefile
++++ b/drivers/misc/mediatek/connectivity/fm/Makefile
+@@ -9,3 +9,16 @@ obj-$(CONFIG_MTK_WCN_FM) += mtk_wcn_fm.o
+ mtk_wcn_fm-y := mtk_wcn_fm_link.o \
+ 		mtk_wcn_fm_chip.o \
+ 		mtk_wcn_fm_v4l2.o
++
++# The ASoC glue (FM codec component; no sound card) is built when the SoC
++# audio core is present and can be linked from this driver.  Without it the FM
++# driver uses the chip level I2S hooks and the inline fallbacks of
++# mtk_wcn_fm_i2s.h.  A built-in FM driver cannot reference the symbols of a
++# modular snd-soc-core, so CONFIG_MTK_WCN_FM=y with CONFIG_SND_SOC=m takes the
++# fallback path exactly like CONFIG_SND_SOC=n (mtk_wcn_fm_i2s.h implements the
++# same rule for the C code).
++ifeq ($(CONFIG_MTK_WCN_FM)$(CONFIG_SND_SOC),ym)
++# no ASoC glue: snd-soc-core is a module and this driver is built in
++else ifneq ($(CONFIG_SND_SOC),)
++mtk_wcn_fm-y += mtk_wcn_fm_i2s.o
++endif
+diff --git a/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm.h b/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm.h
+index 99aa68ac1..0f431b6e7 100644
+--- a/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm.h
++++ b/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm.h
+@@ -28,6 +28,7 @@
+ #include <linux/workqueue.h>
+ #include <linux/videodev2.h>
+ 
++#include <uapi/linux/mtk_fm_i2s.h>
+ #include <uapi/linux/mtk_fm_rds.h>
+ 
+ #include <media/v4l2-ctrls.h>
+@@ -284,6 +285,16 @@
+ #define V4L2_CID_MTK_WCN_FM_SOFTMUTE_GAIN	(V4L2_CID_USER_MTK_WCN_FM_BASE + 2)
+ #define V4L2_CID_MTK_WCN_FM_BLEND		(V4L2_CID_USER_MTK_WCN_FM_BASE + 3)
+ 
++struct mtk_wcn_fm_i2s;
++
++/*
++ * FM I2S control ABI (include/uapi/linux/mtk_fm_i2s.h, shared with
++ * tools/mediatek/wcn/fm_i2s).  The layouts are fixed: three little endian
++ * 32 bit words, 12 bytes per structure.
++ */
++static_assert(sizeof(struct fm_i2s_setting) == 12);
++static_assert(sizeof(struct fm_i2s_info) == 12);
++
+ /* Maximum number of raw RDS records buffered for read(). */
+ #define MTK_WCN_FM_RDS_FIFO_RECORDS	32
+ 
+@@ -349,6 +360,11 @@ struct mtk_wcn_fm_dev {
+ 	bool powered;
+ 	bool opened;
+ 
++	/* MT6627 I2S audio port state (FM_REG_AUDIO_CTRL0 + host reg). */
++	bool i2s_on;
++	/* ASoC glue state, NULL when CONFIG_SND_SOC is disabled. */
++	struct mtk_wcn_fm_i2s *i2s;
++
+ 	u16 cur_freq;		/* 10 kHz units */
+ 	u8 band;
+ 	u8 antenna;		/* 0: long, 1: short */
+@@ -388,4 +404,34 @@ int mtk_wcn_fm_chip_mono(struct mtk_wcn_fm_dev *fm, bool mono);
+ int mtk_wcn_fm_chip_smg(struct mtk_wcn_fm_dev *fm, u8 value);
+ int mtk_wcn_fm_chip_blend(struct mtk_wcn_fm_dev *fm, bool on);
+ 
++/*
++ * MT6627 FM I2S audio port.
++ *
++ * mtk_wcn_fm_chip_i2s_set() enables/disables the port with the exact
++ * downstream register writes:
++ *   enable : FM_REG_AUDIO_CTRL0 = 0xf9ab and host 0x80101054 = 0x00003f35
++ *            (mt6627_fm_lib.c:1023-1024 after every retune, :850-851 in the
++ *            power up sequence and :1511,1513 after a soft-mute scan);
++ *   disable: host 0x80101054 bits 13:14 cleared (mt6627_PowerDown(),
++ *            mt6627_fm_lib.c:892-894) and FM_REG_AUDIO_CTRL0 bits 15:3
++ *            cleared (mt6627_pwrdown(), mt6627_fm_cmd.c:523).
++ * Both require the FM function to be powered.  The ASoC glue
++ * (mtk_wcn_fm_i2s.c) and its inline fallback are the only callers; the power
++ * up and power down sequences of this file program the same registers
++ * themselves.
++ */
++int mtk_wcn_fm_chip_i2s_set(struct mtk_wcn_fm_dev *fm, bool on);
++/* Read the real port state back from the chip.  -EAGAIN if unpowered. */
++int mtk_wcn_fm_chip_i2s_get(struct mtk_wcn_fm_dev *fm, bool *on);
++/*
++ * Fill a downstream struct fm_i2s_info.  The status is the real port state
++ * (FM_I2S_OFF while the FM function is unpowered); mode and rate are the fixed
++ * MT6627 values, mt6627_fm_config.c:116-118.
++ */
++int mtk_wcn_fm_chip_i2s_info(struct mtk_wcn_fm_dev *fm,
++			     struct fm_i2s_info *info);
++
++/* ASoC glue; must stay the last include of this header. */
++#include "mtk_wcn_fm_i2s.h"
++
+ #endif /* _MTK_WCN_FM_H_ */
+diff --git a/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_chip.c b/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_chip.c
+index 601c01864..ddf1ccdf1 100644
+--- a/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_chip.c
++++ b/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_chip.c
+@@ -1060,6 +1060,9 @@ static int mtk_wcn_fm_power_up_seq(struct mtk_wcn_fm_dev *fm)
+ 	if (ret)
+ 		return ret;
+ 
++	/* The power up sequence leaves the I2S port enabled. */
++	fm->i2s_on = true;
++
+ 	return 0;
+ }
+ 
+@@ -1145,6 +1148,10 @@ int mtk_wcn_fm_chip_power_down(struct mtk_wcn_fm_dev *fm)
+ 
+ 	fm->powered = false;
+ 	fm->rds_on = false;
++	/* The power down sequence turned the I2S port off (mt6627_fm_lib.c:
++	 * 892-894, mt6627_fm_cmd.c:523) and the registers are gone.
++	 */
++	fm->i2s_on = false;
+ 
+ 	return ret;
+ }
+@@ -1281,6 +1288,8 @@ int mtk_wcn_fm_chip_tune(struct mtk_wcn_fm_dev *fm, u16 freq)
+ 	ret = mtk_wcn_fm_host_write(fm, FM_HOST_REG_AUDIO_CTRL, 0x00003f35);
+ 	if (ret)
+ 		return ret;
++	/* Every retune re-enables the I2S port (mt6627_fm_lib.c:1023-1024). */
++	fm->i2s_on = true;
+ 
+ 	ret = mtk_wcn_fm_send_tune(fm);
+ 	if (ret) {
+@@ -1642,3 +1651,132 @@ int mtk_wcn_fm_chip_rds(struct mtk_wcn_fm_dev *fm, bool on)
+ 
+ 	return ret;
+ }
++/*
++ * MT6627 FM I2S audio port.
++ *
++ * The port is enabled by two register writes that the downstream driver
++ * issues on every power up and on every retune:
++ *
++ *	mt6627_write(0x9B, 0xF9AB);  -- FM_REG_AUDIO_CTRL0
++ *	mt6627_host_write(0x80101054, 0x00003f35);  -- host audio ctrl
++ *
++ * (mt6627_fm_lib.c:1023-1024 after a retune, :850-851 in the power up
++ * sequence, :1511,1513 after a soft-mute scan).  The matching disable is what
++ * mt6627_PowerDown()/mt6627_pwrdown() do before the DSP clocks are gated: host
++ * bits 13:14 are cleared (mt6627_fm_lib.c:892-894) and FM_REG_AUDIO_CTRL0 bits
++ * 15:3 are cleared (mt6627_fm_cmd.c:523).  There is no downstream or ROM
++ * register sequence that changes the MT6627 I2S clock mode or sample rate
++ * (mt6627_I2s_Setting() has no body, mt6627_fm_lib.c:88-90,1825-1827), so this
++ * file only ever enables or disables the port.
++ */
++#define FM_MT6627_I2S_CTRL0_ON		0xf9ab	/* mt6627_fm_lib.c:1023 */
++#define FM_MT6627_HOST_AUDIO_ON		0x00003f35 /* mt6627_fm_lib.c:851 */
++/* Bits 13:14: cleared by mt6627_PowerDown(), mt6627_fm_lib.c:893. */
++#define FM_HOST_AUDIO_I2S_MASK		0x00006000
++/* Bits 15:3: cleared by mt6627_pwrdown(), mt6627_fm_cmd.c:523. */
++#define FM_AUDIO_CTRL0_I2S_MASK		0xfff8
++/*
++ * The enable value only sets bit 13 of that field, so the read back comparison
++ * has to use the pattern of the ON value rather than the whole mask.
++ */
++#define FM_HOST_AUDIO_I2S_ON_BITS \
++	(FM_MT6627_HOST_AUDIO_ON & FM_HOST_AUDIO_I2S_MASK)
++
++int mtk_wcn_fm_chip_i2s_set(struct mtk_wcn_fm_dev *fm, bool on)
++{
++	u32 host;
++	int ret;
++
++	if (!fm->powered)
++		return -EAGAIN;
++
++	if (on) {
++		ret = mtk_wcn_fm_reg_write(fm, FM_REG_AUDIO_CTRL0,
++					   FM_MT6627_I2S_CTRL0_ON);
++		if (ret)
++			return ret;
++		ret = mtk_wcn_fm_host_write(fm, FM_HOST_REG_AUDIO_CTRL,
++					    FM_MT6627_HOST_AUDIO_ON);
++		if (ret)
++			return ret;
++		fm->i2s_on = true;
++		return 0;
++	}
++
++	/* mt6627_PowerDown(), mt6627_fm_lib.c:892-894 */
++	ret = mtk_wcn_fm_host_read(fm, FM_HOST_REG_AUDIO_CTRL, &host);
++	if (ret)
++		return ret;
++	ret = mtk_wcn_fm_host_write(fm, FM_HOST_REG_AUDIO_CTRL,
++				    host & ~FM_HOST_AUDIO_I2S_MASK);
++	if (ret)
++		return ret;
++
++	/* mt6627_pwrdown(), mt6627_fm_cmd.c:523 */
++	ret = mtk_wcn_fm_reg_set_bits(fm, FM_REG_AUDIO_CTRL0, 0x0000,
++				      FM_AUDIO_CTRL0_I2S_MASK);
++	if (ret)
++		return ret;
++
++	fm->i2s_on = false;
++
++	return 0;
++}
++
++int mtk_wcn_fm_chip_i2s_get(struct mtk_wcn_fm_dev *fm, bool *on)
++{
++	u16 ctrl0;
++	u32 host;
++	int ret;
++
++	if (!on)
++		return -EINVAL;
++	if (!fm->powered)
++		return -EAGAIN;
++
++	ret = mtk_wcn_fm_reg_read(fm, FM_REG_AUDIO_CTRL0, &ctrl0);
++	if (ret)
++		return ret;
++	ret = mtk_wcn_fm_host_read(fm, FM_HOST_REG_AUDIO_CTRL, &host);
++	if (ret)
++		return ret;
++
++	*on = (ctrl0 & FM_AUDIO_CTRL0_I2S_MASK) != 0 &&
++	      (host & FM_HOST_AUDIO_I2S_MASK) == FM_HOST_AUDIO_I2S_ON_BITS;
++	fm->i2s_on = *on;
++
++	return 0;
++}
++
++int mtk_wcn_fm_chip_i2s_info(struct mtk_wcn_fm_dev *fm,
++			     struct fm_i2s_info *info)
++{
++	bool on;
++	int ret;
++
++	if (!info)
++		return -EINVAL;
++
++	/* mt6627_fm_config.c:116-118: fixed master / 32 kHz configuration. */
++	info->mode = FM_I2S_MASTER;
++	info->rate = FM_I2S_32K;
++
++	if (!fm->powered) {
++		/*
++		 * The port cannot be on while the FM function is off, and the
++		 * registers are not reachable, so report the known state.
++		 */
++		info->status = FM_I2S_OFF;
++		return 0;
++	}
++
++	ret = mtk_wcn_fm_chip_i2s_get(fm, &on);
++	if (ret) {
++		info->status = FM_I2S_STATE_ERR;
++		return ret;
++	}
++
++	info->status = on ? FM_I2S_ON : FM_I2S_OFF;
++
++	return 0;
++}
+diff --git a/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_i2s.c b/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_i2s.c
+new file mode 100644
+index 000000000..87928e4c6
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_i2s.c
+@@ -0,0 +1,560 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek WCN FM radio - MT6627 FM I2S audio path (ALSA SoC codec).
++ *
++ * Port from Samsung/MTK downstream:
++ *   sound/soc/mediatek/mt_soc_audio_v3/mt_soc_machine.c:1068-1086
++ *   sound/soc/mediatek/mt_soc_audio_v3/mt_soc_pcm_fm_i2s.c:279-323
++ *   sound/soc/mediatek/mt_soc_audio_v3/mt_soc_afe_control.c:2214-2296
++ *   sound/soc/mediatek/mt_soc_audio_v3/AudDrv_Def.h:230-231,302-307,325-343
++ *
++ * Downstream wires the FM I2S port into the single machine card ("mt-snd-card")
++ * with the DAI links "FM_I2S_RX_Playback"/"FM_I2S_RX_Capture", the CPU DAI
++ * "mt-soc-fmi2S-driver" and the codec DAIs "mt-soc-fm-i2s-dai-codec" /
++ * "mt-soc-fm-i2s-dummy-dai-codec".  The data path is the AFE "2nd I2S in"
++ * block, programmed from mtk_pcm_fm_i2s_prepare() as a consumer of the
++ * connectivity I2S clocks (mI2S_SLAVE = Soc_Aud_I2S_SRC_SLAVE_MODE), at a fixed
++ * 32000 Hz, 16 bit words, I2S framing, LRCK not inverted and the input pads
++ * taken from CONNSYS (mI2S_IN_PAD_SEL = false), mt_soc_pcm_fm_i2s.c:303-320,
++ * mt_soc_afe_control.c:2214-2248.
++ *
++ * This file owns the *chip* side of that port: a codec component named
++ * "mt6627-fm-i2s" carrying the DAI "mt-soc-fm-i2s-dai-codec" that enforces the
++ * real MT6627 constraints (master mode, a fixed 32 kHz, 16 bit, stereo I2S
++ * frame) and enables/disables the port through mtk_wcn_fm_chip_i2s_set().
++ * The AP side - the AFE 2nd I2S input, its
++ * connections and the ASRC that downstream used to reach 44.1/48 kHz - belongs
++ * to the audio subsystem and is specified in
++ * $M/logs/rem-wcn-fm-i2s.md ("AUDIO-FRAGMENT"), because this kernel's
++ * mt6735 AFE implements I2S0 only (sound/soc/mediatek/mt6735/mt6735-dai-i2s.c)
++ * and remapping AFE registers from the FM driver would be a second, competing
++ * audio driver.
++ *
++ * This driver registers no sound card.  A card can only be owned by the board
++ * machine driver (mt6735-mt6331-sound), and ASoC binds a component to exactly
++ * one card (soc_probe_component(), soc-core.c:1602-1622), so a second card
++ * that shares the AFE would always fail.  Instead the machine driver references
++ * "mt6627-fm-i2s" as the codec of the FM link; until it does, the component
++ * stays unbound and FM_IOCTL_I2S_SETTING reports -ENODEV.
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ */
++
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++
++#include "mtk_wcn_fm.h"
++
++/*
++ * Codec/DAI name and stream names.  The stream names follow downstream
++ * MT_SOC_FM_I2S_PLAYBACK_STREAM_NAME / MT_SOC_FM_I2S_CAPTURE_STREAM_NAME
++ * (AudDrv_Def.h:342-343) and the DAI name is downstream
++ * MT_SOC_CODEC_FM_I2S_DAI_NAME (AudDrv_Def.h:307), which is the name the
++ * machine link in mt_soc_machine.c:1068-1086 binds.  The component name is new
++ * because this kernel has no MT63xx codec driver: ASoC binds a component by
++ * name, and "mt6627-fm-i2s" is the name the board machine driver has to put in
++ * its FM DAI link (COMP_CODEC("mt6627-fm-i2s", "mt-soc-fm-i2s-dai-codec")).
++ */
++#define MTK_WCN_FM_I2S_CODEC_NAME	"mt6627-fm-i2s"
++#define MTK_WCN_FM_I2S_DAI_NAME		"mt-soc-fm-i2s-dai-codec"
++#define MTK_WCN_FM_I2S_PB_STREAM	"FM_I2S_Playback"
++#define MTK_WCN_FM_I2S_CAP_STREAM	"FM_I2S_Capture"
++
++/*
++ * The MT6627 I2S port is fixed at master mode with a 32000 Hz frame:
++ * mt6627_fm_config.c:116-118 initialises the audio path to FM_AUD_I2S with
++ * i2s_info = {FM_I2S_OFF, FM_I2S_MASTER, FM_I2S_32K}, and the AP side is
++ * configured for mI2S_SAMPLERATE = 32000 with 16 bit words
++ * (mt_soc_pcm_fm_i2s.c:308-312).  No downstream or ROM sequence changes either
++ * (mt6627_I2s_Setting() has no implementation, mt6627_fm_lib.c:88-90,1825-1827).
++ * The port is a stereo I2S frame (mI2S_IN_PAD_SEL = false feeds both pads from
++ * CONNSYS, mt_soc_pcm_fm_i2s.c:306-307); FM mono content is carried inside it
++ * and selected by the chip's mono/stereo control (FM_REG_AUDIO_MONO).
++ */
++#define MTK_WCN_FM_I2S_RATE		32000
++#define MTK_WCN_FM_I2S_CHANNELS		2
++
++/*
++ * The only DAI format the FM link can carry: I2S framing, no BCLK/LRCK
++ * inversion, and the AP side as the bit clock/frame clock consumer while the
++ * MT6627 drives BCLK/LRCK (downstream mI2S_SLAVE = Soc_Aud_I2S_SRC_SLAVE_MODE,
++ * mt_soc_pcm_fm_i2s.c:309).  This kernel's AFE DAI maps
++ * SND_SOC_DAIFMT_CBC_CFC to AFE_I2S_CON_SLAVE (mt6735-dai-i2s.c:79-89) and the
++ * audio machine card spells the same interface the same way
++ * (mt6735-mt6331.c:152-155); the machine link must therefore use this value.
++ */
++#define MTK_WCN_FM_I2S_DAIFMT \
++	(SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_CBC_CFC)
++
++struct mtk_wcn_fm_i2s {
++	struct mtk_wcn_fm_dev *fm;
++	/* Serialises the state below and every chip access of this file. */
++	struct mutex lock;
++	/* A card bound the component: a machine link uses this DAI. */
++	bool bound;
++	/* The FM function is powered (mirror of fm->powered). */
++	bool powered;
++	/* Userspace enabled the audio path (FM_IOCTL_I2S_SETTING). */
++	bool route;
++	/* Bitmask of substreams set up with hw_params(). */
++	unsigned int armed;
++	/* Port state last written to the chip. */
++	bool chip_on;
++};
++
++static struct mtk_wcn_fm_i2s *mtk_wcn_fm_i2s_from_component(
++					struct snd_soc_component *component)
++{
++	struct mtk_wcn_fm_dev *fm = snd_soc_component_get_drvdata(component);
++
++	return fm ? fm->i2s : NULL;
++}
++
++/*
++ * The port has to be on while the chip is powered and either userspace asked
++ * for audio or a PCM is set up.  The chip power up sequence enables it anyway
++ * (mtk_wcn_fm_chip.c, mt6627_fm_lib.c:849-851), so the state only has to be
++ * written when it actually differs.  Called with i2s->lock held.
++ */
++static bool mtk_wcn_fm_i2s_wanted(struct mtk_wcn_fm_i2s *i2s)
++{
++	return i2s->powered && (i2s->route || i2s->armed);
++}
++
++/*
++ * Bring the chip port in line with the wanted state.  Called with i2s->lock
++ * held from the sleepable ASoC callbacks (component probe/remove, startup,
++ * hw_params, hw_free, mute) and from the V4L2 paths; never from an atomic
++ * context - the register access goes over STP and sleeps.
++ */
++static int mtk_wcn_fm_i2s_apply_locked(struct mtk_wcn_fm_i2s *i2s, bool force)
++{
++	struct mtk_wcn_fm_dev *fm = i2s->fm;
++	bool on;
++	int ret;
++
++	on = mtk_wcn_fm_i2s_wanted(i2s);
++
++	/*
++	 * fm->i2s_on is the last port state known to the chip layer; the power
++	 * up, retune and power down sequences update it too, which is how a
++	 * retune that re-enabled the port behind our back is caught.
++	 */
++	if (!force && on == i2s->chip_on && on == READ_ONCE(fm->i2s_on))
++		return 0;
++
++	if (!i2s->powered) {
++		/* The chip is off: its registers are gone, nothing to write. */
++		i2s->chip_on = false;
++		return 0;
++	}
++
++	ret = mtk_wcn_fm_chip_i2s_set(fm, on);
++	if (ret) {
++		dev_warn(fm->dev, "FM I2S port %s failed (%d)\n",
++			 on ? "enable" : "disable", ret);
++		return ret;
++	}
++
++	i2s->chip_on = on;
++
++	return 0;
++}
++
++static int mtk_wcn_fm_i2s_apply(struct mtk_wcn_fm_i2s *i2s, bool force)
++{
++	int ret;
++
++	mutex_lock(&i2s->lock);
++	ret = mtk_wcn_fm_i2s_apply_locked(i2s, force);
++	mutex_unlock(&i2s->lock);
++
++	return ret;
++}
++
++/*
++ * Codec DAI
++ */
++static int mtk_wcn_fm_i2s_dai_startup(struct snd_pcm_substream *substream,
++				      struct snd_soc_dai *dai)
++{
++	struct mtk_wcn_fm_i2s *i2s = mtk_wcn_fm_i2s_from_component(dai->component);
++	int ret = 0;
++
++	if (!i2s)
++		return -ENODEV;
++
++	mutex_lock(&i2s->lock);
++	if (!i2s->powered)
++		ret = -ENODEV;
++	mutex_unlock(&i2s->lock);
++
++	if (ret)
++		dev_dbg(i2s->fm->dev,
++			"FM I2S stream opened while the FM function is off\n");
++
++	return ret;
++}
++
++static int mtk_wcn_fm_i2s_dai_hw_params(struct snd_pcm_substream *substream,
++					struct snd_pcm_hw_params *params,
++					struct snd_soc_dai *dai)
++{
++	struct mtk_wcn_fm_i2s *i2s = mtk_wcn_fm_i2s_from_component(dai->component);
++	unsigned int rate = params_rate(params);
++	unsigned int channels = params_channels(params);
++	int ret = 0;
++
++	if (!i2s)
++		return -ENODEV;
++
++	if (rate != MTK_WCN_FM_I2S_RATE) {
++		dev_err(i2s->fm->dev,
++			"MT6627 I2S is fixed at %u Hz, %u Hz rejected\n",
++			MTK_WCN_FM_I2S_RATE, rate);
++		return -EINVAL;
++	}
++	if (channels != MTK_WCN_FM_I2S_CHANNELS) {
++		dev_err(i2s->fm->dev,
++			"MT6627 I2S is a stereo frame, %u channels rejected\n",
++			channels);
++		return -EINVAL;
++	}
++	if (params_format(params) != SNDRV_PCM_FORMAT_S16_LE) {
++		dev_err(i2s->fm->dev,
++			"MT6627 I2S is 16 bit, format %u rejected\n",
++			params_format(params));
++		return -EINVAL;
++	}
++
++	mutex_lock(&i2s->lock);
++	if (!i2s->powered) {
++		ret = -ENODEV;
++	} else {
++		i2s->armed |= BIT(substream->stream);
++		ret = mtk_wcn_fm_i2s_apply_locked(i2s, false);
++	}
++	mutex_unlock(&i2s->lock);
++
++	return ret;
++}
++
++static int mtk_wcn_fm_i2s_dai_hw_free(struct snd_pcm_substream *substream,
++				      struct snd_soc_dai *dai)
++{
++	struct mtk_wcn_fm_i2s *i2s = mtk_wcn_fm_i2s_from_component(dai->component);
++	int ret;
++
++	if (!i2s)
++		return -ENODEV;
++
++	mutex_lock(&i2s->lock);
++	i2s->armed &= ~BIT(substream->stream);
++	ret = mtk_wcn_fm_i2s_apply_locked(i2s, false);
++	mutex_unlock(&i2s->lock);
++
++	return ret;
++}
++
++/*
++ * shutdown() is the safety net for a stream that was closed without hw_free();
++ * it is idempotent with hw_free().
++ */
++static void mtk_wcn_fm_i2s_dai_shutdown(struct snd_pcm_substream *substream,
++					struct snd_soc_dai *dai)
++{
++	struct mtk_wcn_fm_i2s *i2s = mtk_wcn_fm_i2s_from_component(dai->component);
++
++	if (!i2s)
++		return;
++
++	mutex_lock(&i2s->lock);
++	i2s->armed &= ~BIT(substream->stream);
++	mtk_wcn_fm_i2s_apply_locked(i2s, false);
++	mutex_unlock(&i2s->lock);
++}
++
++/*
++ * trigger() runs with the PCM stream lock held (Documentation/sound/kernel-api/
++ * writing-an-alsa-driver.rst:1870-1874: "the trigger callback is atomic"), so
++ * it must not touch the chip.  It only refuses to start a stream on a chip that
++ * has been powered down under it; the port itself is programmed in hw_params().
++ */
++static int mtk_wcn_fm_i2s_dai_trigger(struct snd_pcm_substream *substream,
++				      int cmd, struct snd_soc_dai *dai)
++{
++	struct mtk_wcn_fm_i2s *i2s = mtk_wcn_fm_i2s_from_component(dai->component);
++
++	if (!i2s)
++		return -ENODEV;
++
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_START:
++	case SNDRV_PCM_TRIGGER_RESUME:
++		if (!READ_ONCE(i2s->powered))
++			return -ENODEV;
++		return 0;
++	case SNDRV_PCM_TRIGGER_STOP:
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int mtk_wcn_fm_i2s_dai_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
++{
++	struct mtk_wcn_fm_i2s *i2s = mtk_wcn_fm_i2s_from_component(dai->component);
++
++	if (!i2s)
++		return -ENODEV;
++
++	/*
++	 * Only the fixed MT6627 configuration can be carried: I2S framing, no
++	 * BCLK/LRCK inversion, and the AFE as clock consumer while the chip
++	 * drives the clocks.  Anything else is rejected instead of being
++	 * accepted and ignored, because there is no register that could change
++	 * the chip's I2S mode (see the file header).
++	 */
++	if ((fmt & SND_SOC_DAIFMT_FORMAT_MASK) != SND_SOC_DAIFMT_I2S)
++		return -EOPNOTSUPP;
++	if ((fmt & SND_SOC_DAIFMT_INV_MASK) != SND_SOC_DAIFMT_NB_NF)
++		return -EOPNOTSUPP;
++	if ((fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) !=
++	    SND_SOC_DAIFMT_CBC_CFC)
++		return -EOPNOTSUPP;
++
++	return 0;
++}
++
++static int mtk_wcn_fm_i2s_dai_mute(struct snd_soc_dai *dai, int mute,
++				   int stream)
++{
++	struct mtk_wcn_fm_i2s *i2s = mtk_wcn_fm_i2s_from_component(dai->component);
++	int ret = 0;
++
++	if (!i2s)
++		return -ENODEV;
++
++	mutex_lock(&i2s->lock);
++	if (i2s->powered)
++		ret = mtk_wcn_fm_chip_mute(i2s->fm, mute);
++	mutex_unlock(&i2s->lock);
++
++	return ret;
++}
++
++static const struct snd_soc_dai_ops mtk_wcn_fm_i2s_dai_ops = {
++	.startup = mtk_wcn_fm_i2s_dai_startup,
++	.shutdown = mtk_wcn_fm_i2s_dai_shutdown,
++	.hw_params = mtk_wcn_fm_i2s_dai_hw_params,
++	.hw_free = mtk_wcn_fm_i2s_dai_hw_free,
++	.trigger = mtk_wcn_fm_i2s_dai_trigger,
++	.set_fmt = mtk_wcn_fm_i2s_dai_set_fmt,
++	.mute_stream = mtk_wcn_fm_i2s_dai_mute,
++};
++
++static struct snd_soc_dai_driver mtk_wcn_fm_i2s_dai = {
++	.name = MTK_WCN_FM_I2S_DAI_NAME,
++	.id = 0,
++	.ops = &mtk_wcn_fm_i2s_dai_ops,
++	.playback = {
++		.stream_name = MTK_WCN_FM_I2S_PB_STREAM,
++		.channels_min = MTK_WCN_FM_I2S_CHANNELS,
++		.channels_max = MTK_WCN_FM_I2S_CHANNELS,
++		.rates = SNDRV_PCM_RATE_32000,
++		.rate_min = MTK_WCN_FM_I2S_RATE,
++		.rate_max = MTK_WCN_FM_I2S_RATE,
++		.formats = SNDRV_PCM_FMTBIT_S16_LE,
++	},
++	.capture = {
++		.stream_name = MTK_WCN_FM_I2S_CAP_STREAM,
++		.channels_min = MTK_WCN_FM_I2S_CHANNELS,
++		.channels_max = MTK_WCN_FM_I2S_CHANNELS,
++		.rates = SNDRV_PCM_RATE_32000,
++		.rate_min = MTK_WCN_FM_I2S_RATE,
++		.rate_max = MTK_WCN_FM_I2S_RATE,
++		.formats = SNDRV_PCM_FMTBIT_S16_LE,
++	},
++	.symmetric_rate = 1,
++	.symmetric_channels = 1,
++	.symmetric_sample_bits = 1,
++};
++
++/*
++ * Component.  No DAPM widgets: the codec holds no analog switch, the whole FM
++ * audio path is the AFE's 2nd I2S input, so the routing the DAI widgets of this
++ * component would drive is empty.
++ */
++static int mtk_wcn_fm_i2s_component_probe(struct snd_soc_component *component)
++{
++	struct mtk_wcn_fm_i2s *i2s = mtk_wcn_fm_i2s_from_component(component);
++
++	if (!i2s)
++		return -ENODEV;
++
++	mutex_lock(&i2s->lock);
++	i2s->bound = true;
++	mutex_unlock(&i2s->lock);
++
++	dev_info(i2s->fm->dev,
++		 "FM I2S codec bound to sound card \"%s\"\n",
++		 component->card->name);
++
++	return 0;
++}
++
++static void mtk_wcn_fm_i2s_component_remove(struct snd_soc_component *component)
++{
++	struct mtk_wcn_fm_i2s *i2s = mtk_wcn_fm_i2s_from_component(component);
++
++	if (!i2s)
++		return;
++
++	mutex_lock(&i2s->lock);
++	i2s->bound = false;
++	i2s->route = false;
++	i2s->armed = 0;
++	mtk_wcn_fm_i2s_apply_locked(i2s, false);
++	mutex_unlock(&i2s->lock);
++}
++
++static const struct snd_soc_component_driver mtk_wcn_fm_i2s_component = {
++	.name = MTK_WCN_FM_I2S_CODEC_NAME,
++	.probe = mtk_wcn_fm_i2s_component_probe,
++	.remove = mtk_wcn_fm_i2s_component_remove,
++};
++
++/*
++ * FM driver interface
++ */
++int mtk_wcn_fm_i2s_init(struct mtk_wcn_fm_dev *fm)
++{
++	struct mtk_wcn_fm_i2s *i2s;
++	int ret;
++
++	i2s = devm_kzalloc(fm->dev, sizeof(*i2s), GFP_KERNEL);
++	if (!i2s)
++		return -ENOMEM;
++
++	i2s->fm = fm;
++	mutex_init(&i2s->lock);
++	i2s->chip_on = READ_ONCE(fm->i2s_on);
++	fm->i2s = i2s;
++
++	ret = snd_soc_register_component(fm->dev, &mtk_wcn_fm_i2s_component,
++					 &mtk_wcn_fm_i2s_dai, 1);
++	if (ret) {
++		dev_err(fm->dev, "cannot register the FM I2S codec (%d)\n", ret);
++		fm->i2s = NULL;
++		return ret;
++	}
++
++	dev_dbg(fm->dev, "FM I2S codec \"%s\" registered\n",
++		MTK_WCN_FM_I2S_CODEC_NAME);
++
++	return 0;
++}
++
++void mtk_wcn_fm_i2s_exit(struct mtk_wcn_fm_dev *fm)
++{
++	if (!fm->i2s)
++		return;
++
++	/*
++	 * A card that bound this component holds a module reference on this
++	 * driver (snd_soc_component_module_get_when_probe()), so the codec can
++	 * only disappear once that card released it - or when the component was
++	 * never bound, in which case removing it is trivially safe.
++	 */
++	snd_soc_unregister_component_by_driver(fm->dev, &mtk_wcn_fm_i2s_component);
++	fm->i2s = NULL;
++}
++
++/*
++ * mtk_wcn_fm_i2s_power - chip power transition notification.
++ *
++ * Ordering (mtk_wcn_fm_v4l2.c): power_on calls this after
++ * mtk_wcn_fm_chip_power_up() succeeded, power_off calls it before
++ * mtk_wcn_fm_chip_power_down().  The chip layer owns the register sequence in
++ * both directions (the power up sequence enables the port, mt6627_fm_lib.c:
++ * 849-851; the power down sequence clears it, mt6627_fm_lib.c:877-880 and
++ * mt6627_fm_cmd.c:512-517), so this callback only has to keep the ASoC view in
++ * step.  Taking i2s->lock means a stream callback that is already inside
++ * mtk_wcn_fm_i2s_apply_locked() completes before the chip starts powering
++ * down, and no later callback issues a chip access for the dead function.
++ */
++void mtk_wcn_fm_i2s_power(struct mtk_wcn_fm_dev *fm, bool on)
++{
++	struct mtk_wcn_fm_i2s *i2s = fm->i2s;
++
++	if (!i2s)
++		return;
++
++	mutex_lock(&i2s->lock);
++	if (on) {
++		i2s->powered = true;
++		/*
++		 * The power up sequence leaves the port enabled, which is what
++		 * downstream userspace expects; FM_IOCTL_I2S_SETTING(OFF) turns
++		 * it off again.
++		 */
++		i2s->route = true;
++		i2s->armed = 0;
++		i2s->chip_on = true;
++	} else {
++		i2s->powered = false;
++		i2s->route = false;
++		i2s->armed = 0;
++		i2s->chip_on = false;
++	}
++	mutex_unlock(&i2s->lock);
++}
++
++/*
++ * The chip re-enables the I2S port on every retune (mtk_wcn_fm_chip_tune()),
++ * so re-apply the wanted state afterwards.
++ */
++void mtk_wcn_fm_i2s_resync(struct mtk_wcn_fm_dev *fm)
++{
++	struct mtk_wcn_fm_i2s *i2s = fm->i2s;
++
++	if (!i2s)
++		return;
++
++	mtk_wcn_fm_i2s_apply(i2s, false);
++}
++
++int mtk_wcn_fm_i2s_route(struct mtk_wcn_fm_dev *fm, bool on)
++{
++	struct mtk_wcn_fm_i2s *i2s = fm->i2s;
++	int ret = 0;
++
++	if (!i2s)
++		/* Registration failed: the chip side still works. */
++		return mtk_wcn_fm_chip_i2s_set(fm, on);
++
++	mutex_lock(&i2s->lock);
++	if (!i2s->powered) {
++		ret = -EAGAIN;
++	} else if (on && !i2s->bound) {
++		/*
++		 * No machine link uses this codec, so enabling the chip port
++		 * could not produce audio: report the missing link instead of
++		 * succeeding silently.
++		 */
++		ret = -ENODEV;
++	} else {
++		i2s->route = on;
++		ret = mtk_wcn_fm_i2s_apply_locked(i2s, false);
++	}
++	mutex_unlock(&i2s->lock);
++
++	return ret;
++}
+diff --git a/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_i2s.h b/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_i2s.h
+new file mode 100644
+index 000000000..3eec2aa11
+--- /dev/null
++++ b/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_i2s.h
+@@ -0,0 +1,138 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * MediaTek WCN FM radio - MT6627 FM I2S audio path (ALSA SoC codec).
++ *
++ * The MT6627 FM receiver outputs its demodulated audio on the connectivity
++ * "2 wire" I2S port.  Downstream exposes that port as the DAI links
++ * "FM_I2S_RX_Playback"/"FM_I2S_RX_Capture" of the mt-snd-card machine driver
++ * and as the codec DAIs "mt-soc-fm-i2s-dai-codec"/"mt-soc-fm-i2s-dummy-dai-
++ * codec" of the MT63xx codec driver (sound/soc/mediatek/mt_soc_audio_v3/
++ * AudDrv_Def.h:230-231,302-307,325-343, mt_soc_machine.c:1068-1086).  The FM
++ * register sequences only ever enable or disable that port; neither the
++ * downstream source nor the ROM image contains a sequence that changes the
++ * MT6627 I2S clock mode or sample rate (mt6627_I2s_Setting() has no
++ * implementation: declaration and use are both inside #if 0,
++ * mt6627_fm_lib.c:88-90,1825-1827).
++ *
++ * This file declares the kernel-internal interface of the ASoC glue.  When
++ * CONFIG_SND_SOC is disabled the glue is compiled out (see the Makefile) and
++ * the inline fallbacks below keep the FM driver building and running with the
++ * chip level I2S hooks only.
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ */
++
++#ifndef _MTK_WCN_FM_I2S_H_
++#define _MTK_WCN_FM_I2S_H_
++
++#include <linux/errno.h>
++#include <linux/kconfig.h>
++#include <linux/types.h>
++
++struct mtk_wcn_fm_dev;
++
++/*
++ * Opaque FM I2S/ASoC state.  One instance per FM device, allocated by
++ * mtk_wcn_fm_i2s_init() and reachable through mtk_wcn_fm_dev.i2s.
++ */
++struct mtk_wcn_fm_i2s;
++
++/*
++ * The ASoC glue can only be used when the sound core is present and linkable
++ * from this driver: built-in code cannot reference the symbols of a modular
++ * snd-soc-core, so a built-in FM driver with SND_SOC=m falls back to the chip
++ * level hooks.  The Makefile implements the same rule for the object list.
++ */
++#define MTK_WCN_FM_ASOC_ENABLED						\
++	(IS_ENABLED(CONFIG_SND_SOC) &&					\
++	 !(IS_BUILTIN(CONFIG_MTK_WCN_FM) && IS_MODULE(CONFIG_SND_SOC)))
++
++#if MTK_WCN_FM_ASOC_ENABLED
++
++/*
++ * mtk_wcn_fm_i2s_init - register the MT6627 FM I2S codec component
++ * @fm: FM device
++ *
++ * Registers a codec component named "mt6627-fm-i2s" carrying the DAI
++ * "mt-soc-fm-i2s-dai-codec" (downstream MT_SOC_CODEC_FM_I2S_DAI_NAME,
++ * AudDrv_Def.h:307).  No sound card is registered: the board machine driver
++ * owns the card, and has to reference this codec in its FM DAI link (see
++ * $M/logs/rem-wcn-fm-i2s.md, "AUDIO-FRAGMENT").  Until it does, the component
++ * stays unbound and FM_IOCTL_I2S_SETTING reports -ENODEV.
++ *
++ * Returns 0 on success, a negative errno otherwise.
++ */
++int mtk_wcn_fm_i2s_init(struct mtk_wcn_fm_dev *fm);
++
++/*
++ * mtk_wcn_fm_i2s_exit - unregister the codec component
++ * @fm: FM device
++ */
++void mtk_wcn_fm_i2s_exit(struct mtk_wcn_fm_dev *fm);
++
++/*
++ * mtk_wcn_fm_i2s_power - notify the ASoC glue about an FM power transition
++ * @on: true after a successful chip power up, false before a chip power down
++ *
++ * Only bookkeeping: the chip layer programs the port in both directions.  Call
++ * with @on == true after mtk_wcn_fm_chip_power_up() and with @on == false
++ * before mtk_wcn_fm_chip_power_down() so that no stream callback can reach the
++ * chip while it is powering down.
++ */
++void mtk_wcn_fm_i2s_power(struct mtk_wcn_fm_dev *fm, bool on);
++
++/*
++ * mtk_wcn_fm_i2s_resync - re-apply the wanted port state
++ * @fm: FM device
++ *
++ * Called after mtk_wcn_fm_chip_tune(), which re-enables the chip I2S port.
++ */
++void mtk_wcn_fm_i2s_resync(struct mtk_wcn_fm_dev *fm);
++
++/*
++ * mtk_wcn_fm_i2s_route - apply an FM_IOCTL_I2S_SETTING request
++ * @fm: FM device
++ * @on: true for FM_I2S_ON, false for FM_I2S_OFF
++ *
++ * Programs the chip port through mtk_wcn_fm_chip_i2s_set() and keeps the
++ * route state used by the stream callbacks in step.  Returns 0 on success,
++ * -ENODEV when @on is requested but no machine link bound the codec (the
++ * request is then rejected instead of enabling a port that cannot produce
++ * audio) and the negative errno of the chip access otherwise.
++ */
++int mtk_wcn_fm_i2s_route(struct mtk_wcn_fm_dev *fm, bool on);
++
++#else /* !MTK_WCN_FM_ASOC_ENABLED */
++
++/* Provided by mtk_wcn_fm_chip.c; also declared by mtk_wcn_fm.h. */
++int mtk_wcn_fm_chip_i2s_set(struct mtk_wcn_fm_dev *fm, bool on);
++
++static inline int mtk_wcn_fm_i2s_init(struct mtk_wcn_fm_dev *fm)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline void mtk_wcn_fm_i2s_exit(struct mtk_wcn_fm_dev *fm)
++{
++}
++
++static inline void mtk_wcn_fm_i2s_power(struct mtk_wcn_fm_dev *fm, bool on)
++{
++}
++
++static inline void mtk_wcn_fm_i2s_resync(struct mtk_wcn_fm_dev *fm)
++{
++}
++
++/*
++ * Without ASoC there is no route to keep in step, but the chip port itself is
++ * still controllable: the ioctl keeps programming the real registers.
++ */
++static inline int mtk_wcn_fm_i2s_route(struct mtk_wcn_fm_dev *fm, bool on)
++{
++	return mtk_wcn_fm_chip_i2s_set(fm, on);
++}
++
++#endif /* MTK_WCN_FM_ASOC_ENABLED */
++
++#endif /* _MTK_WCN_FM_I2S_H_ */
+diff --git a/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_v4l2.c b/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_v4l2.c
+index 721b438a2..164a3f774 100644
+--- a/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_v4l2.c
++++ b/drivers/misc/mediatek/connectivity/fm/mtk_wcn_fm_v4l2.c
+@@ -93,6 +93,12 @@ static int mtk_wcn_fm_power_on(struct mtk_wcn_fm_dev *fm)
+ 	if (fm->ant_sel_valid)
+ 		gpio_set_value_cansleep(fm->ant_sel_gpio, 1);
+ 
++	/*
++	 * The chip power up sequence leaves the I2S port enabled; let the ASoC
++	 * glue close it again unless the route and a PCM ask for it.
++	 */
++	mtk_wcn_fm_i2s_power(fm, true);
++
+ 	return 0;
+ }
+ 
+@@ -112,6 +118,9 @@ static void mtk_wcn_fm_power_off(struct mtk_wcn_fm_dev *fm)
+ 	if (fm->ant_sel_valid)
+ 		gpio_set_value_cansleep(fm->ant_sel_gpio, 0);
+ 
++	/* Disable the I2S port while its registers are still reachable. */
++	mtk_wcn_fm_i2s_power(fm, false);
++
+ 	mtk_wcn_fm_chip_power_down(fm);
+ 
+ 	/* Wake up readers blocked in read()/poll(). */
+@@ -135,11 +144,14 @@ static void mtk_wcn_fm_reset_work(struct work_struct *work)
+ 	if (fm->powered) {
+ 		dev_warn(fm->dev, "connectivity reset, restoring FM state\n");
+ 		fm->powered = false;
++		mtk_wcn_fm_i2s_power(fm, false);
+ 		if (!mtk_wcn_fm_chip_power_up(fm) &&
+-		    !mtk_wcn_fm_chip_tune(fm, fm->cur_freq))
++		    !mtk_wcn_fm_chip_tune(fm, fm->cur_freq)) {
+ 			restored = true;
+-		else
++			mtk_wcn_fm_i2s_power(fm, true);
++		} else {
+ 			dev_err(fm->dev, "FM restore after reset failed\n");
++		}
+ 	}
+ 	mutex_unlock(&fm->lock);
+ 
+@@ -218,6 +230,9 @@ static int mtk_wcn_fm_s_ctrl(struct v4l2_ctrl *ctrl)
+ 		if (fm->cur_freq < min || fm->cur_freq > max) {
+ 			fm->cur_freq = min;
+ 			ret = mtk_wcn_fm_chip_tune(fm, fm->cur_freq);
++			/* The retune re-enabled the chip I2S port. */
++			if (!ret)
++				mtk_wcn_fm_i2s_resync(fm);
+ 		}
+ 		break;
+ 	case V4L2_CID_MTK_WCN_FM_ANTENNA:
+@@ -370,10 +385,16 @@ static int mtk_wcn_fm_s_frequency(struct file *file, void *priv,
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&fm->lock);
+-	if (!fm->powered)
++	if (!fm->powered) {
+ 		ret = -EIO;
+-	else
++	} else {
+ 		ret = mtk_wcn_fm_chip_tune(fm, freq);
++		/* Every retune re-enables the I2S port; put it back into the
++		 * state the route asked for.
++		 */
++		if (!ret)
++			mtk_wcn_fm_i2s_resync(fm);
++	}
+ 	mutex_unlock(&fm->lock);
+ 
+ 	return ret;
+@@ -448,6 +469,94 @@ static int mtk_wcn_fm_subscribe_event(struct v4l2_fh *fh,
+ 	}
+ }
+ 
++/*
++ * Downstream private FM I2S ioctls (core/fm_module.c:294-315, 735-757).
++ *
++ * They are handled in the file operations instead of vidioc_default because
++ * the downstream command word encodes _IOC_SIZE == 4 (the headers use a
++ * pointer type in _IOWR, fm_ioctl.h:70,81) while the payload is 12 bytes.
++ * video_ioctl2() would copy only the four bytes of _IOC_SIZE into the kernel
++ * buffer handed to vidioc_default(); the downstream character driver instead
++ * copied sizeof(struct) itself, which is what is done here.
++ */
++static int mtk_wcn_fm_ioctl_i2s_setting(struct mtk_wcn_fm_dev *fm,
++					void __user *arg)
++{
++	struct fm_i2s_setting cfg;
++	int ret;
++
++	if (copy_from_user(&cfg, arg, sizeof(cfg)))
++		return -EFAULT;
++
++	if (cfg.onoff != FM_I2S_ON && cfg.onoff != FM_I2S_OFF)
++		return -EINVAL;
++	/*
++	 * The MT6627 audio port is wired as the connectivity I2S master with a
++	 * fixed 32 kHz frame (mt6627_fm_config.c:116-118) and there is no
++	 * downstream register sequence that changes either
++	 * (mt6627_I2s_Setting() has no body, mt6627_fm_lib.c:88-90).  A request
++	 * for any other mode or rate is rejected rather than accepted and
++	 * ignored.
++	 */
++	if (cfg.mode != FM_I2S_MASTER || cfg.sample != FM_I2S_32K)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&fm->lock);
++	if (!fm->powered) {
++		ret = -EAGAIN;
++	} else {
++		/*
++		 * Programs the chip port and keeps the ASoC route state in
++		 * step.  Without CONFIG_SND_SOC this is the chip write itself;
++		 * with ASoC but no machine link using the codec, an enable is
++		 * rejected with -ENODEV because no PCM could reach the port.
++		 */
++		ret = mtk_wcn_fm_i2s_route(fm, cfg.onoff == FM_I2S_ON);
++	}
++	mutex_unlock(&fm->lock);
++
++	return ret;
++}
++
++static int mtk_wcn_fm_ioctl_get_i2s_info(struct mtk_wcn_fm_dev *fm,
++					 void __user *arg)
++{
++	struct fm_i2s_info info;
++	int ret;
++
++	memset(&info, 0, sizeof(info));
++
++	mutex_lock(&fm->lock);
++	ret = mtk_wcn_fm_chip_i2s_info(fm, &info);
++	mutex_unlock(&fm->lock);
++
++	if (ret)
++		return ret;
++	if (copy_to_user(arg, &info, sizeof(info)))
++		return -EFAULT;
++
++	return 0;
++}
++
++/*
++ * Private ioctl dispatch.  Everything that is not an FM I2S ioctl goes back
++ * to the V4L2 core.
++ */
++static long mtk_wcn_fm_fops_ioctl(struct file *file, unsigned int cmd,
++				  unsigned long arg)
++{
++	struct mtk_wcn_fm_dev *fm = video_drvdata(file);
++
++	switch (cmd) {
++	case FM_IOCTL_I2S_SETTING:
++		return mtk_wcn_fm_ioctl_i2s_setting(fm, (void __user *)arg);
++	case FM_IOCTL_GET_I2S_INFO:
++		return mtk_wcn_fm_ioctl_get_i2s_info(fm, (void __user *)arg);
++	default:
++		return video_ioctl2(file, cmd, arg);
++	}
++}
++
+ static const struct v4l2_ioctl_ops mtk_wcn_fm_ioctl_ops = {
+ 	.vidioc_querycap	= mtk_wcn_fm_querycap,
+ 	.vidioc_g_tuner		= mtk_wcn_fm_g_tuner,
+@@ -585,7 +694,11 @@ static const struct v4l2_file_operations mtk_wcn_fm_fops = {
+ 	.release	= mtk_wcn_fm_fops_release,
+ 	.read		= mtk_wcn_fm_fops_read,
+ 	.poll		= mtk_wcn_fm_fops_poll,
+-	.unlocked_ioctl	= video_ioctl2,
++	.unlocked_ioctl	= mtk_wcn_fm_fops_ioctl,
++#ifdef CONFIG_COMPAT
++	/* Same layout for 32-bit callers (three s32 words, no pointers). */
++	.compat_ioctl32	= mtk_wcn_fm_fops_ioctl,
++#endif
+ };
+ 
+ /*
+@@ -608,6 +721,7 @@ static int mtk_wcn_fm_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 
+ 	fm->dev = &pdev->dev;
++	platform_set_drvdata(pdev, fm);
+ 	mutex_init(&fm->lock);
+ 	mutex_init(&fm->cmd_lock);
+ 	spin_lock_init(&fm->evt_lock);
+@@ -728,7 +842,18 @@ static int mtk_wcn_fm_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		goto err_video;
+ 
+-	platform_set_drvdata(pdev, fm);
++	/*
++	 * ASoC glue: the FM codec component only.  No sound card is registered
++	 * here - the board machine driver owns the single card and may link
++	 * this component.  A registration failure (for example the audio
++	 * component being unavailable) only removes the ALSA route; tuning and
++	 * the chip level I2S controls keep working.
++	 */
++	ret = mtk_wcn_fm_i2s_init(fm);
++	if (ret)
++		dev_warn(&pdev->dev,
++			 "FM I2S ALSA route unavailable (%d), continuing\n",
++			 ret);
+ 
+ 	dev_info(&pdev->dev, "MT6627 FM radio on %s\n",
+ 		 video_device_node_name(&fm->vdev));
+@@ -761,6 +886,9 @@ static void mtk_wcn_fm_remove(struct platform_device *pdev)
+ 	}
+ 	mutex_unlock(&fm->lock);
+ 
++	/* Drop the codec component before the chip and its registers go away. */
++	mtk_wcn_fm_i2s_exit(fm);
++
+ 	/* Stop the reset worker before the WMT/STP callbacks go away. */
+ 	cancel_work_sync(&fm->rst_work);
+ 	mtk_wcn_fm_link_exit(fm);
+diff --git a/include/uapi/linux/mtk_fm_i2s.h b/include/uapi/linux/mtk_fm_i2s.h
+new file mode 100644
+index 000000000..31c0bac4b
+--- /dev/null
++++ b/include/uapi/linux/mtk_fm_i2s.h
+@@ -0,0 +1,60 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * MediaTek WCN FM radio - MT6627 I2S control ABI.
++ *
++ * Port from Samsung/MTK downstream:
++ *   drivers/misc/mediatek/fmradio/inc/fm_interface.h:59-90
++ *   drivers/misc/mediatek/fmradio/inc/fm_ioctl.h:19-20,70,81
++ *   drivers/misc/mediatek/fmradio/core/fm_module.c:294-315,735-757
++ *
++ * The two ioctls carry a 12 byte payload made of three little endian 32 bit
++ * words.  Downstream declares the command with a pointer type in _IOWR()
++ * ("struct fm_i2s_setting *"), so its 32-bit command word encodes
++ * _IOC_SIZE == 4 even though twelve bytes are transferred; the kernel driver
++ * copies the full structure itself.  The __u32 payload type below reproduces
++ * that command word on both 32-bit and 64-bit builds, which keeps the ABI of
++ * the shipped 32-bit ROM.
++ */
++
++#ifndef _UAPI_LINUX_MTK_FM_I2S_H
++#define _UAPI_LINUX_MTK_FM_I2S_H
++
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++/* fm_interface.h:59-63 */
++struct fm_i2s_setting {
++	__s32 onoff;		/* fm_i2s_state_e */
++	__s32 mode;		/* fm_i2s_mode_e */
++	__s32 sample;		/* fm_i2s_sample_e */
++};
++
++/* fm_interface.h:82-87 */
++struct fm_i2s_info {
++	__s32 status;		/* fm_i2s_state_e, FM_I2S_STATE_ERR on error */
++	__s32 mode;		/* fm_i2s_mode_e, FM_I2S_MODE_ERR on error */
++	__s32 rate;		/* fm_i2s_sample_e, FM_I2S_SR_ERR on error */
++};
++
++/* fm_interface.h:64-68 */
++#define FM_I2S_ON		0
++#define FM_I2S_OFF		1
++#define FM_I2S_STATE_ERR	2
++
++/* fm_interface.h:70-74 */
++#define FM_I2S_MASTER		0
++#define FM_I2S_SLAVE		1
++#define FM_I2S_MODE_ERR		2
++
++/* fm_interface.h:76-80 */
++#define FM_I2S_32K		0
++#define FM_I2S_44K		1
++#define FM_I2S_48K		2
++#define FM_I2S_SR_ERR		3
++
++/* fm_ioctl.h:19-20,70,81 */
++#define FM_IOC_MAGIC		0xf5
++#define FM_IOCTL_I2S_SETTING	_IOWR(FM_IOC_MAGIC, 33, __u32)
++#define FM_IOCTL_GET_I2S_INFO	_IOWR(FM_IOC_MAGIC, 41, __u32)
++
++#endif /* _UAPI_LINUX_MTK_FM_I2S_H */
+diff --git a/tools/mediatek/wcn/fm_i2s/Makefile b/tools/mediatek/wcn/fm_i2s/Makefile
+new file mode 100644
+index 000000000..aeee3eba1
+--- /dev/null
++++ b/tools/mediatek/wcn/fm_i2s/Makefile
+@@ -0,0 +1,36 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# Host build for the MT6627 FM I2S control helper.
++#
++# The UAPI header is taken from the kernel tree this tool ships with.  It is
++# added with -idirafter so that the host's <linux/types.h> and <linux/ioctl.h>
++# are used while <linux/mtk_fm_i2s.h> comes from include/uapi.
++
++CC ?= cc
++KERNEL_UAPI ?= $(abspath $(CURDIR)/../../../../include/uapi)
++
++# Keep the compiler's intermediate files in the build tree: the host /tmp may
++# be small (or full) and it is not part of the deliverable.  An explicit
++# TMPDIR from the environment still wins.
++TMPDIR ?= $(CURDIR)/.tmp
++export TMPDIR
++
++CPPFLAGS += -idirafter $(KERNEL_UAPI)
++CFLAGS ?= -O2 -g
++CFLAGS += -Wall -Wextra -Werror -std=gnu11
++
++all: fm_i2s
++
++fm_i2s: fm_i2s.c selftest.c | $(TMPDIR)
++	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ fm_i2s.c selftest.c
++
++$(TMPDIR):
++	mkdir -p $@
++
++check: fm_i2s
++	./fm_i2s --selftest
++
++clean:
++	rm -rf fm_i2s .tmp
++
++.PHONY: all check clean
+diff --git a/tools/mediatek/wcn/fm_i2s/fm_i2s.c b/tools/mediatek/wcn/fm_i2s/fm_i2s.c
+new file mode 100644
+index 000000000..44d00c051
+--- /dev/null
++++ b/tools/mediatek/wcn/fm_i2s/fm_i2s.c
+@@ -0,0 +1,221 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MT6627 FM I2S control helper.
++ *
++ * Exercises the two private ioctls of the mtk_wcn_fm driver through the
++ * shared UAPI header (include/uapi/linux/mtk_fm_i2s.h):
++ *
++ *   FM_IOCTL_I2S_SETTING  enable/disable the chip I2S port
++ *   FM_IOCTL_GET_I2S_INFO read back status, mode and sample rate
++ *
++ * The ioctl numbers are the downstream ones (fm_ioctl.h:70,81) and the payload
++ * is the downstream 12 byte structure.  The driver rejects a mode or rate other
++ * than the fixed MT6627 configuration (master, 32 kHz) with -EOPNOTSUPP.
++ *
++ * The radio device is a V4L2 radio node, normally /dev/radio0.
++ */
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++#include <linux/mtk_fm_i2s.h>
++
++/* Offline ABI self-test, selftest.c. */
++int fm_i2s_selftest(void);
++
++#define DEFAULT_DEVICE	"/dev/radio0"
++
++static const char *const state_names[] = {
++	[FM_I2S_ON] = "on",
++	[FM_I2S_OFF] = "off",
++	[FM_I2S_STATE_ERR] = "error",
++};
++
++static const char *const mode_names[] = {
++	[FM_I2S_MASTER] = "master",
++	[FM_I2S_SLAVE] = "slave",
++	[FM_I2S_MODE_ERR] = "error",
++};
++
++static const char *const rate_names[] = {
++	[FM_I2S_32K] = "32k",
++	[FM_I2S_44K] = "44k",
++	[FM_I2S_48K] = "48k",
++	[FM_I2S_SR_ERR] = "error",
++};
++
++static const char *lookup(const char *const *names, size_t n, int value)
++{
++	if (value < 0 || (size_t)value >= n)
++		return "invalid";
++	return names[value];
++}
++
++static void usage(const char *prog)
++{
++	fprintf(stderr,
++		"usage: %s [device] get\n"
++		"       %s [device] set <on|off> [master|slave] [32k|44k|48k]\n"
++		"       %s --selftest\n"
++		"\n"
++		"Defaults: device %s, mode master, rate 32k.\n",
++		prog, prog, prog, DEFAULT_DEVICE);
++}
++
++static int do_get(int fd)
++{
++	struct fm_i2s_info info;
++	int ret;
++
++	memset(&info, 0, sizeof(info));
++	ret = ioctl(fd, FM_IOCTL_GET_I2S_INFO, &info);
++	if (ret < 0) {
++		fprintf(stderr, "FM_IOCTL_GET_I2S_INFO: %s\n",
++			strerror(errno));
++		return 1;
++	}
++
++	printf("status: %s (%d)\n", lookup(state_names,
++					  sizeof(state_names) /
++					  sizeof(state_names[0]),
++					  info.status), info.status);
++	printf("mode:   %s (%d)\n", lookup(mode_names,
++					  sizeof(mode_names) /
++					  sizeof(mode_names[0]),
++					  info.mode), info.mode);
++	printf("rate:   %s (%d)\n", lookup(rate_names,
++					  sizeof(rate_names) /
++					  sizeof(rate_names[0]),
++					  info.rate), info.rate);
++
++	return 0;
++}
++
++static int parse_mode(const char *arg)
++{
++	if (!strcmp(arg, "master"))
++		return FM_I2S_MASTER;
++	if (!strcmp(arg, "slave"))
++		return FM_I2S_SLAVE;
++	return -1;
++}
++
++static int parse_rate(const char *arg)
++{
++	if (!strcmp(arg, "32k"))
++		return FM_I2S_32K;
++	if (!strcmp(arg, "44k"))
++		return FM_I2S_44K;
++	if (!strcmp(arg, "48k"))
++		return FM_I2S_48K;
++	return -1;
++}
++
++static int do_set(int fd, const char *onoff, const char *modearg,
++		  const char *ratearg)
++{
++	struct fm_i2s_setting cfg;
++	int ret;
++
++	memset(&cfg, 0, sizeof(cfg));
++
++	if (!strcmp(onoff, "on"))
++		cfg.onoff = FM_I2S_ON;
++	else if (!strcmp(onoff, "off"))
++		cfg.onoff = FM_I2S_OFF;
++	else {
++		fprintf(stderr, "invalid on/off value \"%s\"\n", onoff);
++		return 2;
++	}
++
++	if (modearg) {
++		cfg.mode = parse_mode(modearg);
++		if (cfg.mode < 0) {
++			fprintf(stderr, "invalid mode \"%s\"\n", modearg);
++			return 2;
++		}
++	}
++
++	if (ratearg) {
++		cfg.sample = parse_rate(ratearg);
++		if (cfg.sample < 0) {
++			fprintf(stderr, "invalid rate \"%s\"\n", ratearg);
++			return 2;
++		}
++	}
++
++	ret = ioctl(fd, FM_IOCTL_I2S_SETTING, &cfg);
++	if (ret < 0) {
++		fprintf(stderr, "FM_IOCTL_I2S_SETTING(%s, %s, %s): %s\n",
++			onoff,
++			lookup(mode_names, sizeof(mode_names) /
++			       sizeof(mode_names[0]), cfg.mode),
++			lookup(rate_names, sizeof(rate_names) /
++			       sizeof(rate_names[0]), cfg.sample),
++			strerror(errno));
++		return 1;
++	}
++
++	printf("FM I2S port set to %s\n", onoff);
++
++	return 0;
++}
++
++int main(int argc, char **argv)
++{
++	const char *device = DEFAULT_DEVICE;
++	const char *command;
++	int fd, ret;
++
++	if (argc >= 2 && !strcmp(argv[1], "--selftest"))
++		return fm_i2s_selftest();
++
++	if (argc < 2) {
++		usage(argv[0]);
++		return 2;
++	}
++
++	/* First argument may be the device node. */
++	if (argv[1][0] == '/') {
++		device = argv[1];
++		argc--;
++		argv++;
++	}
++
++	if (argc < 2) {
++		usage(device);
++		return 2;
++	}
++	command = argv[1];
++
++	fd = open(device, O_RDONLY | O_NONBLOCK);
++	if (fd < 0) {
++		fprintf(stderr, "cannot open %s: %s\n", device,
++			strerror(errno));
++		return 1;
++	}
++
++	if (!strcmp(command, "get")) {
++		ret = do_get(fd);
++	} else if (!strcmp(command, "set")) {
++		if (argc < 3 || argc > 5) {
++			usage(device);
++			close(fd);
++			return 2;
++		}
++		ret = do_set(fd, argv[2], argc > 3 ? argv[3] : NULL,
++			     argc > 4 ? argv[4] : NULL);
++	} else {
++		usage(device);
++		ret = 2;
++	}
++
++	close(fd);
++
++	return ret;
++}
+diff --git a/tools/mediatek/wcn/fm_i2s/selftest.c b/tools/mediatek/wcn/fm_i2s/selftest.c
+new file mode 100644
+index 000000000..4bc73a1ad
+--- /dev/null
++++ b/tools/mediatek/wcn/fm_i2s/selftest.c
+@@ -0,0 +1,138 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Offline self-test for the MT6627 FM I2S control ABI.
++ *
++ * Checks the parts that must not drift from the driver and from the shipped
++ * 32-bit ROM: structure size and offsets, the enum values, and the exact ioctl
++ * command words (FM_IOC_MAGIC 0xf5, numbers 33 and 41, _IOC_SIZE 4 because
++ * downstream declares the payload as a pointer).  No radio device is needed.
++ */
++
++#include <stddef.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/ioctl.h>
++
++#include <linux/mtk_fm_i2s.h>
++
++static unsigned int checks;
++static unsigned int failures;
++
++#define CHECK(cond)							\
++	do {								\
++		checks++;						\
++		if (!(cond)) {						\
++			fprintf(stderr, "FAIL: %s\n", #cond);		\
++			failures++;					\
++		}							\
++	} while (0)
++
++static void check_layout(void)
++{
++	CHECK(sizeof(struct fm_i2s_setting) == 12);
++	CHECK(offsetof(struct fm_i2s_setting, onoff) == 0);
++	CHECK(offsetof(struct fm_i2s_setting, mode) == 4);
++	CHECK(offsetof(struct fm_i2s_setting, sample) == 8);
++
++	CHECK(sizeof(struct fm_i2s_info) == 12);
++	CHECK(offsetof(struct fm_i2s_info, status) == 0);
++	CHECK(offsetof(struct fm_i2s_info, mode) == 4);
++	CHECK(offsetof(struct fm_i2s_info, rate) == 8);
++}
++
++static void check_enums(void)
++{
++	/* fm_interface.h:64-80 */
++	CHECK(FM_I2S_ON == 0);
++	CHECK(FM_I2S_OFF == 1);
++	CHECK(FM_I2S_STATE_ERR == 2);
++	CHECK(FM_I2S_MASTER == 0);
++	CHECK(FM_I2S_SLAVE == 1);
++	CHECK(FM_I2S_MODE_ERR == 2);
++	CHECK(FM_I2S_32K == 0);
++	CHECK(FM_I2S_44K == 1);
++	CHECK(FM_I2S_48K == 2);
++	CHECK(FM_I2S_SR_ERR == 3);
++}
++
++static void check_commands(void)
++{
++	/*
++	 * Downstream fm_ioctl.h:70,81 builds the command from a pointer type,
++	 * which is 4 bytes in the 32-bit ROM userspace, so the wire command is
++	 * _IOC(_IOC_READ | _IOC_WRITE, 0xf5, nr, 4).
++	 */
++	CHECK(_IOC_TYPE(FM_IOCTL_I2S_SETTING) == FM_IOC_MAGIC);
++	CHECK(_IOC_NR(FM_IOCTL_I2S_SETTING) == 33);
++	CHECK(_IOC_SIZE(FM_IOCTL_I2S_SETTING) == 4);
++	CHECK((_IOC_DIR(FM_IOCTL_I2S_SETTING) & (_IOC_READ | _IOC_WRITE)) ==
++	      (_IOC_READ | _IOC_WRITE));
++	CHECK(FM_IOCTL_I2S_SETTING == 0xc004f521U);
++
++	CHECK(_IOC_TYPE(FM_IOCTL_GET_I2S_INFO) == FM_IOC_MAGIC);
++	CHECK(_IOC_NR(FM_IOCTL_GET_I2S_INFO) == 41);
++	CHECK(_IOC_SIZE(FM_IOCTL_GET_I2S_INFO) == 4);
++	CHECK((_IOC_DIR(FM_IOCTL_GET_I2S_INFO) & (_IOC_READ | _IOC_WRITE)) ==
++	      (_IOC_READ | _IOC_WRITE));
++	CHECK(FM_IOCTL_GET_I2S_INFO == 0xc004f529U);
++}
++
++static void check_request(const struct fm_i2s_setting *cfg,
++			  const unsigned char *wire)
++{
++	/* Three little endian s32 words, in structure order. */
++	CHECK(wire[0] == (unsigned char)(cfg->onoff & 0xff));
++	CHECK(wire[4] == (unsigned char)(cfg->mode & 0xff));
++	CHECK(wire[8] == (unsigned char)(cfg->sample & 0xff));
++	CHECK(((unsigned int)wire[3] << 24 | (unsigned int)wire[2] << 16 |
++	       (unsigned int)wire[1] << 8 | wire[0]) ==
++	      (unsigned int)cfg->onoff);
++	CHECK(((unsigned int)wire[7] << 24 | (unsigned int)wire[6] << 16 |
++	       (unsigned int)wire[5] << 8 | wire[4]) ==
++	      (unsigned int)cfg->mode);
++	CHECK(((unsigned int)wire[11] << 24 | (unsigned int)wire[10] << 16 |
++	       (unsigned int)wire[9] << 8 | wire[8]) ==
++	      (unsigned int)cfg->sample);
++}
++
++static void check_payload(void)
++{
++	struct fm_i2s_setting cfg = {
++		.onoff = FM_I2S_OFF,
++		.mode = FM_I2S_MASTER,
++		.sample = FM_I2S_32K,
++	};
++	struct fm_i2s_info info = {
++		.status = FM_I2S_ON,
++		.mode = FM_I2S_MASTER,
++		.rate = FM_I2S_32K,
++	};
++	unsigned char wire[12];
++
++	memset(wire, 0, sizeof(wire));
++	memcpy(wire, &cfg, sizeof(cfg));
++	check_request(&cfg, wire);
++
++	memset(wire, 0, sizeof(wire));
++	memcpy(wire, &info, sizeof(info));
++	CHECK(wire[0] == FM_I2S_ON);
++	CHECK(wire[4] == FM_I2S_MASTER);
++	CHECK(wire[8] == FM_I2S_32K);
++}
++
++int fm_i2s_selftest(void)
++{
++	check_layout();
++	check_enums();
++	check_commands();
++	check_payload();
++
++	if (failures) {
++		fprintf(stderr, "fm_i2s selftest: FAIL (%u/%u checks)\n",
++			failures, checks);
++		return 1;
++	}
++
++	printf("fm_i2s selftest: PASS (%u checks)\n", checks);
++	return 0;
++}

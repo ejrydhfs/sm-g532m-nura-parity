@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# MediaTek FM radio (MT6627 FM function) over STP.
+
+config MTK_WCN_FM
+	tristate "MediaTek WCN FM radio driver"
+	depends on MTK_WCN_WMT
+	depends on MEDIA_SUPPORT
+	depends on VIDEO_DEV
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	select RFKILL
+	help
+	  V4L2 radio driver for the MediaTek MT6627 FM receiver embedded in
+	  the connectivity subsystem.  Tuning and RDS are carried over the
+	  STP FM channel; audio is routed through the SoC I2S interface.
+
+	  The module is called mtk_wcn_fm.

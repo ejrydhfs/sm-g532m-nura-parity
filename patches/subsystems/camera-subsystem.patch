@@ -1,0 +1,4466 @@
+diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
+index 5eb1e0e0a..362a0b421 100644
+--- a/drivers/media/i2c/Kconfig
++++ b/drivers/media/i2c/Kconfig
+@@ -179,6 +179,18 @@ config VIDEO_IMX219
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called imx219.
+ 
++config VIDEO_IMX219_EEPROM
++	tristate "Samsung IMX219 module EEPROM support"
++	depends on I2C && NVMEM
++	help
++	  This is a driver for the calibration EEPROM of Samsung IMX219
++	  camera modules. It exposes the module manufacturer information,
++	  the Samsung module ID and the AF macro/pan calibration values as
++	  a read-only NVMEM device and as sysfs attributes.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called imx219-eeprom.
++
+ config VIDEO_IMX258
+ 	tristate "Sony IMX258 sensor support"
+ 	select V4L2_CCI_I2C
+@@ -772,6 +784,16 @@ config VIDEO_S5K5BAF
+ 	  This is a V4L2 sensor driver for Samsung S5K5BAF 2M
+ 	  camera sensor with an embedded SoC image signal processor.
+ 
++config VIDEO_S5K5E3YX
++	tristate "Samsung S5K5E3YX sensor support"
++	select V4L2_CCI_I2C
++	help
++	  This is a Video4Linux2 sensor driver for the Samsung S5K5E3YX
++	  5MP raw camera sensor.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called s5k5e3yx.
++
+ config VIDEO_S5K6A3
+ 	tristate "Samsung S5K6A3 sensor support"
+ 	help
+diff --git a/drivers/media/i2c/Makefile b/drivers/media/i2c/Makefile
+index a3a6396df..1be95e883 100644
+--- a/drivers/media/i2c/Makefile
++++ b/drivers/media/i2c/Makefile
+@@ -50,6 +50,7 @@ obj-$(CONFIG_VIDEO_IMX111) += imx111.o
+ obj-$(CONFIG_VIDEO_IMX208) += imx208.o
+ obj-$(CONFIG_VIDEO_IMX214) += imx214.o
+ obj-$(CONFIG_VIDEO_IMX219) += imx219.o
++obj-$(CONFIG_VIDEO_IMX219_EEPROM) += imx219-eeprom.o
+ obj-$(CONFIG_VIDEO_IMX258) += imx258.o
+ obj-$(CONFIG_VIDEO_IMX274) += imx274.o
+ obj-$(CONFIG_VIDEO_IMX283) += imx283.o
+@@ -128,6 +129,7 @@ obj-$(CONFIG_VIDEO_RJ54N1) += rj54n1cb0c.o
+ obj-$(CONFIG_VIDEO_S5C73M3) += s5c73m3/
+ obj-$(CONFIG_VIDEO_S5K3M5) += s5k3m5.o
+ obj-$(CONFIG_VIDEO_S5K5BAF) += s5k5baf.o
++obj-$(CONFIG_VIDEO_S5K5E3YX) += s5k5e3yx.o
+ obj-$(CONFIG_VIDEO_S5K6A3) += s5k6a3.o
+ obj-$(CONFIG_VIDEO_S5KJN1) += s5kjn1.o
+ obj-$(CONFIG_VIDEO_SAA6588) += saa6588.o
+diff --git a/drivers/media/i2c/dw9807-vcm.c b/drivers/media/i2c/dw9807-vcm.c
+index 4148009e0..b05291f29 100644
+--- a/drivers/media/i2c/dw9807-vcm.c
++++ b/drivers/media/i2c/dw9807-vcm.c
+@@ -1,11 +1,31 @@
+ // SPDX-License-Identifier: GPL-2.0
+ // Copyright (C) 2018 Intel Corporation
++/*
++ * Port from Samsung/MTK downstream
++ * drivers/misc/mediatek/lens/common/dw9807af/DW9807AF.c
++ * (Copyright (C) 2015 MediaTek Inc., GPL-2.0).
++ *
++ * The downstream AF driver is an ioctl-based character driver attached to the
++ * "mediatek,camera_main_af" i2c node (7-bit address 0x0c).  This file keeps
++ * the upstream V4L2 subdev model and only adopts the downstream register
++ * programming: 10-bit DAC split over 0x03/0x04 (already identical upstream)
++ * and the "ring control mode" value written to 0x02 when the module is
++ * powered up.  The latter is gated on the "samsung,dw9807-vcm" compatible
++ * through OF match data, so "dongwoon,dw9807-vcm" / "dongwoon,dw9807" keep
++ * the upstream direct-mode power-up unchanged.
++ *
++ * The downstream eflash helpers s4DW9807AF_Eflash_ReadReg()/_WriteReg() poke a
++ * separate EEPROM slave on the same adapter; they are NOT implemented here.
++ * That calibration data is provided by the imx219-eeprom nvmem driver
++ * (drivers/media/i2c/imx219-eeprom.c).
++ */
+ 
+ #include <linux/acpi.h>
+ #include <linux/delay.h>
+ #include <linux/i2c.h>
+ #include <linux/iopoll.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/pm_runtime.h>
+ #include <media/v4l2-ctrls.h>
+ #include <media/v4l2-device.h>
+@@ -36,12 +56,32 @@
+ #define DW9807_MODE_ADDR	0x06
+ #define DW9807_RESONANCE_ADDR	0x07
+ 
++/*
++ * Control register 0x02 values.  The Samsung/MTK module needs "ring control
++ * mode" (bit 1) at power-up: DW9807AF.c:190-194 initdrv() writes 0x02 = 0x02.
++ * The generic (Dongwoon) path keeps the upstream value 0x00 (direct mode,
++ * power down cleared) so existing users see no change.
++ */
++#define DW9807_CTL_DIRECT	0x00
++#define DW9807_CTL_PD		0x01
++#define DW9807_CTL_RING		0x02
++
+ #define MAX_RETRY		10
+ 
++/**
++ * struct dw9807_match_data - per-compatible quirks
++ * @ring_mode: power up in ring control mode (0x02 = 0x02) instead of the
++ *             upstream direct mode (0x02 = 0x00)
++ */
++struct dw9807_match_data {
++	bool ring_mode;
++};
++
+ struct dw9807_device {
+ 	struct v4l2_ctrl_handler ctrls_vcm;
+ 	struct v4l2_subdev sd;
+ 	u16 current_val;
++	bool ring_mode;
+ };
+ 
+ static inline struct dw9807_device *sd_to_dw9807_vcm(
+@@ -75,6 +115,13 @@ static int dw9807_i2c_check(struct i2c_client *client)
+ 
+ static int dw9807_set_dac(struct i2c_client *client, u16 data)
+ {
++	/*
++	 * 10-bit DAC split over 0x03 (bits 1:0) and 0x04, identical to the
++	 * downstream driver's s4AF_WriteReg() (DW9807AF.c:128-161): MSB is
++	 * masked with 0x03 and LSB carries the low 8 bits.  The downstream
++	 * driver issues two 2-byte writes (0x03 then 0x04); the 3-byte
++	 * auto-increment write below lands on the same two registers.
++	 */
+ 	const char tx_data[3] = {
+ 		DW9807_MSB_ADDR, ((data >> 8) & 0x03), (data & 0xff)
+ 	};
+@@ -177,6 +224,7 @@ static int dw9807_init_controls(struct dw9807_device *dev_vcm)
+ 
+ static int dw9807_probe(struct i2c_client *client)
+ {
++	const struct dw9807_match_data *data;
+ 	struct dw9807_device *dw9807_dev;
+ 	int rval;
+ 
+@@ -185,6 +233,14 @@ static int dw9807_probe(struct i2c_client *client)
+ 	if (dw9807_dev == NULL)
+ 		return -ENOMEM;
+ 
++	/*
++	 * Only "samsung,dw9807-vcm" carries match data; any other compatible
++	 * (or a non-OF match) keeps ring_mode = false, i.e. the upstream
++	 * direct-mode power-up.
++	 */
++	data = of_device_get_match_data(&client->dev);
++	dw9807_dev->ring_mode = data ? data->ring_mode : false;
++
+ 	v4l2_i2c_subdev_init(&dw9807_dev->sd, client, &dw9807_ops);
+ 	dw9807_dev->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+ 	dw9807_dev->sd.internal_ops = &dw9807_int_ops;
+@@ -236,7 +292,7 @@ static int __maybe_unused dw9807_vcm_suspend(struct device *dev)
+ 	struct i2c_client *client = to_i2c_client(dev);
+ 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+ 	struct dw9807_device *dw9807_dev = sd_to_dw9807_vcm(sd);
+-	const char tx_data[2] = { DW9807_CTL_ADDR, 0x01 };
++	const char tx_data[2] = { DW9807_CTL_ADDR, DW9807_CTL_PD };
+ 	int ret, val;
+ 
+ 	for (val = dw9807_dev->current_val & ~(DW9807_CTRL_STEPS - 1);
+@@ -268,10 +324,18 @@ static int  __maybe_unused dw9807_vcm_resume(struct device *dev)
+ 	struct i2c_client *client = to_i2c_client(dev);
+ 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+ 	struct dw9807_device *dw9807_dev = sd_to_dw9807_vcm(sd);
+-	const char tx_data[2] = { DW9807_CTL_ADDR, 0x00 };
++	const char tx_data[2] = {
++		DW9807_CTL_ADDR,
++		dw9807_dev->ring_mode ? DW9807_CTL_RING : DW9807_CTL_DIRECT
++	};
+ 	int ret, val;
+ 
+-	/* Power on */
++	/*
++	 * Power on.  Samsung/MTK modules additionally need ring control mode,
++	 * written by the downstream driver at the first lens move
++	 * (DW9807AF.c:190-194, 209); every other compatible keeps the upstream
++	 * direct-mode value so their behaviour is unchanged.
++	 */
+ 	ret = i2c_master_send(client, tx_data, sizeof(tx_data));
+ 	if (ret < 0) {
+ 		dev_err(&client->dev, "I2C write CTL fail ret = %d\n", ret);
+@@ -291,7 +355,20 @@ static int  __maybe_unused dw9807_vcm_resume(struct device *dev)
+ 	return 0;
+ }
+ 
++static const struct dw9807_match_data dw9807_samsung_data = {
++	.ring_mode = true,
++};
++
+ static const struct of_device_id dw9807_of_table[] = {
++	/*
++	 * Samsung/MTK modules (downstream i2c node "camera_main_af@18",
++	 * i.e. 7-bit address 0x0c, DW9807AF.c:29 AF_I2C_SLAVE_ADDR 0x18).
++	 * These power up in ring control mode (DW9807AF.c:190-194).
++	 */
++	{
++		.compatible = "samsung,dw9807-vcm",
++		.data = &dw9807_samsung_data,
++	},
+ 	{ .compatible = "dongwoon,dw9807-vcm" },
+ 	/* Compatibility for older firmware, NEVER USE THIS IN FIRMWARE! */
+ 	{ .compatible = "dongwoon,dw9807" },
+diff --git a/drivers/media/i2c/imx219-eeprom.c b/drivers/media/i2c/imx219-eeprom.c
+new file mode 100644
+index 000000000..f3ccaea77
+--- /dev/null
++++ b/drivers/media/i2c/imx219-eeprom.c
+@@ -0,0 +1,392 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Samsung/MTK IMX219 module EEPROM (camera calibration data) provider
++ *
++ * Port from Samsung/MTK downstream
++ *   drivers/misc/mediatek/imgsensor/src/mt6735/imx219_mipi_raw/imx219_eeprom.c
++ *   drivers/misc/mediatek/cam_cal/src/mt6735/imx219_eeprom/imx219_eeprom.c
++ *   drivers/misc/mediatek/cam_cal/inc/cam_cal.h
++ * (Copyright (C) 2015 MediaTek Inc., GPL-2.0)
++ *
++ * Downstream exposes the calibration data in two ways:
++ *   - a character device ("CAM_CAL_DRV") with the CAM_CALIOC_G_READ ioctl
++ *     (cam_cal.h:40) which copies pre-parsed bytes to userspace, and
++ *   - Samsung LED class attributes in drivers/leds/leds_s2mu005.c
++ *     (rear_camfw/rear_afcal/rear_moduleid, lines 730-1080) backed by
++ *     get_imx219_mfr_info(), get_imx219_af_macro_cal(),
++ *     get_imx219_af_pan_cal() and get_imx219_moduleid().
++ *
++ * This driver keeps the data, drops the legacy ABI: the EEPROM is exported as
++ * a read-only nvmem device (consumers/cells resolve through the DT layout)
++ * plus sysfs attributes carrying the same fields the downstream getters
++ * returned.  The CAM_CALIOC_G_READ -> nvmem mapping is documented in
++ * $M/logs/camera-lens-cal.md.
++ *
++ * Layout, all offsets are EEPROM byte offsets:
++ *   0x0020..0x002a  manufacturer information string, 11 bytes
++ *                   (imx219_eeprom.c:413-416 get_imx219_mfr_info)
++ *   0x0050..0x0059  Samsung module ID, 10 bytes
++ *                   (imx219_eeprom.c:427-431, CONFIG_GET_REAR_MODULE_ID=y)
++ *   0x010c..0x010f  AF macro calibration, little endian u32
++ *                   (imx219_eeprom.c:366, 418-421)
++ *   0x0110..0x0113  AF pan/infinity calibration, little endian u32
++ *                   (imx219_eeprom.c:367, 422-426)
++ *   0x0300..0x0301  LSC block length (little endian u16), payload follows
++ *                   (imx219_eeprom.c:324-332)
++ *
++ * The legacy "mtk format" block read by read_imx219_eeprom_mtk_fmt() uses a
++ * different slave address (0xa0..0xa6, i.e. the 24C16 page aliases) and is
++ * only invoked by the mt6735m sensor variant
++ * (imgsensor/src/mt6735m/imx219_mipi_raw/imx219mipiraw_Sensor.c:1238); it is
++ * not registered here.
++ */
++
++#include <linux/device.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/nvmem-provider.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++
++/*
++ * Downstream read address for the sysfs block: IMX219_EEPROM_DEVICE_ID is
++ * 0xb0 (imx219_eeprom.h:40) and iReadRegI2C() stores "i2cId >> 1" into the
++ * i2c client (kd_sensorlist.c:454-462), so the 7-bit address is 0x58.  The
++ * DT node must use reg = <0x58>.
++ *
++ * read_cmos_sensor() always sends two address bytes, high byte first
++ * (imx219_eeprom.c:151-157), i.e. 16-bit register addressing.  Confirmed in
++ * the shipped ROM: read_imx219_eeprom() at 0xc04f4598 sends a 2-byte buffer
++ * with a_sizeSendData = 2.  Hence no SMBus byte/word register accessor can be
++ * used for the address phase; a raw 2-byte write plus a 1-byte read is
++ * required.
++ */
++#define IMX219_EEPROM_ADDR_LEN		2
++
++#define IMX219_EEPROM_MFR_INFO_OFFSET	0x0020
++#define IMX219_EEPROM_MFR_INFO_LEN	11
++#define IMX219_EEPROM_MODULE_ID_OFFSET	0x0050
++#define IMX219_EEPROM_MODULE_ID_LEN	10
++#define IMX219_EEPROM_AF_MACRO_OFFSET	0x010c
++#define IMX219_EEPROM_AF_PAN_OFFSET	0x0110
++#define IMX219_EEPROM_AF_CAL_LEN	4
++
++/*
++ * Downstream declares no total device size.  The highest fixed offset it
++ * reads is the LSC length prefix at 0x300 (imx219_eeprom.c:324-332); 0x400
++ * keeps every metadata field and the LSC header addressable without claiming
++ * a part size.  [INFERENCE]
++ */
++#define IMX219_EEPROM_SIZE		0x400
++
++/* Downstream sentinel: the calibration u32s start at -1 (imx219_eeprom.c:362). */
++#define IMX219_EEPROM_CAL_INVALID	0xffffffff
++
++/**
++ * struct imx219_eeprom - module EEPROM state
++ * @client: i2c client of the EEPROM
++ * @lock: serialises the byte accesses issued on the shared adapter
++ * @nvmem: registered nvmem device
++ */
++struct imx219_eeprom {
++	struct i2c_client *client;
++	struct mutex lock;
++	struct nvmem_device *nvmem;
++};
++
++/*
++ * Read one byte at @offset.  This is the same transfer the downstream helper
++ * performs: address write (2 bytes, big endian) followed by a 1-byte read
++ * (imx219_eeprom.c:151-157), expressed here as a single i2c_transfer so that
++ * the address phase uses a repeated start.
++ */
++static int imx219_eeprom_read_byte(struct imx219_eeprom *eeprom, u16 offset,
++				   u8 *val)
++{
++	struct i2c_client *client = eeprom->client;
++	u8 addr[IMX219_EEPROM_ADDR_LEN] = { offset >> 8, offset & 0xff };
++	struct i2c_msg msgs[2] = {
++		{
++			.addr = client->addr,
++			.flags = 0,
++			.len = sizeof(addr),
++			.buf = addr,
++		}, {
++			.addr = client->addr,
++			.flags = I2C_M_RD,
++			.len = 1,
++			.buf = val,
++		},
++	};
++	int ret;
++
++	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
++	if (ret < 0)
++		return ret;
++	if (ret != ARRAY_SIZE(msgs))
++		return -EIO;
++
++	return 0;
++}
++
++static int imx219_eeprom_nvmem_read(void *priv, unsigned int offset,
++				    void *val, size_t bytes)
++{
++	struct imx219_eeprom *eeprom = priv;
++	u8 *buf = val;
++	size_t i;
++	int ret;
++
++	if (offset > IMX219_EEPROM_SIZE || bytes > IMX219_EEPROM_SIZE - offset)
++		return -EINVAL;
++
++	mutex_lock(&eeprom->lock);
++	for (i = 0; i < bytes; i++) {
++		ret = imx219_eeprom_read_byte(eeprom, offset + i, &buf[i]);
++		if (ret)
++			goto out;
++	}
++	ret = 0;
++
++out:
++	mutex_unlock(&eeprom->lock);
++
++	return ret;
++}
++
++static int imx219_eeprom_read_block(struct imx219_eeprom *eeprom,
++				    u16 offset, void *buf, size_t len)
++{
++	return imx219_eeprom_nvmem_read(eeprom, offset, buf, len);
++}
++
++/*
++ * Unprogrammed modules read back all-0x00 or all-0xff.  Downstream did not
++ * check this and happily printed the raw bytes; returning -ENODATA keeps
++ * erased data from being presented as calibration.  [INFERENCE]
++ */
++static bool imx219_eeprom_block_is_blank(const u8 *buf, size_t len)
++{
++	size_t i;
++
++	for (i = 0; i < len; i++)
++		if (buf[i] != 0x00 && buf[i] != 0xff)
++			return false;
++
++	return true;
++}
++
++/*
++ * The downstream readers fill a u32 byte by byte from increasing offsets
++ * (imx219_eeprom.c:370-380) on a little endian CPU, hence little endian.
++ */
++static int imx219_eeprom_read_cal(struct imx219_eeprom *eeprom, u16 offset,
++				  u32 *val)
++{
++	u8 raw[IMX219_EEPROM_AF_CAL_LEN];
++	int ret;
++
++	ret = imx219_eeprom_read_block(eeprom, offset, raw, sizeof(raw));
++	if (ret)
++		return ret;
++
++	*val = (u32)raw[0] | ((u32)raw[1] << 8) |
++	       ((u32)raw[2] << 16) | ((u32)raw[3] << 24);
++
++	return 0;
++}
++
++static ssize_t mfr_info_show(struct device *dev, struct device_attribute *attr,
++			     char *buf)
++{
++	struct imx219_eeprom *eeprom = dev_get_drvdata(dev);
++	char info[IMX219_EEPROM_MFR_INFO_LEN + 1] = { 0 };
++	int ret;
++
++	ret = imx219_eeprom_read_block(eeprom, IMX219_EEPROM_MFR_INFO_OFFSET,
++				       info, IMX219_EEPROM_MFR_INFO_LEN);
++	if (ret)
++		return ret;
++
++	if (imx219_eeprom_block_is_blank(info, IMX219_EEPROM_MFR_INFO_LEN))
++		return -ENODATA;
++
++	return sysfs_emit(buf, "%s\n", info);
++}
++
++static ssize_t module_id_show(struct device *dev, struct device_attribute *attr,
++			      char *buf)
++{
++	struct imx219_eeprom *eeprom = dev_get_drvdata(dev);
++	u8 id[IMX219_EEPROM_MODULE_ID_LEN];
++	int ret;
++
++	ret = imx219_eeprom_read_block(eeprom, IMX219_EEPROM_MODULE_ID_OFFSET,
++				       id, sizeof(id));
++	if (ret)
++		return ret;
++
++	if (imx219_eeprom_block_is_blank(id, sizeof(id)))
++		return -ENODATA;
++
++	/* Same formatting as leds_s2mu005.c:1042-1057. */
++	return sysfs_emit(buf, "%c%c%c%c%c%02X%02X%02X%02X%02X\n",
++			  id[0], id[1], id[2], id[3], id[4],
++			  id[5], id[6], id[7], id[8], id[9]);
++}
++
++static ssize_t af_macro_cal_show(struct device *dev,
++				 struct device_attribute *attr, char *buf)
++{
++	struct imx219_eeprom *eeprom = dev_get_drvdata(dev);
++	u32 val;
++	int ret;
++
++	ret = imx219_eeprom_read_cal(eeprom, IMX219_EEPROM_AF_MACRO_OFFSET,
++				     &val);
++	if (ret)
++		return ret;
++	if (val == IMX219_EEPROM_CAL_INVALID)
++		return -ENODATA;
++
++	return sysfs_emit(buf, "%u\n", val);
++}
++
++static ssize_t af_pan_cal_show(struct device *dev,
++			       struct device_attribute *attr, char *buf)
++{
++	struct imx219_eeprom *eeprom = dev_get_drvdata(dev);
++	u32 val;
++	int ret;
++
++	ret = imx219_eeprom_read_cal(eeprom, IMX219_EEPROM_AF_PAN_OFFSET, &val);
++	if (ret)
++		return ret;
++	if (val == IMX219_EEPROM_CAL_INVALID)
++		return -ENODATA;
++
++	return sysfs_emit(buf, "%u\n", val);
++}
++
++/*
++ * Combined AF calibration, byte-for-byte compatible with the downstream
++ * "rear_afcal" attribute (leds_s2mu005.c:820-827): "1 <macro> <pan>".
++ */
++static ssize_t afcal_show(struct device *dev, struct device_attribute *attr,
++			  char *buf)
++{
++	struct imx219_eeprom *eeprom = dev_get_drvdata(dev);
++	u32 macro, pan;
++	int ret;
++
++	ret = imx219_eeprom_read_cal(eeprom, IMX219_EEPROM_AF_MACRO_OFFSET,
++				     &macro);
++	if (ret)
++		return ret;
++	ret = imx219_eeprom_read_cal(eeprom, IMX219_EEPROM_AF_PAN_OFFSET, &pan);
++	if (ret)
++		return ret;
++	if (macro == IMX219_EEPROM_CAL_INVALID || pan == IMX219_EEPROM_CAL_INVALID)
++		return -ENODATA;
++
++	return sysfs_emit(buf, "1 %u %u\n", macro, pan);
++}
++
++static DEVICE_ATTR_RO(mfr_info);
++static DEVICE_ATTR_RO(module_id);
++static DEVICE_ATTR_RO(af_macro_cal);
++static DEVICE_ATTR_RO(af_pan_cal);
++static DEVICE_ATTR_RO(afcal);
++
++static struct attribute *imx219_eeprom_attrs[] = {
++	&dev_attr_mfr_info.attr,
++	&dev_attr_module_id.attr,
++	&dev_attr_af_macro_cal.attr,
++	&dev_attr_af_pan_cal.attr,
++	&dev_attr_afcal.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(imx219_eeprom);
++
++static int imx219_eeprom_probe(struct i2c_client *client)
++{
++	struct imx219_eeprom *eeprom;
++	struct nvmem_config config = {
++		.name = "imx219-eeprom",
++		.id = NVMEM_DEVID_NONE,
++		.type = NVMEM_TYPE_EEPROM,
++		.read_only = true,
++		.size = IMX219_EEPROM_SIZE,
++		.word_size = 1,
++		.stride = 1,
++	};
++	int ret;
++
++	eeprom = devm_kzalloc(&client->dev, sizeof(*eeprom), GFP_KERNEL);
++	if (!eeprom)
++		return -ENOMEM;
++
++	mutex_init(&eeprom->lock);
++	eeprom->client = client;
++	dev_set_drvdata(&client->dev, eeprom);
++
++	config.dev = &client->dev;
++	config.of_node = client->dev.of_node;
++	config.priv = eeprom;
++	config.reg_read = imx219_eeprom_nvmem_read;
++
++	/*
++	 * No register access here: the EEPROM shares the module rails with the
++	 * sensor (vcamio/vcama/vcamaf, brought up by the sensor power
++	 * sequence), so it is not readable before the camera is powered.
++	 * Downstream behaves the same way: imx219_update_sysfs_information()
++	 * runs from imx219_open() after the module is powered
++	 * (imx219mipiraw_Sensor.c:1202).
++	 */
++	eeprom->nvmem = devm_nvmem_register(&client->dev, &config);
++	if (IS_ERR(eeprom->nvmem)) {
++		dev_err(&client->dev, "failed to register nvmem device\n");
++		return PTR_ERR(eeprom->nvmem);
++	}
++
++	ret = device_add_groups(&client->dev, imx219_eeprom_groups);
++	if (ret) {
++		dev_err(&client->dev, "failed to add sysfs attributes\n");
++		return ret;
++	}
++
++	return 0;
++}
++
++static void imx219_eeprom_remove(struct i2c_client *client)
++{
++	device_remove_groups(&client->dev, imx219_eeprom_groups);
++}
++
++static const struct of_device_id imx219_eeprom_of_table[] = {
++	{ .compatible = "samsung,imx219-eeprom" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, imx219_eeprom_of_table);
++
++static const struct i2c_device_id imx219_eeprom_id_table[] = {
++	{ "imx219-eeprom", 0 },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(i2c, imx219_eeprom_id_table);
++
++static struct i2c_driver imx219_eeprom_driver = {
++	.driver = {
++		.name = "imx219-eeprom",
++		.of_match_table = imx219_eeprom_of_table,
++	},
++	.probe = imx219_eeprom_probe,
++	.remove = imx219_eeprom_remove,
++	.id_table = imx219_eeprom_id_table,
++};
++
++module_i2c_driver(imx219_eeprom_driver);
++
++MODULE_DESCRIPTION("Samsung/MTK IMX219 module EEPROM calibration provider");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/i2c/imx219.c b/drivers/media/i2c/imx219.c
+index 7da02ce5d..e3dcabac9 100644
+--- a/drivers/media/i2c/imx219.c
++++ b/drivers/media/i2c/imx219.c
+@@ -12,6 +12,12 @@
+  * Flip handling taken from the Sony IMX319 driver.
+  * Copyright (C) 2018 Intel Corporation
+  *
++ * Port from Samsung/MTK downstream driver for the Samsung grandpplte
++ * (SM-G532M) IMX219 module. Register, timing and power sequencing data:
++ *   drivers/misc/mediatek/imgsensor/src/mt6735/imx219_mipi_raw/imx219mipiraw_Sensor.c
++ *   drivers/misc/mediatek/imgsensor/src/mt6735/camera_hw/kd_camera_hw.c
++ * Copyright (C) 2015 MediaTek Inc.
++ *
+  */
+ 
+ #include <linux/clk.h>
+@@ -88,6 +94,14 @@
+ #define IMX219_REG_X_ODD_INC_A		CCI_REG8(0x0170)
+ #define IMX219_REG_Y_ODD_INC_A		CCI_REG8(0x0171)
+ #define IMX219_REG_ORIENTATION		CCI_REG8(0x0172)
++/*
++ * The Samsung module is mounted such that the downstream driver programs
++ * 0x03 for IMAGE_NORMAL and 0x00 for IMAGE_HV_MIRROR
++ * (imx219mipiraw_Sensor.c:600-612), i.e. the register value is the complement
++ * of the mainline "no flip" value. The V4L2 flip controls keep their mainline
++ * meaning and the value is inverted for this module only.
++ */
++#define IMX219_SAMSUNG_ORIENTATION_NORMAL	0x03
+ 
+ /* Binning  Mode */
+ #define IMX219_REG_BINNING_MODE_H	CCI_REG8(0x0174)
+@@ -156,6 +170,27 @@ struct imx219_mode {
+ 
+ 	/* V-timing */
+ 	unsigned int fll_def;
++
++	/*
++	 * Samsung grandpplte module data. All fields are zero for the generic
++	 * modes, in which case the register layout is derived from the active
++	 * format like upstream does.
++	 */
++
++	/* Default line length in pixels (0: IMX219_LLP_MIN) */
++	unsigned int llp_def;
++	/* Sensor pixel clock for this mode (0: generic pixel rate) */
++	unsigned int pixel_rate;
++	/* MIPI link frequency for this mode (0: first menu entry) */
++	s64 link_freq;
++	/* Sensor readout window programmed by this mode */
++	unsigned int crop_left;
++	unsigned int crop_top;
++	unsigned int crop_width;
++	unsigned int crop_height;
++	/* Full register setup, NULL for the generic modes */
++	const struct cci_reg_sequence *regs;
++	unsigned int nr_regs;
+ };
+ 
+ static const struct cci_reg_sequence imx219_common_regs[] = {
+@@ -220,6 +255,184 @@ static const struct cci_reg_sequence imx219_4lane_regs[] = {
+ 	{ IMX219_REG_CSI_LANE_MODE, IMX219_CSI_4_LANE_MODE },
+ };
+ 
++/*
++ * Samsung grandpplte module register setups.
++ *
++ * Every value below is copied verbatim from the downstream mode setting
++ * functions (16-bit register pairs are combined into one CCI_REG16 write):
++ *   3264x2456 @30fps	imx219mipiraw_Sensor.c:640-696  (preview_setting)
++ *			imx219mipiraw_Sensor.c:824-885  (normal_video_setting, same data)
++ *			imx219mipiraw_Sensor.c:733-783  (capture_setting, 30fps branch)
++ *   3280x2464 @24fps	imx219mipiraw_Sensor.c:697-732  (capture_setting, 240 branch)
++ *   816x460   @120fps	imx219mipiraw_Sensor.c:887-948  (hs_video_setting)
++ *   1640x1228 @15fps	imx219mipiraw_Sensor.c:950-1009 (slim_video_setting)
++ *
++ * The downstream trailing "0x0100 = 0x01" (stream on) write is performed by
++ * imx219_enable_streams() after the V4L2 controls have been applied, exactly
++ * like the generic path does, so it is not part of these tables.
++ */
++
++/* 3264x2456 @30fps - preview / capture / normal video */
++static const struct cci_reg_sequence imx219_samsung_3264x2456_regs[] = {
++	{ IMX219_REG_MODE_SELECT, 0x00 },
++	{ CCI_REG8(0x30eb), 0x05 },
++	{ CCI_REG8(0x30eb), 0x0c },
++	{ CCI_REG8(0x300a), 0xff },
++	{ CCI_REG8(0x300b), 0xff },
++	{ CCI_REG8(0x30eb), 0x05 },
++	{ CCI_REG8(0x30eb), 0x09 },
++	{ IMX219_REG_CSI_LANE_MODE, IMX219_CSI_4_LANE_MODE },
++	{ IMX219_REG_DPHY_CTRL, IMX219_DPHY_CTRL_TIMING_AUTO },
++	{ IMX219_REG_EXCK_FREQ, IMX219_EXCK_FREQ(IMX219_XCLK_FREQ / 1000000) },
++	{ IMX219_REG_FRM_LENGTH_A, 0x0a83 },	/* 2691 lines */
++	{ IMX219_REG_LINE_LENGTH_A, 0x0d78 },	/* 3448 pixels */
++	{ IMX219_REG_X_ADD_STA_A, 0x0000 },
++	{ IMX219_REG_X_ADD_END_A, 0x0ccf },
++	{ IMX219_REG_Y_ADD_STA_A, 0x0004 },
++	{ IMX219_REG_Y_ADD_END_A, 0x099b },
++	{ IMX219_REG_X_OUTPUT_SIZE, 0x0cd0 },	/* 3280 */
++	{ IMX219_REG_Y_OUTPUT_SIZE, 0x0998 },	/* 2456 */
++	{ IMX219_REG_X_ODD_INC_A, 0x01 },
++	{ IMX219_REG_Y_ODD_INC_A, 0x01 },
++	{ IMX219_REG_BINNING_MODE_H, 0x00 },
++	{ IMX219_REG_BINNING_MODE_V, 0x00 },
++	{ IMX219_REG_CSI_DATA_FORMAT_A, 0x0a0a },
++	{ IMX219_REG_VTPXCK_DIV, 0x05 },
++	{ IMX219_REG_VTSYCK_DIV, 0x01 },
++	{ IMX219_REG_PREPLLCK_VT_DIV, 0x03 },
++	{ IMX219_REG_PREPLLCK_OP_DIV, 0x03 },
++	{ IMX219_REG_PLL_VT_MPY, 0x0057 },
++	{ IMX219_REG_OPPXCK_DIV, 0x0a },
++	{ IMX219_REG_OPSYCK_DIV, 0x01 },
++	{ IMX219_REG_PLL_OP_MPY, 0x0068 },
++	{ CCI_REG8(0x4767), 0x0f },
++	{ CCI_REG8(0x4750), 0x14 },
++	{ CCI_REG8(0x47b4), 0x14 },
++};
++
++/* 3280x2464 @24fps - PIP capture (downstream cap1) */
++static const struct cci_reg_sequence imx219_samsung_3280x2464_regs[] = {
++	{ IMX219_REG_MODE_SELECT, 0x00 },
++	{ CCI_REG8(0x30eb), 0x05 },
++	{ CCI_REG8(0x30eb), 0x0c },
++	{ CCI_REG8(0x300a), 0xff },
++	{ CCI_REG8(0x300b), 0xff },
++	{ CCI_REG8(0x30eb), 0x05 },
++	{ CCI_REG8(0x30eb), 0x09 },
++	{ IMX219_REG_CSI_LANE_MODE, IMX219_CSI_4_LANE_MODE },
++	{ IMX219_REG_DPHY_CTRL, IMX219_DPHY_CTRL_TIMING_AUTO },
++	{ IMX219_REG_EXCK_FREQ, IMX219_EXCK_FREQ(IMX219_XCLK_FREQ / 1000000) },
++	{ IMX219_REG_FRM_LENGTH_A, 0x0a83 },	/* 2691 lines */
++	{ IMX219_REG_LINE_LENGTH_A, 0x0d78 },	/* 3448 pixels */
++	{ IMX219_REG_X_ADD_STA_A, 0x0000 },
++	{ IMX219_REG_X_ADD_END_A, 0x0ccf },
++	{ IMX219_REG_Y_ADD_STA_A, 0x0000 },
++	{ IMX219_REG_Y_ADD_END_A, 0x099f },
++	{ IMX219_REG_X_OUTPUT_SIZE, 0x0cd0 },	/* 3280 */
++	{ IMX219_REG_Y_OUTPUT_SIZE, 0x09a0 },	/* 2464 */
++	{ IMX219_REG_X_ODD_INC_A, 0x01 },
++	{ IMX219_REG_Y_ODD_INC_A, 0x01 },
++	{ IMX219_REG_BINNING_MODE_H, 0x00 },
++	{ IMX219_REG_BINNING_MODE_V, 0x00 },
++	{ IMX219_REG_CSI_DATA_FORMAT_A, 0x0a0a },
++	{ IMX219_REG_VTPXCK_DIV, 0x05 },
++	{ IMX219_REG_VTSYCK_DIV, 0x01 },
++	{ IMX219_REG_PREPLLCK_VT_DIV, 0x03 },
++	{ IMX219_REG_PREPLLCK_OP_DIV, 0x03 },
++	{ IMX219_REG_PLL_VT_MPY, 0x0053 },
++	{ IMX219_REG_OPPXCK_DIV, 0x0a },
++	{ IMX219_REG_OPSYCK_DIV, 0x01 },
++	{ IMX219_REG_PLL_OP_MPY, 0x0056 },
++	{ CCI_REG8(0x455e), 0x00 },
++	{ CCI_REG8(0x471e), 0x4b },
++	{ CCI_REG8(0x4767), 0x0f },
++	{ CCI_REG8(0x4750), 0x14 },
++	{ CCI_REG8(0x4540), 0x00 },
++	{ CCI_REG8(0x47b4), 0x14 },
++	{ CCI_REG8(0x4713), 0x30 },
++	{ CCI_REG8(0x478b), 0x10 },
++	{ CCI_REG8(0x478f), 0x10 },
++	{ CCI_REG8(0x4793), 0x10 },
++	{ CCI_REG8(0x4797), 0x0e },
++	{ CCI_REG8(0x479b), 0x0e },
++};
++
++/* 816x460 @120fps - high speed video */
++static const struct cci_reg_sequence imx219_samsung_816x460_regs[] = {
++	{ IMX219_REG_MODE_SELECT, 0x00 },
++	{ CCI_REG8(0x30eb), 0x05 },
++	{ CCI_REG8(0x30eb), 0x0c },
++	{ CCI_REG8(0x300a), 0xff },
++	{ CCI_REG8(0x300b), 0xff },
++	{ CCI_REG8(0x30eb), 0x05 },
++	{ CCI_REG8(0x30eb), 0x09 },
++	{ IMX219_REG_CSI_LANE_MODE, IMX219_CSI_4_LANE_MODE },
++	{ IMX219_REG_DPHY_CTRL, IMX219_DPHY_CTRL_TIMING_AUTO },
++	{ IMX219_REG_EXCK_FREQ, IMX219_EXCK_FREQ(IMX219_XCLK_FREQ / 1000000) },
++	{ IMX219_REG_FRM_LENGTH_A, 0x02a1 },	/* 673 lines */
++	{ IMX219_REG_LINE_LENGTH_A, 0x0d78 },	/* 3448 pixels */
++	{ IMX219_REG_X_ADD_STA_A, 0x0008 },
++	{ IMX219_REG_X_ADD_END_A, 0x0cc7 },
++	{ IMX219_REG_Y_ADD_STA_A, 0x0138 },
++	{ IMX219_REG_Y_ADD_END_A, 0x0867 },
++	{ IMX219_REG_X_OUTPUT_SIZE, 0x0330 },	/* 816 */
++	{ IMX219_REG_Y_OUTPUT_SIZE, 0x01cc },	/* 460 */
++	{ IMX219_REG_X_ODD_INC_A, 0x01 },
++	{ IMX219_REG_Y_ODD_INC_A, 0x01 },
++	{ IMX219_REG_BINNING_MODE_H, 0x02 },
++	{ IMX219_REG_BINNING_MODE_V, 0x02 },
++	{ IMX219_REG_CSI_DATA_FORMAT_A, 0x0a0a },
++	{ IMX219_REG_VTPXCK_DIV, 0x05 },
++	{ IMX219_REG_VTSYCK_DIV, 0x01 },
++	{ IMX219_REG_PREPLLCK_VT_DIV, 0x03 },
++	{ IMX219_REG_PREPLLCK_OP_DIV, 0x03 },
++	{ IMX219_REG_PLL_VT_MPY, 0x0057 },
++	{ IMX219_REG_OPPXCK_DIV, 0x0a },
++	{ IMX219_REG_OPSYCK_DIV, 0x01 },
++	{ IMX219_REG_PLL_OP_MPY, 0x0055 },
++	{ CCI_REG8(0x4767), 0x0f },
++	{ CCI_REG8(0x4750), 0x14 },
++	{ CCI_REG8(0x47b4), 0x14 },
++};
++
++/* 1640x1228 @15fps - slim video */
++static const struct cci_reg_sequence imx219_samsung_1640x1228_regs[] = {
++	{ IMX219_REG_MODE_SELECT, 0x00 },
++	{ CCI_REG8(0x30eb), 0x05 },
++	{ CCI_REG8(0x30eb), 0x0c },
++	{ CCI_REG8(0x300a), 0xff },
++	{ CCI_REG8(0x300b), 0xff },
++	{ CCI_REG8(0x30eb), 0x05 },
++	{ CCI_REG8(0x30eb), 0x09 },
++	{ IMX219_REG_CSI_LANE_MODE, IMX219_CSI_4_LANE_MODE },
++	{ IMX219_REG_DPHY_CTRL, IMX219_DPHY_CTRL_TIMING_AUTO },
++	{ IMX219_REG_EXCK_FREQ, IMX219_EXCK_FREQ(IMX219_XCLK_FREQ / 1000000) },
++	{ IMX219_REG_FRM_LENGTH_A, 0x1502 },	/* 5378 lines */
++	{ IMX219_REG_LINE_LENGTH_A, 0x0d78 },	/* 3448 pixels */
++	{ IMX219_REG_X_ADD_STA_A, 0x0000 },
++	{ IMX219_REG_X_ADD_END_A, 0x0ccf },
++	{ IMX219_REG_Y_ADD_STA_A, 0x0004 },
++	{ IMX219_REG_Y_ADD_END_A, 0x099b },
++	{ IMX219_REG_X_OUTPUT_SIZE, 0x0668 },	/* 1640 */
++	{ IMX219_REG_Y_OUTPUT_SIZE, 0x04cc },	/* 1228 */
++	{ IMX219_REG_X_ODD_INC_A, 0x01 },
++	{ IMX219_REG_Y_ODD_INC_A, 0x01 },
++	{ IMX219_REG_BINNING_MODE_H, 0x01 },
++	{ IMX219_REG_BINNING_MODE_V, 0x01 },
++	{ IMX219_REG_CSI_DATA_FORMAT_A, 0x0a0a },
++	{ IMX219_REG_VTPXCK_DIV, 0x05 },
++	{ IMX219_REG_VTSYCK_DIV, 0x01 },
++	{ IMX219_REG_PREPLLCK_VT_DIV, 0x03 },
++	{ IMX219_REG_PREPLLCK_OP_DIV, 0x03 },
++	{ IMX219_REG_PLL_VT_MPY, 0x0057 },
++	{ IMX219_REG_OPPXCK_DIV, 0x0a },
++	{ IMX219_REG_OPSYCK_DIV, 0x01 },
++	{ IMX219_REG_PLL_OP_MPY, 0x0055 },
++	{ CCI_REG8(0x4767), 0x0f },
++	{ CCI_REG8(0x4750), 0x14 },
++	{ CCI_REG8(0x47b4), 0x14 },
++};
++
+ static const s64 imx219_link_freq_menu[] = {
+ 	IMX219_DEFAULT_LINK_FREQ,
+ };
+@@ -233,6 +446,28 @@ static const s64 imx219_link_freq_4lane_menu[] = {
+ 	IMX219_DEFAULT_LINK_FREQ_4LANE_UNSUPPORTED,
+ };
+ 
++/*
++ * Samsung grandpplte module link frequencies.
++ *
++ * [INFERENCE] The rates are not stated directly downstream; they are derived
++ * from the output PLL programmed by each mode. The CSI-2 link frequency is
++ *
++ *	link_freq = INCK * PLL_OP_MPY / (2 * PREPLLCK_OP_DIV)
++ *
++ * with INCK = 24 MHz (imgsensor_info.mclk, imx219mipiraw_Sensor.c:159) and
++ * PREPLLCK_OP_DIV = 3 (register 0x0305, the "AUTO" value also used by the
++ * generic tables above). The formula reproduces both rates of the generic
++ * driver exactly: PLL_OP_MPY 114 -> 456 MHz (2-lane default) and
++ * PLL_OP_MPY 91 -> 364 MHz (4-lane default). The Samsung modes program
++ * 0x030c/0x030d = 0x0068, 0x0056 and 0x0055 respectively, giving
++ * 416 MHz, 344 MHz and 340 MHz.
++ */
++static const s64 imx219_samsung_link_freq_menu[] = {
++	416000000,
++	344000000,
++	340000000,
++};
++
+ static const char * const imx219_test_pattern_menu[] = {
+ 	"Disabled",
+ 	"Color Bars",
+@@ -259,6 +494,53 @@ static const char * const imx219_supply_name[] = {
+ 
+ #define IMX219_NUM_SUPPLIES ARRAY_SIZE(imx219_supply_name)
+ 
++/*
++ * Samsung grandpplte module supplies. Downstream drives vcama, vcamd, vcamaf
++ * and vcamio as separate rails (kd_camera_hw.c:494-517); they are backed by
++ * the PMIC LDOs of the same name (mt6737t_grandpplte_ltn_dtv_gpio_04.dtsi:
++ * 681-698, rom_dtb_0.dts:3719-3735).
++ */
++static const char * const imx219_samsung_supply_name[] = {
++	"vcama",	/* VCAM_A, 2.8 V */
++	"vcamd",	/* VCAM_D, 1.2 V */
++	"vcamaf",	/* VCAM_AF, 2.8 V */
++	"vcamio",	/* VCAM_IO, 1.8 V */
++};
++
++#define IMX219_SAMSUNG_NUM_SUPPLIES ARRAY_SIZE(imx219_samsung_supply_name)
++#define IMX219_MAX_SUPPLIES	4
++
++/*
++ * Power up order, voltage and post-enable delay of the Samsung module,
++ * transcribed from kd_camera_hw.c:494-525:
++ *   VCAM_A 2.8 V, VCAM_D 1.2 V, VCAM_AF 2.8 V, mdelay(2),
++ *   VCAM_IO 1.8 V, mdelay(3), MCLK on, mdelay(1), PDN high, RESET high.
++ */
++struct imx219_power_rail {
++	unsigned int supply;
++	unsigned int uV;
++	unsigned int delay_ms;
++};
++
++static const struct imx219_power_rail imx219_samsung_power_on_seq[] = {
++	{ 0, 2800000, 0 },	/* VCAM_A, kd_camera_hw.c:495 */
++	{ 1, 1200000, 0 },	/* VCAM_D, kd_camera_hw.c:500 */
++	{ 2, 2800000, 2 },	/* VCAM_AF, kd_camera_hw.c:506 + mdelay(2) :511 */
++	{ 3, 1800000, 3 },	/* VCAM_IO, kd_camera_hw.c:514 + mdelay(3) :519 */
++};
++
++/*
++ * Power down sequence: VCAM_AF, MCLK, PDN/RESET low, VCAM_IO, VCAM_D, VCAM_A
++ * with a 1 ms delay after each step (kd_camera_hw.c:767-808).
++ */
++#define IMX219_SAMSUNG_POWER_OFF_RAILS { 2, 3, 1, 0 }
++
++/* Sleep at least @ms milliseconds, downstream uses mdelay() here. */
++static void imx219_samsung_delay_ms(unsigned int ms)
++{
++	usleep_range(ms * 1000, ms * 1000 + 100);
++}
++
+ /*
+  * The supported formats.
+  * This table MUST contain 4 entries per format, to cover the various flip
+@@ -335,6 +617,107 @@ static const struct imx219_mode supported_modes[] = {
+ 	},
+ };
+ 
++/*
++ * Samsung grandpplte mode set.
++ *
++ * Source of every number: imgsensor_info in imx219mipiraw_Sensor.c:65-152 and
++ * the per-mode register tables above.
++ *
++ * The sizes are the module's grabwindow sizes (what the downstream ISP hands
++ * to userspace). The sensor readout window programmed by the matching
++ * register table is slightly larger and is reported through the crop
++ * selection, exactly like downstream's SENSOR_WINSIZE_INFO_STRUCT
++ * (imx219mipiraw_Sensor.c:184-191): e.g. 3280x2456 readout cropped to
++ * 3264x2456 by the ISP (startx = 8).
++ *
++ * pixel_rate is the mode's pclk from imgsensor_info; the downstream driver
++ * writes frame length and shutter directly in lines for all of these modes,
++ * so no binning rate factor is applied to the controls.
++ */
++static const struct imx219_mode imx219_samsung_modes[] = {
++	{
++		/* preview / capture / normal video, 30fps */
++		.width = 3264,
++		.height = 2456,
++		.fll_def = 2691,
++		.llp_def = 3448,
++		.pixel_rate = 278400000,
++		.link_freq = 416000000,
++		.crop_left = 0,
++		.crop_top = 4,
++		.crop_width = 3280,
++		.crop_height = 2456,
++		.regs = imx219_samsung_3264x2456_regs,
++		.nr_regs = ARRAY_SIZE(imx219_samsung_3264x2456_regs),
++	},
++	{
++		/* PIP capture, 24fps */
++		.width = 3280,
++		.height = 2456,
++		.fll_def = 2691,
++		.llp_def = 3448,
++		.pixel_rate = 224000000,
++		.link_freq = 344000000,
++		.crop_left = 0,
++		.crop_top = 0,
++		.crop_width = 3280,
++		.crop_height = 2464,
++		.regs = imx219_samsung_3280x2464_regs,
++		.nr_regs = ARRAY_SIZE(imx219_samsung_3280x2464_regs),
++	},
++	{
++		/* high speed video, 120fps */
++		.width = 816,
++		.height = 460,
++		.fll_def = 673,
++		.llp_def = 3448,
++		.pixel_rate = 278400000,
++		.link_freq = 340000000,
++		.crop_left = 8,
++		.crop_top = 312,
++		.crop_width = 3264,
++		.crop_height = 1840,
++		.regs = imx219_samsung_816x460_regs,
++		.nr_regs = ARRAY_SIZE(imx219_samsung_816x460_regs),
++	},
++	{
++		/* slim video, 15fps */
++		.width = 1640,
++		.height = 1228,
++		.fll_def = 5378,
++		.llp_def = 3448,
++		.pixel_rate = 278400000,
++		.link_freq = 340000000,
++		.crop_left = 0,
++		.crop_top = 4,
++		.crop_width = 3280,
++		.crop_height = 2456,
++		.regs = imx219_samsung_1640x1228_regs,
++		.nr_regs = ARRAY_SIZE(imx219_samsung_1640x1228_regs),
++	},
++};
++
++struct imx219_variant {
++	const char *name;
++	/* Samsung grandpplte module: fixed register layouts and rail control */
++	bool samsung;
++	const struct imx219_mode *modes;
++	unsigned int num_modes;
++};
++
++static const struct imx219_variant imx219_generic_variant = {
++	.name = "sony,imx219",
++	.modes = supported_modes,
++	.num_modes = ARRAY_SIZE(supported_modes),
++};
++
++static const struct imx219_variant imx219_samsung_variant = {
++	.name = "samsung,grandpplte-imx219",
++	.samsung = true,
++	.modes = imx219_samsung_modes,
++	.num_modes = ARRAY_SIZE(imx219_samsung_modes),
++};
++
+ struct imx219 {
+ 	struct v4l2_subdev sd;
+ 	struct media_pad pad;
+@@ -344,7 +727,13 @@ struct imx219 {
+ 	u32 xclk_freq;
+ 
+ 	struct gpio_desc *reset_gpio;
+-	struct regulator_bulk_data supplies[IMX219_NUM_SUPPLIES];
++	struct gpio_desc *powerdown_gpio;
++	struct regulator_bulk_data supplies[IMX219_MAX_SUPPLIES];
++	unsigned int num_supplies;
++
++	const struct imx219_variant *variant;
++	/* Link frequencies advertised by firmware (Samsung variant only) */
++	unsigned long link_freq_bitmap;
+ 
+ 	struct v4l2_ctrl_handler ctrl_handler;
+ 	/* V4L2 Controls */
+@@ -365,6 +754,34 @@ static inline struct imx219 *to_imx219(struct v4l2_subdev *_sd)
+ 	return container_of(_sd, struct imx219, sd);
+ }
+ 
++static const struct imx219_mode *imx219_get_modes(struct imx219 *imx219,
++						  unsigned int *num_modes)
++{
++	*num_modes = imx219->variant->num_modes;
++
++	return imx219->variant->modes;
++}
++
++static const struct imx219_mode *imx219_find_mode(struct imx219 *imx219,
++						  unsigned int width,
++						  unsigned int height)
++{
++	const struct imx219_mode *modes;
++	unsigned int i, num_modes;
++
++	modes = imx219_get_modes(imx219, &num_modes);
++	for (i = 0; i < num_modes; i++)
++		if (modes[i].width == width && modes[i].height == height)
++			return &modes[i];
++
++	return NULL;
++}
++
++static unsigned int imx219_mode_llp(const struct imx219_mode *mode)
++{
++	return mode->llp_def ? mode->llp_def : IMX219_LLP_MIN;
++}
++
+ /* Get bayer order based on flip setting. */
+ static u32 imx219_get_format_code(struct imx219 *imx219, u32 code)
+ {
+@@ -445,7 +862,12 @@ static int imx219_set_ctrl(struct v4l2_ctrl *ctrl)
+ 
+ 	state = v4l2_subdev_get_locked_active_state(&imx219->sd);
+ 	format = v4l2_subdev_state_get_format(state, 0);
+-	rate_factor = imx219_get_rate_factor(state);
++	/*
++	 * The Samsung module writes frame length and shutter in lines for all
++	 * of its modes (imx219mipiraw_Sensor.c:356-475), so the generic analog
++	 * binning rate factor must not be applied to it.
++	 */
++	rate_factor = imx219->variant->samsung ? 1 : imx219_get_rate_factor(state);
+ 
+ 	if (ctrl->id == V4L2_CID_VBLANK) {
+ 		int exposure_max, exposure_def;
+@@ -489,10 +911,19 @@ static int imx219_set_ctrl(struct v4l2_ctrl *ctrl)
+ 			  imx219_test_pattern_val[ctrl->val], &ret);
+ 		break;
+ 	case V4L2_CID_HFLIP:
+-	case V4L2_CID_VFLIP:
+-		cci_write(imx219->regmap, IMX219_REG_ORIENTATION,
+-			  imx219->hflip->val | imx219->vflip->val << 1, &ret);
++	case V4L2_CID_VFLIP: {
++		u32 val = imx219->hflip->val | imx219->vflip->val << 1;
++
++		/*
++		 * The Samsung module is mounted upside down and uses the
++		 * inverted register value (imx219mipiraw_Sensor.c:600-612).
++		 */
++		if (imx219->variant->samsung)
++			val ^= IMX219_SAMSUNG_ORIENTATION_NORMAL;
++
++		cci_write(imx219->regmap, IMX219_REG_ORIENTATION, val, &ret);
+ 		break;
++	}
+ 	case V4L2_CID_VBLANK:
+ 		cci_write(imx219->regmap, IMX219_REG_FRM_LENGTH_A,
+ 			  (format->height + ctrl->val) / rate_factor, &ret);
+@@ -543,9 +974,10 @@ static unsigned long imx219_get_pixel_rate(struct imx219 *imx219)
+ static int imx219_init_controls(struct imx219 *imx219)
+ {
+ 	struct i2c_client *client = v4l2_get_subdevdata(&imx219->sd);
+-	const struct imx219_mode *mode = &supported_modes[0];
++	const struct imx219_mode *mode = &imx219->variant->modes[0];
+ 	struct v4l2_ctrl_handler *ctrl_hdlr;
+ 	struct v4l2_fwnode_device_properties props;
++	u32 pixel_rate, llp;
+ 	int exposure_max, exposure_def;
+ 	int i, ret;
+ 
+@@ -554,19 +986,28 @@ static int imx219_init_controls(struct imx219 *imx219)
+ 	if (ret)
+ 		return ret;
+ 
++	pixel_rate = mode->pixel_rate ? mode->pixel_rate :
++		     imx219_get_pixel_rate(imx219);
++
+ 	/* By default, PIXEL_RATE is read only */
+ 	imx219->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &imx219_ctrl_ops,
+ 					       V4L2_CID_PIXEL_RATE,
+-					       imx219_get_pixel_rate(imx219),
+-					       imx219_get_pixel_rate(imx219), 1,
+-					       imx219_get_pixel_rate(imx219));
+-
+-	imx219->link_freq =
+-		v4l2_ctrl_new_int_menu(ctrl_hdlr, &imx219_ctrl_ops,
+-				       V4L2_CID_LINK_FREQ,
+-				       ARRAY_SIZE(imx219_link_freq_menu) - 1, 0,
+-				       (imx219->lanes == 2) ? imx219_link_freq_menu :
+-				       imx219_link_freq_4lane_menu);
++					       pixel_rate, pixel_rate, 1,
++					       pixel_rate);
++
++	if (imx219->variant->samsung)
++		imx219->link_freq =
++			v4l2_ctrl_new_int_menu(ctrl_hdlr, &imx219_ctrl_ops,
++					       V4L2_CID_LINK_FREQ,
++					       ARRAY_SIZE(imx219_samsung_link_freq_menu) - 1,
++					       0, imx219_samsung_link_freq_menu);
++	else
++		imx219->link_freq =
++			v4l2_ctrl_new_int_menu(ctrl_hdlr, &imx219_ctrl_ops,
++					       V4L2_CID_LINK_FREQ,
++					       ARRAY_SIZE(imx219_link_freq_menu) - 1, 0,
++					       (imx219->lanes == 2) ? imx219_link_freq_menu :
++					       imx219_link_freq_4lane_menu);
+ 	if (imx219->link_freq)
+ 		imx219->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+ 
+@@ -575,11 +1016,12 @@ static int imx219_init_controls(struct imx219 *imx219)
+ 					   V4L2_CID_VBLANK, IMX219_VBLANK_MIN,
+ 					   IMX219_FLL_MAX - mode->height, 1,
+ 					   mode->fll_def - mode->height);
++	llp = imx219_mode_llp(mode);
+ 	imx219->hblank = v4l2_ctrl_new_std(ctrl_hdlr, &imx219_ctrl_ops,
+ 					   V4L2_CID_HBLANK,
+-					   IMX219_LLP_MIN - mode->width,
++					   llp - mode->width,
+ 					   IMX219_LLP_MAX - mode->width, 1,
+-					   IMX219_LLP_MIN - mode->width);
++					   llp - mode->width);
+ 	exposure_max = mode->fll_def - IMX219_EXPOSURE_OFFSET;
+ 	exposure_def = (exposure_max < IMX219_EXPOSURE_DEFAULT) ?
+ 			exposure_max : IMX219_EXPOSURE_DEFAULT;
+@@ -719,33 +1161,64 @@ static int imx219_enable_streams(struct v4l2_subdev *sd,
+ {
+ 	struct imx219 *imx219 = to_imx219(sd);
+ 	struct i2c_client *client = v4l2_get_subdevdata(&imx219->sd);
++	const struct imx219_mode *mode;
++	const struct v4l2_mbus_framefmt *format;
+ 	int ret;
+ 
+ 	ret = pm_runtime_resume_and_get(&client->dev);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	/* Send all registers that are common to all modes */
+-	ret = cci_multi_reg_write(imx219->regmap, imx219_common_regs,
+-				  ARRAY_SIZE(imx219_common_regs), NULL);
+-	if (ret) {
+-		dev_err(&client->dev, "%s failed to send mfg header\n", __func__);
+-		goto err_rpm_put;
+-	}
++	if (imx219->variant->samsung) {
++		format = v4l2_subdev_state_get_format(state, 0);
++		mode = imx219_find_mode(imx219, format->width, format->height);
++		if (!mode) {
++			dev_err(&client->dev,
++				"%s: no Samsung mode for %ux%u\n", __func__,
++				format->width, format->height);
++			ret = -EINVAL;
++			goto err_rpm_put;
++		}
+ 
+-	/* Configure two or four Lane mode */
+-	ret = imx219_configure_lanes(imx219);
+-	if (ret) {
+-		dev_err(&client->dev, "%s failed to configure lanes\n", __func__);
+-		goto err_rpm_put;
+-	}
++		if (!(imx219->link_freq_bitmap & BIT(imx219->link_freq->val))) {
++			dev_err(&client->dev,
++				"%s: link frequency %lld not advertised by firmware\n",
++				__func__,
++				imx219_samsung_link_freq_menu[imx219->link_freq->val]);
++			ret = -EINVAL;
++			goto err_rpm_put;
++		}
+ 
+-	/* Apply format and crop settings. */
+-	ret = imx219_set_framefmt(imx219, state);
+-	if (ret) {
+-		dev_err(&client->dev, "%s failed to set frame format: %d\n",
+-			__func__, ret);
+-		goto err_rpm_put;
++		/* Full mode setup, ported from the downstream mode functions */
++		ret = cci_multi_reg_write(imx219->regmap, mode->regs,
++					  mode->nr_regs, NULL);
++		if (ret) {
++			dev_err(&client->dev, "%s failed to set mode\n", __func__);
++			goto err_rpm_put;
++		}
++	} else {
++		/* Send all registers that are common to all modes */
++		ret = cci_multi_reg_write(imx219->regmap, imx219_common_regs,
++					  ARRAY_SIZE(imx219_common_regs), NULL);
++		if (ret) {
++			dev_err(&client->dev, "%s failed to send mfg header\n", __func__);
++			goto err_rpm_put;
++		}
++
++		/* Configure two or four Lane mode */
++		ret = imx219_configure_lanes(imx219);
++		if (ret) {
++			dev_err(&client->dev, "%s failed to configure lanes\n", __func__);
++			goto err_rpm_put;
++		}
++
++		/* Apply format and crop settings. */
++		ret = imx219_set_framefmt(imx219, state);
++		if (ret) {
++			dev_err(&client->dev, "%s failed to set frame format: %d\n",
++				__func__, ret);
++			goto err_rpm_put;
++		}
+ 	}
+ 
+ 	/* Apply customized values from user */
+@@ -811,18 +1284,21 @@ static int imx219_enum_frame_size(struct v4l2_subdev *sd,
+ 				  struct v4l2_subdev_frame_size_enum *fse)
+ {
+ 	struct imx219 *imx219 = to_imx219(sd);
++	const struct imx219_mode *modes;
++	unsigned int num_modes;
+ 	u32 code;
+ 
+-	if (fse->index >= ARRAY_SIZE(supported_modes))
++	modes = imx219_get_modes(imx219, &num_modes);
++	if (fse->index >= num_modes)
+ 		return -EINVAL;
+ 
+ 	code = imx219_get_format_code(imx219, fse->code);
+ 	if (fse->code != code)
+ 		return -EINVAL;
+ 
+-	fse->min_width = supported_modes[fse->index].width;
++	fse->min_width = modes[fse->index].width;
+ 	fse->max_width = fse->min_width;
+-	fse->min_height = supported_modes[fse->index].height;
++	fse->min_height = modes[fse->index].height;
+ 	fse->max_height = fse->min_height;
+ 
+ 	return 0;
+@@ -833,13 +1309,16 @@ static int imx219_set_pad_format(struct v4l2_subdev *sd,
+ 				 struct v4l2_subdev_format *fmt)
+ {
+ 	struct imx219 *imx219 = to_imx219(sd);
+-	const struct imx219_mode *mode;
++	const struct imx219_mode *modes, *mode;
+ 	struct v4l2_mbus_framefmt *format;
+ 	struct v4l2_rect *crop;
+ 	u8 bin_h, bin_v, binning;
+-	u32 prev_line_len;
++	u32 prev_line_len, llp;
++	unsigned int i, num_modes;
+ 	int ret;
+ 
++	modes = imx219_get_modes(imx219, &num_modes);
++
+ 	format = v4l2_subdev_state_get_format(state, 0);
+ 	prev_line_len = format->width + imx219->hblank->val;
+ 
+@@ -847,10 +1326,10 @@ static int imx219_set_pad_format(struct v4l2_subdev *sd,
+ 	 * Adjust the requested format to match the closest mode. The Bayer
+ 	 * order varies with flips.
+ 	 */
+-	mode = v4l2_find_nearest_size(supported_modes,
+-				      ARRAY_SIZE(supported_modes),
+-				      width, height,
++	mode = v4l2_find_nearest_size(modes, num_modes, width, height,
+ 				      fmt->format.width, fmt->format.height);
++	if (!mode)
++		return -EINVAL;
+ 
+ 	fmt->format.code = imx219_get_format_code(imx219, fmt->format.code);
+ 	fmt->format.width = mode->width;
+@@ -863,21 +1342,35 @@ static int imx219_set_pad_format(struct v4l2_subdev *sd,
+ 
+ 	*format = fmt->format;
+ 
+-	/*
+-	 * Use binning to maximize the crop rectangle size, and centre it in the
+-	 * sensor.
+-	 */
+-	bin_h = min(IMX219_PIXEL_ARRAY_WIDTH / format->width, 2U);
+-	bin_v = min(IMX219_PIXEL_ARRAY_HEIGHT / format->height, 2U);
++	if (imx219->variant->samsung) {
++		/*
++		 * The readout window is fixed by the mode's register table
++		 * (see the mode table comments); publish it unchanged so that
++		 * the crop selection describes what the sensor really puts on
++		 * the CSI-2 bus.
++		 */
++		crop = v4l2_subdev_state_get_crop(state, 0);
++		crop->left = mode->crop_left;
++		crop->top = mode->crop_top;
++		crop->width = mode->crop_width;
++		crop->height = mode->crop_height;
++	} else {
++		/*
++		 * Use binning to maximize the crop rectangle size, and centre
++		 * it in the sensor.
++		 */
++		bin_h = min(IMX219_PIXEL_ARRAY_WIDTH / format->width, 2U);
++		bin_v = min(IMX219_PIXEL_ARRAY_HEIGHT / format->height, 2U);
+ 
+-	/* Ensure bin_h and bin_v are same to avoid 1:2 or 2:1 stretching */
+-	binning = min(bin_h, bin_v);
++		/* Ensure bin_h and bin_v are same to avoid 1:2 or 2:1 stretching */
++		binning = min(bin_h, bin_v);
+ 
+-	crop = v4l2_subdev_state_get_crop(state, 0);
+-	crop->width = format->width * binning;
+-	crop->height = format->height * binning;
+-	crop->left = (IMX219_NATIVE_WIDTH - crop->width) / 2;
+-	crop->top = (IMX219_NATIVE_HEIGHT - crop->height) / 2;
++		crop = v4l2_subdev_state_get_crop(state, 0);
++		crop->width = format->width * binning;
++		crop->height = format->height * binning;
++		crop->left = (IMX219_NATIVE_WIDTH - crop->width) / 2;
++		crop->top = (IMX219_NATIVE_HEIGHT - crop->height) / 2;
++	}
+ 
+ 	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
+ 		int exposure_max;
+@@ -909,40 +1402,80 @@ static int imx219_set_pad_format(struct v4l2_subdev *sd,
+ 		if (ret)
+ 			return ret;
+ 
+-		/*
+-		 * With analog binning the default minimum line length of 3448
+-		 * can cause artefacts with RAW10 formats, because the ADC
+-		 * operates on two lines together. So we switch to a higher
+-		 * minimum of 3560.
+-		 */
+-		imx219_get_binning(state, &bin_h, &bin_v);
+-		llp_min = (bin_h & bin_v) == IMX219_BINNING_X2_ANALOG ?
+-				  IMX219_BINNED_LLP_MIN : IMX219_LLP_MIN;
+-		ret = __v4l2_ctrl_modify_range(imx219->hblank,
+-					       llp_min - mode->width,
+-					       IMX219_LLP_MAX - mode->width, 1,
+-					       llp_min - mode->width);
+-		if (ret)
+-			return ret;
+-		/*
+-		 * Retain PPL setting from previous mode so that the
+-		 * line time does not change on a mode change.
+-		 * Limits have to be recomputed as the controls define
+-		 * the blanking only, so PPL values need to have the
+-		 * mode width subtracted.
+-		 */
+-		hblank = prev_line_len - mode->width;
+-		ret = __v4l2_ctrl_s_ctrl(imx219->hblank, hblank);
+-		if (ret)
+-			return ret;
+-
+-		/* Scale the pixel rate based on the mode specific factor */
+-		pixel_rate = imx219_get_pixel_rate(imx219) *
+-			     imx219_get_rate_factor(state);
+-		ret = __v4l2_ctrl_modify_range(imx219->pixel_rate, pixel_rate,
+-					       pixel_rate, 1, pixel_rate);
+-		if (ret)
+-			return ret;
++		if (imx219->variant->samsung) {
++			/*
++			 * Downstream never changes the line length of these
++			 * modes, it only extends the frame length, so always
++			 * program the mode's fixed line length.
++			 */
++			llp = mode->llp_def;
++			ret = __v4l2_ctrl_modify_range(imx219->hblank,
++						       llp - mode->width,
++						       IMX219_LLP_MAX - mode->width,
++						       1, llp - mode->width);
++			if (ret)
++				return ret;
++
++			ret = __v4l2_ctrl_s_ctrl(imx219->hblank,
++						 llp - mode->width);
++			if (ret)
++				return ret;
++
++			/* Pixel clock and link frequency are mode specific */
++			ret = __v4l2_ctrl_modify_range(imx219->pixel_rate,
++						       mode->pixel_rate,
++						       mode->pixel_rate, 1,
++						       mode->pixel_rate);
++			if (ret)
++				return ret;
++
++			for (i = 0; i < ARRAY_SIZE(imx219_samsung_link_freq_menu); i++)
++				if (imx219_samsung_link_freq_menu[i] ==
++				    mode->link_freq)
++					break;
++			if (i == ARRAY_SIZE(imx219_samsung_link_freq_menu))
++				return -EINVAL;
++
++			ret = __v4l2_ctrl_s_ctrl(imx219->link_freq, i);
++			if (ret)
++				return ret;
++		} else {
++			/*
++			 * With analog binning the default minimum line length
++			 * of 3448 can cause artefacts with RAW10 formats,
++			 * because the ADC operates on two lines together. So we
++			 * switch to a higher minimum of 3560.
++			 */
++			imx219_get_binning(state, &bin_h, &bin_v);
++			llp_min = (bin_h & bin_v) == IMX219_BINNING_X2_ANALOG ?
++					  IMX219_BINNED_LLP_MIN : IMX219_LLP_MIN;
++			ret = __v4l2_ctrl_modify_range(imx219->hblank,
++						       llp_min - mode->width,
++						       IMX219_LLP_MAX - mode->width,
++						       1, llp_min - mode->width);
++			if (ret)
++				return ret;
++			/*
++			 * Retain PPL setting from previous mode so that the
++			 * line time does not change on a mode change.
++			 * Limits have to be recomputed as the controls define
++			 * the blanking only, so PPL values need to have the
++			 * mode width subtracted.
++			 */
++			hblank = prev_line_len - mode->width;
++			ret = __v4l2_ctrl_s_ctrl(imx219->hblank, hblank);
++			if (ret)
++				return ret;
++
++			/* Scale the pixel rate based on the mode specific factor */
++			pixel_rate = imx219_get_pixel_rate(imx219) *
++				     imx219_get_rate_factor(state);
++			ret = __v4l2_ctrl_modify_range(imx219->pixel_rate,
++						       pixel_rate, pixel_rate, 1,
++						       pixel_rate);
++			if (ret)
++				return ret;
++		}
+ 	}
+ 
+ 	return 0;
+@@ -981,13 +1514,15 @@ static int imx219_get_selection(struct v4l2_subdev *sd,
+ static int imx219_init_state(struct v4l2_subdev *sd,
+ 			     struct v4l2_subdev_state *state)
+ {
++	struct imx219 *imx219 = to_imx219(sd);
++	const struct imx219_mode *mode = &imx219->variant->modes[0];
+ 	struct v4l2_subdev_format fmt = {
+ 		.which = V4L2_SUBDEV_FORMAT_TRY,
+ 		.pad = 0,
+ 		.format = {
+ 			.code = MEDIA_BUS_FMT_SRGGB10_1X10,
+-			.width = supported_modes[0].width,
+-			.height = supported_modes[0].height,
++			.width = mode->width,
++			.height = mode->height,
+ 		},
+ 	};
+ 
+@@ -1021,12 +1556,83 @@ static const struct v4l2_subdev_internal_ops imx219_internal_ops = {
+  * Power management
+  */
+ 
++/*
++ * Samsung grandpplte power on sequence, transcribed from
++ * kd_camera_hw.c:487-530:
++ *   - powerdown and reset low,
++ *   - VCAM_A 2.8 V, VCAM_D 1.2 V, VCAM_AF 2.8 V, mdelay(2),
++ *   - VCAM_IO 1.8 V, mdelay(3) (host to MCLK interval),
++ *   - MCLK on, mdelay(1) (MCLK leads RESET by 500 us),
++ *   - powerdown high, then reset high.
++ */
++static int imx219_samsung_power_on(struct device *dev)
++{
++	struct imx219 *imx219 = to_imx219(dev_get_drvdata(dev));
++	unsigned int i;
++	int ret;
++
++	gpiod_set_value_cansleep(imx219->powerdown_gpio, 0);
++	gpiod_set_value_cansleep(imx219->reset_gpio, 0);
++
++	for (i = 0; i < ARRAY_SIZE(imx219_samsung_power_on_seq); i++) {
++		const struct imx219_power_rail *rail = &imx219_samsung_power_on_seq[i];
++		struct regulator *reg = imx219->supplies[rail->supply].consumer;
++
++		ret = regulator_set_voltage(reg, rail->uV, rail->uV);
++		if (ret) {
++			dev_err(dev, "%s: failed to set %s to %u uV\n",
++				__func__, imx219->supplies[rail->supply].supply,
++				rail->uV);
++			goto err_off;
++		}
++
++		ret = regulator_enable(reg);
++		if (ret) {
++			dev_err(dev, "%s: failed to enable %s\n", __func__,
++				imx219->supplies[rail->supply].supply);
++			goto err_off;
++		}
++
++		if (rail->delay_ms)
++			imx219_samsung_delay_ms(rail->delay_ms);
++	}
++
++	ret = clk_prepare_enable(imx219->xclk);
++	if (ret) {
++		dev_err(dev, "%s: failed to enable clock\n", __func__);
++		goto err_off;
++	}
++
++	/* MCLK must lead the reset release (kd_camera_hw.c:525) */
++	imx219_samsung_delay_ms(1);
++
++	gpiod_set_value_cansleep(imx219->powerdown_gpio, 1);
++	gpiod_set_value_cansleep(imx219->reset_gpio, 1);
++
++	/* Sensor needs this long before it leaves software standby */
++	usleep_range(IMX219_XCLR_MIN_DELAY_US,
++		     IMX219_XCLR_MIN_DELAY_US + IMX219_XCLR_DELAY_RANGE_US);
++
++	return 0;
++
++err_off:
++	while (i--) {
++		regulator_disable(imx219->supplies
++				  [imx219_samsung_power_on_seq[i].supply].consumer);
++	}
++
++	return ret;
++}
++
+ static int imx219_power_on(struct device *dev)
+ {
+ 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+ 	struct imx219 *imx219 = to_imx219(sd);
+ 	int ret;
+ 
++	if (imx219->variant->samsung)
++		return imx219_samsung_power_on(dev);
++
+ 	ret = regulator_bulk_enable(IMX219_NUM_SUPPLIES,
+ 				    imx219->supplies);
+ 	if (ret) {
+@@ -1062,6 +1668,32 @@ static int imx219_power_off(struct device *dev)
+ {
+ 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+ 	struct imx219 *imx219 = to_imx219(sd);
++	static const unsigned int off_rails[] = IMX219_SAMSUNG_POWER_OFF_RAILS;
++	unsigned int i;
++
++	if (imx219->variant->samsung) {
++		/*
++		 * kd_camera_hw.c:766-808: VCAM_AF off, MCLK off, powerdown and
++		 * reset low, then VCAM_IO, VCAM_D and VCAM_A off, with a 1 ms
++		 * delay after every step.
++		 */
++		regulator_disable(imx219->supplies[off_rails[0]].consumer);
++		imx219_samsung_delay_ms(1);
++
++		clk_disable_unprepare(imx219->xclk);
++		imx219_samsung_delay_ms(1);
++
++		gpiod_set_value_cansleep(imx219->powerdown_gpio, 0);
++		gpiod_set_value_cansleep(imx219->reset_gpio, 0);
++		imx219_samsung_delay_ms(1);
++
++		for (i = 1; i < ARRAY_SIZE(off_rails); i++) {
++			regulator_disable(imx219->supplies[off_rails[i]].consumer);
++			imx219_samsung_delay_ms(1);
++		}
++
++		return 0;
++	}
+ 
+ 	gpiod_set_value_cansleep(imx219->reset_gpio, 0);
+ 	regulator_bulk_disable(IMX219_NUM_SUPPLIES, imx219->supplies);
+@@ -1077,13 +1709,16 @@ static int imx219_power_off(struct device *dev)
+ static int imx219_get_regulators(struct imx219 *imx219)
+ {
+ 	struct i2c_client *client = v4l2_get_subdevdata(&imx219->sd);
++	const char * const *names = imx219->variant->samsung ?
++				    imx219_samsung_supply_name :
++				    imx219_supply_name;
+ 	unsigned int i;
+ 
+-	for (i = 0; i < IMX219_NUM_SUPPLIES; i++)
+-		imx219->supplies[i].supply = imx219_supply_name[i];
++	for (i = 0; i < imx219->num_supplies; i++)
++		imx219->supplies[i].supply = names[i];
+ 
+ 	return devm_regulator_bulk_get(&client->dev,
+-				       IMX219_NUM_SUPPLIES,
++				       imx219->num_supplies,
+ 				       imx219->supplies);
+ }
+ 
+@@ -1127,14 +1762,44 @@ static int imx219_check_hwcfg(struct device *dev, struct imx219 *imx219)
+ 	}
+ 
+ 	/* Check the number of MIPI CSI2 data lanes */
+-	if (ep_cfg.bus.mipi_csi2.num_data_lanes != 2 &&
+-	    ep_cfg.bus.mipi_csi2.num_data_lanes != 4) {
++	if (imx219->variant->samsung) {
++		/*
++		 * The Samsung module is wired for four lanes only
++		 * (imgsensor_info.mipi_lane_num, imx219mipiraw_Sensor.c:161).
++		 */
++		if (ep_cfg.bus.mipi_csi2.num_data_lanes != 4) {
++			dev_err_probe(dev, -EINVAL,
++				      "the Samsung module requires 4 data lanes\n");
++			goto error_out;
++		}
++	} else if (ep_cfg.bus.mipi_csi2.num_data_lanes != 2 &&
++		   ep_cfg.bus.mipi_csi2.num_data_lanes != 4) {
+ 		dev_err_probe(dev, -EINVAL,
+ 			      "only 2 or 4 data lanes are currently supported\n");
+ 		goto error_out;
+ 	}
+ 	imx219->lanes = ep_cfg.bus.mipi_csi2.num_data_lanes;
+ 
++	if (imx219->variant->samsung) {
++		ret = v4l2_link_freq_to_bitmap(dev,
++					       ep_cfg.link_frequencies,
++					       ep_cfg.nr_of_link_frequencies,
++					       imx219_samsung_link_freq_menu,
++					       ARRAY_SIZE(imx219_samsung_link_freq_menu),
++					       &link_freq_bitmap);
++		if (ret || !(link_freq_bitmap & BIT(0))) {
++			ret = -EINVAL;
++			dev_err_probe(dev, -EINVAL,
++				      "Link frequency not supported: %lld\n",
++				      ep_cfg.link_frequencies[0]);
++			goto error_out;
++		}
++
++		/* Every Samsung mode needs its own rate advertised */
++		imx219->link_freq_bitmap = link_freq_bitmap;
++		goto error_out;
++	}
++
+ 	/* Check the link frequency set in device tree */
+ 	switch (imx219->lanes) {
+ 	case 2:
+@@ -1190,6 +1855,12 @@ static int imx219_probe(struct i2c_client *client)
+ 	v4l2_i2c_subdev_init(&imx219->sd, client, &imx219_subdev_ops);
+ 	imx219->sd.internal_ops = &imx219_internal_ops;
+ 
++	imx219->variant = of_device_get_match_data(dev);
++	if (!imx219->variant)
++		imx219->variant = &imx219_generic_variant;
++	imx219->num_supplies = imx219->variant->samsung ?
++			       IMX219_SAMSUNG_NUM_SUPPLIES : IMX219_NUM_SUPPLIES;
++
+ 	/* Check the hardware configuration in device tree */
+ 	if (imx219_check_hwcfg(dev, imx219))
+ 		return -EINVAL;
+@@ -1215,13 +1886,33 @@ static int imx219_probe(struct i2c_client *client)
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "failed to get regulators\n");
+ 
+-	/* Request optional enable pin */
++	/*
++	 * Request optional enable pin. The Samsung module is held in reset
++	 * (CAM_RST_N low, mt6737t_grandpplte_ltn_dtv_03.dts:606-613) until
++	 * imx219_power_on() releases it.
++	 */
+ 	imx219->reset_gpio = devm_gpiod_get_optional(dev, "reset",
++						     imx219->variant->samsung ?
++						     GPIOD_OUT_LOW :
+ 						     GPIOD_OUT_HIGH);
+ 	if (IS_ERR(imx219->reset_gpio))
+ 		return dev_err_probe(dev, PTR_ERR(imx219->reset_gpio),
+ 				     "failed to get reset gpio\n");
+ 
++	if (imx219->variant->samsung) {
++		/*
++		 * The module has a separate powerdown line in the downstream
++		 * pin table (kd_camera_hw.c:489-492). On grandpplte both the
++		 * reset and powerdown pinctrl states mux the same pin, so this
++		 * is optional.
++		 */
++		imx219->powerdown_gpio = devm_gpiod_get_optional(dev, "powerdown",
++								 GPIOD_OUT_LOW);
++		if (IS_ERR(imx219->powerdown_gpio))
++			return dev_err_probe(dev, PTR_ERR(imx219->powerdown_gpio),
++					     "failed to get powerdown gpio\n");
++	}
++
+ 	/*
+ 	 * The sensor must be powered for imx219_identify_module()
+ 	 * to be able to read the CHIP_ID register
+@@ -1329,7 +2020,9 @@ static void imx219_remove(struct i2c_client *client)
+ }
+ 
+ static const struct of_device_id imx219_dt_ids[] = {
+-	{ .compatible = "sony,imx219" },
++	{ .compatible = "samsung,grandpplte-imx219",
++	  .data = &imx219_samsung_variant },
++	{ .compatible = "sony,imx219", .data = &imx219_generic_variant },
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, imx219_dt_ids);
+diff --git a/drivers/media/i2c/s5k5e3yx.c b/drivers/media/i2c/s5k5e3yx.c
+new file mode 100644
+index 000000000..6f5ff20af
+--- /dev/null
++++ b/drivers/media/i2c/s5k5e3yx.c
+@@ -0,0 +1,1343 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Samsung S5K5E3YX 5MP MIPI RAW image sensor driver
++ *
++ * Port from Samsung/MTK downstream
++ * drivers/misc/mediatek/imgsensor/src/mt6735/s5k5e3yx_mipi_raw/
++ * (s5k5e3yxmipiraw_Sensor.c and s5k5e3yxmipiraw_Sensor.h) of the SM-G532M
++ * (grandpplte, MT6737T) Android 6.0.1 kernel source drop.
++ *
++ * The register sequences, mode geometry, exposure/gain formulas and the
++ * power-up/down ordering are taken from that driver. The per-sensor power
++ * sequencing that downstream implemented in
++ * drivers/misc/mediatek/imgsensor/src/mt6735/camera_hw/kd_camera_hw.c
++ * (kdCISModulePowerOn(), S5K5E3YX branch) is implemented here in
++ * s5k5e3yx_power_on()/s5k5e3yx_power_off().
++ *
++ * Hardware summary (downstream s5k5e3yxmipiraw_Sensor.c:144-151):
++ * 24 MHz MCLK, 2 MIPI CSI-2 data lanes, RAW10, GRBG Bayer order.
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <linux/regulator/consumer.h>
++#include <linux/types.h>
++
++#include <media/media-entity.h>
++#include <media/v4l2-cci.h>
++#include <media/v4l2-common.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fwnode.h>
++#include <media/v4l2-subdev.h>
++
++/* Sensor identification, kd_imgsensor.h:184 */
++#define S5K5E3YX_CHIP_ID			0x5e30
++
++/*
++ * Downstream used the 8-bit I2C write addresses 0x20 and 0x6c
++ * (s5k5e3yxmipiraw_Sensor.c:151, .i2c_addr_table = {0x20, 0x6c, 0xff}).
++ * iWriteRegI2C()/iReadRegI2C() shift the write address right by one before
++ * handing it to the i2c core, so the 7-bit addresses are 0x10 and 0x36.
++ */
++#define S5K5E3YX_I2C_ADDR_1			0x10	/* 0x20 >> 1 */
++#define S5K5E3YX_I2C_ADDR_2			0x36	/* 0x6c >> 1 */
++
++#define S5K5E3YX_XCLK_FREQ			24000000	/* .mclk = 24 */
++
++#define S5K5E3YX_NUM_SUPPLIES			3
++
++/* Register map (16-bit register addresses, 8-bit register values) */
++#define S5K5E3YX_REG_CHIP_ID_MSB		CCI_REG8(0x0000)
++#define S5K5E3YX_REG_CHIP_ID_LSB		CCI_REG8(0x0001)
++#define S5K5E3YX_REG_CTRL_MODE			CCI_REG8(0x0100)
++#define S5K5E3YX_REG_EXPOSURE			CCI_REG16(0x0202)
++#define S5K5E3YX_REG_ANALOG_GAIN		CCI_REG16(0x0204)
++#define S5K5E3YX_REG_FRAME_LENGTH		CCI_REG16(0x0340)
++#define S5K5E3YX_REG_LINE_LENGTH		CCI_REG16(0x0342)
++#define S5K5E3YX_REG_TEST_PATTERN		CCI_REG8(0x0601)
++/* 0x3200 is written to 0x00 together with 0x0601 by set_test_pattern_mode() */
++#define S5K5E3YX_REG_TEST_PATTERN_CTRL		CCI_REG8(0x3200)
++
++#define S5K5E3YX_MODE_STANDBY			0x00
++#define S5K5E3YX_MODE_STREAMING			0x01
++
++/*
++ * Exposure/gain limits, s5k5e3yxmipiraw_Sensor.c:128-130 and :158:
++ *   .margin = 4, .min_shutter = 1, .max_frame_length = 0xffff,
++ *   .shutter = 0x3D0 (AE seed in the imgsensor struct; the mode register
++ *   tables program their own coarse integration time, which is used as the
++ *   control default instead).
++ */
++#define S5K5E3YX_EXPOSURE_MIN			1
++#define S5K5E3YX_EXPOSURE_MARGIN		4
++#define S5K5E3YX_FRAME_LENGTH_MAX		0xffff
++
++/*
++ * set_gain() (s5k5e3yxmipiraw_Sensor.c:474-493) takes a gain in the MTK AE
++ * domain, whose unity is 0x40 ("sensor global gain(base: 0x40)", :465), and
++ * writes reg_gain = gain >> 1 to 0x0204/0x0205, i.e. 0x0020 for 1x.
++ * The downstream driver does not clamp the gain at all; the upper bound below
++ * is the u16 domain of the downstream AE interface.
++ */
++#define S5K5E3YX_ANALOG_GAIN_MIN		0x40
++#define S5K5E3YX_ANALOG_GAIN_MAX		0xffff
++#define S5K5E3YX_ANALOG_GAIN_DEFAULT		0x40
++
++/*
++ * Link frequencies: 896 Mbps/lane (PLL 24 MHz / 6 * 224, PLLS = 0, and
++ * 0x0820/0x0821 = 0x0380 = 896) for the 30 fps modes, and 436 Mbps/lane
++ * (24 MHz / 6 * 218 / 2, PLLS = 1, 0x0820/0x0821 = 0x01b4 = 436) for the
++ * 2560x1920 15 fps capture mode. V4L2 link frequency is the DDR clock, i.e.
++ * half the bit rate.
++ */
++static const s64 s5k5e3yx_link_freq_menu[] = {
++	448000000,
++	218000000,
++};
++
++static const char * const s5k5e3yx_test_pattern_menu[] = {
++	"Disabled",
++	"Color bar",
++};
++
++struct s5k5e3yx_mode {
++	u32 width;
++	u32 height;
++	u32 pclk;
++	u32 line_length;
++	u32 frame_length;
++	u32 exposure_default;
++	u32 native_width;
++	u32 native_height;
++	u32 crop_left;
++	u32 crop_top;
++	u32 crop_width;
++	u32 crop_height;
++	u32 link_freq_index;
++	const struct cci_reg_sequence *regs;
++	u32 num_regs;
++};
++
++/* sensor_init(), s5k5e3yxmipiraw_Sensor.c:593-700 (stream-on write at :699 stripped) */
++static const struct cci_reg_sequence s5k5e3yx_init_regs[] = {
++	{ CCI_REG8(0x3000), 0x04 },
++	{ CCI_REG8(0x3002), 0x03 },
++	{ CCI_REG8(0x3003), 0x04 },
++	{ CCI_REG8(0x3004), 0x02 },
++	{ CCI_REG8(0x3005), 0x00 },
++	{ CCI_REG8(0x3006), 0x10 },
++	{ CCI_REG8(0x3007), 0x03 },
++	{ CCI_REG8(0x3008), 0x55 },
++	{ CCI_REG8(0x3039), 0x00 },
++	{ CCI_REG8(0x303a), 0x00 },
++	{ CCI_REG8(0x303b), 0x00 },
++	{ CCI_REG8(0x3009), 0x05 },
++	{ CCI_REG8(0x300a), 0x55 },
++	{ CCI_REG8(0x300b), 0x38 },
++	{ CCI_REG8(0x300c), 0x10 },
++	{ CCI_REG8(0x3012), 0x05 },
++	{ CCI_REG8(0x3013), 0x00 },
++	{ CCI_REG8(0x3014), 0x22 },
++	{ CCI_REG8(0x300e), 0x79 },
++	{ CCI_REG8(0x3010), 0x68 },
++	{ CCI_REG8(0x3019), 0x03 },
++	{ CCI_REG8(0x301a), 0x00 },
++	{ CCI_REG8(0x301b), 0x06 },
++	{ CCI_REG8(0x301c), 0x00 },
++	{ CCI_REG8(0x301d), 0x22 },
++	{ CCI_REG8(0x301e), 0x00 },
++	{ CCI_REG8(0x301f), 0x10 },
++	{ CCI_REG8(0x3020), 0x00 },
++	{ CCI_REG8(0x3021), 0x00 },
++	{ CCI_REG8(0x3022), 0x0a },
++	{ CCI_REG8(0x3023), 0x1e },
++	{ CCI_REG8(0x3024), 0x00 },
++	{ CCI_REG8(0x3025), 0x00 },
++	{ CCI_REG8(0x3026), 0x00 },
++	{ CCI_REG8(0x3027), 0x00 },
++	{ CCI_REG8(0x3028), 0x1a },
++	{ CCI_REG8(0x3015), 0x00 },
++	{ CCI_REG8(0x3016), 0x84 },
++	{ CCI_REG8(0x3017), 0x00 },
++	{ CCI_REG8(0x3018), 0xa0 },
++	{ CCI_REG8(0x302b), 0x10 },
++	{ CCI_REG8(0x302c), 0x0a },
++	{ CCI_REG8(0x302d), 0x06 },
++	{ CCI_REG8(0x302e), 0x05 },
++	{ CCI_REG8(0x302f), 0x0e },
++	{ CCI_REG8(0x3030), 0x2f },
++	{ CCI_REG8(0x3031), 0x08 },
++	{ CCI_REG8(0x3032), 0x05 },
++	{ CCI_REG8(0x3033), 0x09 },
++	{ CCI_REG8(0x3034), 0x05 },
++	{ CCI_REG8(0x3035), 0x00 },
++	{ CCI_REG8(0x3036), 0x00 },
++	{ CCI_REG8(0x3037), 0x00 },
++	{ CCI_REG8(0x3038), 0x00 },
++	{ CCI_REG8(0x3088), 0x06 },
++	{ CCI_REG8(0x308a), 0x08 },
++	{ CCI_REG8(0x308c), 0x05 },
++	{ CCI_REG8(0x308e), 0x07 },
++	{ CCI_REG8(0x3090), 0x06 },
++	{ CCI_REG8(0x3092), 0x08 },
++	{ CCI_REG8(0x3094), 0x05 },
++	{ CCI_REG8(0x3096), 0x21 },
++	{ CCI_REG8(0x3099), 0x0e },
++	{ CCI_REG8(0x3070), 0x10 },
++	{ CCI_REG8(0x3085), 0x11 },
++	{ CCI_REG8(0x3086), 0x01 },
++	{ CCI_REG8(0x3064), 0x00 },
++	{ CCI_REG8(0x3062), 0x08 },
++	{ CCI_REG8(0x3061), 0x11 },
++	{ CCI_REG8(0x307b), 0x20 },
++	{ CCI_REG8(0x3068), 0x00 },
++	{ CCI_REG8(0x3074), 0x00 },
++	{ CCI_REG8(0x307d), 0x00 },
++	{ CCI_REG8(0x3045), 0x01 },
++	{ CCI_REG8(0x3046), 0x05 },
++	{ CCI_REG8(0x3047), 0x78 },
++	{ CCI_REG8(0x307f), 0xb1 },
++	{ CCI_REG8(0x3098), 0x01 },
++	{ CCI_REG8(0x305c), 0xf6 },
++	{ CCI_REG8(0x306b), 0x10 },
++	{ CCI_REG8(0x3063), 0x27 },
++	{ CCI_REG8(0x3400), 0x01 },
++	{ CCI_REG8(0x3235), 0x49 },
++	{ CCI_REG8(0x3233), 0x00 },
++	{ CCI_REG8(0x3234), 0x00 },
++	{ CCI_REG8(0x3300), 0x0c },
++	{ CCI_REG8(0x3203), 0x45 },
++	{ CCI_REG8(0x3205), 0x4d },
++	{ CCI_REG8(0x320b), 0x40 },
++	{ CCI_REG8(0x320c), 0x06 },
++	{ CCI_REG8(0x320d), 0xc0 },
++	{ CCI_REG8(0x3929), 0x07 },
++};
++
++/* preview_setting(), :703-757 (identical to capture 30fps :777-890 and normal_video_setting :893-947; stream writes stripped) */
++static const struct cci_reg_sequence s5k5e3yx_2576x1932_30_regs[] = {
++	{ CCI_REG8(0x0305), 0x06 },
++	{ CCI_REG8(0x0306), 0x00 },
++	{ CCI_REG8(0x0307), 0xe0 },
++	{ CCI_REG8(0x3c1f), 0x00 },
++	{ CCI_REG8(0x0820), 0x03 },
++	{ CCI_REG8(0x0821), 0x80 },
++	{ CCI_REG8(0x3c1c), 0x58 },
++	{ CCI_REG8(0x0114), 0x01 },
++	{ CCI_REG8(0x0340), 0x07 },
++	{ CCI_REG8(0x0341), 0xe9 },
++	{ CCI_REG8(0x0342), 0x0b },
++	{ CCI_REG8(0x0343), 0x86 },
++	{ CCI_REG8(0x0344), 0x00 },
++	{ CCI_REG8(0x0345), 0x00 },
++	{ CCI_REG8(0x0346), 0x00 },
++	{ CCI_REG8(0x0347), 0x02 },
++	{ CCI_REG8(0x0348), 0x0a },
++	{ CCI_REG8(0x0349), 0x0f },
++	{ CCI_REG8(0x034a), 0x07 },
++	{ CCI_REG8(0x034b), 0x8d },
++	{ CCI_REG8(0x034c), 0x0a },
++	{ CCI_REG8(0x034d), 0x10 },
++	{ CCI_REG8(0x034e), 0x07 },
++	{ CCI_REG8(0x034f), 0x8c },
++	{ CCI_REG8(0x0900), 0x00 },
++	{ CCI_REG8(0x0901), 0x00 },
++	{ CCI_REG8(0x0383), 0x01 },
++	{ CCI_REG8(0x0387), 0x01 },
++	{ CCI_REG8(0x0204), 0x00 },
++	{ CCI_REG8(0x0205), 0x20 },
++	{ CCI_REG8(0x0202), 0x02 },
++	{ CCI_REG8(0x0203), 0x00 },
++	{ CCI_REG8(0x0200), 0x04 },
++	{ CCI_REG8(0x0201), 0x98 },
++	{ CCI_REG8(0x3941), 0x04 },
++	{ CCI_REG8(0x3942), 0xb5 },
++	{ CCI_REG8(0x3924), 0x2f },
++	{ CCI_REG8(0x3925), 0x10 },
++	{ CCI_REG8(0x3c31), 0x54 },
++	{ CCI_REG8(0x3c32), 0x60 },
++	{ CCI_REG8(0x3c08), 0x5d },
++	{ CCI_REG8(0x3c09), 0xc0 },
++	{ CCI_REG8(0x3320), 0x02 },
++	{ CCI_REG8(0x0112), 0x0a },
++	{ CCI_REG8(0x0113), 0x0a },
++};
++
++/* capture_setting(150), :759-836 (15 fps variant; stream writes stripped) */
++static const struct cci_reg_sequence s5k5e3yx_2560x1920_15_regs[] = {
++	{ CCI_REG8(0x0305), 0x06 },
++	{ CCI_REG8(0x0306), 0x00 },
++	{ CCI_REG8(0x0307), 0xda },
++	{ CCI_REG8(0x3c1f), 0x01 },
++	{ CCI_REG8(0x0820), 0x01 },
++	{ CCI_REG8(0x0821), 0xb4 },
++	{ CCI_REG8(0x3c1c), 0x54 },
++	{ CCI_REG8(0x0114), 0x01 },
++	{ CCI_REG8(0x0340), 0x07 },
++	{ CCI_REG8(0x0341), 0xe9 },
++	{ CCI_REG8(0x0342), 0x0b },
++	{ CCI_REG8(0x0343), 0x86 },
++	{ CCI_REG8(0x0344), 0x00 },
++	{ CCI_REG8(0x0345), 0x08 },
++	{ CCI_REG8(0x0346), 0x00 },
++	{ CCI_REG8(0x0347), 0x08 },
++	{ CCI_REG8(0x0348), 0x0a },
++	{ CCI_REG8(0x0349), 0x07 },
++	{ CCI_REG8(0x034a), 0x07 },
++	{ CCI_REG8(0x034b), 0x87 },
++	{ CCI_REG8(0x034c), 0x0a },
++	{ CCI_REG8(0x034d), 0x00 },
++	{ CCI_REG8(0x034e), 0x07 },
++	{ CCI_REG8(0x034f), 0x80 },
++	{ CCI_REG8(0x0900), 0x00 },
++	{ CCI_REG8(0x0901), 0x20 },
++	{ CCI_REG8(0x0383), 0x01 },
++	{ CCI_REG8(0x0387), 0x01 },
++	{ CCI_REG8(0x0202), 0x02 },
++	{ CCI_REG8(0x0203), 0x00 },
++	{ CCI_REG8(0x0200), 0x04 },
++	{ CCI_REG8(0x0201), 0x98 },
++	{ CCI_REG8(0x3407), 0x00 },
++	{ CCI_REG8(0x3408), 0x00 },
++	{ CCI_REG8(0x3409), 0x00 },
++	{ CCI_REG8(0x340a), 0x00 },
++	{ CCI_REG8(0x340b), 0x00 },
++	{ CCI_REG8(0x340c), 0x00 },
++	{ CCI_REG8(0x340d), 0x00 },
++	{ CCI_REG8(0x340e), 0x00 },
++	{ CCI_REG8(0x3401), 0x50 },
++	{ CCI_REG8(0x3402), 0x3c },
++	{ CCI_REG8(0x3403), 0x03 },
++	{ CCI_REG8(0x3404), 0x33 },
++	{ CCI_REG8(0x3405), 0x04 },
++	{ CCI_REG8(0x3406), 0x44 },
++	{ CCI_REG8(0x3458), 0x03 },
++	{ CCI_REG8(0x3459), 0x33 },
++	{ CCI_REG8(0x345a), 0x04 },
++	{ CCI_REG8(0x345b), 0x44 },
++	{ CCI_REG8(0x3400), 0x01 },
++};
++
++/* hs_video_setting(), :949-1005 (stream writes stripped) */
++static const struct cci_reg_sequence s5k5e3yx_640x480_120_regs[] = {
++	{ CCI_REG8(0x0305), 0x06 },
++	{ CCI_REG8(0x0306), 0x00 },
++	{ CCI_REG8(0x0307), 0xe0 },
++	{ CCI_REG8(0x3c1f), 0x00 },
++	{ CCI_REG8(0x0820), 0x03 },
++	{ CCI_REG8(0x0821), 0x80 },
++	{ CCI_REG8(0x3c1c), 0x58 },
++	{ CCI_REG8(0x0114), 0x01 },
++	{ CCI_REG8(0x0340), 0x01 },
++	{ CCI_REG8(0x0341), 0xfa },
++	{ CCI_REG8(0x0342), 0x0b },
++	{ CCI_REG8(0x0343), 0x86 },
++	{ CCI_REG8(0x0344), 0x00 },
++	{ CCI_REG8(0x0345), 0x08 },
++	{ CCI_REG8(0x0346), 0x00 },
++	{ CCI_REG8(0x0347), 0x08 },
++	{ CCI_REG8(0x0348), 0x0a },
++	{ CCI_REG8(0x0349), 0x07 },
++	{ CCI_REG8(0x034a), 0x07 },
++	{ CCI_REG8(0x034b), 0x87 },
++	{ CCI_REG8(0x034c), 0x02 },
++	{ CCI_REG8(0x034d), 0x80 },
++	{ CCI_REG8(0x034e), 0x01 },
++	{ CCI_REG8(0x034f), 0xe0 },
++	{ CCI_REG8(0x0900), 0x01 },
++	{ CCI_REG8(0x0901), 0x44 },
++	{ CCI_REG8(0x0383), 0x03 },
++	{ CCI_REG8(0x0387), 0x07 },
++	{ CCI_REG8(0x0204), 0x00 },
++	{ CCI_REG8(0x0205), 0x20 },
++	{ CCI_REG8(0x0202), 0x01 },
++	{ CCI_REG8(0x0203), 0xf4 },
++	{ CCI_REG8(0x0200), 0x04 },
++	{ CCI_REG8(0x0201), 0x98 },
++	{ CCI_REG8(0x3941), 0x04 },
++	{ CCI_REG8(0x3942), 0xb5 },
++	{ CCI_REG8(0x3924), 0x2f },
++	{ CCI_REG8(0x3925), 0x10 },
++	{ CCI_REG8(0x3c31), 0x54 },
++	{ CCI_REG8(0x3c32), 0x60 },
++	{ CCI_REG8(0x3c08), 0x5d },
++	{ CCI_REG8(0x3c09), 0xc0 },
++	{ CCI_REG8(0x3320), 0x02 },
++	{ CCI_REG8(0x0112), 0x0a },
++	{ CCI_REG8(0x0113), 0x0a },
++};
++
++/* slim_video_setting(), :1007-1062 (stream writes stripped) */
++static const struct cci_reg_sequence s5k5e3yx_1280x960_15_regs[] = {
++	{ CCI_REG8(0x0305), 0x06 },
++	{ CCI_REG8(0x0306), 0x00 },
++	{ CCI_REG8(0x0307), 0xe0 },
++	{ CCI_REG8(0x3c1f), 0x00 },
++	{ CCI_REG8(0x0820), 0x03 },
++	{ CCI_REG8(0x0821), 0x80 },
++	{ CCI_REG8(0x3c1c), 0x58 },
++	{ CCI_REG8(0x0114), 0x01 },
++	{ CCI_REG8(0x0340), 0x0f },
++	{ CCI_REG8(0x0341), 0xd2 },
++	{ CCI_REG8(0x0342), 0x0b },
++	{ CCI_REG8(0x0343), 0x86 },
++	{ CCI_REG8(0x0344), 0x00 },
++	{ CCI_REG8(0x0345), 0x08 },
++	{ CCI_REG8(0x0346), 0x00 },
++	{ CCI_REG8(0x0347), 0x08 },
++	{ CCI_REG8(0x0348), 0x0a },
++	{ CCI_REG8(0x0349), 0x07 },
++	{ CCI_REG8(0x034a), 0x07 },
++	{ CCI_REG8(0x034b), 0x87 },
++	{ CCI_REG8(0x034c), 0x05 },
++	{ CCI_REG8(0x034d), 0x00 },
++	{ CCI_REG8(0x034e), 0x03 },
++	{ CCI_REG8(0x034f), 0xc0 },
++	{ CCI_REG8(0x0900), 0x01 },
++	{ CCI_REG8(0x0901), 0x22 },
++	{ CCI_REG8(0x0383), 0x01 },
++	{ CCI_REG8(0x0387), 0x03 },
++	{ CCI_REG8(0x0204), 0x00 },
++	{ CCI_REG8(0x0205), 0x20 },
++	{ CCI_REG8(0x0202), 0x02 },
++	{ CCI_REG8(0x0203), 0x00 },
++	{ CCI_REG8(0x0200), 0x04 },
++	{ CCI_REG8(0x0201), 0x98 },
++	{ CCI_REG8(0x3941), 0x04 },
++	{ CCI_REG8(0x3942), 0xb5 },
++	{ CCI_REG8(0x3924), 0x2f },
++	{ CCI_REG8(0x3925), 0x10 },
++	{ CCI_REG8(0x3c31), 0x54 },
++	{ CCI_REG8(0x3c32), 0x60 },
++	{ CCI_REG8(0x3c08), 0x5d },
++	{ CCI_REG8(0x3c09), 0xc0 },
++	{ CCI_REG8(0x3320), 0x02 },
++	{ CCI_REG8(0x0112), 0x0a },
++	{ CCI_REG8(0x0113), 0x0a },
++};
++
++
++/*
++ * Downstream mode table: imgsensor_info (pre/cap/normal_video, :61-105) plus
++ * imgsensor_winsize_info (:172-179). pre, cap and normal_video are identical,
++ * so a single mode entry covers the preview, capture (30 fps) and video
++ * scenarios.
++ */
++static const struct s5k5e3yx_mode s5k5e3yx_modes[] = {
++	{
++		/* 2576x1932 30 fps, pre/cap/normal_video */
++		.width = 2576,
++		.height = 1932,
++		.pclk = 179200000,
++		.line_length = 2950,
++		.frame_length = 2025,
++		.exposure_default = 512,   /* 0x0202/0x0203 = 0x0200 */
++		.native_width = 2576,
++		.native_height = 1936,
++		.crop_left = 0,
++		.crop_top = 2,
++		.crop_width = 2576,
++		.crop_height = 1932,
++		.link_freq_index = 0,
++		.regs = s5k5e3yx_2576x1932_30_regs,
++		.num_regs = ARRAY_SIZE(s5k5e3yx_2576x1932_30_regs),
++	},
++	{
++		/* 2560x1920 15 fps capture (cap1, :83-94) */
++		.width = 2560,
++		.height = 1920,
++		.pclk = 89616000,
++		.line_length = 2950,
++		.frame_length = 2025,
++		.exposure_default = 512,   /* 0x0202/0x0203 = 0x0200 */
++		.native_width = 2576,
++		.native_height = 1936,
++		.crop_left = 8,
++		.crop_top = 8,
++		.crop_width = 2560,
++		.crop_height = 1920,
++		.link_freq_index = 1,
++		.regs = s5k5e3yx_2560x1920_15_regs,
++		.num_regs = ARRAY_SIZE(s5k5e3yx_2560x1920_15_regs),
++	},
++	{
++		/* 640x480 120 fps high speed video (:106-116) */
++		.width = 640,
++		.height = 480,
++		.pclk = 179200000,
++		.line_length = 2950,
++		.frame_length = 506,
++		.exposure_default = 500,   /* 0x0202/0x0203 = 0x01f4 */
++		.native_width = 2576,
++		.native_height = 1936,
++		.crop_left = 8,
++		.crop_top = 8,
++		.crop_width = 2560,
++		.crop_height = 1920,
++		.link_freq_index = 0,
++		.regs = s5k5e3yx_640x480_120_regs,
++		.num_regs = ARRAY_SIZE(s5k5e3yx_640x480_120_regs),
++	},
++	{
++		/* 1280x960 15 fps slim video (:117-127) */
++		.width = 1280,
++		.height = 960,
++		.pclk = 179200000,
++		.line_length = 2950,
++		.frame_length = 4050,
++		.exposure_default = 512,   /* 0x0202/0x0203 = 0x0200 */
++		.native_width = 2576,
++		.native_height = 1936,
++		.crop_left = 8,
++		.crop_top = 8,
++		.crop_width = 2560,
++		.crop_height = 1920,
++		.link_freq_index = 0,
++		.regs = s5k5e3yx_1280x960_15_regs,
++		.num_regs = ARRAY_SIZE(s5k5e3yx_1280x960_15_regs),
++	},
++};
++
++/*
++ * Regulator order and voltages as used by the S5K5E3YX branch of
++ * kdCISModulePowerOn(): VCAM_A 2.8 V, VCAM_D 1.2 V, VCAM_IO 1.8 V
++ * (kd_camera_hw.c:335-351). The rails are the shared camera LDOs
++ * (mt6737t_grandpplte_ltn_dtv_gpio_04.dtsi:681-696).
++ */
++static const struct {
++	const char *supply;
++	u32 min_uV;
++	u32 max_uV;
++} s5k5e3yx_supplies[S5K5E3YX_NUM_SUPPLIES] = {
++	{ "vcama",  2800000, 2800000 },
++	{ "vcamd",  1200000, 1200000 },
++	{ "vcamio", 1800000, 1800000 },
++};
++
++struct s5k5e3yx {
++	struct v4l2_subdev sd;
++	struct media_pad pad;
++
++	struct regmap *regmap;
++	struct clk *xclk;
++
++	struct gpio_desc *reset_gpio;
++
++	struct regulator_bulk_data supplies[S5K5E3YX_NUM_SUPPLIES];
++
++	struct v4l2_ctrl_handler ctrl_handler;
++	struct v4l2_ctrl *pixel_rate;
++	struct v4l2_ctrl *link_freq;
++	struct v4l2_ctrl *exposure;
++	struct v4l2_ctrl *vblank;
++	struct v4l2_ctrl *hblank;
++
++	const struct s5k5e3yx_mode *cur_mode;
++};
++
++static inline struct s5k5e3yx *to_s5k5e3yx(struct v4l2_subdev *sd)
++{
++	return container_of(sd, struct s5k5e3yx, sd);
++}
++
++/* -------------------------------------------------------------------------
++ * Controls
++ */
++
++static int s5k5e3yx_set_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct s5k5e3yx *s = container_of(ctrl->handler, struct s5k5e3yx,
++					  ctrl_handler);
++	struct i2c_client *client = v4l2_get_subdevdata(&s->sd);
++	const struct s5k5e3yx_mode *mode = s->cur_mode;
++	int ret = 0;
++
++	if (ctrl->id == V4L2_CID_VBLANK) {
++		int exposure_max, exposure_def;
++
++		/* write_shutter(): frame_length = max(shutter + margin, ...) */
++		exposure_max = mode->height + ctrl->val - S5K5E3YX_EXPOSURE_MARGIN;
++		exposure_def = min_t(int, mode->exposure_default, exposure_max);
++		ret = __v4l2_ctrl_modify_range(s->exposure,
++					       s->exposure->minimum, exposure_max,
++					       s->exposure->step, exposure_def);
++		if (ret)
++			return ret;
++	}
++
++	/*
++	 * Applying V4L2 control values only happens when power is up for
++	 * streaming.
++	 */
++	if (pm_runtime_get_if_in_use(&client->dev) == 0)
++		return 0;
++
++	switch (ctrl->id) {
++	case V4L2_CID_ANALOGUE_GAIN:
++		/* set_gain(): reg_gain = gain >> 1 -> 0x0204/0x0205 */
++		cci_write(s->regmap, S5K5E3YX_REG_ANALOG_GAIN, ctrl->val >> 1,
++			  &ret);
++		break;
++	case V4L2_CID_EXPOSURE:
++		/* write_shutter(): coarse integration time, 0x0202/0x0203 */
++		cci_write(s->regmap, S5K5E3YX_REG_EXPOSURE, ctrl->val, &ret);
++		break;
++	case V4L2_CID_VBLANK:
++		/*
++		 * write_shutter()/set_dummy(): frame_length_lines goes to
++		 * 0x0340/0x0341 before the shutter is updated. The exposure
++		 * range was reduced above, so use the (possibly clamped)
++		 * exposure value.
++		 */
++		cci_write(s->regmap, S5K5E3YX_REG_FRAME_LENGTH,
++			  mode->height + ctrl->val, &ret);
++		cci_write(s->regmap, S5K5E3YX_REG_EXPOSURE, s->exposure->val,
++			  &ret);
++		break;
++	case V4L2_CID_TEST_PATTERN:
++		/* set_test_pattern_mode(), :1657-1676 */
++		cci_write(s->regmap, S5K5E3YX_REG_TEST_PATTERN, ctrl->val, &ret);
++		cci_write(s->regmap, S5K5E3YX_REG_TEST_PATTERN_CTRL, 0x00, &ret);
++		break;
++	case V4L2_CID_LINK_FREQ:
++	case V4L2_CID_PIXEL_RATE:
++		/* Selected by the mode, nothing to program */
++		break;
++	default:
++		dev_err(&client->dev, "ctrl 0x%x not handled\n", ctrl->id);
++		ret = -EINVAL;
++		break;
++	}
++
++	pm_runtime_put(&client->dev);
++
++	return ret;
++}
++
++static const struct v4l2_ctrl_ops s5k5e3yx_ctrl_ops = {
++	.s_ctrl = s5k5e3yx_set_ctrl,
++};
++
++static int s5k5e3yx_init_controls(struct s5k5e3yx *s)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(&s->sd);
++	const struct s5k5e3yx_mode *mode = &s5k5e3yx_modes[0];
++	struct v4l2_ctrl_handler *ctrl_hdlr = &s->ctrl_handler;
++	struct v4l2_fwnode_device_properties props;
++	int exposure_max, exposure_def;
++	int ret;
++
++	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 8);
++	if (ret)
++		return ret;
++
++	s->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &s5k5e3yx_ctrl_ops,
++					  V4L2_CID_PIXEL_RATE, mode->pclk,
++					  mode->pclk, 1, mode->pclk);
++
++	s->link_freq = v4l2_ctrl_new_int_menu(ctrl_hdlr,
++					      &s5k5e3yx_ctrl_ops,
++					      V4L2_CID_LINK_FREQ,
++					      ARRAY_SIZE(s5k5e3yx_link_freq_menu) - 1,
++					      mode->link_freq_index,
++					      s5k5e3yx_link_freq_menu);
++	if (s->link_freq)
++		s->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	/*
++	 * min_frame_length is the mode frame length (s5k5e3yxmipiraw_Sensor.c
++	 * :1180), max_frame_length is 0xffff (:130), so blanking is
++	 * expressed relative to those two limits here.
++	 */
++	s->vblank = v4l2_ctrl_new_std(ctrl_hdlr, &s5k5e3yx_ctrl_ops,
++				      V4L2_CID_VBLANK,
++				      mode->frame_length - mode->height,
++				      S5K5E3YX_FRAME_LENGTH_MAX - mode->height, 1,
++				      mode->frame_length - mode->height);
++
++	/* The sensor has a single, fixed line length (0x0342/0x0343 = 2950) */
++	s->hblank = v4l2_ctrl_new_std(ctrl_hdlr, &s5k5e3yx_ctrl_ops,
++				      V4L2_CID_HBLANK,
++				      mode->line_length - mode->width,
++				      mode->line_length - mode->width, 1,
++				      mode->line_length - mode->width);
++	if (s->hblank)
++		s->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	exposure_max = mode->frame_length - S5K5E3YX_EXPOSURE_MARGIN;
++	exposure_def = min_t(int, mode->exposure_default, exposure_max);
++	s->exposure = v4l2_ctrl_new_std(ctrl_hdlr, &s5k5e3yx_ctrl_ops,
++					V4L2_CID_EXPOSURE,
++					S5K5E3YX_EXPOSURE_MIN, exposure_max, 1,
++					exposure_def);
++
++	v4l2_ctrl_new_std(ctrl_hdlr, &s5k5e3yx_ctrl_ops,
++			  V4L2_CID_ANALOGUE_GAIN, S5K5E3YX_ANALOG_GAIN_MIN,
++			  S5K5E3YX_ANALOG_GAIN_MAX, 1,
++			  S5K5E3YX_ANALOG_GAIN_DEFAULT);
++
++	v4l2_ctrl_new_std_menu_items(ctrl_hdlr, &s5k5e3yx_ctrl_ops,
++				     V4L2_CID_TEST_PATTERN,
++				     ARRAY_SIZE(s5k5e3yx_test_pattern_menu) - 1,
++				     0, 0, s5k5e3yx_test_pattern_menu);
++
++	if (ctrl_hdlr->error) {
++		ret = ctrl_hdlr->error;
++		dev_err_probe(&client->dev, ret, "control init failed\n");
++		goto error;
++	}
++
++	ret = v4l2_fwnode_device_parse(&client->dev, &props);
++	if (ret)
++		goto error;
++
++	ret = v4l2_ctrl_new_fwnode_properties(ctrl_hdlr, &s5k5e3yx_ctrl_ops,
++					      &props);
++	if (ret)
++		goto error;
++
++	s->sd.ctrl_handler = ctrl_hdlr;
++
++	return 0;
++
++error:
++	v4l2_ctrl_handler_free(ctrl_hdlr);
++
++	return ret;
++}
++
++/* -------------------------------------------------------------------------
++ * Subdev operations
++ */
++
++static const struct s5k5e3yx_mode *
++s5k5e3yx_find_mode(struct v4l2_subdev_state *state)
++{
++	const struct v4l2_mbus_framefmt *format =
++		v4l2_subdev_state_get_format(state, 0);
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(s5k5e3yx_modes); i++)
++		if (s5k5e3yx_modes[i].width == format->width &&
++		    s5k5e3yx_modes[i].height == format->height)
++			return &s5k5e3yx_modes[i];
++
++	return &s5k5e3yx_modes[0];
++}
++
++static int s5k5e3yx_enum_mbus_code(struct v4l2_subdev *sd,
++				   struct v4l2_subdev_state *state,
++				   struct v4l2_subdev_mbus_code_enum *code)
++{
++	if (code->pad != 0 || code->index != 0)
++		return -EINVAL;
++
++	/* SENSOR_OUTPUT_FORMAT_RAW_Gr (s5k5e3yxmipiraw_Sensor.c:148) */
++	code->code = MEDIA_BUS_FMT_SGRBG10_1X10;
++
++	return 0;
++}
++
++static int s5k5e3yx_enum_frame_size(struct v4l2_subdev *sd,
++				    struct v4l2_subdev_state *state,
++				    struct v4l2_subdev_frame_size_enum *fse)
++{
++	if (fse->pad != 0 || fse->index >= ARRAY_SIZE(s5k5e3yx_modes))
++		return -EINVAL;
++
++	if (fse->code != MEDIA_BUS_FMT_SGRBG10_1X10)
++		return -EINVAL;
++
++	fse->min_width = s5k5e3yx_modes[fse->index].width;
++	fse->max_width = fse->min_width;
++	fse->min_height = s5k5e3yx_modes[fse->index].height;
++	fse->max_height = fse->min_height;
++
++	return 0;
++}
++
++static int s5k5e3yx_set_pad_format(struct v4l2_subdev *sd,
++				   struct v4l2_subdev_state *state,
++				   struct v4l2_subdev_format *fmt)
++{
++	struct s5k5e3yx *s = to_s5k5e3yx(sd);
++	const struct s5k5e3yx_mode *mode;
++	struct v4l2_mbus_framefmt *format;
++	int exposure_max, exposure_def;
++	int ret;
++
++	mode = v4l2_find_nearest_size(s5k5e3yx_modes,
++				      ARRAY_SIZE(s5k5e3yx_modes),
++				      width, height,
++				      fmt->format.width, fmt->format.height);
++
++	fmt->format.code = MEDIA_BUS_FMT_SGRBG10_1X10;
++	fmt->format.width = mode->width;
++	fmt->format.height = mode->height;
++	fmt->format.field = V4L2_FIELD_NONE;
++	fmt->format.colorspace = V4L2_COLORSPACE_RAW;
++	fmt->format.ycbcr_enc = V4L2_YCBCR_ENC_601;
++	fmt->format.quantization = V4L2_QUANTIZATION_FULL_RANGE;
++	fmt->format.xfer_func = V4L2_XFER_FUNC_NONE;
++
++	format = v4l2_subdev_state_get_format(state, 0);
++	*format = fmt->format;
++
++	if (fmt->which != V4L2_SUBDEV_FORMAT_ACTIVE)
++		return 0;
++
++	s->cur_mode = mode;
++
++	/* Frame length limits come from the mode (min) and 0xffff (max) */
++	ret = __v4l2_ctrl_modify_range(s->vblank,
++				       mode->frame_length - mode->height,
++				       S5K5E3YX_FRAME_LENGTH_MAX - mode->height, 1,
++				       mode->frame_length - mode->height);
++	if (ret)
++		return ret;
++
++	ret = __v4l2_ctrl_s_ctrl(s->vblank, mode->frame_length - mode->height);
++	if (ret)
++		return ret;
++
++	exposure_max = mode->frame_length - S5K5E3YX_EXPOSURE_MARGIN;
++	exposure_def = min_t(int, mode->exposure_default, exposure_max);
++	ret = __v4l2_ctrl_modify_range(s->exposure,
++				       s->exposure->minimum, exposure_max,
++				       s->exposure->step, exposure_def);
++	if (ret)
++		return ret;
++
++	/* Line length never changes: 0x0342/0x0343 = 2950 in every mode */
++	ret = __v4l2_ctrl_modify_range(s->hblank,
++				       mode->line_length - mode->width,
++				       mode->line_length - mode->width, 1,
++				       mode->line_length - mode->width);
++	if (ret)
++		return ret;
++
++	ret = __v4l2_ctrl_modify_range(s->pixel_rate, mode->pclk, mode->pclk,
++				       1, mode->pclk);
++	if (ret)
++		return ret;
++
++	return __v4l2_ctrl_s_ctrl(s->link_freq, mode->link_freq_index);
++}
++
++static int s5k5e3yx_get_selection(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *state,
++				  struct v4l2_subdev_selection *sel)
++{
++	const struct s5k5e3yx_mode *mode = s5k5e3yx_find_mode(state);
++
++	if (sel->pad != 0)
++		return -EINVAL;
++
++	switch (sel->target) {
++	case V4L2_SEL_TGT_NATIVE_SIZE:
++		sel->r.left = 0;
++		sel->r.top = 0;
++		sel->r.width = mode->native_width;
++		sel->r.height = mode->native_height;
++		return 0;
++	case V4L2_SEL_TGT_CROP:
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++		/*
++		 * The crop window is part of the sensor mode tables
++		 * (imgsensor_winsize_info, :172-179); the downstream driver
++		 * exposes no crop control.
++		 */
++		sel->r.left = mode->crop_left;
++		sel->r.top = mode->crop_top;
++		sel->r.width = mode->crop_width;
++		sel->r.height = mode->crop_height;
++		return 0;
++	}
++
++	return -EINVAL;
++}
++
++static int s5k5e3yx_set_selection(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *state,
++				  struct v4l2_subdev_selection *sel)
++{
++	/*
++	 * The crop rectangle is fixed by the mode register tables, so a
++	 * selection request can only report it back.
++	 */
++	return s5k5e3yx_get_selection(sd, state, sel);
++}
++
++static int s5k5e3yx_enable_streams(struct v4l2_subdev *sd,
++				   struct v4l2_subdev_state *state, u32 pad,
++				   u64 streams_mask)
++{
++	struct s5k5e3yx *s = to_s5k5e3yx(sd);
++	struct i2c_client *client = v4l2_get_subdevdata(&s->sd);
++	const struct s5k5e3yx_mode *mode = s->cur_mode;
++	int ret;
++
++	if (pad != 0)
++		return -EINVAL;
++
++	ret = pm_runtime_resume_and_get(&client->dev);
++	if (ret < 0)
++		return ret;
++
++	/* All downstream mode tables start by stopping the stream */
++	ret = cci_write(s->regmap, S5K5E3YX_REG_CTRL_MODE,
++			S5K5E3YX_MODE_STANDBY, NULL);
++	if (ret)
++		goto err_rpm_put;
++
++	/*
++	 * The 30 fps capture path waits 40 ms between stream off and the
++	 * register writes (capture_setting(), :840 mdelay(40)). Applied to
++	 * every mode; the other mode setups have no delay between the two.
++	 */
++	msleep(40);
++
++	ret = cci_multi_reg_write(s->regmap, s5k5e3yx_init_regs,
++				  ARRAY_SIZE(s5k5e3yx_init_regs), NULL);
++	if (ret)
++		goto err_rpm_put;
++
++	ret = cci_multi_reg_write(s->regmap, mode->regs, mode->num_regs, NULL);
++	if (ret)
++		goto err_rpm_put;
++
++	ret = cci_write(s->regmap, S5K5E3YX_REG_CTRL_MODE,
++			S5K5E3YX_MODE_STREAMING, NULL);
++	if (ret)
++		goto err_rpm_put;
++
++	return 0;
++
++err_rpm_put:
++	pm_runtime_put_autosuspend(&client->dev);
++
++	return ret;
++}
++
++static int s5k5e3yx_disable_streams(struct v4l2_subdev *sd,
++				    struct v4l2_subdev_state *state, u32 pad,
++				    u64 streams_mask)
++{
++	struct s5k5e3yx *s = to_s5k5e3yx(sd);
++	struct i2c_client *client = v4l2_get_subdevdata(&s->sd);
++	int ret;
++
++	if (pad != 0)
++		return -EINVAL;
++
++	ret = cci_write(s->regmap, S5K5E3YX_REG_CTRL_MODE,
++			S5K5E3YX_MODE_STANDBY, NULL);
++	if (ret)
++		dev_err(&client->dev, "failed to stop streaming: %d\n", ret);
++
++	pm_runtime_put_autosuspend(&client->dev);
++
++	return ret;
++}
++
++static int s5k5e3yx_init_state(struct v4l2_subdev *sd,
++			       struct v4l2_subdev_state *state)
++{
++	struct v4l2_subdev_format fmt = {
++		.which = V4L2_SUBDEV_FORMAT_TRY,
++		.pad = 0,
++		.format = {
++			.code = MEDIA_BUS_FMT_SGRBG10_1X10,
++			.width = s5k5e3yx_modes[0].width,
++			.height = s5k5e3yx_modes[0].height,
++		},
++	};
++
++	return s5k5e3yx_set_pad_format(sd, state, &fmt);
++}
++
++static const struct v4l2_subdev_video_ops s5k5e3yx_video_ops = {
++	.s_stream = v4l2_subdev_s_stream_helper,
++};
++
++static const struct v4l2_subdev_pad_ops s5k5e3yx_pad_ops = {
++	.enum_mbus_code = s5k5e3yx_enum_mbus_code,
++	.enum_frame_size = s5k5e3yx_enum_frame_size,
++	.get_fmt = v4l2_subdev_get_fmt,
++	.set_fmt = s5k5e3yx_set_pad_format,
++	.get_selection = s5k5e3yx_get_selection,
++	.set_selection = s5k5e3yx_set_selection,
++	.enable_streams = s5k5e3yx_enable_streams,
++	.disable_streams = s5k5e3yx_disable_streams,
++};
++
++static const struct v4l2_subdev_ops s5k5e3yx_subdev_ops = {
++	.video = &s5k5e3yx_video_ops,
++	.pad = &s5k5e3yx_pad_ops,
++};
++
++static const struct v4l2_subdev_internal_ops s5k5e3yx_internal_ops = {
++	.init_state = s5k5e3yx_init_state,
++};
++
++/* -------------------------------------------------------------------------
++ * Power management
++ *
++ * Sequence from the S5K5E3YX branch of kdCISModulePowerOn():
++ *   power on  (kd_camera_hw.c:325-366)
++ *     CMPDN low, CMRST low -> VCAMA 2.8 V -> VCAMD 1.2 V -> VCAMIO 1.8 V
++ *     -> 1 ms -> CMRST high, CMPDN high -> 1 ms -> ISP_MCLK2_EN(1)
++ *   power off (kd_camera_hw.c:642-683)
++ *     ISP_MCLK2_EN(0) -> 1 ms -> CMPDN low, CMRST low -> 1 ms
++ *     -> VCAM_IO off -> 1 ms -> VCAM_D off -> 1 ms -> VCAM_A off
++ *
++ * The sub camera reset and powerdown pinctrl states both drive GPIO12
++ * (mt6737t_grandpplte_ltn_dtv_03.dts:542-569), so a single active-high
++ * reset GPIO reproduces both signals.
++ */
++
++static int s5k5e3yx_power_on(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct s5k5e3yx *s = to_s5k5e3yx(sd);
++	unsigned int i;
++	int ret;
++
++	/* "First Power Pin low and Reset Pin Low" */
++	gpiod_set_value_cansleep(s->reset_gpio, 0);
++
++	for (i = 0; i < S5K5E3YX_NUM_SUPPLIES; i++) {
++		ret = regulator_set_voltage(s->supplies[i].consumer,
++					    s5k5e3yx_supplies[i].min_uV,
++					    s5k5e3yx_supplies[i].max_uV);
++		if (ret) {
++			dev_err(dev, "failed to set %s voltage: %d\n",
++				s5k5e3yx_supplies[i].supply, ret);
++			goto err_disable;
++		}
++
++		ret = regulator_enable(s->supplies[i].consumer);
++		if (ret) {
++			dev_err(dev, "failed to enable %s: %d\n",
++				s5k5e3yx_supplies[i].supply, ret);
++			goto err_disable;
++		}
++	}
++
++	usleep_range(1000, 1100);
++
++	/* "enable active sensor" */
++	gpiod_set_value_cansleep(s->reset_gpio, 1);
++
++	usleep_range(1000, 1100);
++
++	/* ISP_MCLK2_EN(1) */
++	ret = clk_prepare_enable(s->xclk);
++	if (ret) {
++		dev_err(dev, "failed to enable xclk: %d\n", ret);
++		gpiod_set_value_cansleep(s->reset_gpio, 0);
++		i = S5K5E3YX_NUM_SUPPLIES;
++		goto err_disable;
++	}
++
++	return 0;
++
++err_disable:
++	while (i--)
++		regulator_disable(s->supplies[i].consumer);
++
++	return ret;
++}
++
++static int s5k5e3yx_power_off(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct s5k5e3yx *s = to_s5k5e3yx(sd);
++
++	/* ISP_MCLK2_EN(0) */
++	clk_disable_unprepare(s->xclk);
++
++	usleep_range(1000, 1100);
++
++	gpiod_set_value_cansleep(s->reset_gpio, 0);
++
++	usleep_range(1000, 1100);
++
++	regulator_disable(s->supplies[2].consumer);	/* VCAM_IO */
++	usleep_range(1000, 1100);
++	regulator_disable(s->supplies[1].consumer);	/* VCAM_D */
++	usleep_range(1000, 1100);
++	regulator_disable(s->supplies[0].consumer);	/* VCAM_A */
++
++	return 0;
++}
++
++/* -------------------------------------------------------------------------
++ * Probe & remove
++ */
++
++static int s5k5e3yx_get_regulators(struct s5k5e3yx *s)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(&s->sd);
++	unsigned int i;
++
++	for (i = 0; i < S5K5E3YX_NUM_SUPPLIES; i++)
++		s->supplies[i].supply = s5k5e3yx_supplies[i].supply;
++
++	return devm_regulator_bulk_get(&client->dev, S5K5E3YX_NUM_SUPPLIES,
++				       s->supplies);
++}
++
++static int s5k5e3yx_read_chip_id(struct s5k5e3yx *s, u32 *id)
++{
++	u64 msb, lsb;
++	int ret;
++
++	/* return_sensor_id(): read 0x0000 and 0x0001, MSB first (:216-220) */
++	ret = cci_read(s->regmap, S5K5E3YX_REG_CHIP_ID_MSB, &msb, NULL);
++	if (ret)
++		return ret;
++
++	ret = cci_read(s->regmap, S5K5E3YX_REG_CHIP_ID_LSB, &lsb, NULL);
++	if (ret)
++		return ret;
++
++	*id = (msb << 8) | lsb;
++
++	return 0;
++}
++
++static int s5k5e3yx_identify_module(struct s5k5e3yx *s)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(&s->sd);
++	unsigned short addr = client->addr;
++	unsigned short alt_addr;
++	unsigned int attempt, retry;
++	u32 id = 0;
++
++	alt_addr = (addr == S5K5E3YX_I2C_ADDR_1) ? S5K5E3YX_I2C_ADDR_2 :
++		   (addr == S5K5E3YX_I2C_ADDR_2) ? S5K5E3YX_I2C_ADDR_1 : 0;
++
++	/*
++	 * get_imgsensor_id()/open(): try every address of the downstream
++	 * i2c_addr_table, two read attempts per address (:1082-1125, :1128-1190)
++	 */
++	for (attempt = 0; attempt < 2; attempt++) {
++		for (retry = 0; retry < 2; retry++) {
++			if (!s5k5e3yx_read_chip_id(s, &id) &&
++			    id == S5K5E3YX_CHIP_ID) {
++				dev_info(&client->dev,
++					 "i2c address 0x%02x, sensor id 0x%04x\n",
++					 client->addr, id);
++				return 0;
++			}
++		}
++
++		if (!alt_addr)
++			break;
++
++		dev_dbg(&client->dev, "no sensor at 0x%02x, trying 0x%02x\n",
++			client->addr, alt_addr);
++		client->addr = alt_addr;
++		alt_addr = 0;
++	}
++
++	dev_err(&client->dev, "sensor id mismatch, read 0x%04x\n", id);
++
++	return -ENODEV;
++}
++
++static int s5k5e3yx_check_hwcfg(struct device *dev, struct s5k5e3yx *s)
++{
++	struct fwnode_handle *endpoint;
++	struct v4l2_fwnode_endpoint ep_cfg = {
++		.bus_type = V4L2_MBUS_CSI2_DPHY,
++	};
++	unsigned long link_freq_bitmap;
++	int ret = -EINVAL;
++
++	endpoint = fwnode_graph_get_next_endpoint(dev_fwnode(dev), NULL);
++	if (!endpoint)
++		return dev_err_probe(dev, -EINVAL, "endpoint node not found\n");
++
++	if (v4l2_fwnode_endpoint_alloc_parse(endpoint, &ep_cfg)) {
++		dev_err_probe(dev, -EINVAL, "could not parse endpoint\n");
++		goto error_out;
++	}
++
++	/* .mipi_lane_num = SENSOR_MIPI_2_LANE (:150) */
++	if (ep_cfg.bus.mipi_csi2.num_data_lanes != 2) {
++		dev_err_probe(dev, -EINVAL, "only 2 data lanes are supported\n");
++		goto error_out;
++	}
++
++	ret = v4l2_link_freq_to_bitmap(dev, ep_cfg.link_frequencies,
++				       ep_cfg.nr_of_link_frequencies,
++				       s5k5e3yx_link_freq_menu,
++				       ARRAY_SIZE(s5k5e3yx_link_freq_menu),
++				       &link_freq_bitmap);
++	if (ret || !link_freq_bitmap) {
++		ret = -EINVAL;
++		dev_err_probe(dev, -EINVAL, "link frequency not supported\n");
++	}
++
++error_out:
++	v4l2_fwnode_endpoint_free(&ep_cfg);
++	fwnode_handle_put(endpoint);
++
++	return ret;
++}
++
++static int s5k5e3yx_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct s5k5e3yx *s;
++	int ret;
++
++	s = devm_kzalloc(dev, sizeof(*s), GFP_KERNEL);
++	if (!s)
++		return -ENOMEM;
++
++	v4l2_i2c_subdev_init(&s->sd, client, &s5k5e3yx_subdev_ops);
++	s->sd.internal_ops = &s5k5e3yx_internal_ops;
++
++	ret = s5k5e3yx_check_hwcfg(dev, s);
++	if (ret)
++		return ret;
++
++	s->regmap = devm_cci_regmap_init_i2c(client, 16);
++	if (IS_ERR(s->regmap))
++		return dev_err_probe(dev, PTR_ERR(s->regmap),
++				     "failed to initialize CCI\n");
++
++	/* MCLK provided by the MTK SENINF per-camera clock */
++	s->xclk = devm_v4l2_sensor_clk_get(dev, "xclk");
++	if (IS_ERR(s->xclk))
++		return dev_err_probe(dev, PTR_ERR(s->xclk),
++				     "failed to get xclk\n");
++
++	if (clk_get_rate(s->xclk) != S5K5E3YX_XCLK_FREQ)
++		dev_warn(dev, "xclk is %lu Hz, expected %u Hz\n",
++			 clk_get_rate(s->xclk), S5K5E3YX_XCLK_FREQ);
++
++	ret = s5k5e3yx_get_regulators(s);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to get regulators\n");
++
++	s->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
++	if (IS_ERR(s->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(s->reset_gpio),
++				     "failed to get reset gpio\n");
++
++	/* The sensor must be powered to read the chip ID */
++	ret = s5k5e3yx_power_on(dev);
++	if (ret)
++		return ret;
++
++	ret = s5k5e3yx_identify_module(s);
++	if (ret)
++		goto error_power_off;
++
++	s->cur_mode = &s5k5e3yx_modes[0];
++
++	ret = s5k5e3yx_init_controls(s);
++	if (ret)
++		goto error_power_off;
++
++	s->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	s->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
++
++	s->pad.flags = MEDIA_PAD_FL_SOURCE;
++	ret = media_entity_pads_init(&s->sd.entity, 1, &s->pad);
++	if (ret) {
++		dev_err_probe(dev, ret, "failed to init entity pads\n");
++		goto error_handler_free;
++	}
++
++	s->sd.state_lock = s->ctrl_handler.lock;
++	ret = v4l2_subdev_init_finalize(&s->sd);
++	if (ret < 0) {
++		dev_err_probe(dev, ret, "subdev init error\n");
++		goto error_media_entity;
++	}
++
++	pm_runtime_set_active(dev);
++	pm_runtime_enable(dev);
++
++	ret = v4l2_async_register_subdev_sensor(&s->sd);
++	if (ret < 0) {
++		dev_err_probe(dev, ret, "failed to register sensor sub-device\n");
++		goto error_subdev_cleanup;
++	}
++
++	pm_runtime_idle(dev);
++	pm_runtime_set_autosuspend_delay(dev, 1000);
++	pm_runtime_use_autosuspend(dev);
++
++	return 0;
++
++error_subdev_cleanup:
++	v4l2_subdev_cleanup(&s->sd);
++	pm_runtime_disable(dev);
++	pm_runtime_set_suspended(dev);
++
++error_media_entity:
++	media_entity_cleanup(&s->sd.entity);
++
++error_handler_free:
++	v4l2_ctrl_handler_free(&s->ctrl_handler);
++
++error_power_off:
++	s5k5e3yx_power_off(dev);
++
++	return ret;
++}
++
++static void s5k5e3yx_remove(struct i2c_client *client)
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct s5k5e3yx *s = to_s5k5e3yx(sd);
++
++	v4l2_async_unregister_subdev(sd);
++	v4l2_subdev_cleanup(sd);
++	media_entity_cleanup(&sd->entity);
++	v4l2_ctrl_handler_free(&s->ctrl_handler);
++
++	pm_runtime_disable(&client->dev);
++	if (!pm_runtime_status_suspended(&client->dev)) {
++		s5k5e3yx_power_off(&client->dev);
++		pm_runtime_set_suspended(&client->dev);
++	}
++}
++
++static const struct of_device_id s5k5e3yx_dt_ids[] = {
++	{ .compatible = "samsung,s5k5e3yx" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, s5k5e3yx_dt_ids);
++
++static const struct dev_pm_ops s5k5e3yx_pm_ops = {
++	SET_RUNTIME_PM_OPS(s5k5e3yx_power_off, s5k5e3yx_power_on, NULL)
++};
++
++static struct i2c_driver s5k5e3yx_i2c_driver = {
++	.driver = {
++		.name = "s5k5e3yx",
++		.of_match_table = s5k5e3yx_dt_ids,
++		.pm = &s5k5e3yx_pm_ops,
++	},
++	.probe = s5k5e3yx_probe,
++	.remove = s5k5e3yx_remove,
++};
++
++module_i2c_driver(s5k5e3yx_i2c_driver);
++
++MODULE_DESCRIPTION("Samsung S5K5E3YX sensor driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/mediatek/Kconfig b/drivers/media/platform/mediatek/Kconfig
+index 84104e2cd..dcce2da41 100644
+--- a/drivers/media/platform/mediatek/Kconfig
++++ b/drivers/media/platform/mediatek/Kconfig
+@@ -7,3 +7,5 @@ source "drivers/media/platform/mediatek/mdp/Kconfig"
+ source "drivers/media/platform/mediatek/vcodec/Kconfig"
+ source "drivers/media/platform/mediatek/vpu/Kconfig"
+ source "drivers/media/platform/mediatek/mdp3/Kconfig"
++source "drivers/media/platform/mediatek/imgsys/Kconfig"
++source "drivers/media/platform/mediatek/seninf/Kconfig"
+diff --git a/drivers/media/platform/mediatek/Makefile b/drivers/media/platform/mediatek/Makefile
+index 38e6ba917..8ba486982 100644
+--- a/drivers/media/platform/mediatek/Makefile
++++ b/drivers/media/platform/mediatek/Makefile
+@@ -4,3 +4,5 @@ obj-y += mdp/
+ obj-y += vcodec/
+ obj-y += vpu/
+ obj-y += mdp3/
++obj-y += imgsys/
++obj-y += seninf/
+diff --git a/drivers/media/platform/mediatek/imgsys/Kconfig b/drivers/media/platform/mediatek/imgsys/Kconfig
+new file mode 100644
+index 000000000..2e600c8cd
+--- /dev/null
++++ b/drivers/media/platform/mediatek/imgsys/Kconfig
+@@ -0,0 +1,25 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config VIDEO_MTK_IMGSYS
++	tristate "MediaTek MT6735 IMGSYS/ISP platform driver"
++	depends on MEDIA_SUPPORT
++	depends on VIDEO_DEV
++	depends on COMMON_CLK
++	depends on OF
++	depends on PM
++	help
++	  Platform, clock, power and reset driver for the MediaTek MT6735 /
++	  MT6737T image signal processor (IMGSYS) block.
++
++	  The driver owns the ISP core register windows, the six IMGSYS clock
++	  gates and the ISP power domain, performs the documented Pass 1 soft
++	  reset on probe and resume, and exposes the mapped register windows
++	  through debugfs for diagnostics.
++
++	  The ISP capture pipeline itself is not implemented: running the
++	  Pass 1 / Pass 2 / CAM_SV / DSP pipelines requires the proprietary
++	  MTK camera userspace ABI (libcamdrv) plus the ISP firmware images,
++	  neither of which is available.  This driver therefore provides no
++	  V4L2 entity and no video node.
++
++	  To compile this driver as a module, choose M here: the module will
++	  be called mtk-imgsys.
+diff --git a/drivers/media/platform/mediatek/imgsys/Makefile b/drivers/media/platform/mediatek/imgsys/Makefile
+new file mode 100644
+index 000000000..729a3af8d
+--- /dev/null
++++ b/drivers/media/platform/mediatek/imgsys/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_VIDEO_MTK_IMGSYS) += mtk-imgsys.o
+diff --git a/drivers/media/platform/mediatek/imgsys/mtk-imgsys-regs.h b/drivers/media/platform/mediatek/imgsys/mtk-imgsys-regs.h
+new file mode 100644
+index 000000000..c41e3919a
+--- /dev/null
++++ b/drivers/media/platform/mediatek/imgsys/mtk-imgsys-regs.h
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * MediaTek MT6735/MT6737T IMGSYS/ISP register definitions
++ *
++ * Port from Samsung/MTK downstream
++ * drivers/misc/mediatek/cameraisp/src/mt6735/camera_isp_D1.c
++ *
++ * Copyright 2008-2009 MediaTek Co., Ltd.
++ *
++ * Only the registers needed to power up, reset and inspect the ISP block are
++ * described here.  The downstream ISP register map is much larger, but every
++ * other register belongs to the Pass 1/Pass 2/CAM_SV programming sequences
++ * which are driven by the proprietary MTK camera userspace ABI (libcamdrv)
++ * and are intentionally not ported.
++ */
++
++#ifndef __MTK_IMGSYS_REGS_H
++#define __MTK_IMGSYS_REGS_H
++
++/* ISP core window, DT reg entry 0 (camera_isp_D1.c:110-200, :1278). */
++#define MTK_IMGSYS_ISP_WINDOW_SIZE		0x4000
++
++/* Inner ISP window, DT reg entry 1 (camera_isp_D1.c:311-313). */
++#define MTK_IMGSYS_INNER_ISP_WINDOW_SIZE	0x1000
++
++/*
++ * CAM_CTL_SW_CTL, ISP base + 0x8C
++ * (camera_isp_D1.c:244 "ISP_REG_ADDR_CAM_SW_CTL (ISP_ADDR + 0x8C)").
++ */
++#define MTK_IMGSYS_CAM_SW_CTL			0x008c
++
++/* P1 soft reset field, camera_isp_D1.c:370-374. */
++#define MTK_IMGSYS_SW_CTL_SW_RST_P1_MASK	GENMASK(2, 0)
++#define MTK_IMGSYS_SW_CTL_SW_RST_TRIG		BIT(0)
++#define MTK_IMGSYS_SW_CTL_SW_RST_STATUS		BIT(1)
++#define MTK_IMGSYS_SW_CTL_HW_RST		BIT(2)
++
++#endif /* __MTK_IMGSYS_REGS_H */
+diff --git a/drivers/media/platform/mediatek/imgsys/mtk-imgsys.c b/drivers/media/platform/mediatek/imgsys/mtk-imgsys.c
+new file mode 100644
+index 000000000..c89459f38
+--- /dev/null
++++ b/drivers/media/platform/mediatek/imgsys/mtk-imgsys.c
+@@ -0,0 +1,300 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek MT6735/MT6737T IMGSYS/ISP platform driver
++ *
++ * Port from Samsung/MTK downstream
++ * drivers/misc/mediatek/cameraisp/src/mt6735/camera_isp_D1.c
++ *
++ * Copyright 2008-2009 MediaTek Co., Ltd.
++ *
++ * This driver implements the parts of the MT6735 ISP block that are fully
++ * documented by the downstream GPL source drop: register window mapping, the
++ * six IMGSYS clock gates, the ISP power domain, the Pass 1 soft reset and a
++ * register dump for diagnostics.
++ *
++ * The ISP capture pipeline (Pass 1 / Pass 2 / CAM_SV / DSP programming, CQ
++ * command queues, interrupt driven frame completion) is not implemented: it
++ * is driven by the proprietary MTK camera userspace ABI (libcamdrv) and
++ * requires ISP firmware images.  Consequently this driver registers no V4L2
++ * entity, no video node and no interrupt handler; see the driver report for
++ * the detailed rationale and the deferred work list.
++ */
++
++#include <linux/clk.h>
++#include <linux/debugfs.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/seq_file.h>
++
++#include "mtk-imgsys-regs.h"
++
++/*
++ * Clock gates, in the order mandated by the downstream ISP driver
++ * (camera_isp_D1.c:3062-3100, "must keep this clk open order"):
++ * CG_IMAGE_CAM_SMI, CG_IMAGE_CAM_CAM, CG_IMAGE_SEN_TG, CG_IMAGE_SEN_CAM,
++ * CG_IMAGE_CAM_SV, CG_IMAGE_LARB2_SMI.
++ *
++ * All six are gates of the IMGSYS clock controller, addressed through the
++ * <&imgsys CLK_IMG_*> clock specifiers (include/dt-bindings/clock/
++ * mediatek,mt6735-imgsys.h).
++ */
++static const char *const mtk_imgsys_clk_names[] = {
++	"CG_IMAGE_CAM_SMI",
++	"CG_IMAGE_CAM_CAM",
++	"CG_IMAGE_SEN_TG",
++	"CG_IMAGE_SEN_CAM",
++	"CG_IMAGE_CAM_SV",
++	"CG_IMAGE_LARB2_SMI",
++};
++
++#define MTK_IMGSYS_CLK_NUM	ARRAY_SIZE(mtk_imgsys_clk_names)
++
++/* Software policy: reset completion poll interval and timeout. */
++#define MTK_IMGSYS_RESET_POLL_US	10
++#define MTK_IMGSYS_RESET_TIMEOUT_US	10000
++
++struct mtk_imgsys {
++	struct device *dev;
++	void __iomem *isp_base;
++	void __iomem *inner_base;
++	phys_addr_t isp_phys;
++	phys_addr_t inner_phys;
++	struct clk *clks[MTK_IMGSYS_CLK_NUM];
++	struct dentry *debugfs_dir;
++};
++
++static int mtk_imgsys_clks_enable(struct mtk_imgsys *priv)
++{
++	int i, ret;
++
++	for (i = 0; i < MTK_IMGSYS_CLK_NUM; i++) {
++		ret = clk_prepare_enable(priv->clks[i]);
++		if (ret) {
++			dev_err(priv->dev, "failed to enable clock %s: %d\n",
++				mtk_imgsys_clk_names[i], ret);
++			while (--i >= 0)
++				clk_disable_unprepare(priv->clks[i]);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++static void mtk_imgsys_clks_disable(struct mtk_imgsys *priv)
++{
++	int i;
++
++	for (i = MTK_IMGSYS_CLK_NUM - 1; i >= 0; i--)
++		clk_disable_unprepare(priv->clks[i]);
++}
++
++/*
++ * Pass 1 soft reset, following ISP_Reset(ISP_REG_SW_CTL_RST_CAM_P1) at
++ * camera_isp_D1.c:3263-3300 (the enabled "#if 1" variant):
++ *
++ *	reg = readl(CAM_SW_CTL);
++ *	writel((reg & ~RST_P1_MASK) | SW_RST_TRIG, CAM_SW_CTL);
++ *	poll SW_RST_STATUS;
++ *	writel(HW_RST, CAM_SW_CTL);
++ *	writel(reg & ~RST_P1_MASK, CAM_SW_CTL);
++ *
++ * The downstream completion loop is
++ * "do { Reg = read; } while ((!Reg) & SW_RST_STATUS);", which always
++ * terminates after a single read because of the use of bitwise "&" instead
++ * of "&&" and the inverted test.  The loop below waits for the documented
++ * status bit (bit 1, camera_isp_D1.c:372) with a bounded timeout instead.
++ */
++static int mtk_imgsys_soft_reset(struct mtk_imgsys *priv)
++{
++	void __iomem *sw_ctl = priv->isp_base + MTK_IMGSYS_CAM_SW_CTL;
++	u32 val;
++	int ret;
++
++	val = readl(sw_ctl);
++	writel((val & ~MTK_IMGSYS_SW_CTL_SW_RST_P1_MASK) |
++	       MTK_IMGSYS_SW_CTL_SW_RST_TRIG, sw_ctl);
++
++	ret = readl_poll_timeout(sw_ctl, val,
++				 val & MTK_IMGSYS_SW_CTL_SW_RST_STATUS,
++				 MTK_IMGSYS_RESET_POLL_US,
++				 MTK_IMGSYS_RESET_TIMEOUT_US);
++	if (ret) {
++		dev_err(priv->dev, "ISP P1 soft reset timed out, CAM_SW_CTL=0x%08x\n",
++			val);
++		return ret;
++	}
++
++	writel(MTK_IMGSYS_SW_CTL_HW_RST, sw_ctl);
++	writel(val & ~MTK_IMGSYS_SW_CTL_SW_RST_P1_MASK, sw_ctl);
++
++	return 0;
++}
++
++static int mtk_imgsys_runtime_resume(struct device *dev)
++{
++	struct mtk_imgsys *priv = dev_get_drvdata(dev);
++	int ret;
++
++	ret = mtk_imgsys_clks_enable(priv);
++	if (ret)
++		return ret;	/* mtk_imgsys_clks_enable() rolled back */
++
++	ret = mtk_imgsys_soft_reset(priv);
++	if (ret) {
++		mtk_imgsys_clks_disable(priv);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int mtk_imgsys_runtime_suspend(struct device *dev)
++{
++	struct mtk_imgsys *priv = dev_get_drvdata(dev);
++
++	mtk_imgsys_clks_disable(priv);
++
++	return 0;
++}
++
++static const struct dev_pm_ops mtk_imgsys_pm_ops = {
++	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
++	RUNTIME_PM_OPS(mtk_imgsys_runtime_suspend, mtk_imgsys_runtime_resume,
++		       NULL)
++};
++
++static int mtk_imgsys_regs_show(struct seq_file *s, void *unused)
++{
++	struct mtk_imgsys *priv = s->private;
++	unsigned int i, off;
++	int ret;
++
++	/*
++	 * The register windows are only accessible while the ISP power domain
++	 * and the clock gates are on, so resume the device for the duration of
++	 * the dump.
++	 */
++	ret = pm_runtime_resume_and_get(priv->dev);
++	if (ret)
++		return ret;
++
++	seq_printf(s, "ISP core @ %pa (0x%x bytes)\n", &priv->isp_phys,
++		   MTK_IMGSYS_ISP_WINDOW_SIZE);
++	for (i = 0, off = 0; i < MTK_IMGSYS_ISP_WINDOW_SIZE / sizeof(u32);
++	     i++, off += sizeof(u32))
++		seq_printf(s, "%04x: %08x\n", off,
++			   readl(priv->isp_base + off));
++
++	seq_printf(s, "inner ISP @ %pa (0x%x bytes)\n", &priv->inner_phys,
++		   MTK_IMGSYS_INNER_ISP_WINDOW_SIZE);
++	for (i = 0, off = 0; i < MTK_IMGSYS_INNER_ISP_WINDOW_SIZE / sizeof(u32);
++	     i++, off += sizeof(u32))
++		seq_printf(s, "%04x: %08x\n", off,
++			   readl(priv->inner_base + off));
++
++	pm_runtime_put(priv->dev);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mtk_imgsys_regs);
++
++static int mtk_imgsys_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct mtk_imgsys *priv;
++	struct resource *res;
++	int i, ret;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->dev = dev;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res)
++		return -ENODEV;
++	priv->isp_phys = res->start;
++	priv->isp_base = devm_ioremap_resource(dev, res);
++	if (IS_ERR(priv->isp_base))
++		return PTR_ERR(priv->isp_base);
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++	if (!res)
++		return -ENODEV;
++	priv->inner_phys = res->start;
++	priv->inner_base = devm_ioremap_resource(dev, res);
++	if (IS_ERR(priv->inner_base))
++		return PTR_ERR(priv->inner_base);
++
++	for (i = 0; i < MTK_IMGSYS_CLK_NUM; i++) {
++		priv->clks[i] = devm_clk_get(dev, mtk_imgsys_clk_names[i]);
++		if (IS_ERR(priv->clks[i])) {
++			dev_err(dev, "failed to get clock %s: %ld\n",
++				mtk_imgsys_clk_names[i],
++				PTR_ERR(priv->clks[i]));
++			return PTR_ERR(priv->clks[i]);
++		}
++	}
++
++	platform_set_drvdata(pdev, priv);
++
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
++
++	/*
++	 * Power the block on (ISP power domain through genpd, then the clock
++	 * gates) and run the Pass 1 soft reset.  The device is suspended again
++	 * right after probe; every later user (debugfs dump) resumes it.
++	 */
++	ret = pm_runtime_resume_and_get(dev);
++	if (ret) {
++		dev_err(dev, "failed to power on ISP block: %d\n", ret);
++		return ret;
++	}
++
++	priv->debugfs_dir = debugfs_create_dir("mtk-imgsys", NULL);
++	if (!IS_ERR_OR_NULL(priv->debugfs_dir))
++		debugfs_create_file("regs", 0444, priv->debugfs_dir, priv,
++				    &mtk_imgsys_regs_fops);
++
++	pm_runtime_put(dev);
++
++	dev_info(dev, "MT6735 IMGSYS/ISP block registered (ISP pipeline deferred)\n");
++
++	return 0;
++}
++
++static void mtk_imgsys_remove(struct platform_device *pdev)
++{
++	struct mtk_imgsys *priv = platform_get_drvdata(pdev);
++
++	debugfs_remove(priv->debugfs_dir);
++}
++
++static const struct of_device_id mtk_imgsys_of_match[] = {
++	{ .compatible = "mediatek,mt6735-ispsys" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, mtk_imgsys_of_match);
++
++static struct platform_driver mtk_imgsys_driver = {
++	.probe = mtk_imgsys_probe,
++	.remove = mtk_imgsys_remove,
++	.driver = {
++		.name = "mtk-imgsys",
++		.of_match_table = mtk_imgsys_of_match,
++		.pm = pm_ptr(&mtk_imgsys_pm_ops),
++	},
++};
++module_platform_driver(mtk_imgsys_driver);
++
++MODULE_AUTHOR("MediaTek Co., Ltd.");
++MODULE_DESCRIPTION("MediaTek MT6735 IMGSYS/ISP platform driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/mediatek/seninf/Kconfig b/drivers/media/platform/mediatek/seninf/Kconfig
+new file mode 100644
+index 000000000..e1ec4693a
+--- /dev/null
++++ b/drivers/media/platform/mediatek/seninf/Kconfig
+@@ -0,0 +1,16 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config VIDEO_MTK_SENINF
++	tristate "MediaTek MT6735 SENINF driver"
++	depends on MEDIA_SUPPORT && VIDEO_DEV && MEDIA_CONTROLLER && VIDEO_V4L2_SUBDEV_API && OF && COMMON_CLK
++	select V4L2_ASYNC
++	select V4L2_FWNODE
++	help
++	  Say Y or M here to enable the MediaTek MT6735 SENINF (sensor
++	  interface) driver.  The driver owns the camera subsystem media
++	  device, binds the sensor subdevices described in the device tree
++	  through the V4L2 async framework, and provides the per-camera MCLK
++	  output clocks.  The MIPI CSI-2 lane, D-PHY and timing programming is
++	  done by the proprietary MTK camera userspace and is not implemented.
++
++	  To compile this driver as a module, choose M here: the module will be
++	  called mtk-seninf.
+diff --git a/drivers/media/platform/mediatek/seninf/Makefile b/drivers/media/platform/mediatek/seninf/Makefile
+new file mode 100644
+index 000000000..4bfc5d7f8
+--- /dev/null
++++ b/drivers/media/platform/mediatek/seninf/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_VIDEO_MTK_SENINF) += mtk-seninf.o
+diff --git a/drivers/media/platform/mediatek/seninf/mtk-seninf-regs.h b/drivers/media/platform/mediatek/seninf/mtk-seninf-regs.h
+new file mode 100644
+index 000000000..6b2661da4
+--- /dev/null
++++ b/drivers/media/platform/mediatek/seninf/mtk-seninf-regs.h
+@@ -0,0 +1,73 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * MediaTek MT6735 SENINF register definitions
++ *
++ * Port from Samsung/MTK downstream:
++ *   drivers/misc/mediatek/cameraisp/src/mt6735/camera_isp_D1.c
++ *   drivers/misc/mediatek/cameraisp/src/mt6735/inc/camera_isp_D1.h
++ *   drivers/misc/mediatek/imgsensor/src/mt6735/kd_sensorlist.c
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ * Copyright (C) 2016 Samsung Electronics Co., Ltd.
++ *
++ * Downstream maps the SENINF block through the ISP driver and reaches the
++ * registers below as ISP_ADDR + offset, where ISP_ADDR is 0x15004000
++ * (camera_isp_D1.c:124-133) while the SENINF block itself starts at
++ * 0x15008000 (SENINF_BASE_ADDR, same lines, and the kd_camera_hw1 node in
++ * arch/arm/boot/dts/mt6735.dtsi:1307-1320).  The offsets in this file are
++ * expressed relative to the SENINF base, i.e. downstream offset - 0x4000.
++ */
++
++#ifndef __MTK_SENINF_REGS_H__
++#define __MTK_SENINF_REGS_H__
++
++#include <linux/bits.h>
++
++/* SENINF_REG_RANGE, camera_isp_D1.c:125 */
++#define MTK_SENINF_REG_RANGE		0x4000
++/* MIPIRX_CONFIG_RANGE, camera_isp_D1.c:129 */
++#define MTK_SENINF_MIPIRX_REG_RANGE	0x1000
++/* MIPIRX_ANALOG_RANGE, camera_isp_D1.c:131 */
++#define MTK_SENINF_MIPI_ANA_RANGE	0x3000
++
++/*
++ * Per-camera SENINF register block stride.  The four SENINF instances are
++ * 0x400 apart: SENINFn_IRQ_INTSTA is ISP_ADDR + 0x4128/0x4528/0x4928/0x4D28
++ * (camera_isp_D1.c:257-260) and the MCLK control registers are
++ * ISP_ADDR + 0x4200/0x4600/0x4A00 (camera_isp_D1.c:12060/12093/12123).
++ */
++#define MTK_SENINF_CAM_STRIDE		0x400
++
++/*
++ * SENINFn_IRQ_INTSTA, relative to the SENINF base:
++ *   SENINF1: 0x15008128 = 0x128, SENINF2: 0x15008528 = 0x528,
++ *   SENINF3: 0x15008928 = 0x928, SENINF4: 0x15008D28 = 0xD28.
++ */
++#define MTK_SENINF_CAM_INTSTA(n)	(0x128 + (n) * MTK_SENINF_CAM_STRIDE)
++
++/* SENINFn_IRQ_INTSTA error bits, camera_isp_D1.h:268-298 */
++#define MTK_SENINF_IRQ_OVERRUN		BIT(0)
++#define MTK_SENINF_IRQ_CRCERR		BIT(1)
++#define MTK_SENINF_IRQ_FSMERR		BIT(2)
++#define MTK_SENINF_IRQ_VSIZEERR		BIT(3)
++#define MTK_SENINF_IRQ_HSIZEERR		BIT(4)
++#define MTK_SENINF_IRQ_SENSOR_VSIZEERR	BIT(5)
++#define MTK_SENINF_IRQ_SENSOR_HSIZEERR	BIT(6)
++
++/* Error mask used downstream by ISP_REG_MASK_INT_SENINFn_ERR, camera_isp_D1.c:618-662 */
++#define MTK_SENINF_IRQ_ERR_MASK		(GENMASK(6, 0))
++
++/*
++ * MCLK control register, relative to the SENINF base:
++ *   ISP_MCLK1_EN: 0x15008200 = 0x200 (camera_isp_D1.c:12060)
++ *   ISP_MCLK2_EN: 0x15008600 = 0x600 (camera_isp_D1.c:12093)
++ *   ISP_MCLK3_EN: 0x15008A00 = 0xA00 (camera_isp_D1.c:12123)
++ * There is no ISP_MCLK4_EN in the downstream GPL source, so only three MCLK
++ * outputs are modelled.
++ */
++#define MTK_SENINF_MCLK_REG(n)		(0x200 + (n) * MTK_SENINF_CAM_STRIDE)
++
++/* Bit 29 (0x20000000) of the ISP_MCLKn_EN registers, camera_isp_D1.c:12063-12069 */
++#define MTK_SENINF_MCLK_EN		BIT(29)
++
++#endif /* __MTK_SENINF_REGS_H__ */
+diff --git a/drivers/media/platform/mediatek/seninf/mtk-seninf.c b/drivers/media/platform/mediatek/seninf/mtk-seninf.c
+new file mode 100644
+index 000000000..1ea4d819b
+--- /dev/null
++++ b/drivers/media/platform/mediatek/seninf/mtk-seninf.c
+@@ -0,0 +1,822 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek MT6735 SENINF (sensor interface) driver
++ *
++ * Port from Samsung/MTK downstream
++ *   drivers/misc/mediatek/cameraisp/src/mt6735/camera_isp_D1.c
++ *   drivers/misc/mediatek/cameraisp/src/mt6735/inc/camera_isp_D1.h
++ *   drivers/misc/mediatek/imgsensor/src/mt6735/kd_sensorlist.c
++ *   drivers/misc/mediatek/imgsensor/src/mt6735/camera_hw/kd_camera_hw.c
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ * Copyright (C) 2016 Samsung Electronics Co., Ltd.
++ *
++ * The SENINF block is the CSI-2 receiver of the MT6735 camera subsystem.  It
++ * owns the per-camera MCLK output gates and the per-camera error status
++ * registers, and it is the MIPI CSI-2 receiver the sensor subdevices connect
++ * to.  The table that programs the MIPI D-PHY and the SENINF lane/timing
++ * registers lives only in the proprietary userspace "seninf_drv" library
++ * (referenced at camera_isp_D1.c:125-133) and has no equivalent in the
++ * downstream GPL source; that programming is therefore deferred, see
++ * Documentation in the report.
++ */
++
++#include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/debugfs.h>
++#include <linux/minmax.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_graph.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/sprintf.h>
++
++#include <media/media-device.h>
++#include <media/v4l2-async.h>
++#include <media/v4l2-common.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fwnode.h>
++#include <media/v4l2-subdev.h>
++
++#include "mtk-seninf-regs.h"
++
++#define MTK_SENINF_NAME			"mtk-seninf"
++
++/*
++ * SENINF1..SENINF4 have a status block each (camera_isp_D1.c:257-260), so up
++ * to four sink ports can be described in DT.
++ */
++#define MTK_SENINF_NUM_CAMS		4
++
++/*
++ * Only ISP_MCLK1_EN..ISP_MCLK3_EN exist in the downstream source
++ * (camera_isp_D1.c:12048-12137, EXPORT_SYMBOL at 12076/12107/12137); no
++ * ISP_MCLK4_EN is defined anywhere in the GPL drop.
++ */
++#define MTK_SENINF_NUM_MCLKS		3
++
++/*
++ * Upper bound on the number of MIPI CSI-2 data lanes checked against the
++ * remote sensor configuration.  Four lanes are in use on this platform: the
++ * IMX219 sensor driver configures SENSOR_MIPI_4_LANE
++ * (imx219_mipi_raw/imx219mipiraw_Sensor.c:160) and is routed through this
++ * receiver, so the MIPI RX block accepts at least four data lanes.
++ */
++#define MTK_SENINF_MAX_DATA_LANES	4
++
++struct mtk_seninf;
++
++/**
++ * struct mtk_seninf_mclk - one MCLK output gate
++ * @hw: clock hardware exposed through the #clock-cells=<1> provider
++ * @priv: back pointer to the SENINF instance
++ * @parent_hws: single parent, the "camtg" clock
++ * @idx: camera index, selects the ISP_MCLKn_EN register
++ */
++struct mtk_seninf_mclk {
++	struct clk_hw hw;
++	struct mtk_seninf *priv;
++	const struct clk_hw *parent_hws[1];
++	unsigned int idx;
++};
++
++/**
++ * struct mtk_seninf_asc - async connection carrying the local sink pad index
++ * @asc: V4L2 async connection, must be the first member
++ * @pad: sink pad (== DT port number) the remote sensor is bound to
++ */
++struct mtk_seninf_asc {
++	struct v4l2_async_connection asc;
++	unsigned int pad;
++};
++
++/**
++ * struct mtk_seninf - driver instance
++ * @dev: device
++ * @base: SENINF register window
++ * @mipi_rx: MIPIRX_CONFIG register window (debugfs only)
++ * @mipi_ana: MIPIRX_ANALOG register window (debugfs only)
++ * @camtg: camera timing clock feeding the MCLK outputs
++ * @mclk: MCLK output gates
++ * @v4l2_dev: V4L2 device
++ * @mdev: media device, the single one of the camera subsystem
++ * @sd: SENINF V4L2 subdevice
++ * @pads: sink pads (one per DT port) plus one source pad
++ * @num_sink_pads: number of sink pads
++ * @notifier: async notifier for the sensor subdevices
++ * @lock: serialises s_stream
++ * @streaming: streaming state
++ * @debugfs: debugfs directory
++ */
++struct mtk_seninf {
++	struct device *dev;
++	void __iomem *base;
++	void __iomem *mipi_rx;
++	void __iomem *mipi_ana;
++	struct clk *camtg;
++
++	struct mtk_seninf_mclk mclk[MTK_SENINF_NUM_MCLKS];
++
++	struct v4l2_device v4l2_dev;
++	struct media_device mdev;
++	struct v4l2_subdev sd;
++	struct media_pad *pads;
++	unsigned int num_sink_pads;
++
++	struct v4l2_async_notifier notifier;
++
++	struct mutex lock;
++	bool streaming;
++
++	struct dentry *debugfs;
++};
++
++static inline struct mtk_seninf *to_mtk_seninf(struct v4l2_subdev *sd)
++{
++	return v4l2_get_subdevdata(sd);
++}
++
++static inline struct mtk_seninf_mclk *to_mtk_seninf_mclk(struct clk_hw *hw)
++{
++	return container_of(hw, struct mtk_seninf_mclk, hw);
++}
++
++/*
++ * Error status
++ *
++ * The SENINF status registers are polled through the ISP CAM0..CAM2 interrupt
++ * lines downstream (arch/arm/boot/dts/mt6735.dtsi:1314-1320, camera_isp_D1.c
++ * ISP_IRQ_TYPE_INT_SENINF1..4), never through an interrupt of their own, so this
++ * driver does not request an IRQ and has no interrupt-enable programming.
++ */
++
++static const char * const mtk_seninf_err_names[] = {
++	"overrun", "crc", "fsm", "vsize", "hsize", "sensor-vsize", "sensor-hsize",
++};
++
++static void mtk_seninf_check_errors(struct mtk_seninf *priv, const char *where)
++{
++	unsigned int i;
++
++	for (i = 0; i < MTK_SENINF_NUM_CAMS; i++) {
++		u32 reg = MTK_SENINF_CAM_INTSTA(i);
++		u32 err;
++		u32 sta;
++		char names[128];
++		size_t len = 0;
++		unsigned int bit;
++
++		sta = readl(priv->base + reg);
++		err = sta & MTK_SENINF_IRQ_ERR_MASK;
++		if (!err)
++			continue;
++
++		names[0] = '\0';
++		for (bit = 0; bit < ARRAY_SIZE(mtk_seninf_err_names); bit++) {
++			if (!(err & BIT(bit)))
++				continue;
++			len += scnprintf(names + len, sizeof(names) - len, "%s%s",
++					 len ? "|" : "", mtk_seninf_err_names[bit]);
++			if (len >= sizeof(names))
++				break;
++		}
++
++		dev_err(priv->dev, "SENINF%u error status 0x%08x at %s: %s\n",
++			i + 1, sta, where, names);
++
++		/*
++		 * [INFERENCE] The status register is cleared by writing back the
++		 * set bits (write-one-to-clear), like the other MTK IRQ_STA
++		 * registers.  The downstream source only ever reads this register
++		 * (camera_isp_D1.c:9203-9217, inside "#if 0"), so the clear
++		 * convention cannot be cited from the GPL drop.
++		 */
++		writel(err, priv->base + reg);
++		if (readl(priv->base + reg) & err)
++			dev_warn(priv->dev,
++				 "SENINF%u error status 0x%08x did not clear\n",
++				 i + 1, err);
++	}
++}
++
++/*
++ * MCLK clock provider
++ *
++ * ISP_MCLKn_EN sits in the per-camera SENINF register block and is raised while
++ * the "camtg" clock runs: kd_sensorlist.c:2453-2459 enables camtg before
++ * kdCISModulePowerOn() raises MCLK (kd_camera_hw.c:519-523) and disables it
++ * after the MCLK gate is dropped.
++ *
++ * The "camtg" clock is modelled as the CCF parent of every MCLK output, so
++ * clk_prepare_enable() on an MCLK output prepares/enables camtg through the
++ * clock core (correct refcounting, no manual user counters) and the rate
++ * reported to the sensor drivers is camtg's rate, exactly what the downstream
++ * kdSetSensorMclk() programs (kd_sensorlist.c:2442-2461).
++ *
++ * The SENINF registers themselves only need the ISP power domain, which is a
++ * pure SPM power domain (no clocks property in its DT node,
++ * arch/arm64/boot/dts/mediatek/mt6735.dtsi:223-227).  .prepare therefore takes
++ * a runtime PM reference so the domain is on, and .unprepare drops it.  Calling
++ * runtime PM from .prepare is safe: nothing in the resume path takes the CCF
++ * prepare_lock, because camtg is brought up by the clock core parent chain, not
++ * by the resume callback.
++ */
++static int mtk_seninf_mclk_prepare(struct clk_hw *hw)
++{
++	struct mtk_seninf_mclk *mclk = to_mtk_seninf_mclk(hw);
++	struct mtk_seninf *priv = mclk->priv;
++	u32 reg = MTK_SENINF_MCLK_REG(mclk->idx);
++	int ret;
++
++	ret = pm_runtime_resume_and_get(priv->dev);
++	if (ret < 0) {
++		dev_err(priv->dev, "mclk%u: failed to resume: %d\n",
++			mclk->idx, ret);
++		return ret;
++	}
++
++	writel(readl(priv->base + reg) | MTK_SENINF_MCLK_EN, priv->base + reg);
++
++	return 0;
++}
++
++static void mtk_seninf_mclk_unprepare(struct clk_hw *hw)
++{
++	struct mtk_seninf_mclk *mclk = to_mtk_seninf_mclk(hw);
++	struct mtk_seninf *priv = mclk->priv;
++	u32 reg = MTK_SENINF_MCLK_REG(mclk->idx);
++
++	writel(readl(priv->base + reg) & ~MTK_SENINF_MCLK_EN, priv->base + reg);
++
++	/* No autosuspend is used, so this matches the get in .prepare. */
++	pm_runtime_put(priv->dev);
++}
++
++static const struct clk_ops mtk_seninf_mclk_ops = {
++	.prepare = mtk_seninf_mclk_prepare,
++	.unprepare = mtk_seninf_mclk_unprepare,
++};
++
++static const char * const mtk_seninf_mclk_names[MTK_SENINF_NUM_MCLKS] = {
++	"mclk0", "mclk1", "mclk2",
++};
++
++static int mtk_seninf_register_mclks(struct mtk_seninf *priv)
++{
++	struct clk_hw *camtg_hw = __clk_get_hw(priv->camtg);
++	struct clk_hw_onecell_data *data;
++	unsigned int i;
++	int ret;
++
++	data = devm_kzalloc(priv->dev, struct_size(data, hws, MTK_SENINF_NUM_MCLKS),
++			    GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++
++	data->num = MTK_SENINF_NUM_MCLKS;
++
++	for (i = 0; i < MTK_SENINF_NUM_MCLKS; i++) {
++		struct mtk_seninf_mclk *mclk = &priv->mclk[i];
++		struct clk_init_data init = {
++			.name = mtk_seninf_mclk_names[i],
++			.ops = &mtk_seninf_mclk_ops,
++			.parent_hws = mclk->parent_hws,
++			.num_parents = 1,
++		};
++
++		mclk->priv = priv;
++		mclk->idx = i;
++		mclk->parent_hws[0] = camtg_hw;
++		mclk->hw.init = &init;
++
++		ret = devm_clk_hw_register(priv->dev, &mclk->hw);
++		if (ret) {
++			dev_err(priv->dev, "failed to register mclk%u: %d\n", i, ret);
++			return ret;
++		}
++
++		data->hws[i] = &mclk->hw;
++	}
++
++	return devm_of_clk_add_hw_provider(priv->dev, of_clk_hw_onecell_get, data);
++}
++
++/* Re-apply the MCLK gates after the ISP power domain came back. */
++static void mtk_seninf_mclk_restore(struct mtk_seninf *priv)
++{
++	unsigned int i;
++
++	for (i = 0; i < MTK_SENINF_NUM_MCLKS; i++) {
++		if (!clk_hw_is_prepared(&priv->mclk[i].hw))
++			continue;
++		writel(readl(priv->base + MTK_SENINF_MCLK_REG(i)) | MTK_SENINF_MCLK_EN,
++		       priv->base + MTK_SENINF_MCLK_REG(i));
++	}
++}
++
++static int mtk_seninf_runtime_resume(struct device *dev)
++{
++	struct mtk_seninf *priv = dev_get_drvdata(dev);
++
++	/*
++	 * The ISP power domain has just been switched on again, so the SENINF
++	 * registers lost their contents: re-apply the MCLK gates of every output
++	 * a consumer still holds and poll the error status.
++	 */
++	mtk_seninf_mclk_restore(priv);
++	mtk_seninf_check_errors(priv, "runtime resume");
++
++	return 0;
++}
++
++static int mtk_seninf_runtime_suspend(struct device *dev)
++{
++	/*
++	 * Nothing to do: the ISP power domain is switched off by genpd and the
++	 * "camtg" clock is kept on by the CCF parent chain for as long as a
++	 * consumer holds its MCLK output.
++	 */
++	return 0;
++}
++
++static const struct dev_pm_ops mtk_seninf_pm_ops = {
++	RUNTIME_PM_OPS(mtk_seninf_runtime_suspend, mtk_seninf_runtime_resume, NULL)
++};
++
++/*
++ * Link validation
++ *
++ * The remote sensor describes the CSI-2 link through its mbus configuration
++ * (link frequency and number of data lanes).  Those are the parameters the
++ * deferred D-PHY/SENINF programming would consume, so they are queried and
++ * logged here and a configuration the receiver cannot support is rejected.
++ */
++static int mtk_seninf_check_link(struct mtk_seninf *priv, unsigned int pad)
++{
++	struct media_pad *remote;
++	struct v4l2_subdev *remote_sd;
++	s64 link_freq;
++	int lanes;
++
++	remote = media_pad_remote_pad_first(&priv->pads[pad]);
++	if (!remote)
++		return 0;
++
++	remote_sd = media_entity_to_v4l2_subdev(remote->entity);
++
++	link_freq = v4l2_get_link_freq(remote, 1, 1);
++	if (link_freq < 0) {
++		if (link_freq != -ENOENT) {
++			dev_err(priv->dev, "pad%u: invalid link frequency: %lld\n",
++				pad, link_freq);
++			return link_freq;
++		}
++		dev_warn(priv->dev, "pad%u: %s does not report a link frequency\n",
++			 pad, remote_sd->name);
++	} else {
++		dev_info(priv->dev, "pad%u: %s link frequency %lld Hz\n",
++			 pad, remote_sd->name, link_freq);
++	}
++
++	lanes = v4l2_get_active_data_lanes(remote, MTK_SENINF_MAX_DATA_LANES);
++	if (lanes < 0) {
++		dev_err(priv->dev, "pad%u: unusable data lane count: %d\n",
++			pad, lanes);
++		return lanes;
++	}
++
++	dev_info(priv->dev, "pad%u: %s %d data lane(s)\n",
++		 pad, remote_sd->name, lanes);
++
++	return 0;
++}
++
++static int mtk_seninf_s_stream(struct v4l2_subdev *sd, int enable)
++{
++	struct mtk_seninf *priv = to_mtk_seninf(sd);
++	unsigned int i;
++	int ret = 0;
++
++	mutex_lock(&priv->lock);
++
++	if (enable == priv->streaming) {
++		mutex_unlock(&priv->lock);
++		return 0;
++	}
++
++	if (enable) {
++		ret = pm_runtime_resume_and_get(priv->dev);
++		if (ret < 0) {
++			dev_err(priv->dev, "failed to resume: %d\n", ret);
++			goto out_unlock;
++		}
++
++		for (i = 0; i < priv->num_sink_pads; i++) {
++			ret = mtk_seninf_check_link(priv, i);
++			if (ret)
++				goto err_put;
++		}
++
++		mtk_seninf_check_errors(priv, "stream on");
++		priv->streaming = true;
++	} else {
++		mtk_seninf_check_errors(priv, "stream off");
++		priv->streaming = false;
++		pm_runtime_put(priv->dev);
++	}
++
++	mutex_unlock(&priv->lock);
++	return 0;
++
++err_put:
++	pm_runtime_put(priv->dev);
++out_unlock:
++	mutex_unlock(&priv->lock);
++	return ret;
++}
++
++static const struct v4l2_subdev_video_ops mtk_seninf_video_ops = {
++	/*
++	 * Classic single-interface streaming hook, invoked through
++	 * v4l2_subdev_call(sd, video, s_stream, enable).  The newer per-pad
++	 * enable_streams/disable_streams pad operations require subdev state and
++	 * routing, which this bridge without a capture pipeline does not have.
++	 */
++	.s_stream = mtk_seninf_s_stream,
++};
++
++static const struct v4l2_subdev_ops mtk_seninf_subdev_ops = {
++	.video = &mtk_seninf_video_ops,
++};
++
++/*
++ * Async binding
++ */
++static int mtk_seninf_notifier_bound(struct v4l2_async_notifier *notifier,
++				     struct v4l2_subdev *subdev,
++				     struct v4l2_async_connection *asc)
++{
++	struct mtk_seninf *priv = container_of(notifier, struct mtk_seninf,
++					       notifier);
++	struct mtk_seninf_asc *sasc = container_of(asc, struct mtk_seninf_asc,
++						   asc);
++	unsigned int src_pad;
++	unsigned int i;
++	int ret;
++
++	for (i = 0, src_pad = 0; i < subdev->entity.num_pads; i++) {
++		if (subdev->entity.pads[i].flags & MEDIA_PAD_FL_SOURCE) {
++			src_pad = i;
++			break;
++		}
++	}
++	if (i == subdev->entity.num_pads) {
++		dev_err(priv->dev, "%s has no source pad\n", subdev->name);
++		return -EINVAL;
++	}
++
++	ret = media_create_pad_link(&subdev->entity, src_pad, &priv->sd.entity,
++				    sasc->pad,
++				    MEDIA_LNK_FL_IMMUTABLE | MEDIA_LNK_FL_ENABLED);
++	if (ret) {
++		dev_err(priv->dev, "failed to link %s to pad%u: %d\n",
++			subdev->name, sasc->pad, ret);
++		return ret;
++	}
++
++	dev_info(priv->dev, "bound %s to pad%u\n", subdev->name, sasc->pad);
++
++	return 0;
++}
++
++static int mtk_seninf_notifier_complete(struct v4l2_async_notifier *notifier)
++{
++	struct mtk_seninf *priv = container_of(notifier, struct mtk_seninf,
++					       notifier);
++	int ret;
++
++	ret = v4l2_device_register_subdev_nodes(&priv->v4l2_dev);
++	if (ret) {
++		dev_err(priv->dev, "failed to register subdev nodes: %d\n", ret);
++		return ret;
++	}
++
++	dev_info(priv->dev, "all sensor subdevices bound\n");
++
++	return 0;
++}
++
++static const struct v4l2_async_notifier_operations mtk_seninf_notifier_ops = {
++	.bound = mtk_seninf_notifier_bound,
++	.complete = mtk_seninf_notifier_complete,
++};
++
++static int mtk_seninf_register_notifier(struct mtk_seninf *priv)
++{
++	struct device_node *ep;
++	unsigned int count = 0;
++	int ret;
++
++	v4l2_async_nf_init(&priv->notifier, &priv->v4l2_dev);
++	priv->notifier.ops = &mtk_seninf_notifier_ops;
++
++	for_each_endpoint_of_node(priv->dev->of_node, ep) {
++		struct mtk_seninf_asc *sasc;
++		struct of_endpoint of_ep;
++
++		ret = of_graph_parse_endpoint(ep, &of_ep);
++		if (ret) {
++			dev_err(priv->dev, "failed to parse %pOF: %d\n", ep, ret);
++			of_node_put(ep);
++			goto err_cleanup;
++		}
++
++		if (of_ep.port >= MTK_SENINF_NUM_CAMS) {
++			dev_err(priv->dev, "%pOF: port %u out of range\n",
++				ep, of_ep.port);
++			of_node_put(ep);
++			ret = -EINVAL;
++			goto err_cleanup;
++		}
++
++		sasc = (struct mtk_seninf_asc *)
++			v4l2_async_nf_add_fwnode_remote(&priv->notifier,
++							of_fwnode_handle(ep),
++							struct mtk_seninf_asc);
++		if (IS_ERR(sasc)) {
++			ret = PTR_ERR(sasc);
++			dev_err(priv->dev, "failed to add %pOF: %d\n", ep, ret);
++			of_node_put(ep);
++			goto err_cleanup;
++		}
++
++		sasc->pad = of_ep.port;
++		count++;
++	}
++
++	if (!count) {
++		dev_err(priv->dev, "no sensor endpoint described in DT\n");
++		ret = -ENODEV;
++		goto err_cleanup;
++	}
++
++	ret = v4l2_async_nf_register(&priv->notifier);
++	if (ret) {
++		dev_err(priv->dev, "failed to register async notifier: %d\n", ret);
++		goto err_cleanup;
++	}
++
++	return 0;
++
++err_cleanup:
++	v4l2_async_nf_cleanup(&priv->notifier);
++	return ret;
++}
++
++/*
++ * Debugfs
++ *
++ * MIPIRX_CONFIG and MIPIRX_ANALOG are owned by the proprietary "seninf_drv"
++ * userspace component; the GPL drop contains no programming sequence for them,
++ * so they are mapped but only exposed through a read-only dump.
++ */
++static void mtk_seninf_dump_window(struct seq_file *s, const char *name,
++				   void __iomem *base, unsigned int size)
++{
++	unsigned int off;
++
++	seq_printf(s, "%s (%u bytes)\n", name, size);
++	for (off = 0; off < size; off += 4)
++		seq_printf(s, "  %04x: %08x\n", off, readl(base + off));
++}
++
++static int mtk_seninf_regs_show(struct seq_file *s, void *unused)
++{
++	struct mtk_seninf *priv = s->private;
++	int ret;
++
++	ret = pm_runtime_resume_and_get(priv->dev);
++	if (ret < 0)
++		return ret;
++
++	mtk_seninf_dump_window(s, "SENINF", priv->base, MTK_SENINF_REG_RANGE);
++	mtk_seninf_dump_window(s, "MIPIRX_CONFIG", priv->mipi_rx,
++			       MTK_SENINF_MIPIRX_REG_RANGE);
++	mtk_seninf_dump_window(s, "MIPIRX_ANALOG", priv->mipi_ana,
++			       MTK_SENINF_MIPI_ANA_RANGE);
++
++	pm_runtime_put(priv->dev);
++
++	return 0;
++}
++
++static int mtk_seninf_regs_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, mtk_seninf_regs_show, inode->i_private);
++}
++
++static const struct file_operations mtk_seninf_regs_fops = {
++	.owner = THIS_MODULE,
++	.open = mtk_seninf_regs_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++static void mtk_seninf_debugfs_init(struct mtk_seninf *priv)
++{
++	priv->debugfs = debugfs_create_dir(MTK_SENINF_NAME, NULL);
++	if (IS_ERR_OR_NULL(priv->debugfs)) {
++		dev_dbg(priv->dev, "debugfs not available\n");
++		priv->debugfs = NULL;
++		return;
++	}
++
++	debugfs_create_file("regs", 0444, priv->debugfs, priv,
++			    &mtk_seninf_regs_fops);
++}
++
++/*
++ * Probe / remove
++ */
++static int mtk_seninf_init_entity(struct mtk_seninf *priv)
++{
++	struct device_node *ep;
++	unsigned int num_sink = 0;
++	unsigned int i;
++	int ret;
++
++	for_each_endpoint_of_node(priv->dev->of_node, ep) {
++		struct of_endpoint of_ep;
++
++		ret = of_graph_parse_endpoint(ep, &of_ep);
++		if (ret)
++			continue;
++
++		if (of_ep.port >= MTK_SENINF_NUM_CAMS)
++			continue;
++
++		num_sink = max(num_sink, of_ep.port + 1);
++	}
++
++	if (!num_sink)
++		return -ENODEV;
++
++	priv->num_sink_pads = num_sink;
++	priv->pads = devm_kcalloc(priv->dev, num_sink + 1, sizeof(*priv->pads),
++				  GFP_KERNEL);
++	if (!priv->pads)
++		return -ENOMEM;
++
++	for (i = 0; i < num_sink; i++)
++		priv->pads[i].flags = MEDIA_PAD_FL_SINK;
++	priv->pads[num_sink].flags = MEDIA_PAD_FL_SOURCE;
++
++	v4l2_subdev_init(&priv->sd, &mtk_seninf_subdev_ops);
++	priv->sd.dev = priv->dev;
++	priv->sd.owner = THIS_MODULE;
++	priv->sd.flags = V4L2_SUBDEV_FL_HAS_DEVNODE;
++	priv->sd.entity.function = MEDIA_ENT_F_VID_IF_BRIDGE;
++	strscpy(priv->sd.name, MTK_SENINF_NAME, sizeof(priv->sd.name));
++	v4l2_set_subdevdata(&priv->sd, priv);
++
++	ret = media_entity_pads_init(&priv->sd.entity, num_sink + 1, priv->pads);
++	if (ret)
++		return ret;
++
++	return v4l2_device_register_subdev(&priv->v4l2_dev, &priv->sd);
++}
++
++static int mtk_seninf_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct mtk_seninf *priv;
++	int ret;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->dev = dev;
++	mutex_init(&priv->lock);
++	platform_set_drvdata(pdev, priv);
++
++	priv->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(priv->base))
++		return dev_err_probe(dev, PTR_ERR(priv->base),
++				     "failed to map SENINF registers\n");
++
++	priv->mipi_rx = devm_platform_ioremap_resource(pdev, 1);
++	if (IS_ERR(priv->mipi_rx))
++		return dev_err_probe(dev, PTR_ERR(priv->mipi_rx),
++				     "failed to map MIPIRX_CONFIG registers\n");
++
++	priv->mipi_ana = devm_platform_ioremap_resource(pdev, 2);
++	if (IS_ERR(priv->mipi_ana))
++		return dev_err_probe(dev, PTR_ERR(priv->mipi_ana),
++				     "failed to map MIPIRX_ANALOG registers\n");
++
++	priv->camtg = devm_clk_get(dev, "camtg");
++	if (IS_ERR(priv->camtg))
++		return dev_err_probe(dev, PTR_ERR(priv->camtg),
++				     "failed to get camtg clock\n");
++
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
++
++	priv->mdev.dev = dev;
++	strscpy(priv->mdev.model, "MT6735 SENINF", sizeof(priv->mdev.model));
++	media_device_init(&priv->mdev);
++	priv->v4l2_dev.mdev = &priv->mdev;
++
++	ret = v4l2_device_register(dev, &priv->v4l2_dev);
++	if (ret) {
++		dev_err_probe(dev, ret, "failed to register v4l2 device\n");
++		goto err_media_cleanup;
++	}
++
++	ret = media_device_register(&priv->mdev);
++	if (ret) {
++		dev_err_probe(dev, ret, "failed to register media device\n");
++		goto err_v4l2_unregister;
++	}
++
++	ret = mtk_seninf_init_entity(priv);
++	if (ret) {
++		if (ret == -ENODEV)
++			dev_err_probe(dev, ret,
++				      "no sensor endpoints described in DT\n");
++		else
++			dev_err_probe(dev, ret, "failed to init subdevice\n");
++		goto err_media_unregister;
++	}
++
++	ret = mtk_seninf_register_mclks(priv);
++	if (ret)
++		goto err_subdev_unregister;
++
++	ret = mtk_seninf_register_notifier(priv);
++	if (ret)
++		goto err_subdev_unregister;
++
++	mtk_seninf_debugfs_init(priv);
++
++	dev_info(dev, "%u sink pad(s), %u MCLK output(s)\n",
++		 priv->num_sink_pads, MTK_SENINF_NUM_MCLKS);
++
++	return 0;
++
++err_subdev_unregister:
++	v4l2_device_unregister_subdev(&priv->sd);
++err_media_unregister:
++	media_device_unregister(&priv->mdev);
++err_v4l2_unregister:
++	v4l2_device_unregister(&priv->v4l2_dev);
++err_media_cleanup:
++	media_device_cleanup(&priv->mdev);
++	mutex_destroy(&priv->lock);
++	return ret;
++}
++
++static void mtk_seninf_remove(struct platform_device *pdev)
++{
++	struct mtk_seninf *priv = platform_get_drvdata(pdev);
++
++	if (priv->streaming) {
++		priv->streaming = false;
++		pm_runtime_put(priv->dev);
++	}
++
++	debugfs_remove_recursive(priv->debugfs);
++	v4l2_async_nf_unregister(&priv->notifier);
++	v4l2_async_nf_cleanup(&priv->notifier);
++	v4l2_device_unregister_subdev(&priv->sd);
++	media_device_unregister(&priv->mdev);
++	v4l2_device_unregister(&priv->v4l2_dev);
++	media_device_cleanup(&priv->mdev);
++	mutex_destroy(&priv->lock);
++}
++
++static const struct of_device_id mtk_seninf_of_match[] = {
++	{ .compatible = "mediatek,mt6735-seninf" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, mtk_seninf_of_match);
++
++static struct platform_driver mtk_seninf_driver = {
++	.probe = mtk_seninf_probe,
++	.remove = mtk_seninf_remove,
++	.driver = {
++		.name = MTK_SENINF_NAME,
++		.of_match_table = mtk_seninf_of_match,
++		.pm = pm_ptr(&mtk_seninf_pm_ops),
++	},
++};
++module_platform_driver(mtk_seninf_driver);
++
++MODULE_DESCRIPTION("MediaTek MT6735 SENINF driver");
++MODULE_LICENSE("GPL");

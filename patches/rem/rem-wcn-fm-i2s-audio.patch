@@ -1,0 +1,740 @@
+diff --git a/sound/soc/mediatek/mt6735/Makefile b/sound/soc/mediatek/mt6735/Makefile
+index 76b8e62f9..a757a99f1 100644
+--- a/sound/soc/mediatek/mt6735/Makefile
++++ b/sound/soc/mediatek/mt6735/Makefile
+@@ -5,7 +5,8 @@ snd-soc-mt6735-afe-objs := \
+ 	mt6735-dai-pcm.o \
+ 	mt6735-dai-hpimp.o \
+ 	mt6735-dai-voice.o \
+-	mt6735-dai-i2s.o
++	mt6735-dai-i2s.o \
++	mt6735-dai-fm-i2s.o
+ 
+ obj-$(CONFIG_SND_SOC_MT6735) += snd-soc-mt6735-afe.o
+ 
+diff --git a/sound/soc/mediatek/mt6735/mt6735-afe-common.h b/sound/soc/mediatek/mt6735/mt6735-afe-common.h
+index 15c42a169..e96276d8b 100644
+--- a/sound/soc/mediatek/mt6735/mt6735-afe-common.h
++++ b/sound/soc/mediatek/mt6735/mt6735-afe-common.h
+@@ -61,6 +61,12 @@ enum {
+ 	MT6735_AFE_DAI_VOICE_MD2,
+ 	MT6735_AFE_DAI_VOICE_MD1_BT,
+ 	MT6735_AFE_DAI_VOICE_MD2_BT,
++	/*
++	 * FM I2S back end (mt6735-dai-fm-i2s.c).  It is memif-less like the
++	 * I2S0 and voice DAIs and is appended after the contiguous voice/BT
++	 * block so that MT6735_AFE_VOICE_DAI_IDX() keeps working.
++	 */
++	MT6735_AFE_DAI_FM_I2S,
+ 	MT6735_AFE_DAI_NUM,
+ };
+ 
+@@ -83,6 +89,23 @@ enum {
+ #define MT6735_BTCVSD_BUFFER_MAX	(16 * 1024)
+ #define MT6735_BTCVSD_PERIODS_MAX	4	/* SOC_NORMAL_USE_PERIODS_MAX, mt_soc_pcm_common.h:194 */
+ 
++/*
++ * FM I2S CPU DAI name, downstream MT_SOC_FM_I2S_NAME
++ * (AudDrv_Def.h:230).  The FM codec DAI (rem-wcn-fm-i2s) is the other end of
++ * the mt-snd-card link in mt6735-mt6331.c.
++ */
++#define MT6735_AFE_FM_I2S_DAI_NAME	"mt-soc-fmi2S-driver"
++
++/*
++ * The 2nd I2S input from CONNSYS is a fixed 32 kHz, 16 bit stereo link:
++ * Set2ndI2SIn() is always called with mI2S_SAMPLERATE = 32000,
++ * mI2S_WLEN = WLEN_16BITS (mt_soc_pcm_fm_i2s.c:305-313) and the AFE has no
++ * 24 bit or mono mode for this path.
++ */
++#define MT6735_AFE_FM_I2S_RATE		32000
++#define MT6735_AFE_FM_I2S_FORMATS	SNDRV_PCM_FMTBIT_S16_LE
++#define MT6735_AFE_FM_I2S_CHANNELS	2
++
+ /*
+  * Per-DAI state for the voice and BT SCO DAIs.  The AFE has one modem PCM
+  * interface (or one DAI_BT block) per DAI, so the state is per DAI and not
+@@ -171,6 +194,23 @@ struct mt6735_afe_priv {
+ 	bool i2s_slave;
+ 	unsigned int i2s_sysclk;
+ 
++	/*
++	 * AFE_I2S_CON (0x0018) is shared between the I2S0 4 wire path
++	 * (Enable4pin_I2S0_I2S3(), mt_soc_afe_control.c:3749-3761) and the FM
++	 * 2nd I2S input (Set2ndI2SIn(), mt_soc_afe_control.c:2231).  The two
++	 * users are mutually exclusive; i2s_con_lock serialises their open
++	 * paths and the *_active flags make the second user fail with -EBUSY
++	 * instead of overwriting the register.
++	 */
++	struct mutex i2s_con_lock;
++	bool i2s0_active;
++	bool fm_i2s_active;
++
++	/* FM I2S back end state, mt6735-dai-fm-i2s.c */
++	bool fm_i2s_prepared;	/* FM I2S registers programmed */
++	bool fm_i2s_on;		/* AFE_I2S_CON enabled, counts as EnableAfe() */
++	bool fm_i2s_dac_owner;	/* this DAI programmed the PMIC I2S DAC */
++
+ 	unsigned int spurious_irqs;
+ 
+ 	/*
+@@ -216,6 +256,7 @@ void mt6735_afe_dac_disable(struct mtk_base_afe *afe);
+ extern const struct snd_soc_dai_driver mt6735_afe_pcm_dais[MT6735_AFE_PCM_DAI_NUM];
+ extern const struct snd_soc_dai_driver mt6735_afe_i2s_dai;
+ extern const struct snd_soc_dai_driver mt6735_afe_hp_imp_dai;
++extern const struct snd_soc_dai_driver mt6735_afe_fm_i2s_dai;
+ extern const struct snd_soc_dai_driver
+ 	mt6735_afe_voice_dais[MT6735_AFE_VOICE_DAI_NUM];
+ 
+diff --git a/sound/soc/mediatek/mt6735/mt6735-afe-pcm.c b/sound/soc/mediatek/mt6735/mt6735-afe-pcm.c
+index a886aef60..1935c32c4 100644
+--- a/sound/soc/mediatek/mt6735/mt6735-afe-pcm.c
++++ b/sound/soc/mediatek/mt6735/mt6735-afe-pcm.c
+@@ -273,11 +273,12 @@ void mt6735_afe_update_power(struct mtk_base_afe *afe)
+ {
+ 	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
+ 	/*
+-	 * The modem PCM interfaces and DAI_BT have no memory interface, so
+-	 * their EnableAfe() calls are tracked separately
+-	 * (mt6735-dai-voice.c, EnableAfe() mt_soc_afe_control.c:951-1032).
++	 * The modem PCM interfaces, DAI_BT and the FM I2S back end have no
++	 * memory interface, so their EnableAfe() calls are tracked separately
++	 * (mt6735-dai-voice.c and mt6735-dai-fm-i2s.c, EnableAfe()
++	 * mt_soc_afe_control.c:951-1032).
+ 	 */
+-	bool enabled = priv->voice_afe_users > 0;
++	bool enabled = priv->voice_afe_users > 0 || priv->fm_i2s_on;
+ 	int i;
+ 
+ 	for (i = 0; i < MT6735_AFE_MEMIF_NUM; i++)
+@@ -421,11 +422,11 @@ static irqreturn_t mt6735_afe_irq_handler(int irq, void *data)
+ /*
+  * Map a CPU DAI id to the memory interface it drives.  DL1/DL2/VUL are the
+  * memory interface with the same id; the BT SCO DAI was appended after the
+- * memif-less I2S0 DAI, so it needs an explicit translation.  The I2S0 and
+- * voice DAIs have no memory interface: the modem PCM interfaces move data
+- * between the modem and the AFE without AP memory, so their stream position
+- * never advances (mt_soc_pcm_voice_md1.c:253-257 leaves the ALSA buffer
+- * untouched).
++ * memif-less I2S0 DAI, so it needs an explicit translation.  The I2S0, HP
++ * impedance, voice and FM I2S DAIs have no memory interface: the modem PCM
++ * interfaces and the FM 2nd I2S path move data inside the AFE without AP
++ * memory, so their stream position never advances
++ * (mt_soc_pcm_voice_md1.c:253-257 leaves the ALSA buffer untouched).
+  */
+ static int mt6735_afe_dai_memif_id(unsigned int dai_id)
+ {
+@@ -633,6 +634,7 @@ static int mt6735_afe_pcm_dev_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 	afe->platform_priv = priv;
+ 	mutex_init(&priv->hp_imp_lock);
++	mutex_init(&priv->i2s_con_lock);
+ 
+ 	afe->base_addr = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(afe->base_addr))
+@@ -714,6 +716,8 @@ static int mt6735_afe_pcm_dev_probe(struct platform_device *pdev)
+ 	 */
+ 	memcpy(&dais[MT6735_AFE_DAI_BTCVSD], mt6735_afe_voice_dais,
+ 	       sizeof(mt6735_afe_voice_dais));
++	/* FM I2S back end, memif-less like I2S0, mt6735-dai-fm-i2s.c */
++	dais[MT6735_AFE_DAI_FM_I2S] = mt6735_afe_fm_i2s_dai;
+ 
+ 	ret = devm_snd_soc_register_component(dev, &mt6735_afe_component,
+ 					      dais, MT6735_AFE_DAI_NUM);
+diff --git a/sound/soc/mediatek/mt6735/mt6735-afe-regs.h b/sound/soc/mediatek/mt6735/mt6735-afe-regs.h
+index eb563aae0..3b43447cd 100644
+--- a/sound/soc/mediatek/mt6735/mt6735-afe-regs.h
++++ b/sound/soc/mediatek/mt6735/mt6735-afe-regs.h
+@@ -90,6 +90,25 @@
+ #define AFE_I2S_CON1_LR_SWAP		BIT(31)		/* mt_soc_afe_control.c:1645 */
+ #define AFE_I2S_CON1_EN			BIT(0)		/* mt_soc_afe_control.c:2018 */
+ 
++/*
++ * Hardware digital gain block 1, used by the FM I2S path
++ * (SetHwDigitalGainMode()/SetHwDigitalGainEnable()/SetHwDigitalGain(),
++ * mt_soc_afe_control.c:1657-1711).
++ */
++#define AFE_GAIN1_CON0			0x0410		/* AudDrv_Afe.h:618 */
++#define AFE_GAIN1_CON1			0x0414		/* AudDrv_Afe.h:619 */
++#define AFE_GAIN1_CONN			0x0420		/* AudDrv_Afe.h:622 */
++#define AFE_GAIN1_CUR			0x0424		/* AudDrv_Afe.h:623 */
++#define AFE_GAIN1_CONN2			0x0448		/* AudDrv_Afe.h:632 */
++
++/* AFE_GAIN1_CON0 mode field: bits [15:4], written as
++ * (sample per step << 8) | (fs << 4) with the 0xfff0 mask of
++ * SetHwDigitalGainMode() (mt_soc_afe_control.c:1663,1667); bit 0 is the
++ * enable bit of SetHwDigitalGainEnable() (:1686-1688).
++ */
++#define AFE_GAIN1_CON0_MODE_MASK	GENMASK(15, 4)	/* 0xfff0, :1667 */
++#define AFE_GAIN1_CON0_EN		BIT(0)		/* :1688 */
++
+ /* I2S format field values (mt_soc_digital_type.h:245-247, 260-263) */
+ #define AFE_I2S_FORMAT_EIAJ		0
+ #define AFE_I2S_FORMAT_I2S		1
+@@ -167,6 +186,28 @@
+ #define AFE_CONN4_I04_TO_O18		BIT(16)		/* mConnectionReg[I04][O18] :291-292, mConnectionbits[I04][O18] :185-186 */
+ #define AFE_CONN4_I14_TO_O04		BIT(0)		/* mConnectionReg[I14][O04] :311-312, mConnectionbits[I14][O04] :205-206 */
+ 
++/*
++ * FM I2S routing: the four routes of mtk_pcm_fm_i2s_prepare()
++ * (mt_soc_pcm_fm_i2s.c:278-285), disconnected by mtk_pcm_fm_i2s_close()
++ * (:246-254).  All of them end in hardware gain block 1, so the registers and
++ * bit positions are the mConnectionReg[]/mConnectionbits[] entries of
++ * mt_soc_afe_connection.c:
++ *
++ *	[I00][O13] -> AFE_GAIN1_CONN2 bit 2	(regs :283-284, bits :177-178)
++ *	[I01][O14] -> AFE_GAIN1_CONN2 bit 16	(regs :285-286, bits :179-180)
++ *	[I10][O03] -> AFE_GAIN1_CONN bit 8	(regs :303-304, bits :197-198)
++ *	[I11][O04] -> AFE_GAIN1_CONN bit 10	(regs :305-306, bits :199-200)
++ */
++#define AFE_CONN_FM_I2S_I00_TO_O13	BIT(2)
++#define AFE_CONN_FM_I2S_I01_TO_O14	BIT(16)
++#define AFE_CONN_FM_I2S_I10_TO_O03	BIT(8)
++#define AFE_CONN_FM_I2S_I11_TO_O04	BIT(10)
++
++/* SetI2SASRCConfig(): bit 30 of AFE_CONN4 selects the ASRC input path (0) or
++ * bypasses the ASRC (1) (mt_soc_afe_control.c:2257, 2274).
++ */
++#define AFE_CONN4_ASRC_BYPASS		BIT(30)
++
+ /*
+  * mConnectionReg[I02][O08] is -1, so the second channel of the BT ->
+  * external-modem uplink (mt_soc_pcm_voice_md2_bt.c:264-266) has no
+@@ -280,12 +321,14 @@
+  * AFE_DAC_CON0 additions.  SetMemoryPathEnable() enables the digital block
+  * with bit (block + 1) (mt_soc_afe_control.c:1995-1997); block numbers come
+  * from the Soc_Aud_Digital_Block enum (mt_soc_digital_type.h:48-82):
+- * MEM_DAI = 3, I2S_OUT_DAC = 12, I2S_IN_ADC = 14.
++ * MEM_DAI = 3, I2S_OUT_DAC = 12 (mt_soc_digital_type.h:68), I2S_IN_ADC = 14
++ * and I2S_IN_2 = 17 (mt_soc_digital_type.h:74).
+  */
+ #define AFE_DAC_CON0_DAI_FS_SHIFT	24		/* mt_soc_afe_control.c:1099-1112 */
+ #define AFE_DAC_CON0_DAI_FS_MASK	GENMASK(1, 0)
+ #define AFE_DAC_CON0_I2S_OUT_DAC_EN	BIT(13)		/* block 12 + 1 */
+ #define AFE_DAC_CON0_I2S_IN_ADC_EN	BIT(15)		/* block 14 + 1 */
++#define AFE_DAC_CON0_I2S_IN_2_EN	BIT(18)		/* block 17 + 1 */
+ 
+ /* MEM_DAI rate field values, SetSampleRate(MEM_DAI) :1099-1112 */
+ #define AFE_DAI_FS_8K			0
+diff --git a/sound/soc/mediatek/mt6735/mt6735-dai-fm-i2s.c b/sound/soc/mediatek/mt6735/mt6735-dai-fm-i2s.c
+new file mode 100644
+index 000000000..85b00ba25
+--- /dev/null
++++ b/sound/soc/mediatek/mt6735/mt6735-dai-fm-i2s.c
+@@ -0,0 +1,395 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT6735/MT6737T ALSA SoC AFE FM I2S back-end DAI.
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * Port from Samsung/MTK downstream
++ * sound/soc/mediatek/mt_soc_audio_v3/:
++ *   mt_soc_pcm_fm_i2s.c     - mtk_pcm_fm_i2s_open()/close()/prepare(),
++ *                             mtk_fm_i2s_hardware, mfm_i2s_Volume
++ *   mt_soc_afe_control.c    - Set2ndI2SIn(), Set2ndI2SInEnable(),
++ *                             SetI2SASRCConfig(), SetHwDigitalGainMode(),
++ *                             SetHwDigitalGainEnable(), SetHwDigitalGain(),
++ *                             SetI2SDacOut(), SetMemoryPathEnable()
++ *   mt_soc_afe_connection.c - mConnectionReg[]/mConnectionbits[] FM routes
++ *
++ * The FM audio path has no AP memory interface: the MT6627 tuner feeds the AFE
++ * through the 2nd I2S input from CONNSYS (I2S_IN_2, digital block 17), through
++ * hardware digital gain 1, to the PMIC codec DAC (I2S_OUT_DAC, digital block
++ * 12).  The stream therefore never advances its ALSA pointer, exactly like the
++ * I2S0 and voice back ends.
++ *
++ * AFE_I2S_CON (0x0018) is shared with the I2S0 four wire path: this DAI and
++ * mt6735-dai-i2s.c refuse to run at the same time (-EBUSY) so neither can
++ * overwrite the other's register programming.
++ */
++
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++
++#include "mt6735-afe-common.h"
++
++/* mfm_i2s_Volume, mt_soc_pcm_fm_i2s.c:73 */
++#define MT6735_AFE_FM_I2S_GAIN		0x10000
++/* SamplePerStep handed to SetHwDigitalGainMode(), mt_soc_pcm_fm_i2s.c:288-289 */
++#define MT6735_AFE_FM_I2S_GAIN_STEP	0x40
++
++/*
++ * soc_fm_supported_sample_rates[] is { 32000, 44100, 48000 }
++ * (mt_soc_pcm_common.h:210-212).  Downstream uses 44.1/48 kHz for the stream
++ * and resamples the fixed 32 kHz 2nd I2S input with SetI2SASRCConfig()
++ * (mt_soc_pcm_fm_i2s.c:316-321).  This port keeps the whole path - 2nd I2S
++ * input, ASRC bypass and PMIC DAC out - at the 32 kHz input rate, which is the
++ * only rate the FM I2S link carries, so no resampling is required.
++ */
++static const unsigned int mt6735_afe_fm_i2s_rates[] = {
++	MT6735_AFE_FM_I2S_RATE,
++};
++
++static const struct snd_pcm_hw_constraint_list mt6735_afe_fm_i2s_rate_constraint = {
++	.count = ARRAY_SIZE(mt6735_afe_fm_i2s_rates),
++	.list = mt6735_afe_fm_i2s_rates,
++	.mask = 0,
++};
++
++static int mt6735_afe_fm_i2s_startup(struct snd_pcm_substream *substream,
++				     struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	int ret;
++
++	/*
++	 * Two shared interfaces have to be free before the FM path may run:
++	 *
++	 * - AFE_I2S_CON (0x0018) belongs to the I2S0 four wire path while
++	 *   that PCM is open (Enable4pin_I2S0_I2S3(),
++	 *   mt_soc_afe_control.c:3749-3761 writes the same register).
++	 *   mt6735-dai-i2s.c has the symmetric check.
++	 * - The PMIC codec DAC (AFE_I2S_CON1, I2S_OUT_DAC block 12) is shared
++	 *   with the modem voice paths, which program it at their own 8/16 kHz
++	 *   rates (mt6735-dai-voice.c, SetI2SDacOut() :1637-1655).  Starting
++	 *   the 32 kHz FM stream underneath a call would reprogram it.
++	 */
++	mutex_lock(&priv->i2s_con_lock);
++	if (priv->i2s0_active || priv->voice_afe_users) {
++		mutex_unlock(&priv->i2s_con_lock);
++		return -EBUSY;
++	}
++	priv->fm_i2s_active = true;
++	mutex_unlock(&priv->i2s_con_lock);
++
++	/* AudDrv_Clk_On()/AudDrv_I2S_Clk_On(), mt_soc_pcm_fm_i2s.c:196-197 */
++	ret = pm_runtime_get_sync(afe->dev);
++	if (ret < 0) {
++		pm_runtime_put_noidle(afe->dev);
++		goto err_release;
++	}
++
++	/* runtime->hw = mtk_fm_i2s_hardware (:134-150), mt_soc_pcm_fm_i2s.c:200 */
++	snd_soc_set_runtime_hwparams(substream, afe->mtk_afe_hardware);
++
++	/* snd_pcm_hw_constraint_list() for the FM rates, :204-205 */
++	ret = snd_pcm_hw_constraint_list(runtime, 0, SNDRV_PCM_HW_PARAM_RATE,
++					 &mt6735_afe_fm_i2s_rate_constraint);
++	if (ret < 0)
++		goto err_put;
++
++	ret = snd_pcm_hw_constraint_minmax(runtime,
++					   SNDRV_PCM_HW_PARAM_CHANNELS,
++					   MT6735_AFE_FM_I2S_CHANNELS,
++					   MT6735_AFE_FM_I2S_CHANNELS);
++	if (ret < 0)
++		goto err_put;
++
++	ret = snd_pcm_hw_constraint_mask64(runtime, SNDRV_PCM_HW_PARAM_FORMAT,
++					   MT6735_AFE_FM_I2S_FORMATS);
++	if (ret < 0)
++		goto err_put;
++
++	/* snd_pcm_hw_constraint_integer(), :206 */
++	ret = snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
++	if (ret < 0)
++		goto err_put;
++
++	return 0;
++
++err_put:
++	pm_runtime_put_noidle(afe->dev);
++err_release:
++	mutex_lock(&priv->i2s_con_lock);
++	priv->fm_i2s_active = false;
++	mutex_unlock(&priv->i2s_con_lock);
++
++	return ret;
++}
++
++/*
++ * Set2ndI2SIn()/Set2ndI2SInEnable(false) + mtk_pcm_fm_i2s_close(),
++ * mt_soc_pcm_fm_i2s.c:227-264 and mt_soc_afe_control.c:2214-2249.
++ * Idempotent so that a failed prepare or a double shutdown is harmless.
++ */
++static void mt6735_afe_fm_i2s_teardown(struct mtk_base_afe *afe)
++{
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++
++	/* Set2ndI2SInEnable(false) */
++	regmap_update_bits(afe->regmap, AFE_I2S_CON, AFE_I2S_CON_EN, 0);
++	priv->fm_i2s_on = false;
++
++	/* SetMemoryPathEnable(I2S_IN_2, false) */
++	regmap_update_bits(afe->regmap, AFE_DAC_CON0,
++			   AFE_DAC_CON0_I2S_IN_2_EN, 0);
++
++	/*
++	 * SetMemoryPathEnable(I2S_OUT_DAC, false) followed by
++	 * SetI2SDacEnable(false), mt_soc_pcm_fm_i2s.c:242-244.  The
++	 * I2S_OUT_DAC block is also enabled by the modem voice paths, so it is
++	 * only released once no call is running, and AFE_I2S_CON1 is only
++	 * returned when this DAI programmed it (fm_i2s_dac_owner) and no
++	 * multimedia stream holds the PMIC codec DAC.
++	 */
++	if (!priv->voice_afe_users) {
++		regmap_update_bits(afe->regmap, AFE_DAC_CON0,
++				   AFE_DAC_CON0_I2S_OUT_DAC_EN, 0);
++		if (priv->fm_i2s_dac_owner &&
++		    !mt6735_afe_playback_enabled(afe)) {
++			mt6735_afe_dac_disable(afe);
++			priv->fm_i2s_dac_owner = false;
++		}
++	}
++
++	/*
++	 * Disconnect the four FM routes, mt_soc_pcm_fm_i2s.c:246-254.  The
++	 * hardware gain block itself is left programmed, as downstream does;
++	 * the next prepare() resets its current gain value.
++	 */
++	regmap_update_bits(afe->regmap, AFE_GAIN1_CONN2,
++			   AFE_CONN_FM_I2S_I00_TO_O13 |
++			   AFE_CONN_FM_I2S_I01_TO_O14, 0);
++	regmap_update_bits(afe->regmap, AFE_GAIN1_CONN,
++			   AFE_CONN_FM_I2S_I10_TO_O03 |
++			   AFE_CONN_FM_I2S_I11_TO_O04, 0);
++
++	priv->fm_i2s_prepared = false;
++
++	/* EnableAfe(false), mt_soc_pcm_fm_i2s.c:257 */
++	mt6735_afe_update_power(afe);
++
++	/*
++	 * EnableAfe(false) also returns the PMIC audio bus pins to GPIO mode
++	 * once no audio path is running (AudDrv_Gpio.c:215-236).
++	 */
++	if (!mt6735_afe_playback_enabled(afe) && !priv->adc_path_on &&
++	    !priv->voice_afe_users)
++		mt6735_afe_select_pmic_pins(afe, false);
++}
++
++static void mt6735_afe_fm_i2s_shutdown(struct snd_pcm_substream *substream,
++				       struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++
++	mt6735_afe_fm_i2s_teardown(afe);
++
++	mutex_lock(&priv->i2s_con_lock);
++	priv->fm_i2s_active = false;
++	mutex_unlock(&priv->i2s_con_lock);
++
++	/* AudDrv_I2S_Clk_Off()/AudDrv_Clk_Off(), mt_soc_pcm_fm_i2s.c:259-260 */
++	pm_runtime_put(afe->dev);
++}
++
++static int mt6735_afe_fm_i2s_hw_params(struct snd_pcm_substream *substream,
++				       struct snd_pcm_hw_params *params,
++				       struct snd_soc_dai *dai)
++{
++	/*
++	 * The 2nd I2S input is a fixed link: Set2ndI2SIn() is always called
++	 * with 32000 Hz, 16 bit stereo (mt_soc_pcm_fm_i2s.c:305-313) and the
++	 * FM codec DAI configures the same format.  Anything else would
++	 * silently play at the wrong rate, so reject it.
++	 */
++	if (params_rate(params) != MT6735_AFE_FM_I2S_RATE)
++		return -EINVAL;
++	if (params_channels(params) != MT6735_AFE_FM_I2S_CHANNELS)
++		return -EINVAL;
++	if (params_format(params) != SNDRV_PCM_FORMAT_S16_LE)
++		return -EINVAL;
++
++	return 0;
++}
++
++/*
++ * mtk_pcm_fm_i2s_prepare(), mt_soc_pcm_fm_i2s.c:267-329.  The final enable
++ * (Set2ndI2SInEnable(true) and EnableAfe(true)) is left to the trigger so the
++ * data path only starts when the PCM actually runs; mPrepareDone becomes
++ * fm_i2s_prepared and short circuits a repeated prepare.
++ */
++static int mt6735_afe_fm_i2s_prepare(struct snd_pcm_substream *substream,
++				     struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	unsigned int con;
++	int fs, ret;
++
++	if (priv->fm_i2s_prepared)
++		return 0;
++
++	fs = mt6735_afe_rate_to_fs(MT6735_AFE_FM_I2S_RATE);
++	if (fs < 0)
++		return fs;
++
++	/* EnableAfe(true) muxes the PMIC audio bus, mt_soc_afe_control.c:993 */
++	mt6735_afe_select_pmic_pins(afe, true);
++
++	/* Interconnection: I00->O13, I01->O14, I10->O03, I11->O04 (:278-285) */
++	regmap_update_bits(afe->regmap, AFE_GAIN1_CONN2,
++			   AFE_CONN_FM_I2S_I00_TO_O13 |
++			   AFE_CONN_FM_I2S_I01_TO_O14,
++			   AFE_CONN_FM_I2S_I00_TO_O13 |
++			   AFE_CONN_FM_I2S_I01_TO_O14);
++	regmap_update_bits(afe->regmap, AFE_GAIN1_CONN,
++			   AFE_CONN_FM_I2S_I10_TO_O03 |
++			   AFE_CONN_FM_I2S_I11_TO_O04,
++			   AFE_CONN_FM_I2S_I10_TO_O03 |
++			   AFE_CONN_FM_I2S_I11_TO_O04);
++
++	/*
++	 * SetHwDigitalGainMode(GAIN1, runtime->rate, 0x40), :288-289:
++	 * the 0xfff0 mode field is (sample per step << 8) | (fs << 4).
++	 */
++	regmap_update_bits(afe->regmap, AFE_GAIN1_CON0,
++			   AFE_GAIN1_CON0_MODE_MASK,
++			   (MT6735_AFE_FM_I2S_GAIN_STEP << 8) | (fs << 4));
++
++	/* SetHwDigitalGainEnable(GAIN1, true): ramp up from a zero gain, :290 */
++	regmap_write(afe->regmap, AFE_GAIN1_CUR, 0);
++	regmap_update_bits(afe->regmap, AFE_GAIN1_CON0, AFE_GAIN1_CON0_EN,
++			   AFE_GAIN1_CON0_EN);
++
++	/* SetHwDigitalGain(mfm_i2s_Volume, GAIN1), :291 */
++	regmap_write(afe->regmap, AFE_GAIN1_CON1, MT6735_AFE_FM_I2S_GAIN);
++
++	/*
++	 * Start the I2S DAC out: SetI2SDacOut(rate, false, 16 bit) followed by
++	 * SetMemoryPathEnable(I2S_OUT_DAC) and SetI2SDacEnable(true), :294-299.
++	 * When another stream already owns the PMIC codec DAC, keep its rate
++	 * and only take the memory path, as downstream does (:298-299).
++	 */
++	if (!priv->dac_path_on) {
++		ret = mt6735_afe_dac_prepare(afe, MT6735_AFE_FM_I2S_RATE, false);
++		if (ret)
++			return ret;
++		priv->fm_i2s_dac_owner = true;
++	}
++	regmap_update_bits(afe->regmap, AFE_DAC_CON0,
++			   AFE_DAC_CON0_I2S_OUT_DAC_EN,
++			   AFE_DAC_CON0_I2S_OUT_DAC_EN);
++
++	/* SetMemoryPathEnable(I2S_IN_2, true), :302 */
++	regmap_update_bits(afe->regmap, AFE_DAC_CON0,
++			   AFE_DAC_CON0_I2S_IN_2_EN, AFE_DAC_CON0_I2S_IN_2_EN);
++
++	/*
++	 * Set2ndI2SIn(), mt_soc_afe_control.c:2224-2231:
++	 *	bit  1 = 0	16 bit samples
++	 *	bit  2 = 1	I2S slave (clock comes from CONNSYS)
++	 *	bit  3 = 1	I2S framing
++	 *	bit  5 = 0	LRCK not inverted
++	 *	bit 28 = 0	I2S input pad select: from CONNSYS, not the IO mux
++	 *	bit 31 = 1	phase shift fix
++	 * Bit 0 (enable) is set by the trigger, and the register carries no
++	 * low jitter or LR swap bit for this path.  Downstream masks the write
++	 * with 0xfffffffe, i.e. every bit except the enable is overwritten.
++	 */
++	con = AFE_I2S_CON_PHASE_SHIFT_FIX |
++	      (AFE_I2S_FORMAT_I2S << AFE_I2S_CON_FMT_SHIFT) |
++	      AFE_I2S_CON_SLAVE |
++	      (AFE_I2S_WLEN_16BIT << AFE_I2S_CON_WLEN_SHIFT);
++	regmap_write(afe->regmap, AFE_I2S_CON, con);
++
++	/*
++	 * SetI2SASRCConfig(false, 0): bypass the ASRC.  Downstream only uses
++	 * it to convert the fixed 32 kHz input to a 44.1/48 kHz stream
++	 * (mt_soc_pcm_fm_i2s.c:316-321); everything runs at 32 kHz here, so
++	 * the ASRC block stays out of the path (mt_soc_afe_control.c:2274).
++	 */
++	regmap_update_bits(afe->regmap, AFE_CONN4, AFE_CONN4_ASRC_BYPASS,
++			   AFE_CONN4_ASRC_BYPASS);
++
++	priv->fm_i2s_prepared = true;
++
++	return 0;
++}
++
++static int mt6735_afe_fm_i2s_trigger(struct snd_pcm_substream *substream,
++				     int cmd, struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
++	int ret;
++
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_START:
++	case SNDRV_PCM_TRIGGER_RESUME:
++	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++		/* Set2ndI2SInEnable(true), mt_soc_afe_control.c:2241-2248 */
++		ret = regmap_update_bits(afe->regmap, AFE_I2S_CON,
++					 AFE_I2S_CON_EN, AFE_I2S_CON_EN);
++		if (ret)
++			return ret;
++
++		/* EnableAfe(true), mt_soc_pcm_fm_i2s.c:326 */
++		priv->fm_i2s_on = true;
++		mt6735_afe_update_power(afe);
++
++		return 0;
++	case SNDRV_PCM_TRIGGER_STOP:
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++		ret = regmap_update_bits(afe->regmap, AFE_I2S_CON,
++					 AFE_I2S_CON_EN, 0);
++		if (ret)
++			return ret;
++
++		/* EnableAfe(false): the FM path no longer needs the AFE clock */
++		priv->fm_i2s_on = false;
++		mt6735_afe_update_power(afe);
++
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static const struct snd_soc_dai_ops mt6735_afe_fm_i2s_ops = {
++	.startup = mt6735_afe_fm_i2s_startup,
++	.shutdown = mt6735_afe_fm_i2s_shutdown,
++	.hw_params = mt6735_afe_fm_i2s_hw_params,
++	.prepare = mt6735_afe_fm_i2s_prepare,
++	.trigger = mt6735_afe_fm_i2s_trigger,
++};
++
++const struct snd_soc_dai_driver mt6735_afe_fm_i2s_dai = {
++	.name = MT6735_AFE_FM_I2S_DAI_NAME,
++	.id = MT6735_AFE_DAI_FM_I2S,
++	.ops = &mt6735_afe_fm_i2s_ops,
++	.playback = {
++		.stream_name = "FM_I2S Playback",
++		.channels_min = MT6735_AFE_FM_I2S_CHANNELS,
++		.channels_max = MT6735_AFE_FM_I2S_CHANNELS,
++		.rates = SNDRV_PCM_RATE_32000,
++		.rate_min = MT6735_AFE_FM_I2S_RATE,
++		.rate_max = MT6735_AFE_FM_I2S_RATE,
++		.formats = MT6735_AFE_FM_I2S_FORMATS,
++	},
++};
+diff --git a/sound/soc/mediatek/mt6735/mt6735-dai-i2s.c b/sound/soc/mediatek/mt6735/mt6735-dai-i2s.c
+index cd7f7a88d..e80f63bec 100644
+--- a/sound/soc/mediatek/mt6735/mt6735-dai-i2s.c
++++ b/sound/soc/mediatek/mt6735/mt6735-dai-i2s.c
+@@ -32,20 +32,45 @@ static int mt6735_afe_i2s_startup(struct snd_pcm_substream *substream,
+ 				  struct snd_soc_dai *dai)
+ {
+ 	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
+ 	int ret;
+ 
++	/*
++	 * AFE_I2S_CON (0x0018) is shared with the FM I2S back end, which takes
++	 * the same register for the 2nd I2S input (Set2ndI2SIn(),
++	 * mt_soc_afe_control.c:2231).  Refuse the I2S0 stream while the FM
++	 * path owns it instead of overwriting its programming;
++	 * mt6735-dai-fm-i2s.c has the symmetric check.
++	 */
++	mutex_lock(&priv->i2s_con_lock);
++	if (priv->fm_i2s_active) {
++		mutex_unlock(&priv->i2s_con_lock);
++		return -EBUSY;
++	}
++	priv->i2s0_active = true;
++	mutex_unlock(&priv->i2s_con_lock);
++
+ 	ret = pm_runtime_get_sync(afe->dev);
+ 	if (ret < 0) {
+ 		pm_runtime_put_noidle(afe->dev);
+-		return ret;
++		goto err_release;
+ 	}
+ 
+ 	snd_soc_set_runtime_hwparams(substream, afe->mtk_afe_hardware);
+ 
+ 	ret = snd_pcm_hw_constraint_integer(substream->runtime,
+ 					    SNDRV_PCM_HW_PARAM_PERIODS);
+-	if (ret < 0)
++	if (ret < 0) {
+ 		pm_runtime_put_noidle(afe->dev);
++		goto err_release;
++	}
++
++	return 0;
++
++err_release:
++	mutex_lock(&priv->i2s_con_lock);
++	priv->i2s0_active = false;
++	mutex_unlock(&priv->i2s_con_lock);
+ 
+ 	return ret;
+ }
+@@ -54,9 +79,14 @@ static void mt6735_afe_i2s_shutdown(struct snd_pcm_substream *substream,
+ 				    struct snd_soc_dai *dai)
+ {
+ 	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	struct mt6735_afe_priv *priv = mt6735_afe_priv(afe);
+ 
+ 	mt6735_afe_select_i2s_pins(afe, false);
+ 	pm_runtime_put(afe->dev);
++
++	mutex_lock(&priv->i2s_con_lock);
++	priv->i2s0_active = false;
++	mutex_unlock(&priv->i2s_con_lock);
+ }
+ 
+ /*
+diff --git a/sound/soc/mediatek/mt6735/mt6735-mt6331.c b/sound/soc/mediatek/mt6735/mt6735-mt6331.c
+index ea0abc3b8..942a72f1a 100644
+--- a/sound/soc/mediatek/mt6735/mt6735-mt6331.c
++++ b/sound/soc/mediatek/mt6735/mt6735-mt6331.c
+@@ -114,6 +114,28 @@ SND_SOC_DAILINK_DEFS(hp_impedance,
+ 				      "mt-soc-codec-hp-impedance-dai")),
+ 	DAILINK_COMP_ARRAY(COMP_EMPTY()));
+ 
++/*
++ * FM I2S playback, mt_soc_machine.c:1068-1076: CPU DAI MT_SOC_FM_I2S_NAME,
++ * stream MT_SOC_FM_I2S_PLAYBACK_STREAM_NAME, codec DAI
++ * MT_SOC_CODEC_FM_I2S_DAI_NAME (AudDrv_Def.h:230, 307, 342).  The codec side
++ * is the separate FM I2S codec component provided by the WCN FM driver; that
++ * component registers no card of its own, so this link is its only binding and
++ * the card stays mt-snd-card / mediatek,mt6735-sound.
++ *
++ * Downstream always lists the link because its FM codec is part of the
++ * always-built codec driver; here the FM component is an optional module, so
++ * the link is only compiled in when CONFIG_MTK_WCN_FM is enabled - a link whose
++ * codec can never appear would make soc_bind_dai_link() defer the whole card
++ * forever and take the base audio links down with it.
++ */
++#if IS_ENABLED(CONFIG_MTK_WCN_FM)
++SND_SOC_DAILINK_DEFS(fm_i2s,
++	DAILINK_COMP_ARRAY(COMP_CPU("mt-soc-fmi2S-driver")),
++	DAILINK_COMP_ARRAY(COMP_CODEC("mt6627-fm-i2s",
++				      "mt-soc-fm-i2s-dai-codec")),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++#endif
++
+ /*
+  * Voice links, mt_soc_machine.c:863-869 ("Voice_MD1"), :985-992
+  * ("Voice_MD1_BT"), :1047-1056 ("Voice_MD2") and :1087-1094
+@@ -227,6 +249,21 @@ static struct snd_soc_dai_link mt6735_mt6331_dai_links[] = {
+ 		.playback_only = 1,
+ 		SND_SOC_DAILINK_REG(hp_impedance),
+ 	},
++#if IS_ENABLED(CONFIG_MTK_WCN_FM)
++	{
++		/*
++		 * mt_soc_machine.c:1068-1076.  Link, stream and DAI names and
++		 * the I2S/NB_NF/CBC_CFC format are the frozen FM I2S contract
++		 * shared with the WCN FM codec driver.
++		 */
++		.name = "FM_I2S_RX_Playback",
++		.stream_name = "FM_I2S_Playback",
++		.playback_only = 1,
++		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
++			   SND_SOC_DAIFMT_CBC_CFC,
++		SND_SOC_DAILINK_REG(fm_i2s),
++	},
++#endif
+ 	{
+ 		.name = "Voice_MD1",
+ 		.stream_name = MT6735_VOICE_MD1_STREAM,

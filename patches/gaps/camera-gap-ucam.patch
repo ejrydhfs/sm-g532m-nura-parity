@@ -1,0 +1,3057 @@
+diff --git a/tools/mediatek/camera/.gitignore b/tools/mediatek/camera/.gitignore
+new file mode 100644
+index 000000000..567609b12
+--- /dev/null
++++ b/tools/mediatek/camera/.gitignore
+@@ -0,0 +1 @@
++build/
+diff --git a/tools/mediatek/camera/Makefile b/tools/mediatek/camera/Makefile
+new file mode 100644
+index 000000000..a27bcfe02
+--- /dev/null
++++ b/tools/mediatek/camera/Makefile
+@@ -0,0 +1,138 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# libcamdrv, the camdrv command line tool and the camservice front end.
++#
++# Port from Samsung/MTK downstream GPL kernel
++# drivers/misc/mediatek/cameraisp/src/mt6735/ and from the ROM userspace
++# libcamdrv.so interface.
++#
++# This is a host build with the system compiler.  The only kernel header it
++# consumes is include/uapi/linux/mtk_isp.h; no kernel internal header and no
++# proprietary blob takes part in the build.
++#
++#   make            static + shared library, the CLI and the service
++#   make compat32   32-bit ABI check (-m32, skipped if unavailable)
++#   make check      no-device behaviour of both programs plus compat32
++#   make clean
++#
++# Everything generated lives under build/: objects in build/obj/ and
++# build/obj/32/, binaries and libraries in build/bin/.  Keeping the
++# executable directory separate from the object tree means no target name can
++# collide with a directory left behind by an older layout.
++
++ROOT := $(abspath $(CURDIR)/../../..)
++
++CC ?= gcc
++AR ?= ar
++CFLAGS ?= -O2
++CPPFLAGS += -I$(ROOT)/include/uapi -I$(CURDIR)/libcamdrv -D__EXPORTED_HEADERS__
++CFLAGS += -Wall -Wextra -std=gnu11 -fPIC
++LDFLAGS ?=
++LDLIBS ?=
++
++BUILD := build
++OBJ := $(BUILD)/obj
++BIN := $(BUILD)/bin
++
++LIB_SRCS := libcamdrv/camdrv.c libcamdrv/camdrv_cq.c
++LIB_OBJS := $(LIB_SRCS:%.c=$(OBJ)/%.o)
++LIB32_OBJS := $(LIB_SRCS:%.c=$(OBJ)/32/%.o)
++CLI_OBJS := $(OBJ)/camdrv/main.o
++SVC_OBJS := $(OBJ)/camdrv/camservice.o
++
++# The uapi fixes every pointer field to __u64 so that the ioctl size field
++# (and therefore the ioctl number) does not depend on the userspace pointer
++# width.  That only holds on ABIs that align __u64 to 8 bytes: arm, arm64 and
++# x86-64 all do, i386 does not.  -malign-double restores the ARM EABI
++# alignment on i386 so the 32-bit build reproduces the real numbers; without
++# it the check would compare a different ABI and is skipped.
++COMPAT32_FLAGS := $(shell $(CC) -m32 -malign-double -x c -c /dev/null -o /dev/null >/dev/null 2>&1 && echo "-m32 -malign-double")
++
++.PHONY: all static shared cli service compat32 check nodev-check clean
++
++all: static shared cli service
++
++static: $(BIN)/libcamdrv.a
++shared: $(BIN)/libcamdrv.so
++cli: $(BIN)/camdrv
++service: $(BIN)/camservice
++
++$(OBJ)/%.o: %.c
++	@mkdir -p $(dir $@)
++	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
++
++$(OBJ)/32/%.o: %.c
++	@mkdir -p $(dir $@)
++	$(CC) $(CPPFLAGS) $(CFLAGS) $(COMPAT32_FLAGS) -c $< -o $@
++
++$(BIN)/libcamdrv.a: $(LIB_OBJS)
++	@mkdir -p $(dir $@)
++	$(AR) rcs $@ $(LIB_OBJS)
++
++$(BIN)/libcamdrv.so: $(LIB_OBJS)
++	@mkdir -p $(dir $@)
++	$(CC) $(CFLAGS) -shared -Wl,-soname,libcamdrv.so -o $@ $(LIB_OBJS) \
++		$(LDFLAGS) $(LDLIBS)
++
++$(BIN)/camdrv: $(CLI_OBJS) $(BIN)/libcamdrv.a
++	@mkdir -p $(dir $@)
++	$(CC) $(CFLAGS) -o $@ $(CLI_OBJS) $(BIN)/libcamdrv.a $(LDFLAGS) $(LDLIBS)
++
++$(BIN)/camservice: $(SVC_OBJS) $(BIN)/libcamdrv.a
++	@mkdir -p $(dir $@)
++	$(CC) $(CFLAGS) -o $@ $(SVC_OBJS) $(BIN)/libcamdrv.a $(LDFLAGS) $(LDLIBS)
++
++$(BIN)/libcamdrv32.a: $(LIB32_OBJS)
++	@mkdir -p $(dir $@)
++	$(AR) rcs $@ $(LIB32_OBJS)
++
++$(BIN)/abi32: tests/abi32.c $(BIN)/libcamdrv32.a
++	@mkdir -p $(dir $@)
++	$(CC) $(CPPFLAGS) $(CFLAGS) $(COMPAT32_FLAGS) -o $@ tests/abi32.c \
++		$(BIN)/libcamdrv32.a $(LDFLAGS) $(LDLIBS)
++
++ifneq ($(COMPAT32_FLAGS),)
++compat32: $(BIN)/abi32
++	@echo "compat32: built $< (32-bit ABI layout checked)"
++else
++compat32:
++	@echo "compat32: no 32-bit toolchain ($(CC) -m32 -malign-double), check skipped"
++endif
++
++# Acceptance behaviour without a device: both programs must fail and both
++# must name ENODEV, never print a fabricated success.
++nodev-check: cli service
++	@$(BIN)/camdrv --help >/dev/null
++	@$(BIN)/camservice --help >/dev/null
++	@if $(BIN)/camdrv info >$(BUILD)/nodev.out 2>$(BUILD)/nodev.err; then \
++		echo "nodev-check: unexpected success, is a camera ISP device present?"; \
++		exit 1; \
++	fi
++	@if grep -q ENODEV $(BUILD)/nodev.err; then \
++		echo "nodev-check: camdrv reports the missing device as ENODEV"; \
++	else \
++		echo "nodev-check: camdrv device error not reported as ENODEV"; \
++		cat $(BUILD)/nodev.err; \
++		exit 1; \
++	fi
++	@if $(BIN)/camservice --frames 1 >$(BUILD)/nodev-svc.out 2>$(BUILD)/nodev-svc.err; then \
++		echo "nodev-check: camservice succeeded without a device"; \
++		exit 1; \
++	fi
++	@if grep -q ENODEV $(BUILD)/nodev-svc.err; then \
++		echo "nodev-check: camservice reports the missing device as ENODEV"; \
++	else \
++		echo "nodev-check: camservice device error not reported as ENODEV"; \
++		cat $(BUILD)/nodev-svc.err; \
++		exit 1; \
++	fi
++
++ifeq ($(COMPAT32_FLAGS),)
++check: nodev-check compat32
++else
++check: nodev-check compat32
++	@$(BIN)/abi32 >/dev/null
++endif
++
++clean:
++	rm -rf $(BUILD)
+diff --git a/tools/mediatek/camera/camdrv/camservice.c b/tools/mediatek/camera/camdrv/camservice.c
+new file mode 100644
+index 000000000..89fad7d69
+--- /dev/null
++++ b/tools/mediatek/camera/camdrv/camservice.c
+@@ -0,0 +1,338 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * camservice - userspace camera ISP service front end.
++ *
++ * Port from Samsung/MTK downstream GPL kernel
++ * drivers/misc/mediatek/cameraisp/src/mt6735/camera_isp_D1.c
++ * and from the ROM userspace libcamdrv.so IspDrvImp::* API.
++ *
++ * This is the process that owns /dev/camera-isp for the lifetime of a camera
++ * session, the way the ROM camera service does through libcamdrv.so:
++ *
++ *   - it is the single opener of the device node,
++ *   - it is the single mapper of the ISP register windows (mmap(2), the page
++ *     offset is the physical base, exactly what the uapi defines),
++ *   - it registers the interrupt user key and blocks in ISP_WAIT_IRQ, waking
++ *     a frame consumer per pass-1 interrupt.
++ *
++ * It does not program the ISP pipeline.  The pipeline is written through the
++ * CQ0C ring and the tuning tables, whose instruction encodings exist only in
++ * the closed camera HAL and are not part of this port; libcamdrv refuses to
++ * invent those words (see camdrv_cq_ring_init()).  Everything this program
++ * does is a real ioctl or mmap(2) on /dev/camera-isp: when the device, the
++ * interrupt or the timeout is missing it prints the errno and exits non-zero,
++ * and it never reports a frame it did not receive.
++ */
++
++#include <errno.h>
++#include <getopt.h>
++#include <signal.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "camdrv.h"
++
++#define ARRAY_SIZE(a)	(sizeof(a) / sizeof((a)[0]))
++
++static const char *const prog = "camservice";
++static volatile sig_atomic_t stop;
++
++static void on_signal(int sig)
++{
++	(void)sig;
++	stop = 1;
++}
++
++static void usage(FILE *out)
++{
++	int i;
++
++	fprintf(out,
++"usage: %s [options]\n"
++"\n"
++"Opens %s, maps the requested ISP register windows, registers an\n"
++"interrupt user key and then waits for pass-1 interrupts until the requested\n"
++"number of frames arrived or a signal is received.\n"
++"\n"
++"options:\n"
++"  --frames <n>      stop after n interrupts (0 = until signalled, default 0)\n"
++"  --type <n|name>   IRQ type to wait for (default 0 = p1)\n"
++"  --status <hex>    status bits to wait for (default 0x%08x)\n"
++"  --timeout <ms>    per-wait timeout (default 1000)\n"
++"  --key <n>         IRQ user key (default: the key registered at start)\n"
++"  --user <n>        use the v1 IRQ flow with this user number (> 0)\n"
++"  --map <window>    map a register window; repeatable, or 'all'\n"
++"  --no-irq-key      do not register an interrupt user key\n"
++"  --quiet           only report errors\n"
++"  --help            this text\n"
++"\n"
++"windows:",
++		prog, CAMDRV_DEV_NODE, ISP_IRQ_P1_STATUS_SOF1_INT_ST);
++	for (i = 0; i < CAMDRV_WIN_COUNT; i++)
++		fprintf(out, " %s(0x%08x+0x%x)", camdrv_windows[i].name,
++			camdrv_windows[i].base, camdrv_windows[i].size);
++	fprintf(out, "\n\nexit status: 0 when the requested frames arrived or a "
++		"signal stopped the loop,\n             1 on a driver error, "
++		"2 on a usage error\n");
++}
++
++static void usage_error(const char *msg)
++{
++	fprintf(stderr, "%s: %s\n", prog, msg);
++	fprintf(stderr, "%s: try '%s --help'\n", prog, prog);
++	exit(2);
++}
++
++static int fail(int err, const char *what)
++{
++	fprintf(stderr, "%s: %s: %s: %s\n", prog, what, camdrv_errname(err),
++		strerror(-err));
++	return 1;
++}
++
++static bool parse_num(const char *s, uint64_t *out)
++{
++	char *end;
++	unsigned long long v;
++
++	if (!s || !*s)
++		return false;
++	errno = 0;
++	v = strtoull(s, &end, 0);
++	if (errno || *end)
++		return false;
++	*out = v;
++	return true;
++}
++
++static uint64_t need_num(const char *s, const char *what)
++{
++	uint64_t v;
++
++	if (!parse_num(s, &v))
++		usage_error(what);
++	return v;
++}
++
++static int irq_type_by_name(const char *s)
++{
++	static const char *const names[] = {
++		[ISP_IRQ_TYPE_INT_P1_ST]	= "p1",
++		[ISP_IRQ_TYPE_INT_P1_ST2]	= "p1-dma",
++		[ISP_IRQ_TYPE_INT_P1_ST_D]	= "p1-d",
++		[ISP_IRQ_TYPE_INT_P1_ST2_D]	= "p1-dma-d",
++		[ISP_IRQ_TYPE_INT_P2_ST]	= "p2",
++		[ISP_IRQ_TYPE_INT_STATUSX]	= "statusx",
++		[ISP_IRQ_TYPE_INT_STATUS2X]	= "status2x",
++		[ISP_IRQ_TYPE_INT_STATUS3X]	= "status3x",
++		[ISP_IRQ_TYPE_INT_SENINF1]	= "seninf1",
++		[ISP_IRQ_TYPE_INT_SENINF2]	= "seninf2",
++		[ISP_IRQ_TYPE_INT_SENINF3]	= "seninf3",
++		[ISP_IRQ_TYPE_INT_SENINF4]	= "seninf4",
++		[ISP_IRQ_TYPE_INT_CAMSV]	= "camsv",
++		[ISP_IRQ_TYPE_INT_CAMSV2]	= "camsv2",
++	};
++	uint64_t v;
++	size_t i;
++
++	for (i = 0; i < ARRAY_SIZE(names); i++)
++		if (names[i] && !strcmp(s, names[i]))
++			return (int)i;
++	if (parse_num(s, &v) && v < ISP_IRQ_TYPE_AMOUNT)
++		return (int)v;
++	return -1;
++}
++
++int main(int argc, char **argv)
++{
++	static const struct option opts[] = {
++		{ "frames",	required_argument,	NULL, 'f' },
++		{ "type",	required_argument,	NULL, 't' },
++		{ "status",	required_argument,	NULL, 's' },
++		{ "timeout",	required_argument,	NULL, 'o' },
++		{ "key",	required_argument,	NULL, 'k' },
++		{ "user",	required_argument,	NULL, 'u' },
++		{ "map",	required_argument,	NULL, 'm' },
++		{ "no-irq-key",	no_argument,		NULL, 'n' },
++		{ "quiet",	no_argument,		NULL, 'q' },
++		{ "help",	no_argument,		NULL, 'h' },
++		{ NULL, 0, NULL, 0 },
++	};
++	struct sigaction sa = { .sa_handler = on_signal };
++	uint64_t frames = 0;
++	uint32_t type = ISP_IRQ_TYPE_INT_P1_ST;
++	uint32_t status = ISP_IRQ_P1_STATUS_SOF1_INT_ST;
++	uint32_t timeout = 1000;
++	bool map_all = false, quiet = false, no_key = false;
++	unsigned int map_mask = 0;
++	long user = -1, key = -1;
++	struct camdrv *d;
++	uint64_t frame;
++	int c, ret, rc = 0;
++
++	optind = 1;
++	while ((c = getopt_long(argc, argv, "h", opts, NULL)) != -1) {
++		uint64_t v;
++
++		switch (c) {
++		case 'f':
++			frames = need_num(optarg, "bad --frames");
++			break;
++		case 't':
++			if (irq_type_by_name(optarg) < 0)
++				usage_error("bad --type");
++			type = (uint32_t)irq_type_by_name(optarg);
++			break;
++		case 's':
++			status = (uint32_t)need_num(optarg, "bad --status");
++			if (!status)
++				usage_error("--status needs at least one bit");
++			break;
++		case 'o':
++			v = need_num(optarg, "bad --timeout");
++			if (!v || v > UINT32_MAX)
++				usage_error("bad --timeout");
++			timeout = (uint32_t)v;
++			break;
++		case 'k':
++			v = need_num(optarg, "bad --key");
++			if (v < 1 || v > INT32_MAX)
++				usage_error("--key must be 1..INT32_MAX");
++			key = (long)v;
++			break;
++		case 'u':
++			v = need_num(optarg, "bad --user");
++			if (v < 1 || v >= ISP_IRQ_USER_MAX)
++				usage_error("--user must be 1..ISP_IRQ_USER_MAX-1");
++			user = (long)v;
++			break;
++		case 'm': {
++			int id;
++
++			if (!strcmp(optarg, "all")) {
++				map_all = true;
++				break;
++			}
++			id = camdrv_window_id_by_name(optarg);
++			if (id < 0)
++				usage_error("unknown window name");
++			map_mask |= 1u << id;
++			break;
++		}
++		case 'n':
++			no_key = true;
++			break;
++		case 'q':
++			quiet = true;
++			break;
++		case 'h':
++			usage(stdout);
++			return 0;
++		default:
++			usage_error("unknown option");
++		}
++	}
++	if (optind != argc)
++		usage_error("unexpected argument");
++	if (key >= 0 && user > 0)
++		usage_error("--key and --user are mutually exclusive");
++
++	if (!quiet) {
++		printf("%s: opening %s\n", prog, CAMDRV_DEV_NODE);
++		fflush(stdout);
++	}
++
++	d = camdrv_create();
++	if (!d) {
++		fprintf(stderr, "%s: out of memory\n", prog);
++		return 1;
++	}
++
++	/* Registering a key is what the downstream service does in
++	 * IspDrvImp::init().  --no-irq-key skips it, which is what a client
++	 * of the v1 --user flow or a kernel without
++	 * ISP_REGISTER_IRQ_USER_KEY needs. */
++	ret = camdrv_init(d, no_key ? NULL : "camservice");
++	if (ret) {
++		rc = fail(ret, "open");
++		goto out_destroy;
++	}
++
++	if (map_all)
++		map_mask = (1u << CAMDRV_WIN_COUNT) - 1;
++	for (c = 0; c < CAMDRV_WIN_COUNT; c++) {
++		if (!(map_mask & (1u << c)))
++			continue;
++		ret = camdrv_mmap(d, (enum camdrv_window_id)c);
++		if (ret) {
++			rc = fail(ret, camdrv_windows[c].name);
++			goto out_uninit;
++		}
++		if (!quiet)
++			printf("%s: mapped %s at 0x%08x (%u bytes)\n", prog,
++			       camdrv_windows[c].name, camdrv_windows[c].base,
++			       camdrv_windows[c].size);
++	}
++
++	if (key < 0)
++		key = camdrv_user_key(d);
++	if (user <= 0 && key <= 0) {
++		fprintf(stderr, "%s: no IRQ user key registered; pass --key <n> "
++			"or --user <n>\n", prog);
++		rc = 2;
++		goto out_uninit;
++	}
++
++	sigaction(SIGINT, &sa, NULL);
++	sigaction(SIGTERM, &sa, NULL);
++
++	frame = 0;
++	while (!stop && (!frames || frame < frames)) {
++		ISP_WAIT_IRQ_STRUCT irq;
++
++		if (user > 0)
++			camdrv_irq_fill_v1(&irq, (ISP_IRQ_TYPE_ENUM)type, status,
++					   (ISP_IRQ_USER_ENUM)user, timeout);
++		else
++			camdrv_irq_fill_v3(&irq, (ISP_IRQ_TYPE_ENUM)type, status,
++					   (int)key, timeout);
++
++		ret = camdrv_wait_irq(d, &irq);
++		if (ret) {
++			rc = fail(ret, "wait-irq");
++			goto out_uninit;
++		}
++
++		frame++;
++		if (!quiet) {
++			unsigned int u = (unsigned int)(type < ISP_IRQ_TYPE_AMOUNT ?
++							type : 0);
++
++			printf("%s: frame %llu irq type=%u status=0x%08x "
++			       "tstamp=%u sig=%u.%06u\n",
++			       prog, (unsigned long long)frame, u,
++			       irq.UserInfo.Status ? irq.UserInfo.Status :
++			       irq.Status, irq.irq_TStamp,
++			       irq.TimeInfo.tLastSig_sec,
++			       irq.TimeInfo.tLastSig_usec);
++			fflush(stdout);
++		}
++	}
++
++	if (stop && !quiet)
++		printf("%s: stopped by signal after %llu frames\n", prog,
++		       (unsigned long long)frame);
++	else if (!quiet)
++		printf("%s: done, %llu frames\n", prog,
++		       (unsigned long long)frame);
++
++out_uninit:
++	camdrv_uninit(d);
++out_destroy:
++	camdrv_destroy(d);
++	return rc;
++}
+diff --git a/tools/mediatek/camera/camdrv/main.c b/tools/mediatek/camera/camdrv/main.c
+new file mode 100644
+index 000000000..573f58765
+--- /dev/null
++++ b/tools/mediatek/camera/camdrv/main.c
+@@ -0,0 +1,947 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * camdrv - command line front end for libcamdrv.
++ *
++ * Port from Samsung/MTK downstream GPL kernel
++ * drivers/misc/mediatek/cameraisp/src/mt6735/camera_isp_D1.c
++ * and from the ROM userspace libcamdrv.so IspDrvImp::* API.
++ *
++ * Every subcommand issues a real ioctl on /dev/camera-isp.  Nothing is
++ * simulated: a missing device, an unsupported control or a timeout is
++ * reported on stderr and turned into a non-zero exit status.
++ */
++
++#include <errno.h>
++#include <getopt.h>
++#include <inttypes.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "camdrv.h"
++
++#define ARRAY_SIZE(a)	(sizeof(a) / sizeof((a)[0]))
++
++static const char *const prog = "camdrv";
++static const char *const default_user = "camdrv";
++
++struct dma_name {
++	const char *name;
++	_isp_dma_enum_ id;
++};
++
++static const struct dma_name dma_names[] = {
++	{ "imgi",		_imgi_ },
++	{ "vipi",		_vipi_ },
++	{ "vip2i",		_vip2i_ },
++	{ "vip3i",		_vip3i_ },
++	{ "imgo",		_imgo_ },
++	{ "ufdi",		_ufdi_ },
++	{ "lcei",		_lcei_ },
++	{ "ufeo",		_ufeo_ },
++	{ "rrzo",		_rrzo_ },
++	{ "imgo-d",		_imgo_d_ },
++	{ "rrzo-d",		_rrzo_d_ },
++	{ "img2o",		_img2o_ },
++	{ "img3o",		_img3o_ },
++	{ "img3bo",		_img3bo_ },
++	{ "img3co",		_img3co_ },
++	{ "camsv-imgo",		_camsv_imgo_ },
++	{ "camsv2-imgo",	_camsv2_imgo_ },
++	{ "mfbo",		_mfbo_ },
++	{ "feo",		_feo_ },
++	{ "wrot",		_wrot_ },
++	{ "wdma",		_wdma_ },
++	{ "jpeg",		_jpeg_ },
++};
++
++static const char *const irq_type_names[] = {
++	[ISP_IRQ_TYPE_INT_P1_ST]	= "p1",
++	[ISP_IRQ_TYPE_INT_P1_ST2]	= "p1-dma",
++	[ISP_IRQ_TYPE_INT_P1_ST_D]	= "p1-d",
++	[ISP_IRQ_TYPE_INT_P1_ST2_D]	= "p1-dma-d",
++	[ISP_IRQ_TYPE_INT_P2_ST]	= "p2",
++	[ISP_IRQ_TYPE_INT_STATUSX]	= "statusx",
++	[ISP_IRQ_TYPE_INT_STATUS2X]	= "status2x",
++	[ISP_IRQ_TYPE_INT_STATUS3X]	= "status3x",
++	[ISP_IRQ_TYPE_INT_SENINF1]	= "seninf1",
++	[ISP_IRQ_TYPE_INT_SENINF2]	= "seninf2",
++	[ISP_IRQ_TYPE_INT_SENINF3]	= "seninf3",
++	[ISP_IRQ_TYPE_INT_SENINF4]	= "seninf4",
++	[ISP_IRQ_TYPE_INT_CAMSV]	= "camsv",
++	[ISP_IRQ_TYPE_INT_CAMSV2]	= "camsv2",
++};
++
++static const char *const ref_ctrl_names[] = {
++	[ISP_REF_CNT_GET]				= "get",
++	[ISP_REF_CNT_INC]				= "inc",
++	[ISP_REF_CNT_DEC]				= "dec",
++	[ISP_REF_CNT_DEC_AND_RESET_P1_P2_IF_LAST_ONE]	= "dec-reset-p1p2",
++	[ISP_REF_CNT_DEC_AND_RESET_P1_IF_LAST_ONE]	= "dec-reset-p1",
++	[ISP_REF_CNT_DEC_AND_RESET_P2_IF_LAST_ONE]	= "dec-reset-p2",
++};
++
++static const char *const ref_id_names[] = {
++	"imem", "isp-func", "global-pipe", "p1-pipe", "p2-pipe",
++};
++
++static void usage(FILE *out)
++{
++	int i;
++
++	fprintf(out,
++"usage: %s <command> [options]\n"
++"\n"
++"commands:\n"
++"  info                       device node, register scenario, burst queue,\n"
++"                             SOF and drop-frame counters, error counters\n"
++"  dump-regs                  request a full ISP register dump (kernel log)\n"
++"  dump-isr-log [--tg n]      request an interrupt log dump for one TG\n"
++"  read-reg <addr> [count]    read one register or a block of registers\n"
++"  write-reg <addr> <value>   write one register\n"
++"  wait-irq [options]         wait for an ISP interrupt\n"
++"  rtbuf-enqueue [options]    enqueue a pass-1 real time buffer\n"
++"  rtbuf-dequeue [options]    dequeue a filled pass-1 real time buffer\n"
++"  rtbuf-status [options]     ring size, ready flag and current FBC dump\n"
++"  mmap-dump [options]        hex dump a mapped ISP register window\n"
++"  get-sof [options]          query the software SOF counter\n"
++"  get-errors                 dump interrupt and DMA error counters\n"
++"  ref-cnt [options]          get/inc/dec a driver reference counter\n"
++"  hold <0|1>                 hold register writes until the next trigger\n"
++"\n"
++"device node: %s (fixed by the uapi)\n", prog, CAMDRV_DEV_NODE);
++
++	fprintf(out, "\nwait-irq options:\n"
++"  --type <n|name>            IRQ type (default 0 = p1)\n"
++"  --status <hex>             status bits to wait for (default 0x%08x)\n"
++"  --timeout <ms>             timeout in milliseconds (default 1000)\n"
++"  --clear <n>                ISP_IRQ_CLEAR_ENUM (default 0 = none)\n"
++"  --user <n>                 use the v1 flow with this user number (> 0)\n"
++"  --key <n>                  use the v3 flow with this IRQ user key\n"
++"                             (default: the key registered at init)\n"
++"  --mark                     mark an IRQ request instead of waiting\n"
++"  --flush                    flush pending IRQ requests\n"
++"  --mark-time                query the mark-to-query time only\n",
++		ISP_IRQ_P1_STATUS_SOF1_INT_ST);
++
++	fprintf(out, "\nrtbuf options:\n"
++"  --dma <name>               DMA channel (default imgo)\n"
++"  --pa <hex>                 buffer physical address (required)\n"
++"  --va <num>                 buffer virtual address recorded in the ring\n"
++"  --size <num>               buffer size\n"
++"  --index <num>              buffer index used for replacement\n"
++"  --memid <num>              memory id\n"
++"  --immediate                use ENQUE_IMD instead of ENQUE\n");
++
++	fprintf(out, "\nwindows:");
++	for (i = 0; i < CAMDRV_WIN_COUNT; i++)
++		fprintf(out, " %s(0x%08x+0x%x)", camdrv_windows[i].name,
++			camdrv_windows[i].base, camdrv_windows[i].size);
++	fprintf(out, "\n\nmmap-dump options:\n"
++"  --window <name>            window to map (default isp)\n"
++"  --offset <num>             byte offset inside the window\n"
++"  --length <num>             bytes to dump (default 64, max window size)\n"
++"\nref-cnt options:\n"
++"  --ctrl <name|n>            get/inc/dec/dec-reset-* (default get)\n"
++"  --id <name|n>              imem/isp-func/global-pipe/p1-pipe/p2-pipe\n"
++"\n"
++"exit status: 0 on success, 1 on a driver error, 2 on a usage error\n");
++}
++
++static void usage_error(const char *msg)
++{
++	fprintf(stderr, "%s: %s\n", prog, msg);
++	fprintf(stderr, "%s: try '%s --help'\n", prog, prog);
++	exit(2);
++}
++
++static int fail(int err, const char *what)
++{
++	fprintf(stderr, "%s: %s: %s: %s\n", prog, what, camdrv_errname(err),
++		strerror(-err));
++	return 1;
++}
++
++static bool parse_num(const char *s, uint64_t *out)
++{
++	char *end;
++	unsigned long long v;
++
++	if (!s || !*s)
++		return false;
++	errno = 0;
++	v = strtoull(s, &end, 0);
++	if (errno || *end)
++		return false;
++	*out = v;
++	return true;
++}
++
++static uint64_t need_num(const char *s, const char *what)
++{
++	uint64_t v;
++
++	if (!parse_num(s, &v))
++		usage_error(what);
++	return v;
++}
++
++static int dma_by_name(const char *name)
++{
++	size_t i;
++
++	for (i = 0; i < ARRAY_SIZE(dma_names); i++)
++		if (!strcmp(name, dma_names[i].name))
++			return dma_names[i].id;
++	return -1;
++}
++
++static const char *dma_name(int id)
++{
++	size_t i;
++
++	for (i = 0; i < ARRAY_SIZE(dma_names); i++)
++		if ((int)dma_names[i].id == id)
++			return dma_names[i].name;
++	return "?";
++}
++
++static int irq_type_by_name(const char *s)
++{
++	size_t i;
++	uint64_t v;
++
++	for (i = 0; i < ARRAY_SIZE(irq_type_names); i++)
++		if (irq_type_names[i] && !strcmp(s, irq_type_names[i]))
++			return (int)i;
++	if (parse_num(s, &v) && v < ISP_IRQ_TYPE_AMOUNT)
++		return (int)v;
++	return -1;
++}
++
++static int ref_ctrl_by_name(const char *s)
++{
++	size_t i;
++	uint64_t v;
++
++	for (i = 0; i < ARRAY_SIZE(ref_ctrl_names); i++)
++		if (ref_ctrl_names[i] && !strcmp(s, ref_ctrl_names[i]))
++			return (int)i;
++	if (parse_num(s, &v) && v < ISP_REF_CNT_MAX)
++		return (int)v;
++	return -1;
++}
++
++static int ref_id_by_name(const char *s)
++{
++	size_t i;
++	uint64_t v;
++
++	for (i = 0; i < ARRAY_SIZE(ref_id_names); i++)
++		if (!strcmp(s, ref_id_names[i]))
++			return (int)i;
++	if (parse_num(s, &v) && v < ISP_REF_CNT_ID_MAX)
++		return (int)v;
++	return -1;
++}
++
++static int dump_errors(struct camdrv *d)
++{
++	uint32_t ints[ISP_INT_ERR_COUNT];
++	uint32_t dma[ISP_DMA_ERR_COUNT];
++	int ret, i;
++
++	ret = camdrv_get_int_err(d, ints, ARRAY_SIZE(ints));
++	if (ret)
++		return fail(ret, "get-int-err");
++	printf("int errors: p1=%u p1-d=%u camsv=%u camsv2=%u\n",
++	       ints[0], ints[1], ints[2], ints[3]);
++
++	ret = camdrv_get_dma_err(d, dma, ARRAY_SIZE(dma));
++	if (ret)
++		return fail(ret, "get-dma-err");
++	printf("dma errors (%d counters):", ISP_DMA_ERR_COUNT);
++	for (i = 0; i < ISP_DMA_ERR_COUNT; i++)
++		printf(" %u", dma[i]);
++	printf("\n");
++	return 0;
++}
++
++static int dump_sof_all(struct camdrv *d)
++{
++	int tg, rc = 0;
++
++	for (tg = 0; tg < 4; tg++) {
++		uint32_t sof = 0, drop = 0;
++		int ret;
++
++		ret = camdrv_get_cur_sof(d, tg, &sof);
++		if (ret)
++			return fail(ret, "get-sof");
++		ret = camdrv_get_drop_frame(d, tg, &drop);
++		if (ret)
++			return fail(ret, "get-drop-frame");
++		printf("tg%d: sof=%u pass1done=%u\n", tg, sof, drop);
++	}
++	return rc;
++}
++
++static int cmd_info(struct camdrv *d, int argc, char **argv)
++{
++	uint32_t scen = 0;
++	int32_t burst = 0;
++	int ret, rc = 0;
++
++	(void)argv;
++	if (argc > 1)
++		usage_error("info takes no arguments");
++
++	printf("node:  %s\n", CAMDRV_DEV_NODE);
++	ret = camdrv_query_regscen(d, &scen);
++	if (ret) {
++		printf("regscen: %s\n", camdrv_errname(ret));
++		rc = 1;
++	} else {
++		printf("regscen: 0x%08x\n", scen);
++	}
++	ret = camdrv_query_burstqnum(d, &burst);
++	if (ret) {
++		printf("burstqnum: %s\n", camdrv_errname(ret));
++		rc = 1;
++	} else {
++		printf("burstqnum: %d\n", burst);
++	}
++	ret = dump_sof_all(d);
++	if (ret)
++		return ret;
++	ret = dump_errors(d);
++	if (ret)
++		return ret;
++	return rc;
++}
++
++static int cmd_read_reg(struct camdrv *d, int argc, char **argv)
++{
++	uint32_t addr, count, i;
++	ISP_REG_STRUCT *regs;
++	int ret;
++
++	if (argc < 2)
++		usage_error("read-reg needs an address");
++	addr = (uint32_t)need_num(argv[1], "bad address");
++	count = argc > 2 ? (uint32_t)need_num(argv[2], "bad count") : 1;
++	if (!count || count > 4096)
++		usage_error("count out of range");
++
++	regs = calloc(count, sizeof(*regs));
++	if (!regs)
++		return fail(-ENOMEM, "read-reg");
++	for (i = 0; i < count; i++)
++		regs[i].Addr = addr + i * 4;
++
++	ret = camdrv_read_regs(d, regs, count);
++	if (ret) {
++		free(regs);
++		return fail(ret, "read-reg");
++	}
++	for (i = 0; i < count; i++)
++		printf("0x%08x = 0x%08x\n", regs[i].Addr, regs[i].Val);
++	free(regs);
++	return 0;
++}
++
++static int cmd_write_reg(struct camdrv *d, int argc, char **argv)
++{
++	uint32_t addr, value;
++	int ret;
++
++	if (argc < 3)
++		usage_error("write-reg needs an address and a value");
++	addr = (uint32_t)need_num(argv[1], "bad address");
++	value = (uint32_t)need_num(argv[2], "bad value");
++	ret = camdrv_write_reg(d, addr, value);
++	if (ret)
++		return fail(ret, "write-reg");
++	printf("wrote 0x%08x = 0x%08x\n", addr, value);
++	return 0;
++}
++
++static int cmd_dump_regs(struct camdrv *d, int argc, char **argv)
++{
++	int ret;
++
++	(void)argv;
++	if (argc > 1)
++		usage_error("dump-regs takes no arguments");
++	ret = camdrv_dump_reg(d);
++	if (ret)
++		return fail(ret, "dump-regs");
++	printf("register dump requested (output goes to the kernel log)\n");
++	return 0;
++}
++
++static int cmd_dump_isr_log(struct camdrv *d, int argc, char **argv)
++{
++	static const struct option opts[] = {
++		{ "tg",		required_argument,	NULL, 't' },
++		{ "help",	no_argument,		NULL, 'h' },
++		{ NULL, 0, NULL, 0 },
++	};
++	unsigned int tg = 0;
++	int c, ret;
++
++	optind = 1;
++	while ((c = getopt_long(argc, argv, "h", opts, NULL)) != -1) {
++		uint64_t v;
++
++		switch (c) {
++		case 't':
++			v = need_num(optarg, "bad --tg");
++			if (v > 3)
++				usage_error("--tg must be 0..3");
++			tg = (unsigned int)v;
++			break;
++		case 'h':
++			usage(stdout);
++			exit(0);
++		default:
++			usage_error("unknown dump-isr-log option");
++		}
++	}
++	if (optind != argc)
++		usage_error("unexpected dump-isr-log argument");
++
++	ret = camdrv_dump_isr_log(d, tg);
++	if (ret)
++		return fail(ret, "dump-isr-log");
++	printf("interrupt log dump of tg%u requested (output goes to the kernel "
++	       "log)\n", tg);
++	return 0;
++}
++
++static int cmd_wait_irq(struct camdrv *d, int argc, char **argv)
++{
++	static const struct option opts[] = {
++		{ "type",	required_argument,	NULL, 't' },
++		{ "status",	required_argument,	NULL, 's' },
++		{ "timeout",	required_argument,	NULL, 'o' },
++		{ "clear",	required_argument,	NULL, 'c' },
++		{ "user",	required_argument,	NULL, 'u' },
++		{ "key",	required_argument,	NULL, 'k' },
++		{ "mark",	no_argument,		NULL, 'm' },
++		{ "flush",	no_argument,		NULL, 'f' },
++		{ "mark-time",	no_argument,		NULL, 'q' },
++		{ "help",	no_argument,		NULL, 'h' },
++		{ NULL, 0, NULL, 0 },
++	};
++	ISP_WAIT_IRQ_STRUCT irq;
++	uint32_t type = ISP_IRQ_TYPE_INT_P1_ST;
++	uint32_t status = ISP_IRQ_P1_STATUS_SOF1_INT_ST;
++	uint32_t timeout = 1000;
++	uint32_t clear = ISP_IRQ_CLEAR_NONE;
++	long user = -1;
++	long key = -1;
++	int action = 0;
++	int c, ret;
++
++	optind = 1;
++	while ((c = getopt_long(argc, argv, "h", opts, NULL)) != -1) {
++		uint64_t v;
++
++		switch (c) {
++		case 't':
++			if (irq_type_by_name(optarg) < 0)
++				usage_error("bad --type");
++			type = (uint32_t)irq_type_by_name(optarg);
++			break;
++		case 's':
++			status = (uint32_t)need_num(optarg, "bad --status");
++			break;
++		case 'o':
++			timeout = (uint32_t)need_num(optarg, "bad --timeout");
++			break;
++		case 'c':
++			v = need_num(optarg, "bad --clear");
++			if (v > ISP_IRQ_CLEAR_ALL)
++				usage_error("bad --clear");
++			clear = (uint32_t)v;
++			break;
++		case 'u':
++			user = (long)need_num(optarg, "bad --user");
++			break;
++		case 'k':
++			key = (long)need_num(optarg, "bad --key");
++			break;
++		case 'm':
++		case 'f':
++		case 'q':
++			action = c;
++			break;
++		case 'h':
++			usage(stdout);
++			exit(0);
++		default:
++			usage_error("unknown wait-irq option");
++		}
++	}
++	if (optind != argc)
++		usage_error("unexpected wait-irq argument");
++
++	if (key >= 0)
++		camdrv_irq_fill_v3(&irq, (ISP_IRQ_TYPE_ENUM)type, status,
++				   (int)key, timeout);
++	else if (user > 0)
++		camdrv_irq_fill_v1(&irq, (ISP_IRQ_TYPE_ENUM)type, status,
++				   (ISP_IRQ_USER_ENUM)user, timeout);
++	else if (camdrv_user_key(d) > 0)
++		/* Default to the key camdrv_init() registered for us; the
++		 * kernel rejects key 0 for mark/flush and uses only the ISPDRV
++		 * slot for it. */
++		camdrv_irq_fill_v3(&irq, (ISP_IRQ_TYPE_ENUM)type, status,
++				   camdrv_user_key(d), timeout);
++	else {
++		fprintf(stderr, "%s: no IRQ user key registered; "
++			"pass --key <n> or --user <n>\n", prog);
++		return 2;
++	}
++	irq.Clear = (ISP_IRQ_CLEAR_ENUM)clear;
++
++	switch (action) {
++	case 'm':
++		ret = camdrv_mark_irq(d, &irq);
++		break;
++	case 'f':
++		ret = camdrv_flush_irq(d, &irq);
++		break;
++	case 'q':
++		ret = camdrv_get_mark2query_time(d, &irq);
++		break;
++	default:
++		ret = camdrv_wait_irq(d, &irq);
++		break;
++	}
++	if (ret)
++		return fail(ret, action == 0 ? "wait-irq" :
++			    action == 'm' ? "mark-irq" :
++			    action == 'f' ? "flush-irq" : "get-mark2query");
++
++	printf("irq: type=%s status=0x%08x tstamp=%u\n",
++	       irq_type_names[type] ? irq_type_names[type] : "?", status,
++	       irq.irq_TStamp);
++	printf("time: last-signal=%u.%06u mark2wait=%u.%06u last2get=%u.%06u passed=%d\n",
++	       irq.TimeInfo.tLastSig_sec, irq.TimeInfo.tLastSig_usec,
++	       irq.TimeInfo.tMark2WaitSig_sec, irq.TimeInfo.tMark2WaitSig_usec,
++	       irq.TimeInfo.tLastSig2GetSig_sec, irq.TimeInfo.tLastSig2GetSig_usec,
++	       irq.TimeInfo.passedbySigcnt);
++	printf("eis: sof2p1done=%u.%06u\n", irq.EisMeta.tLastSOF2P1done_sec,
++	       irq.EisMeta.tLastSOF2P1done_usec);
++	return 0;
++}
++
++static void parse_rtbuf_opts(int argc, char **argv, _isp_dma_enum_ *dma,
++			     ISP_RT_BUF_INFO_STRUCT *buf, bool *immediate)
++{
++	static const struct option opts[] = {
++		{ "dma",	required_argument,	NULL, 'd' },
++		{ "pa",		required_argument,	NULL, 'p' },
++		{ "va",		required_argument,	NULL, 'v' },
++		{ "size",	required_argument,	NULL, 's' },
++		{ "index",	required_argument,	NULL, 'i' },
++		{ "memid",	required_argument,	NULL, 'm' },
++		{ "immediate",	no_argument,		NULL, 'I' },
++		{ "help",	no_argument,		NULL, 'h' },
++		{ NULL, 0, NULL, 0 },
++	};
++	int c;
++
++	memset(buf, 0, sizeof(*buf));
++	*dma = _imgo_;
++	*immediate = false;
++	buf->bufIdx = -1;
++
++	optind = 1;
++	while ((c = getopt_long(argc, argv, "h", opts, NULL)) != -1) {
++		uint64_t v;
++
++		switch (c) {
++		case 'd':
++			if (dma_by_name(optarg) < 0)
++				usage_error("unknown --dma channel");
++			*dma = (_isp_dma_enum_)dma_by_name(optarg);
++			break;
++		case 'p':
++			buf->base_pAddr = (uint32_t)need_num(optarg, "bad --pa");
++			break;
++		case 'v':
++			buf->base_vAddr = (int64_t)need_num(optarg, "bad --va");
++			break;
++		case 's':
++			buf->size = (uint32_t)need_num(optarg, "bad --size");
++			break;
++		case 'i':
++			v = need_num(optarg, "bad --index");
++			if (v > INT32_MAX)
++				usage_error("--index out of range");
++			buf->bufIdx = (int32_t)v;
++			break;
++		case 'm':
++			buf->memID = (uint32_t)need_num(optarg, "bad --memid");
++			break;
++		case 'I':
++			*immediate = true;
++			break;
++		case 'h':
++			usage(stdout);
++			exit(0);
++		default:
++			usage_error("unknown rtbuf option");
++		}
++	}
++	if (optind != argc)
++		usage_error("unexpected rtbuf argument");
++	if (!buf->base_pAddr)
++		usage_error("--pa is required");
++}
++
++static int cmd_rtbuf_enqueue(struct camdrv *d, int argc, char **argv)
++{
++	ISP_RT_BUF_INFO_STRUCT buf;
++	_isp_dma_enum_ dma;
++	bool immediate;
++	int ret;
++
++	parse_rtbuf_opts(argc, argv, &dma, &buf, &immediate);
++	if (immediate)
++		ret = camdrv_rtbuf_enqueue_immediate(d, dma, &buf);
++	else
++		ret = camdrv_rtbuf_enqueue(d, dma, &buf);
++	if (ret)
++		return fail(ret, "rtbuf-enqueue");
++	printf("enqueued dma=%s pa=0x%08x size=%u idx=%d%s\n", dma_name(dma),
++	       buf.base_pAddr, buf.size, buf.bufIdx,
++	       immediate ? " (immediate)" : "");
++	return 0;
++}
++
++static _isp_dma_enum_ parse_dma_only(int argc, char **argv)
++{
++	static const struct option opts[] = {
++		{ "dma",	required_argument,	NULL, 'd' },
++		{ "help",	no_argument,		NULL, 'h' },
++		{ NULL, 0, NULL, 0 },
++	};
++	_isp_dma_enum_ dma = _imgo_;
++	int c;
++
++	optind = 1;
++	while ((c = getopt_long(argc, argv, "h", opts, NULL)) != -1) {
++		switch (c) {
++		case 'd':
++			if (dma_by_name(optarg) < 0)
++				usage_error("unknown --dma channel");
++			dma = (_isp_dma_enum_)dma_by_name(optarg);
++			break;
++		case 'h':
++			usage(stdout);
++			exit(0);
++		default:
++			usage_error("unknown option");
++		}
++	}
++	if (optind != argc)
++		usage_error("unexpected argument");
++	return dma;
++}
++
++static int cmd_rtbuf_dequeue(struct camdrv *d, int argc, char **argv)
++{
++	ISP_DEQUE_BUF_INFO_STRUCT deque;
++	_isp_dma_enum_ dma;
++	unsigned int i;
++	int ret;
++
++	dma = parse_dma_only(argc, argv);
++	ret = camdrv_rtbuf_dequeue(d, dma, &deque);
++	if (ret)
++		return fail(ret, "rtbuf-dequeue");
++
++	printf("dequeued dma=%s count=%u sof=%u img=%u\n", dma_name(dma),
++	       deque.count, deque.sof_cnt, deque.img_cnt);
++	for (i = 0; i < deque.count && i < ISP_P1_DEQUE_CNT; i++) {
++		const ISP_RT_BUF_INFO_STRUCT *b = &deque.data[i];
++
++		printf("  [%u] pa=0x%08x va=0x%016" PRIx64 " size=%u memID=%u idx=%d\n",
++		       i, b->base_pAddr, (uint64_t)b->base_vAddr, b->size,
++		       b->memID, b->bufIdx);
++		printf("      ts=%u.%06u filled=%u raw=%u dequeued=%u frm=%u\n",
++		       b->timeStampS, b->timeStampUs, b->bFilled,
++		       b->bProcessRaw, b->bDequeued, b->image.frm_cnt);
++	}
++	return 0;
++}
++
++static int cmd_rtbuf_status(struct camdrv *d, int argc, char **argv)
++{
++	_isp_dma_enum_ dma;
++	uint32_t total = 0, ready = 0;
++	int ret;
++
++	dma = parse_dma_only(argc, argv);
++	ret = camdrv_rtbuf_get_size(d, dma, &total);
++	if (ret)
++		return fail(ret, "rtbuf-get-size");
++	ret = camdrv_rtbuf_is_ready(d, dma, &ready);
++	if (ret)
++		return fail(ret, "rtbuf-is-ready");
++	ret = camdrv_rtbuf_cur_status(d, dma);
++	if (ret)
++		return fail(ret, "rtbuf-cur-status");
++
++	printf("dma=%s total=%u ready=%u (FBC state dumped to the kernel log)\n",
++	       dma_name(dma), total, ready);
++	return 0;
++}
++
++static int cmd_mmap_dump(struct camdrv *d, int argc, char **argv)
++{
++	static const struct option opts[] = {
++		{ "window",	required_argument,	NULL, 'w' },
++		{ "offset",	required_argument,	NULL, 'o' },
++		{ "length",	required_argument,	NULL, 'l' },
++		{ "help",	no_argument,		NULL, 'h' },
++		{ NULL, 0, NULL, 0 },
++	};
++	const char *wanted = "isp";
++	uint32_t offset = 0, length = 64;
++	const struct camdrv_window *win;
++	const uint8_t *base;
++	int c, id, ret;
++	uint32_t i;
++
++	optind = 1;
++	while ((c = getopt_long(argc, argv, "h", opts, NULL)) != -1) {
++		switch (c) {
++		case 'w':
++			wanted = optarg;
++			break;
++		case 'o':
++			offset = (uint32_t)need_num(optarg, "bad --offset");
++			break;
++		case 'l':
++			length = (uint32_t)need_num(optarg, "bad --length");
++			break;
++		case 'h':
++			usage(stdout);
++			exit(0);
++		default:
++			usage_error("unknown mmap-dump option");
++		}
++	}
++	if (optind != argc)
++		usage_error("unexpected mmap-dump argument");
++
++	id = camdrv_window_id_by_name(wanted);
++	if (id < 0)
++		usage_error("unknown window name");
++	win = &camdrv_windows[id];
++	if (!length || offset >= win->size || length > win->size - offset)
++		usage_error("dump range outside the window");
++
++	ret = camdrv_mmap(d, (enum camdrv_window_id)id);
++	if (ret)
++		return fail(ret, "mmap");
++
++	base = camdrv_map(d, (enum camdrv_window_id)id);
++	if (!base)
++		return fail(-ENODEV, "mmap");
++	for (i = 0; i < length; i += 16) {
++		uint32_t j, n = length - i > 16 ? 16 : length - i;
++
++		printf("%08x:", win->base + offset + i);
++		for (j = 0; j < n; j++)
++			printf(" %02x", base[offset + i + j]);
++		printf("\n");
++	}
++	return 0;
++}
++
++static int cmd_get_sof(struct camdrv *d, int argc, char **argv)
++{
++	static const struct option opts[] = {
++		{ "tg",		required_argument,	NULL, 't' },
++		{ "help",	no_argument,		NULL, 'h' },
++		{ NULL, 0, NULL, 0 },
++	};
++	long tg = -1;
++	int c, ret;
++	uint32_t sof = 0;
++
++	optind = 1;
++	while ((c = getopt_long(argc, argv, "h", opts, NULL)) != -1) {
++		switch (c) {
++		case 't':
++			tg = (long)need_num(optarg, "bad --tg");
++			if (tg < 0 || tg > 3)
++				usage_error("--tg must be 0..3");
++			break;
++		case 'h':
++			usage(stdout);
++			exit(0);
++		default:
++			usage_error("unknown get-sof option");
++		}
++	}
++	if (optind != argc)
++		usage_error("unexpected get-sof argument");
++
++	if (tg < 0)
++		return dump_sof_all(d);
++	ret = camdrv_get_cur_sof(d, (unsigned int)tg, &sof);
++	if (ret)
++		return fail(ret, "get-sof");
++	printf("tg%ld: sof=%u\n", tg, sof);
++	return 0;
++}
++
++static int cmd_get_errors(struct camdrv *d, int argc, char **argv)
++{
++	(void)argv;
++	if (argc > 1)
++		usage_error("get-errors takes no arguments");
++	return dump_errors(d);
++}
++
++static int cmd_ref_cnt(struct camdrv *d, int argc, char **argv)
++{
++	static const struct option opts[] = {
++		{ "ctrl",	required_argument,	NULL, 'c' },
++		{ "id",		required_argument,	NULL, 'i' },
++		{ "help",	no_argument,		NULL, 'h' },
++		{ NULL, 0, NULL, 0 },
++	};
++	int ctrl = ISP_REF_CNT_GET;
++	int id = ISP_REF_CNT_ID_IMEM;
++	int32_t value = 0;
++	int c, ret;
++
++	optind = 1;
++	while ((c = getopt_long(argc, argv, "h", opts, NULL)) != -1) {
++		switch (c) {
++		case 'c':
++			ctrl = ref_ctrl_by_name(optarg);
++			if (ctrl < 0)
++				usage_error("bad --ctrl");
++			break;
++		case 'i':
++			id = ref_id_by_name(optarg);
++			if (id < 0)
++				usage_error("bad --id");
++			break;
++		case 'h':
++			usage(stdout);
++			exit(0);
++		default:
++			usage_error("unknown ref-cnt option");
++		}
++	}
++	if (optind != argc)
++		usage_error("unexpected ref-cnt argument");
++
++	ret = camdrv_ref_cnt(d, (ISP_REF_CNT_CTRL_ENUM)ctrl,
++			     (ISP_REF_CNT_ID_ENUM)id, &value);
++	if (ret)
++		return fail(ret, "ref-cnt");
++	printf("ref-cnt ctrl=%s id=%d value=%d\n",
++	       ref_ctrl_names[ctrl] ? ref_ctrl_names[ctrl] : "?", id, value);
++	return 0;
++}
++
++static int cmd_hold(struct camdrv *d, int argc, char **argv)
++{
++	uint64_t value;
++	int ret;
++
++	if (argc != 2)
++		usage_error("hold needs 0 or 1");
++	value = need_num(argv[1], "bad hold value");
++	if (value > 1)
++		usage_error("hold needs 0 or 1");
++	ret = camdrv_hold_reg(d, value == 1);
++	if (ret)
++		return fail(ret, "hold");
++	printf("hold reg %s\n", value ? "enabled" : "disabled");
++	return 0;
++}
++
++int main(int argc, char **argv)
++{
++	struct camdrv *d;
++	const char *cmd;
++	int ret, rc;
++
++	if (argc < 2 || !strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
++		usage(argc < 2 ? stderr : stdout);
++		return argc < 2 ? 2 : 0;
++	}
++	if (!strcmp(argv[1], "help")) {
++		usage(stdout);
++		return 0;
++	}
++
++	cmd = argv[1];
++
++	d = camdrv_create();
++	if (!d) {
++		fprintf(stderr, "%s: out of memory\n", prog);
++		return 1;
++	}
++
++	/* Registers the IRQ user key, like downstream IspDrvImp::init(). */
++	ret = camdrv_init(d, default_user);
++	if (ret) {
++		rc = fail(ret, "open");
++		camdrv_destroy(d);
++		return rc;
++	}
++
++	argc--;
++	argv++;
++
++	if (!strcmp(cmd, "info"))
++		rc = cmd_info(d, argc, argv);
++	else if (!strcmp(cmd, "dump-regs"))
++		rc = cmd_dump_regs(d, argc, argv);
++	else if (!strcmp(cmd, "dump-isr-log"))
++		rc = cmd_dump_isr_log(d, argc, argv);
++	else if (!strcmp(cmd, "read-reg"))
++		rc = cmd_read_reg(d, argc, argv);
++	else if (!strcmp(cmd, "write-reg"))
++		rc = cmd_write_reg(d, argc, argv);
++	else if (!strcmp(cmd, "wait-irq"))
++		rc = cmd_wait_irq(d, argc, argv);
++	else if (!strcmp(cmd, "rtbuf-enqueue"))
++		rc = cmd_rtbuf_enqueue(d, argc, argv);
++	else if (!strcmp(cmd, "rtbuf-dequeue"))
++		rc = cmd_rtbuf_dequeue(d, argc, argv);
++	else if (!strcmp(cmd, "rtbuf-status"))
++		rc = cmd_rtbuf_status(d, argc, argv);
++	else if (!strcmp(cmd, "mmap-dump"))
++		rc = cmd_mmap_dump(d, argc, argv);
++	else if (!strcmp(cmd, "get-sof"))
++		rc = cmd_get_sof(d, argc, argv);
++	else if (!strcmp(cmd, "get-errors"))
++		rc = cmd_get_errors(d, argc, argv);
++	else if (!strcmp(cmd, "ref-cnt"))
++		rc = cmd_ref_cnt(d, argc, argv);
++	else if (!strcmp(cmd, "hold"))
++		rc = cmd_hold(d, argc, argv);
++	else
++		usage_error("unknown command");
++
++	camdrv_uninit(d);
++	camdrv_destroy(d);
++	return rc;
++}
+diff --git a/tools/mediatek/camera/libcamdrv/camdrv.c b/tools/mediatek/camera/libcamdrv/camdrv.c
+new file mode 100644
+index 000000000..3200831be
+--- /dev/null
++++ b/tools/mediatek/camera/libcamdrv/camdrv.c
+@@ -0,0 +1,738 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * libcamdrv - userspace camera ISP driver layer for the MediaTek MT6735
++ * camera ISP character device.
++ *
++ * Port from Samsung/MTK downstream GPL kernel
++ * drivers/misc/mediatek/cameraisp/src/mt6735/camera_isp_D1.c
++ * and from the ROM userspace libcamdrv.so IspDrvImp::* implementation.
++ *
++ * All requests go through the ioctl contract published in
++ * include/uapi/linux/mtk_isp.h.  The downstream kernel copies both the
++ * structure and, for the controls whose payload lives behind a pointer, the
++ * pointed-to memory itself.  The layer therefore always passes a user pointer
++ * as the ioctl argument, never a scalar.
++ */
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++#include "camdrv.h"
++
++const struct camdrv_window camdrv_windows[CAMDRV_WIN_COUNT] = {
++	{ "imgsys",	MTK_ISP_MMAP_IMGSYS,		MTK_ISP_MMAP_IMGSYS_SIZE },
++	{ "isp",	MTK_ISP_MMAP_ISP,		MTK_ISP_MMAP_ISP_SIZE },
++	{ "seninf",	MTK_ISP_MMAP_SENINF,		MTK_ISP_MMAP_SENINF_SIZE },
++	{ "mipirx-cfg",	MTK_ISP_MMAP_MIPIRX_CFG,	MTK_ISP_MMAP_MIPIRX_CFG_SIZE },
++	{ "isp-inner",	MTK_ISP_MMAP_ISP_INNER,		MTK_ISP_MMAP_ISP_INNER_SIZE },
++	{ "pll",	MTK_ISP_MMAP_PLL,		MTK_ISP_MMAP_PLL_SIZE },
++	{ "gpio",	MTK_ISP_MMAP_GPIO,		MTK_ISP_MMAP_GPIO_SIZE },
++	{ "mipirx-ana",	MTK_ISP_MMAP_MIPIRX_ANA,	MTK_ISP_MMAP_MIPIRX_ANA_SIZE },
++};
++
++int camdrv_window_id_by_name(const char *name)
++{
++	int i;
++
++	if (!name)
++		return -1;
++	for (i = 0; i < CAMDRV_WIN_COUNT; i++)
++		if (!strcmp(name, camdrv_windows[i].name))
++			return i;
++	return -1;
++}
++
++static int camdrv_ioctl(struct camdrv *d, unsigned long cmd, const void *arg)
++{
++	if (!d || d->fd < 0)
++		return -ENODEV;
++	if (ioctl(d->fd, cmd, arg) < 0)
++		return -errno;
++	return 0;
++}
++
++/*
++ * The uapi names exactly one device node (MTK_ISP_DEV_NAME).  When it does
++ * not exist no camera ISP device is registered with the kernel, which is
++ * ENODEV; ENOENT would suggest a path problem instead.  Every other open(2)
++ * error is passed through unchanged.
++ */
++static int camdrv_open_node(void)
++{
++	int fd = open(CAMDRV_DEV_NODE, O_RDWR | O_CLOEXEC);
++
++	if (fd >= 0)
++		return fd;
++	if (errno == ENOENT || errno == ENXIO)
++		return -ENODEV;
++	return -errno;
++}
++
++struct camdrv *camdrv_create(void)
++{
++	struct camdrv *d = calloc(1, sizeof(*d));
++
++	if (!d)
++		return NULL;
++	d->fd = -1;
++	d->user_key = -1;
++	return d;
++}
++
++int camdrv_probe(void)
++{
++	int fd = camdrv_open_node();
++
++	if (fd < 0)
++		return fd;
++	close(fd);
++	return 0;
++}
++
++int camdrv_init(struct camdrv *d, const char *user_name)
++{
++	int ret;
++
++	if (!d)
++		return -EINVAL;
++	if (d->fd >= 0) {
++		/* Downstream ref-counts repeated init() calls. */
++		d->ref++;
++		return 0;
++	}
++
++	d->fd = camdrv_open_node();
++	if (d->fd < 0)
++		return d->fd;
++
++	if (user_name && user_name[0]) {
++		ret = camdrv_register_user_key(d, user_name, &d->user_key);
++		if (ret) {
++			close(d->fd);
++			d->fd = -1;
++			d->user_key = -1;
++			return ret;
++		}
++	}
++
++	d->ref = 1;
++	return 0;
++}
++
++static void camdrv_unmap_all(struct camdrv *d)
++{
++	int i;
++
++	for (i = 0; i < CAMDRV_WIN_COUNT; i++) {
++		if (d->mapped[i]) {
++			munmap(d->map[i], camdrv_windows[i].size);
++			d->map[i] = NULL;
++			d->mapped[i] = false;
++		}
++	}
++}
++
++int camdrv_uninit(struct camdrv *d)
++{
++	if (!d)
++		return -EINVAL;
++	if (d->fd < 0)
++		return 0;
++	if (d->ref > 1) {
++		d->ref--;
++		return 0;
++	}
++
++	camdrv_unmap_all(d);
++	if (close(d->fd) < 0) {
++		d->fd = -1;
++		d->ref = 0;
++		return -errno;
++	}
++	d->fd = -1;
++	d->ref = 0;
++	d->user_key = -1;
++	return 0;
++}
++
++void camdrv_destroy(struct camdrv *d)
++{
++	if (!d)
++		return;
++	camdrv_uninit(d);
++	free(d);
++}
++
++/* ------------------------------------------------------------------ */
++/* Registers                                                           */
++/* ------------------------------------------------------------------ */
++
++int camdrv_read_reg(struct camdrv *d, uint32_t addr, uint32_t *val)
++{
++	ISP_REG_STRUCT reg = { .Addr = addr, .Val = 0 };
++	ISP_REG_IO_STRUCT io = {
++		.pData = (__u64)(uintptr_t)&reg,
++		.Count = 1,
++	};
++	int ret;
++
++	if (!val)
++		return -EINVAL;
++	ret = camdrv_ioctl(d, ISP_READ_REGISTER, &io);
++	if (ret)
++		return ret;
++	*val = reg.Val;
++	return 0;
++}
++
++int camdrv_write_reg(struct camdrv *d, uint32_t addr, uint32_t val)
++{
++	ISP_REG_STRUCT reg = { .Addr = addr, .Val = val };
++	ISP_REG_IO_STRUCT io = {
++		.pData = (__u64)(uintptr_t)&reg,
++		.Count = 1,
++	};
++
++	return camdrv_ioctl(d, ISP_WRITE_REGISTER, &io);
++}
++
++int camdrv_read_regs(struct camdrv *d, ISP_REG_STRUCT *regs, uint32_t count)
++{
++	ISP_REG_IO_STRUCT io;
++
++	if (!regs || !count)
++		return -EINVAL;
++	io.pData = (__u64)(uintptr_t)regs;
++	io.Count = count;
++	return camdrv_ioctl(d, ISP_READ_REGISTER, &io);
++}
++
++int camdrv_write_regs(struct camdrv *d, const ISP_REG_STRUCT *regs,
++		      uint32_t count)
++{
++	ISP_REG_IO_STRUCT io;
++
++	if (!regs || !count)
++		return -EINVAL;
++	io.pData = (__u64)(uintptr_t)regs;
++	io.Count = count;
++	return camdrv_ioctl(d, ISP_WRITE_REGISTER, &io);
++}
++
++int camdrv_hold_reg(struct camdrv *d, bool enable)
++{
++	__u8 value = enable ? 1 : 0;
++
++	return camdrv_ioctl(d, ISP_HOLD_REG, &value);
++}
++
++int camdrv_hold_reg_time(struct camdrv *d, ISP_HOLD_TIME_ENUM when)
++{
++	ISP_HOLD_TIME_ENUM value = when;
++
++	return camdrv_ioctl(d, ISP_HOLD_REG_TIME, &value);
++}
++
++int camdrv_dump_reg(struct camdrv *d)
++{
++	return camdrv_ioctl(d, ISP_DUMP_REG, NULL);
++}
++
++int camdrv_dump_isr_log(struct camdrv *d, unsigned int tg)
++{
++	uint32_t value = tg;
++
++	if (tg > 3)
++		return -EINVAL;
++	return camdrv_ioctl(d, ISP_DUMP_ISR_LOG, &value);
++}
++
++int camdrv_ed_bufque(struct camdrv *d, const ISP_ED_BUFQUE_STRUCT *req)
++{
++	if (!req)
++		return -EINVAL;
++	return camdrv_ioctl(d, ISP_ED_QUEBUF_CTRL, req);
++}
++
++/* ------------------------------------------------------------------ */
++/* Interrupts                                                          */
++/* ------------------------------------------------------------------ */
++
++void camdrv_irq_fill_v1(ISP_WAIT_IRQ_STRUCT *irq, ISP_IRQ_TYPE_ENUM type,
++			uint32_t status, ISP_IRQ_USER_ENUM user,
++			uint32_t timeout_ms)
++{
++	memset(irq, 0, sizeof(*irq));
++	irq->Clear = ISP_IRQ_CLEAR_NONE;
++	irq->Type = type;
++	irq->Status = status;
++	/* UserNumber > 0 selects the downstream v1 flow. */
++	irq->UserNumber = (int)user;
++	irq->Timeout = timeout_ms;
++	irq->SpecUser = ISP_IRQ_WAITIRQ_SPEUSER_NONE;
++}
++
++void camdrv_irq_fill_v3(ISP_WAIT_IRQ_STRUCT *irq, ISP_IRQ_TYPE_ENUM type,
++			uint32_t status, int user_key, uint32_t timeout_ms)
++{
++	memset(irq, 0, sizeof(*irq));
++	irq->Clear = ISP_IRQ_CLEAR_NONE;
++	irq->UserNumber = (int)ISP_IRQ_USER_ISPDRV;	/* 0: v3 flow */
++	irq->Timeout = timeout_ms;
++	irq->UserInfo.Type = type;
++	irq->UserInfo.Status = status;
++	irq->UserInfo.UserKey = user_key;
++	irq->SpecUser = ISP_IRQ_WAITIRQ_SPEUSER_NONE;
++}
++
++int camdrv_wait_irq(struct camdrv *d, ISP_WAIT_IRQ_STRUCT *irq)
++{
++	if (!irq)
++		return -EINVAL;
++	return camdrv_ioctl(d, ISP_WAIT_IRQ, irq);
++}
++
++int camdrv_read_irq(struct camdrv *d, ISP_READ_IRQ_STRUCT *irq)
++{
++	if (!irq)
++		return -EINVAL;
++	return camdrv_ioctl(d, ISP_READ_IRQ, irq);
++}
++
++int camdrv_clear_irq(struct camdrv *d, const ISP_CLEAR_IRQ_STRUCT *irq)
++{
++	if (!irq)
++		return -EINVAL;
++	return camdrv_ioctl(d, ISP_CLEAR_IRQ, irq);
++}
++
++int camdrv_register_irq(struct camdrv *d, const ISP_WAIT_IRQ_STRUCT *irq)
++{
++	if (!irq)
++		return -EINVAL;
++	return camdrv_ioctl(d, ISP_REGISTER_IRQ, irq);
++}
++
++int camdrv_unregister_irq(struct camdrv *d, const ISP_WAIT_IRQ_STRUCT *irq)
++{
++	if (!irq)
++		return -EINVAL;
++	return camdrv_ioctl(d, ISP_UNREGISTER_IRQ, irq);
++}
++
++int camdrv_mark_irq(struct camdrv *d, ISP_WAIT_IRQ_STRUCT *irq)
++{
++	if (!irq)
++		return -EINVAL;
++	return camdrv_ioctl(d, ISP_MARK_IRQ_REQUEST, irq);
++}
++
++int camdrv_flush_irq(struct camdrv *d, ISP_WAIT_IRQ_STRUCT *irq)
++{
++	if (!irq)
++		return -EINVAL;
++	return camdrv_ioctl(d, ISP_FLUSH_IRQ_REQUEST, irq);
++}
++
++int camdrv_get_mark2query_time(struct camdrv *d, ISP_WAIT_IRQ_STRUCT *irq)
++{
++	if (!irq)
++		return -EINVAL;
++	return camdrv_ioctl(d, ISP_GET_MARK2QUERY_TIME, irq);
++}
++
++int camdrv_register_user_key(struct camdrv *d, const char *name, int *key)
++{
++	ISP_REGISTER_USERKEY_STRUCT req;
++	int ret;
++
++	if (!name || !name[0] || !key)
++		return -EINVAL;
++	req.userKey = 0;
++	req.userName = (__u64)(uintptr_t)name;
++	ret = camdrv_ioctl(d, ISP_REGISTER_IRQ_USER_KEY, &req);
++	if (ret)
++		return ret;
++	if (req.userKey < 0)
++		return -EIO;
++	*key = req.userKey;
++	return 0;
++}
++
++int camdrv_user_key(const struct camdrv *d)
++{
++	if (!d || d->fd < 0)
++		return -1;
++	return d->user_key;
++}
++
++/* ------------------------------------------------------------------ */
++/* mmap                                                                */
++/* ------------------------------------------------------------------ */
++
++int camdrv_mmap(struct camdrv *d, enum camdrv_window_id id)
++{
++	const struct camdrv_window *win;
++	void *addr;
++
++	if (!d || id < 0 || id >= CAMDRV_WIN_COUNT)
++		return -EINVAL;
++	if (d->fd < 0)
++		return -ENODEV;
++	if (d->mapped[id])
++		return 0;
++
++	win = &camdrv_windows[id];
++	/* The page offset is the physical base of the window and the length
++	 * must be the documented one; the kernel rejects everything else
++	 * (downstream ISP_mmap(), camera_isp_D1.c:11263-11335). */
++	addr = mmap(NULL, win->size, PROT_READ | PROT_WRITE, MAP_SHARED, d->fd,
++		    (off_t)win->base);
++	if (addr == MAP_FAILED)
++		return -errno;
++
++	d->map[id] = addr;
++	d->mapped[id] = true;
++	return 0;
++}
++
++void *camdrv_map(struct camdrv *d, enum camdrv_window_id id)
++{
++	if (!d || id < 0 || id >= CAMDRV_WIN_COUNT || !d->mapped[id])
++		return NULL;
++	return d->map[id];
++}
++
++/* ------------------------------------------------------------------ */
++/* Real time buffers                                                   */
++/* ------------------------------------------------------------------ */
++
++static int camdrv_buf_ctrl(struct camdrv *d, ISP_RT_BUF_CTRL_ENUM ctrl,
++			   _isp_dma_enum_ dma, __u64 data_ptr,
++			   __u64 ex_data_ptr, __u64 p_extend)
++{
++	ISP_BUFFER_CTRL_STRUCT req = {
++		.ctrl = ctrl,
++		.buf_id = dma,
++		.data_ptr = data_ptr,
++		.ex_data_ptr = ex_data_ptr,
++		.pExtend = p_extend,
++	};
++
++	return camdrv_ioctl(d, ISP_BUFFER_CTRL, &req);
++}
++
++int camdrv_rtbuf_enqueue(struct camdrv *d, _isp_dma_enum_ dma,
++			 const ISP_RT_BUF_INFO_STRUCT *buf)
++{
++	if (!buf)
++		return -EINVAL;
++	return camdrv_buf_ctrl(d, ISP_RT_BUF_CTRL_ENQUE, dma,
++			       (__u64)(uintptr_t)buf, 0, 0);
++}
++
++int camdrv_rtbuf_enqueue_immediate(struct camdrv *d, _isp_dma_enum_ dma,
++				   const ISP_RT_BUF_INFO_STRUCT *buf)
++{
++	if (!buf)
++		return -EINVAL;
++	return camdrv_buf_ctrl(d, ISP_RT_BUF_CTRL_ENQUE_IMD, dma,
++			       (__u64)(uintptr_t)buf, 0, 0);
++}
++
++int camdrv_rtbuf_enqueue_exchange(struct camdrv *d, _isp_dma_enum_ dma,
++				  const ISP_RT_BUF_INFO_STRUCT *buf,
++				  const ISP_RT_BUF_INFO_STRUCT *replaced)
++{
++	if (!buf || !replaced)
++		return -EINVAL;
++	/* ex_data_ptr carries the new buffer; data_ptr identifies the slot
++	 * through the base_pAddr of the buffer being replaced
++	 * (camera_isp_D1.c:4813-4935, mtk-isp.c:1227-1232). */
++	return camdrv_buf_ctrl(d, ISP_RT_BUF_CTRL_ENQUE, dma,
++			       (__u64)(uintptr_t)replaced,
++			       (__u64)(uintptr_t)buf, 0);
++}
++
++int camdrv_rtbuf_dequeue(struct camdrv *d, _isp_dma_enum_ dma,
++			 ISP_DEQUE_BUF_INFO_STRUCT *out)
++{
++	int ret;
++
++	if (!out)
++		return -EINVAL;
++	memset(out, 0, sizeof(*out));
++	/* The kernel writes ISP_DEQUE_BUF_INFO_STRUCT through pExtend
++	 * (camera_isp_D1.c:5838-5846). */
++	ret = camdrv_buf_ctrl(d, ISP_RT_BUF_CTRL_DEQUE, dma, 0, 0,
++			      (__u64)(uintptr_t)out);
++	if (ret)
++		return ret;
++	if (out->count > ISP_P1_DEQUE_CNT)
++		return -EIO;
++	return 0;
++}
++
++int camdrv_rtbuf_is_ready(struct camdrv *d, _isp_dma_enum_ dma,
++			  uint32_t *ready)
++{
++	uint32_t wait = 1;
++	int ret;
++
++	if (!ready)
++		return -EINVAL;
++	*ready = 0;
++	ret = camdrv_buf_ctrl(d, ISP_RT_BUF_CTRL_IS_RDY, dma, 0, 0,
++			      (__u64)(uintptr_t)&wait);
++	if (ret)
++		return ret;
++	/* The kernel hands back the "wait" flag: 1 means no filled buffer is
++	 * available yet (mtk-isp.c:3146-3162). */
++	*ready = wait ? 0 : 1;
++	return 0;
++}
++
++int camdrv_rtbuf_dma_en(struct camdrv *d, const uint8_t *enabled, size_t count)
++{
++	if (!enabled || count != (size_t)_rt_dma_max_)
++		return -EINVAL;
++	/* buf_id is not used by this control; the kernel indexes the array by
++	 * _isp_dma_enum_ (camera_isp_D1.c:6096-6110). */
++	return camdrv_buf_ctrl(d, ISP_RT_BUF_CTRL_DMA_EN, _imgo_, 0, 0,
++			       (__u64)(uintptr_t)enabled);
++}
++
++int camdrv_rtbuf_get_size(struct camdrv *d, _isp_dma_enum_ dma,
++			  uint32_t *total)
++{
++	int ret;
++
++	if (!total)
++		return -EINVAL;
++	*total = 0;
++	ret = camdrv_buf_ctrl(d, ISP_RT_BUF_CTRL_GET_SIZE, dma, 0, 0,
++			      (__u64)(uintptr_t)total);
++	if (ret)
++		return ret;
++	return 0;
++}
++
++int camdrv_rtbuf_clear(struct camdrv *d, _isp_dma_enum_ dma)
++{
++	return camdrv_buf_ctrl(d, ISP_RT_BUF_CTRL_CLEAR, dma, 0, 0, 0);
++}
++
++int camdrv_rtbuf_cur_status(struct camdrv *d, _isp_dma_enum_ dma)
++{
++	return camdrv_buf_ctrl(d, ISP_RT_BUF_CTRL_CUR_STATUS, dma, 0, 0, 0);
++}
++
++/* ------------------------------------------------------------------ */
++/* Reference counts                                                    */
++/* ------------------------------------------------------------------ */
++
++int camdrv_ref_cnt(struct camdrv *d, ISP_REF_CNT_CTRL_ENUM ctrl,
++		   ISP_REF_CNT_ID_ENUM id, int32_t *value)
++{
++	ISP_REF_CNT_CTRL_STRUCT req;
++	int32_t tmp = 0;	/* the kernel only writes the result */
++	int ret;
++
++	req.ctrl = ctrl;
++	req.id = id;
++	req.data_ptr = (__u64)(uintptr_t)&tmp;
++	ret = camdrv_ioctl(d, ISP_REF_CNT_CTRL, &req);
++	if (ret)
++		return ret;
++	if (value)
++		*value = tmp;
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* Misc                                                                */
++/* ------------------------------------------------------------------ */
++
++int camdrv_reset(struct camdrv *d, unsigned int which)
++{
++	unsigned long cmd;
++
++	switch (which) {
++	case ISP_CMD_RESET_CAM_P1:
++		cmd = ISP_RESET_CAM_P1;
++		break;
++	case ISP_CMD_RESET_CAM_P2:
++		cmd = ISP_RESET_CAM_P2;
++		break;
++	case ISP_CMD_RESET_CAMSV:
++		cmd = ISP_RESET_CAMSV;
++		break;
++	case ISP_CMD_RESET_CAMSV2:
++		cmd = ISP_RESET_CAMSV2;
++		break;
++	case ISP_CMD_RESET_BUF:
++		cmd = ISP_RESET_BUF;
++		break;
++	default:
++		return -EINVAL;
++	}
++	return camdrv_ioctl(d, cmd, NULL);
++}
++
++int camdrv_set_user_pid(struct camdrv *d, uint32_t pid)
++{
++	uint32_t value = pid;
++
++	return camdrv_ioctl(d, ISP_SET_USER_PID, &value);
++}
++
++int camdrv_get_cur_sof(struct camdrv *d, unsigned int tg, uint32_t *sof)
++{
++	uint32_t value;
++	int ret;
++
++	if (!sof || tg > 3)
++		return -EINVAL;
++	value = tg;
++	ret = camdrv_ioctl(d, ISP_GET_CUR_SOF, &value);
++	if (ret)
++		return ret;
++	*sof = value;
++	return 0;
++}
++
++int camdrv_get_drop_frame(struct camdrv *d, unsigned int tg, uint32_t *state)
++{
++	uint32_t value;
++	int ret;
++
++	if (!state || tg > 3)
++		return -EINVAL;
++	value = tg;
++	ret = camdrv_ioctl(d, ISP_GET_DROP_FRAME, &value);
++	if (ret)
++		return ret;
++	*state = value;
++	return 0;
++}
++
++int camdrv_get_dma_err(struct camdrv *d, uint32_t *errs, size_t count)
++{
++	if (!errs || count < ISP_DMA_ERR_COUNT)
++		return -EINVAL;
++	memset(errs, 0, ISP_DMA_ERR_COUNT * sizeof(*errs));
++	return camdrv_ioctl(d, ISP_GET_DMA_ERR, errs);
++}
++
++int camdrv_get_int_err(struct camdrv *d, uint32_t *errs, size_t count)
++{
++	if (!errs || count < ISP_INT_ERR_COUNT)
++		return -EINVAL;
++	memset(errs, 0, ISP_INT_ERR_COUNT * sizeof(*errs));
++	return camdrv_ioctl(d, ISP_GET_INT_ERR, errs);
++}
++
++int camdrv_set_fps(struct camdrv *d, uint32_t fps)
++{
++	uint32_t value = fps;
++
++	return camdrv_ioctl(d, ISP_SET_FPS, &value);
++}
++
++int camdrv_wakelock(struct camdrv *d, bool enable)
++{
++	uint32_t value = enable ? 1 : 0;
++
++	return camdrv_ioctl(d, ISP_WAKELOCK_CTRL, &value);
++}
++
++int camdrv_update_regscen(struct camdrv *d, uint32_t scen)
++{
++	uint32_t value = scen;
++
++	return camdrv_ioctl(d, ISP_UPDATE_REGSCEN, &value);
++}
++
++int camdrv_query_regscen(struct camdrv *d, uint32_t *scen)
++{
++	if (!scen)
++		return -EINVAL;
++	*scen = 0;
++	return camdrv_ioctl(d, ISP_QUERY_REGSCEN, scen);
++}
++
++int camdrv_update_burstqnum(struct camdrv *d, int32_t qnum)
++{
++	int32_t value = qnum;
++
++	return camdrv_ioctl(d, ISP_UPDATE_BURSTQNUM, &value);
++}
++
++int camdrv_query_burstqnum(struct camdrv *d, int32_t *qnum)
++{
++	if (!qnum)
++		return -EINVAL;
++	*qnum = 0;
++	return camdrv_ioctl(d, ISP_QUERY_BURSTQNUM, qnum);
++}
++
++int camdrv_debug_flag(struct camdrv *d, uint32_t mask, unsigned int tg)
++{
++	uint32_t value[2] = { mask, tg };
++
++	if (tg > 3)
++		return -EINVAL;
++	return camdrv_ioctl(d, ISP_DEBUG_FLAG, value);
++}
++
++/* ------------------------------------------------------------------ */
++/* Error names                                                         */
++/* ------------------------------------------------------------------ */
++
++const char *camdrv_errname(int err)
++{
++	if (err >= 0)
++		return "OK";
++
++	switch (-err) {
++	case ENODEV:
++		return "ENODEV";
++	case ENOENT:
++		return "ENOENT";
++	case EINVAL:
++		return "EINVAL";
++	case ENOTTY:
++		return "ENOTTY";
++	case ENOSYS:
++		return "ENOSYS";
++	case EFAULT:
++		return "EFAULT";
++	case EAGAIN:
++		return "EAGAIN";
++	case EIO:
++		return "EIO";
++	case ENOMEM:
++		return "ENOMEM";
++	case ENOSPC:
++		return "ENOSPC";
++	case EBUSY:
++		return "EBUSY";
++	case EPERM:
++		return "EPERM";
++	case EACCES:
++		return "EACCES";
++	case ETIMEDOUT:
++		return "ETIMEDOUT";
++	case EINTR:
++		return "EINTR";
++	case EOPNOTSUPP:
++		return "EOPNOTSUPP";
++	default:
++		return "unknown";
++	}
++}
+diff --git a/tools/mediatek/camera/libcamdrv/camdrv.h b/tools/mediatek/camera/libcamdrv/camdrv.h
+new file mode 100644
+index 000000000..07455ccea
+--- /dev/null
++++ b/tools/mediatek/camera/libcamdrv/camdrv.h
+@@ -0,0 +1,414 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * libcamdrv - userspace camera ISP driver layer for the MediaTek MT6735
++ * camera ISP character device.
++ *
++ * Port from Samsung/MTK downstream GPL kernel
++ * drivers/misc/mediatek/cameraisp/src/mt6735/{camera_isp_D1.c,camera_isp_D1.h}
++ * and from the ROM userspace libcamdrv.so IspDrvImp::* symbol set.
++ *
++ * The layer implements the downstream IspDrv API on top of the uapi contract
++ * in include/uapi/linux/mtk_isp.h.  The device node, ioctl numbering and
++ * structure layout are the ones defined by that contract; nothing in this
++ * header redefines them.
++ *
++ * ABI note: every pointer field in the uapi structures is a fixed __u64, so
++ * a 32-bit client builds the same ioctl numbers and the same structure sizes
++ * as a 64-bit client (on ABIs where __u64 is 8-byte aligned, i.e. ARM EABI).
++ * This library never stores a host pointer in a 32-bit field.
++ */
++
++#ifndef CAMDRV_H
++#define CAMDRV_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include <linux/mtk_isp.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Downstream ISP_DEV_NAME, camera_isp_D1.c:116.  Same string in the ROM
++ * libcamdrv.so (string table: "/dev/camera-isp"). */
++#define CAMDRV_DEV_NODE		"/dev/" MTK_ISP_DEV_NAME
++
++/* ------------------------------------------------------------------ */
++/* Register windows (downstream ISP_mmap() contract)                   */
++/* ------------------------------------------------------------------ */
++
++enum camdrv_window_id {
++	CAMDRV_WIN_IMGSYS = 0,
++	CAMDRV_WIN_ISP,
++	CAMDRV_WIN_SENINF,
++	CAMDRV_WIN_MIPIRX_CFG,
++	CAMDRV_WIN_ISP_INNER,
++	CAMDRV_WIN_PLL,
++	CAMDRV_WIN_GPIO,
++	CAMDRV_WIN_MIPIRX_ANA,
++	CAMDRV_WIN_COUNT,
++};
++
++struct camdrv_window {
++	const char *name;
++	uint32_t base;		/* mmap(2) page offset == physical base */
++	uint32_t size;		/* exact accepted length */
++};
++
++extern const struct camdrv_window camdrv_windows[CAMDRV_WIN_COUNT];
++
++/* Returns the window id for a name ("isp", "seninf", ...) or -1. */
++int camdrv_window_id_by_name(const char *name);
++
++/* ------------------------------------------------------------------ */
++/* Driver instance                                                     */
++/* ------------------------------------------------------------------ */
++
++struct camdrv {
++	int fd;			/* /dev/camera-isp, -1 when closed */
++	int ref;		/* init reference count (downstream mRefCount) */
++	int user_key;		/* downstream IRQ user key, -1 if unregistered */
++	void *map[CAMDRV_WIN_COUNT];
++	bool mapped[CAMDRV_WIN_COUNT];
++};
++
++/* Downstream IspDrv::createInstance().  Never fails. */
++struct camdrv *camdrv_create(void);
++
++/*
++ * Downstream IspDrvImp::init(const char *) + isp_fd_open():
++ * opens CAMDRV_DEV_NODE and, when user_name is non-NULL and non-empty,
++ * registers an interrupt user key for the calling process.  Subsequent calls
++ * on an already initialised instance only bump the reference count.
++ * Returns 0 or a negative errno.
++ *
++ * A missing device node is reported as -ENODEV, not -ENOENT: the ABI names
++ * exactly one device (MTK_ISP_DEV_NAME) and its absence means no camera ISP
++ * device is registered with the kernel, which is what ENODEV means.  The
++ * errno from the failed open(2) is otherwise returned unchanged.
++ */
++int camdrv_init(struct camdrv *d, const char *user_name);
++
++/* Downstream IspDrvImp::uninit(): drops the reference count, unmaps every
++ * window and closes the descriptor when the last reference goes away. */
++int camdrv_uninit(struct camdrv *d);
++
++/* Downstream IspDrv::destroyInstance(). */
++void camdrv_destroy(struct camdrv *d);
++
++/* 0 when the device cannot be opened, negative errno otherwise. */
++int camdrv_probe(void);
++
++/* ------------------------------------------------------------------ */
++/* Register access                                                     */
++/* ------------------------------------------------------------------ */
++
++/* Downstream IspDrvImp::readReg(unsigned int, int).  addr is the physical
++ * ISP register address as used by the downstream driver. */
++int camdrv_read_reg(struct camdrv *d, uint32_t addr, uint32_t *val);
++
++/* Downstream IspDrvImp::writeReg(unsigned int, unsigned long, int, int). */
++int camdrv_write_reg(struct camdrv *d, uint32_t addr, uint32_t val);
++
++/* Downstream IspDrvImp::readRegs(ISP_DRV_REG_IO_STRUCT *, count, ...).
++ * regs[].Val is written by the kernel. */
++int camdrv_read_regs(struct camdrv *d, ISP_REG_STRUCT *regs, uint32_t count);
++
++/* Downstream IspDrvImp::writeRegs(ISP_DRV_REG_IO_STRUCT *, count, ...). */
++int camdrv_write_regs(struct camdrv *d, const ISP_REG_STRUCT *regs,
++		      uint32_t count);
++
++/* Downstream IspDrvImp::holdReg(int): hold writes until the next trigger. */
++int camdrv_hold_reg(struct camdrv *d, bool enable);
++
++/* Downstream IspDrvImp::holdReg / ISP_SetHoldTime(). */
++int camdrv_hold_reg_time(struct camdrv *d, ISP_HOLD_TIME_ENUM when);
++
++/* Downstream IspDrvImp::dumpReg(). */
++int camdrv_dump_reg(struct camdrv *d);
++
++/*
++ * ISP_DUMP_ISR_LOG: print the interrupt log pages of one TG to the kernel log.
++ *
++ * The uapi spells this command _IO (no encoded argument size), but the
++ * downstream handler still reads the TG index from the argument
++ * (camera_isp_D1.c:10311-10324: copy_from_user(&tg, Param, 4), then
++ * IRQ_LOG_PRINTER(tg, ...)).  The wrapper therefore always passes a pointer
++ * to a u32; passing NULL would be an -EFAULT on such a kernel.  tg is one of
++ * _cam_tg_.._camsv2_tg_ (0..3).
++ */
++int camdrv_dump_isr_log(struct camdrv *d, unsigned int tg);
++
++/* Downstream ISP_ED_QUEBUF_CTRL (camera_isp_D1.c:2759-2930): the P2 early
++ * done buffer queue.  The kernel consumes the request by value and answers
++ * through the return code, so the structure is never written back. */
++int camdrv_ed_bufque(struct camdrv *d, const ISP_ED_BUFQUE_STRUCT *req);
++
++/* ------------------------------------------------------------------ */
++/* Interrupts                                                          */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Downstream IspDrvImp::waitIrq(ISP_DRV_WAIT_IRQ_STRUCT *).  The caller owns
++ * the uapi structure; the two helpers below fill either the v1 fields
++ * (UserNumber > 0, dispatches to the downstream v1 flow) or the v3 fields
++ * (UserInfo, UserNumber == ISP_IRQ_USER_ISPDRV).
++ *
++ * The kernel reads the argument through copy_from_user(), so the ioctl is
++ * always issued with a pointer, never with a value.
++ */
++int camdrv_wait_irq(struct camdrv *d, ISP_WAIT_IRQ_STRUCT *irq);
++
++void camdrv_irq_fill_v1(ISP_WAIT_IRQ_STRUCT *irq, ISP_IRQ_TYPE_ENUM type,
++			uint32_t status, ISP_IRQ_USER_ENUM user,
++			uint32_t timeout_ms);
++void camdrv_irq_fill_v3(ISP_WAIT_IRQ_STRUCT *irq, ISP_IRQ_TYPE_ENUM type,
++			uint32_t status, int user_key, uint32_t timeout_ms);
++
++/* Downstream IspDrvImp::readIrq(ISP_DRV_READ_IRQ_STRUCT *). */
++int camdrv_read_irq(struct camdrv *d, ISP_READ_IRQ_STRUCT *irq);
++
++/* Downstream IspDrvImp::clearIrq(ISP_DRV_CLEAR_IRQ_STRUCT). */
++int camdrv_clear_irq(struct camdrv *d, const ISP_CLEAR_IRQ_STRUCT *irq);
++
++/* Downstream IspDrvImp::registerIrq(const char *) / unregisterIrq(...). */
++int camdrv_register_irq(struct camdrv *d, const ISP_WAIT_IRQ_STRUCT *irq);
++int camdrv_unregister_irq(struct camdrv *d, const ISP_WAIT_IRQ_STRUCT *irq);
++
++/* Downstream IspDrvImp::markIrq() / flushIrq() / queryirqtimeinfo(). */
++int camdrv_mark_irq(struct camdrv *d, ISP_WAIT_IRQ_STRUCT *irq);
++int camdrv_flush_irq(struct camdrv *d, ISP_WAIT_IRQ_STRUCT *irq);
++int camdrv_get_mark2query_time(struct camdrv *d, ISP_WAIT_IRQ_STRUCT *irq);
++
++/* Downstream ISP_REGISTER_IRQ_USER_KEY / IspDrvImp::registerIrq(name).
++ * Writes the assigned key to *key (>= 0 on success). */
++int camdrv_register_user_key(struct camdrv *d, const char *name, int *key);
++
++/* Key registered by camdrv_init() for this instance, -1 when none.  The v3
++ * IRQ flows (wait/mark/flush) need it: the kernel rejects UserKey < 1 for
++ * ISP_MARK_IRQ_REQUEST (mtk-isp.c:3730-3740). */
++int camdrv_user_key(const struct camdrv *d);
++
++/* ------------------------------------------------------------------ */
++/* mmap                                                                */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Maps one uapi window.  Length validation is done against
++ * camdrv_windows[id].size, the only lengths the downstream ISP_mmap()
++ * accepts (camera_isp_D1.c:11263-11335).  Idempotent.
++ */
++int camdrv_mmap(struct camdrv *d, enum camdrv_window_id id);
++
++/* Returns the mapping or NULL when the window is not mapped. */
++void *camdrv_map(struct camdrv *d, enum camdrv_window_id id);
++
++/* ------------------------------------------------------------------ */
++/* Pass-1 real time buffers (downstream ISP_Buf_CTRL_FUNC)             */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Every RT buffer call fills ISP_BUFFER_CTRL_STRUCT exactly as the downstream
++ * userspace does: data_ptr points at the ISP_RT_BUF_INFO_STRUCT and pExtend
++ * carries the per-control payload.  The kernel copies the payload itself
++ * (camera_isp_D1.c:5820-6115), so the pointer is a plain user pointer cast to
++ * __u64.
++ */
++int camdrv_rtbuf_enqueue(struct camdrv *d, _isp_dma_enum_ dma,
++			 const ISP_RT_BUF_INFO_STRUCT *buf);
++int camdrv_rtbuf_enqueue_immediate(struct camdrv *d, _isp_dma_enum_ dma,
++				   const ISP_RT_BUF_INFO_STRUCT *buf);
++
++/*
++ * Buffer replacement.  Downstream performs the swap in the ENQUE path when
++ * ex_data_ptr is non-NULL (camera_isp_D1.c:4813-4935): ex_data_ptr is the
++ * *new* buffer to install, data_ptr is the buffer whose base_pAddr selects
++ * the ring slot being replaced.  When the new buffer's bufIdx is not 0xFFFF
++ * the kernel selects the slot by that idx instead and base_pAddr is only
++ * used for the error log (camera_isp_D1.c:4830-4870), so pass -1 as bufIdx
++ * when the replacement must be looked up by physical address.
++ *
++ * The EXCHANGE_ENQUE control is a no-op in that kernel
++ * (camera_isp_D1.c:4797-4799), so this helper deliberately uses ENQUE with
++ * both pointers set, in that order.
++ *
++ * buf is the new buffer, replaced identifies the slot to overwrite.
++ */
++int camdrv_rtbuf_enqueue_exchange(struct camdrv *d, _isp_dma_enum_ dma,
++				  const ISP_RT_BUF_INFO_STRUCT *buf,
++				  const ISP_RT_BUF_INFO_STRUCT *replaced);
++
++/* Downstream ISP_RT_BUF_CTRL_DEQUE: the kernel fills ISP_DEQUE_BUF_INFO_STRUCT
++ * through pExtend and fails with -EFAULT when no buffer is filled. */
++int camdrv_rtbuf_dequeue(struct camdrv *d, _isp_dma_enum_ dma,
++			 ISP_DEQUE_BUF_INFO_STRUCT *out);
++
++/*
++ * Downstream ISP_RT_BUF_CTRL_IS_RDY: *ready is 1 when a filled buffer is
++ * waiting to be dequeued, 0 otherwise.  The kernel publishes the inverse
++ * ("wait" = 1 while nothing is ready), so this helper flips it back to the
++ * name the control carries (mtk-isp.c:3146-3162).
++ */
++int camdrv_rtbuf_is_ready(struct camdrv *d, _isp_dma_enum_ dma,
++			  uint32_t *ready);
++
++/*
++ * Downstream ISP_RT_BUF_CTRL_DMA_EN: pExtend points at an array of one byte
++ * per _isp_dma_enum_ entry (_rt_dma_max_ bytes, camera_isp_D1.c:6096-6110).
++ */
++int camdrv_rtbuf_dma_en(struct camdrv *d, const uint8_t *enabled,
++			size_t count);
++
++/* Downstream ISP_RT_BUF_CTRL_GET_SIZE (pExtend -> unsigned int). */
++int camdrv_rtbuf_get_size(struct camdrv *d, _isp_dma_enum_ dma,
++			  uint32_t *total);
++
++/* Downstream ISP_RT_BUF_CTRL_CLEAR. */
++int camdrv_rtbuf_clear(struct camdrv *d, _isp_dma_enum_ dma);
++
++/* Downstream ISP_RT_BUF_CTRL_CUR_STATUS.  The downstream kernel only dumps
++ * the FBC state to the kernel log, it returns no data to userspace. */
++int camdrv_rtbuf_cur_status(struct camdrv *d, _isp_dma_enum_ dma);
++
++/* ------------------------------------------------------------------ */
++/* Reference counts                                                    */
++/* ------------------------------------------------------------------ */
++
++/* Downstream IspDrvImp::kRefCntCtrl(ISP_REF_CNT_CTRL_STRUCT *).  The kernel
++ * returns the resulting counter through data_ptr, so *value is always
++ * written on success. */
++int camdrv_ref_cnt(struct camdrv *d, ISP_REF_CNT_CTRL_ENUM ctrl,
++		   ISP_REF_CNT_ID_ENUM id, int32_t *value);
++
++/* ------------------------------------------------------------------ */
++/* Misc controls                                                       */
++/* ------------------------------------------------------------------ */
++
++int camdrv_reset(struct camdrv *d, unsigned int which);	/* ISP_CMD_RESET_* */
++int camdrv_set_user_pid(struct camdrv *d, uint32_t pid);
++int camdrv_get_cur_sof(struct camdrv *d, unsigned int tg, uint32_t *sof);
++int camdrv_get_drop_frame(struct camdrv *d, unsigned int tg, uint32_t *state);
++
++/*
++ * Both arrays are written by the kernel with fixed sizes:
++ * ISP_DMA_ERR_COUNT u32 for the DMA errors and ISP_INT_ERR_COUNT u32 for the
++ * interrupt error counters (camera_isp_D1.c:9834-9845).  The caller must
++ * provide at least that many entries; anything smaller is -EINVAL.
++ */
++int camdrv_get_dma_err(struct camdrv *d, uint32_t *errs, size_t count);
++int camdrv_get_int_err(struct camdrv *d, uint32_t *errs, size_t count);
++
++int camdrv_set_fps(struct camdrv *d, uint32_t fps);
++int camdrv_wakelock(struct camdrv *d, bool enable);
++int camdrv_update_regscen(struct camdrv *d, uint32_t scen);
++int camdrv_query_regscen(struct camdrv *d, uint32_t *scen);
++int camdrv_update_burstqnum(struct camdrv *d, int32_t qnum);
++int camdrv_query_burstqnum(struct camdrv *d, int32_t *qnum);
++
++/* Downstream ISP_DEBUG_FLAG: { debug mask, TG } pair, 8 bytes. */
++int camdrv_debug_flag(struct camdrv *d, uint32_t mask, unsigned int tg);
++
++/* ------------------------------------------------------------------ */
++/* CQ0C real-time ring (downstream IspDrvImp::cqRingBuf)               */
++/* ------------------------------------------------------------------ */
++
++/*
++ * The ring is CQ_RTBC_RING_ST, a fixed array of ISP_RT_CQ0C_BUF_SIZE
++ * ISP_CQ_RING_CMD_ST records.  The hardware consumes it through physical
++ * addresses, so the backing memory must be physically contiguous and the
++ * client must supply its physical base; the uapi exposes no DMA allocator
++ * and this library never guesses a PA.
++ *
++ * The CQ instruction words themselves (ISP_CQ_CMD_ST.inst) are MediaTek
++ * pipeline encodings that are not present in any source available for this
++ * port.  They must be supplied by the camera service; camdrv_cq_ring_init()
++ * rejects a zero word with -EINVAL instead of inventing an opcode.
++ */
++struct camdrv_mem {
++	void *va;
++	uint32_t pa;
++	size_t size;
++};
++
++struct camdrv_cq_ring {
++	struct camdrv_mem mem;
++	ISP_CQ_RTBC_RING_ST *ring;
++	uint32_t inst_imgo;
++	uint32_t inst_rrzo;
++	uint32_t inst_patch;
++	uint32_t inst_end;
++	unsigned int count;
++	unsigned int head;	/* slot programmed by the next push */
++	uint32_t pushed;	/* number of committed slots */
++	bool ready;
++};
++
++/*
++ * Attach a physically contiguous buffer of at least
++ * sizeof(ISP_CQ_RTBC_RING_ST) bytes and build the cyclic next_cq0ci/end
++ * links.  imgo_inst/rrzo_inst are the "write DMA base address" CQ
++ * instructions, addr_patch_inst is the instruction that patches an address
++ * operand (used for next_cq0ci).  The end-of-descriptor word defaults to
++ * addr_patch_inst; use camdrv_cq_ring_set_inst() to supply a distinct value.
++ */
++int camdrv_cq_ring_init(struct camdrv_cq_ring *ring, const struct camdrv_mem *mem,
++			uint32_t imgo_inst, uint32_t rrzo_inst,
++			uint32_t addr_patch_inst);
++
++/* Override the ring instruction words after camdrv_cq_ring_init(). */
++int camdrv_cq_ring_set_inst(struct camdrv_cq_ring *ring, uint32_t inst_imgo,
++			    uint32_t inst_rrzo, uint32_t inst_patch,
++			    uint32_t inst_end);
++
++/*
++ * Downstream CQ_RTBC_RING_ST.imgo_ring_size / rrzo_ring_size are filled by
++ * the downstream userspace CQ table builder, whose source is not available.
++ * camdrv_cq_ring_init() sets both to the byte size of the ring; a service
++ * that knows the downstream values can override them here.
++ */
++int camdrv_cq_ring_set_sizes(struct camdrv_cq_ring *ring, uint32_t imgo_bytes,
++			     uint32_t rrzo_bytes);
++
++/*
++ * Program one ring slot: IMGO/RRZO base commands, the next_cq0ci link to the
++ * following slot and the base/buf_idx bookkeeping fields.  Returns the slot
++ * index in *slot (may be NULL).
++ */
++int camdrv_cq_ring_push(struct camdrv_cq_ring *ring, uint32_t imgo_pa,
++			int32_t imgo_idx, uint32_t rrzo_pa, int32_t rrzo_idx,
++			unsigned int *slot);
++
++/* Physical base address to program into the CQ0C base register. */
++uint32_t camdrv_cq_ring_base_pa(const struct camdrv_cq_ring *ring);
++
++/* Accessor for validation/inspection (NULL when not initialised). */
++const ISP_CQ_RTBC_RING_ST *camdrv_cq_ring_data(const struct camdrv_cq_ring *ring);
++
++/* Buffers handed to camdrv_cq_ring_swap(); the *_old members are optional and
++ * select the downstream replacement path. */
++struct camdrv_cq_swap {
++	const ISP_RT_BUF_INFO_STRUCT *imgo;
++	const ISP_RT_BUF_INFO_STRUCT *imgo_old;
++	const ISP_RT_BUF_INFO_STRUCT *rrzo;
++	const ISP_RT_BUF_INFO_STRUCT *rrzo_old;
++};
++
++/*
++ * Build the next ring slot and hand both buffers to the kernel in the order
++ * the downstream kernel patches them: a slot is programmed, then IMGO is
++ * enqueued, then RRZO (camera_isp_D1.c:4901-5130, 5590-5600).  Any failure
++ * is returned; no buffer is enqueued silently.
++ */
++int camdrv_cq_ring_swap(struct camdrv *d, struct camdrv_cq_ring *ring,
++			const struct camdrv_cq_swap *swap);
++
++/* Name of a negative errno, e.g. "ENODEV" (never NULL). */
++const char *camdrv_errname(int err);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* CAMDRV_H */
+diff --git a/tools/mediatek/camera/libcamdrv/camdrv_cq.c b/tools/mediatek/camera/libcamdrv/camdrv_cq.c
+new file mode 100644
+index 000000000..acb509549
+--- /dev/null
++++ b/tools/mediatek/camera/libcamdrv/camdrv_cq.c
+@@ -0,0 +1,213 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * CQ0C real-time ring builder.
++ *
++ * Port from Samsung/MTK downstream GPL kernel
++ * drivers/misc/mediatek/cameraisp/src/mt6735/inc/camera_isp_D1.h:735-758
++ * (CQ_CMD_ST / CQ_INFO_RTBC_ST / CQ_RING_CMD_ST / CQ_RTBC_RING_ST) and from
++ * the ROM userspace libcamdrv.so IspDrvImp::cqRingBuf symbol.
++ *
++ * The ring is consumed by the ISP through physical addresses.  Its memory is
++ * therefore owned and mapped by the camera service, which knows how to get a
++ * physically contiguous buffer from its own DMA-BUF/ION allocator; this
++ * layer only lays out the records and patches the addresses.
++ *
++ * The CQ instruction words (inst) are MediaTek pipeline encodings and are not
++ * present in any source available for this port.  They are supplied by the
++ * caller and validated here; no opcode value is fabricated.
++ */
++
++#include <errno.h>
++#include <string.h>
++
++#include "camdrv.h"
++
++static int camdrv_cq_inst_valid(const struct camdrv_cq_ring *ring)
++{
++	return ring->inst_imgo && ring->inst_rrzo && ring->inst_patch &&
++	       ring->inst_end;
++}
++
++static void camdrv_cq_link_all(struct camdrv_cq_ring *ring)
++{
++	ISP_CQ_RING_CMD_ST *cmd;
++	uint32_t next_pa;
++	unsigned int i, next;
++
++	for (i = 0; i < ring->count; i++) {
++		next = (i + 1) % ring->count;
++		next_pa = ring->mem.pa + next * (uint32_t)sizeof(*cmd);
++		cmd = &ring->ring->rtbc_ring[i];
++		cmd->next_pa = next_pa;
++		cmd->pNext = &ring->ring->rtbc_ring[next];
++	}
++}
++
++int camdrv_cq_ring_init(struct camdrv_cq_ring *ring, const struct camdrv_mem *mem,
++			uint32_t imgo_inst, uint32_t rrzo_inst,
++			uint32_t addr_patch_inst)
++{
++	if (!ring || !mem || !mem->va || !mem->pa ||
++	    mem->size < sizeof(ISP_CQ_RTBC_RING_ST))
++		return -EINVAL;
++	/* CQ commands are 32-bit words; a ring that is not word aligned cannot
++	 * be addressed by the hardware. */
++	if (mem->pa & 0x3)
++		return -EINVAL;
++	if (!imgo_inst || !rrzo_inst || !addr_patch_inst)
++		return -EINVAL;
++
++	memset(ring, 0, sizeof(*ring));
++	ring->mem = *mem;
++	ring->ring = (ISP_CQ_RTBC_RING_ST *)mem->va;
++	ring->count = ISP_RT_CQ0C_BUF_SIZE;
++	if (ring->mem.size < ring->count * sizeof(ISP_CQ_RING_CMD_ST))
++		return -EINVAL;
++
++	ring->inst_imgo = imgo_inst;
++	ring->inst_rrzo = rrzo_inst;
++	ring->inst_patch = addr_patch_inst;
++	/* The terminal descriptor word is not documented anywhere available.
++	 * Default it to the address-patch instruction so that no zero opcode is
++	 * ever emitted; a service that knows the real encoding overrides it
++	 * with camdrv_cq_ring_set_inst(). */
++	ring->inst_end = addr_patch_inst;
++	ring->head = 0;
++	ring->pushed = 0;
++
++	memset(ring->ring, 0, sizeof(*ring->ring));
++	/* [INFERENCE] downstream CQ_RTBC_RING_ST.imgo_ring_size and
++	 * rrzo_ring_size are filled by the unavailable userspace CQ table
++	 * builder; the ring byte size is used as the default and can be
++	 * overridden through camdrv_cq_ring_set_sizes(). */
++	ring->ring->imgo_ring_size = ring->count * sizeof(ISP_CQ_RING_CMD_ST);
++	ring->ring->rrzo_ring_size = ring->count * sizeof(ISP_CQ_RING_CMD_ST);
++	camdrv_cq_link_all(ring);
++
++	ring->ready = true;
++	return 0;
++}
++
++int camdrv_cq_ring_set_inst(struct camdrv_cq_ring *ring, uint32_t inst_imgo,
++			    uint32_t inst_rrzo, uint32_t inst_patch,
++			    uint32_t inst_end)
++{
++	if (!ring || !ring->ready)
++		return -EINVAL;
++	if (!inst_imgo || !inst_rrzo || !inst_patch || !inst_end)
++		return -EINVAL;
++	ring->inst_imgo = inst_imgo;
++	ring->inst_rrzo = inst_rrzo;
++	ring->inst_patch = inst_patch;
++	ring->inst_end = inst_end;
++	return 0;
++}
++
++int camdrv_cq_ring_set_sizes(struct camdrv_cq_ring *ring, uint32_t imgo_bytes,
++			     uint32_t rrzo_bytes)
++{
++	if (!ring || !ring->ready)
++		return -EINVAL;
++	ring->ring->imgo_ring_size = imgo_bytes;
++	ring->ring->rrzo_ring_size = rrzo_bytes;
++	return 0;
++}
++
++static uint32_t camdrv_slot_pa(const struct camdrv_cq_ring *ring,
++			       unsigned int slot)
++{
++	return ring->mem.pa + slot * (uint32_t)sizeof(ISP_CQ_RING_CMD_ST);
++}
++
++int camdrv_cq_ring_push(struct camdrv_cq_ring *ring, uint32_t imgo_pa,
++			int32_t imgo_idx, uint32_t rrzo_pa, int32_t rrzo_idx,
++			unsigned int *slot_out)
++{
++	ISP_CQ_RING_CMD_ST *cmd;
++	unsigned int slot, next;
++	uint32_t next_pa;
++
++	if (!ring || !ring->ready || !ring->ring)
++		return -EINVAL;
++	if (!camdrv_cq_inst_valid(ring))
++		return -EINVAL;
++	if (!imgo_pa || !rrzo_pa)
++		return -EINVAL;
++
++	slot = ring->head;
++	next = (slot + 1) % ring->count;
++	next_pa = camdrv_slot_pa(ring, next);
++
++	cmd = &ring->ring->rtbc_ring[slot];
++	memset(cmd, 0, sizeof(*cmd));
++
++	cmd->cq_rtbc.imgo.inst = ring->inst_imgo;
++	cmd->cq_rtbc.imgo.data_ptr_pa = imgo_pa;
++	cmd->cq_rtbc.rrzo.inst = ring->inst_rrzo;
++	cmd->cq_rtbc.rrzo.data_ptr_pa = rrzo_pa;
++	cmd->cq_rtbc.next_cq0ci.inst = ring->inst_patch;
++	cmd->cq_rtbc.next_cq0ci.data_ptr_pa = next_pa;
++	cmd->cq_rtbc.end.inst = ring->inst_end;
++	cmd->cq_rtbc.end.data_ptr_pa = next_pa;
++	cmd->cq_rtbc.imgo_base_pAddr = imgo_pa;
++	cmd->cq_rtbc.rrzo_base_pAddr = rrzo_pa;
++	cmd->cq_rtbc.imgo_buf_idx = imgo_idx;
++	cmd->cq_rtbc.rrzo_buf_idx = rrzo_idx;
++	cmd->next_pa = next_pa;
++	cmd->pNext = &ring->ring->rtbc_ring[next];
++
++	ring->head = next;
++	ring->pushed++;
++	if (slot_out)
++		*slot_out = slot;
++	return 0;
++}
++
++uint32_t camdrv_cq_ring_base_pa(const struct camdrv_cq_ring *ring)
++{
++	if (!ring || !ring->ready)
++		return 0;
++	return ring->mem.pa;
++}
++
++const ISP_CQ_RTBC_RING_ST *camdrv_cq_ring_data(const struct camdrv_cq_ring *ring)
++{
++	if (!ring || !ring->ready)
++		return NULL;
++	return ring->ring;
++}
++
++int camdrv_cq_ring_swap(struct camdrv *d, struct camdrv_cq_ring *ring,
++			const struct camdrv_cq_swap *swap)
++{
++	int ret;
++
++	if (!d || !ring || !ring->ready || !swap || !swap->imgo || !swap->rrzo)
++		return -EINVAL;
++	if (ring->ring->imgo_ring_size == 0 || ring->ring->rrzo_ring_size == 0)
++		return -EINVAL;
++
++	ret = camdrv_cq_ring_push(ring, swap->imgo->base_pAddr,
++				  swap->imgo->bufIdx, swap->rrzo->base_pAddr,
++				  swap->rrzo->bufIdx, NULL);
++	if (ret)
++		return ret;
++
++	/* Patch order of the downstream kernel: IMGO is replaced first, then
++	 * RRZO, and RCNT_INC is pulled on the same VD
++	 * (camera_isp_D1.c:4730-4731, 4901-5130). */
++	if (swap->imgo_old)
++		ret = camdrv_rtbuf_enqueue_exchange(d, _imgo_, swap->imgo,
++						    swap->imgo_old);
++	else
++		ret = camdrv_rtbuf_enqueue(d, _imgo_, swap->imgo);
++	if (ret)
++		return ret;
++
++	if (swap->rrzo_old)
++		ret = camdrv_rtbuf_enqueue_exchange(d, _rrzo_, swap->rrzo,
++						    swap->rrzo_old);
++	else
++		ret = camdrv_rtbuf_enqueue(d, _rrzo_, swap->rrzo);
++	return ret;
++}
+diff --git a/tools/mediatek/camera/tests/abi32.c b/tools/mediatek/camera/tests/abi32.c
+new file mode 100644
+index 000000000..6085f9db0
+--- /dev/null
++++ b/tools/mediatek/camera/tests/abi32.c
+@@ -0,0 +1,220 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * 32-bit ABI compatibility check for libcamdrv.
++ *
++ * Port from Samsung/MTK downstream GPL kernel
++ * drivers/misc/mediatek/cameraisp/src/mt6735/inc/camera_isp_D1.h.
++ *
++ * The uapi fixes every pointer field to __u64 so that a 32-bit client builds
++ * the same ioctl numbers and the same structure sizes as a 64-bit client.
++ * That holds on every ABI used by this port (arm EABI, arm64, x86-64), where
++ * __u64 is 8-byte aligned.  On i386 the alignment is 4 unless -malign-double
++ * is given, so the Makefile passes it for this target; the first assertion
++ * below refuses to run the check under a mismatched ABI rather than
++ * comparing the wrong layout.
++ *
++ * The ioctl numbers are asserted literally: they are the contract between
++ * /dev/camera-isp and every client, and a change in the size field of any
++ * structure silently changes them.
++ */
++
++#include <errno.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++
++#include <linux/mtk_isp.h>
++
++#include "camdrv.h"
++
++_Static_assert(sizeof(void *) == 4, "this check must be built with -m32");
++_Static_assert(_Alignof(__u64) == 8,
++	       "i386 needs -malign-double to match the ARM EABI __u64 alignment");
++
++/* ------------------------------------------------------------------ */
++/* Structure layout                                                    */
++/* ------------------------------------------------------------------ */
++
++/* Enums are 4 bytes, so only the fixed-width fields matter here. */
++_Static_assert(sizeof(ISP_IRQ_USER_STRUCT) == 12,
++	       "ISP_IRQ_USER_STRUCT layout changed");
++_Static_assert(sizeof(ISP_IRQ_TIME_STRUCT) == 28,
++	       "ISP_IRQ_TIME_STRUCT layout changed");
++_Static_assert(sizeof(ISP_EIS_META_STRUCT) == 8,
++	       "ISP_EIS_META_STRUCT layout changed");
++_Static_assert(sizeof(ISP_WAIT_IRQ_STRUCT) == 96,
++	       "ISP_WAIT_IRQ_STRUCT layout changed");
++_Static_assert(offsetof(ISP_WAIT_IRQ_STRUCT, UserName) == 24,
++	       "UserName must stay a 64-bit field at offset 24");
++_Static_assert(offsetof(ISP_WAIT_IRQ_STRUCT, UserInfo) == 40,
++	       "UserInfo must stay at offset 40");
++_Static_assert(offsetof(ISP_WAIT_IRQ_STRUCT, TimeInfo) == 52,
++	       "TimeInfo must stay at offset 52");
++_Static_assert(offsetof(ISP_WAIT_IRQ_STRUCT, EisMeta) == 80,
++	       "EisMeta must stay at offset 80");
++
++_Static_assert(sizeof(ISP_REGISTER_USERKEY_STRUCT) == 16,
++	       "ISP_REGISTER_USERKEY_STRUCT layout changed");
++_Static_assert(offsetof(ISP_REGISTER_USERKEY_STRUCT, userName) == 8,
++	       "userName must stay a 64-bit field at offset 8");
++
++_Static_assert(sizeof(ISP_READ_IRQ_STRUCT) == 12,
++	       "ISP_READ_IRQ_STRUCT layout changed");
++_Static_assert(sizeof(ISP_CLEAR_IRQ_STRUCT) == 12,
++	       "ISP_CLEAR_IRQ_STRUCT layout changed");
++_Static_assert(sizeof(ISP_REG_STRUCT) == 8, "ISP_REG_STRUCT layout changed");
++
++_Static_assert(sizeof(ISP_REG_IO_STRUCT) == 16,
++	       "ISP_REG_IO_STRUCT layout changed");
++_Static_assert(offsetof(ISP_REG_IO_STRUCT, pData) == 0,
++	       "pData must stay a 64-bit field at offset 0");
++
++_Static_assert(sizeof(ISP_RT_IMAGE_INFO_STRUCT) == 52,
++	       "ISP_RT_IMAGE_INFO_STRUCT layout changed");
++_Static_assert(sizeof(ISP_RT_RRZ_INFO_STRUCT) == 24,
++	       "ISP_RT_RRZ_INFO_STRUCT layout changed");
++_Static_assert(sizeof(ISP_RT_DMAO_CROPPING_STRUCT) == 16,
++	       "ISP_RT_DMAO_CROPPING_STRUCT layout changed");
++
++_Static_assert(sizeof(ISP_RT_BUF_INFO_STRUCT) == 136,
++	       "ISP_RT_BUF_INFO_STRUCT layout changed");
++_Static_assert(offsetof(ISP_RT_BUF_INFO_STRUCT, base_vAddr) == 8,
++	       "base_vAddr must stay a 64-bit field at offset 8");
++_Static_assert(offsetof(ISP_RT_BUF_INFO_STRUCT, bufIdx) == 132,
++	       "bufIdx must stay at offset 132");
++
++_Static_assert(sizeof(ISP_DEQUE_BUF_INFO_STRUCT) == 152,
++	       "ISP_DEQUE_BUF_INFO_STRUCT layout changed");
++
++_Static_assert(sizeof(ISP_BUFFER_CTRL_STRUCT) == 32,
++	       "ISP_BUFFER_CTRL_STRUCT layout changed");
++_Static_assert(offsetof(ISP_BUFFER_CTRL_STRUCT, data_ptr) == 8,
++	       "data_ptr must stay a 64-bit field at offset 8");
++_Static_assert(offsetof(ISP_BUFFER_CTRL_STRUCT, ex_data_ptr) == 16,
++	       "ex_data_ptr must stay a 64-bit field at offset 16");
++_Static_assert(offsetof(ISP_BUFFER_CTRL_STRUCT, pExtend) == 24,
++	       "pExtend must stay a 64-bit field at offset 24");
++
++_Static_assert(sizeof(ISP_REF_CNT_CTRL_STRUCT) == 16,
++	       "ISP_REF_CNT_CTRL_STRUCT layout changed");
++_Static_assert(offsetof(ISP_REF_CNT_CTRL_STRUCT, data_ptr) == 8,
++	       "ref-cnt data_ptr must stay a 64-bit field at offset 8");
++
++_Static_assert(sizeof(ISP_ED_BUFQUE_STRUCT) == 24,
++	       "ISP_ED_BUFQUE_STRUCT layout changed");
++
++_Static_assert(sizeof(ISP_CQ_CMD_ST) == 8, "ISP_CQ_CMD_ST layout changed");
++_Static_assert(sizeof(ISP_CQ_INFO_RTBC_ST) == 48,
++	       "ISP_CQ_INFO_RTBC_ST layout changed");
++/* The ring entry embeds the __u64 next_pa and a process-local pNext pointer;
++ * the record is only meaningful inside one process, and the compiler pads it
++ * to the 8-byte alignment the __u64 forces. */
++_Static_assert(sizeof(ISP_CQ_RING_CMD_ST) == 64,
++	       "ISP_CQ_RING_CMD_ST layout changed");
++_Static_assert(sizeof(ISP_CQ_RTBC_RING_ST) ==
++	       ISP_RT_CQ0C_BUF_SIZE * 64 + 8,
++	       "ISP_CQ_RTBC_RING_ST layout changed");
++_Static_assert(ISP_RT_CQ0C_BUF_SIZE == 16, "ring depth changed");
++
++/* ------------------------------------------------------------------ */
++/* ioctl numbers                                                       */
++/* ------------------------------------------------------------------ */
++
++/* _IOC(dir, 'k', nr, size) with the sizes asserted above. */
++_Static_assert(ISP_RESET_CAM_P1 == 0x00006b00, "ISP_RESET_CAM_P1");
++_Static_assert(ISP_RESET_CAM_P2 == 0x00006b01, "ISP_RESET_CAM_P2");
++_Static_assert(ISP_RESET_CAMSV == 0x00006b02, "ISP_RESET_CAMSV");
++_Static_assert(ISP_RESET_CAMSV2 == 0x00006b03, "ISP_RESET_CAMSV2");
++_Static_assert(ISP_RESET_BUF == 0x00006b04, "ISP_RESET_BUF");
++_Static_assert(ISP_READ_REGISTER == 0xc0106b05, "ISP_READ_REGISTER");
++_Static_assert(ISP_WRITE_REGISTER == 0xc0106b06, "ISP_WRITE_REGISTER");
++_Static_assert(ISP_HOLD_REG_TIME == 0x40046b07, "ISP_HOLD_REG_TIME");
++_Static_assert(ISP_HOLD_REG == 0x40016b08, "ISP_HOLD_REG");
++_Static_assert(ISP_WAIT_IRQ == 0x40606b09, "ISP_WAIT_IRQ");
++_Static_assert(ISP_READ_IRQ == 0x800c6b0a, "ISP_READ_IRQ");
++_Static_assert(ISP_CLEAR_IRQ == 0x400c6b0b, "ISP_CLEAR_IRQ");
++_Static_assert(ISP_DUMP_REG == 0x00006b0c, "ISP_DUMP_REG");
++_Static_assert(ISP_SET_USER_PID == 0x40046b0d, "ISP_SET_USER_PID");
++_Static_assert(ISP_BUFFER_CTRL == 0xc0206b0e, "ISP_BUFFER_CTRL");
++_Static_assert(ISP_REF_CNT_CTRL == 0xc0106b0f, "ISP_REF_CNT_CTRL");
++_Static_assert(ISP_DEBUG_FLAG == 0x40086b10, "ISP_DEBUG_FLAG");
++_Static_assert(ISP_REGISTER_IRQ == 0x40606b11, "ISP_REGISTER_IRQ");
++_Static_assert(ISP_UNREGISTER_IRQ == 0x40606b12, "ISP_UNREGISTER_IRQ");
++_Static_assert(ISP_ED_QUEBUF_CTRL == 0xc0186b13, "ISP_ED_QUEBUF_CTRL");
++_Static_assert(ISP_UPDATE_REGSCEN == 0xc0046b14, "ISP_UPDATE_REGSCEN");
++_Static_assert(ISP_QUERY_REGSCEN == 0x80046b15, "ISP_QUERY_REGSCEN");
++_Static_assert(ISP_UPDATE_BURSTQNUM == 0x40046b16, "ISP_UPDATE_BURSTQNUM");
++_Static_assert(ISP_QUERY_BURSTQNUM == 0x80046b17, "ISP_QUERY_BURSTQNUM");
++_Static_assert(ISP_DUMP_ISR_LOG == 0x00006b18, "ISP_DUMP_ISR_LOG");
++_Static_assert(ISP_GET_CUR_SOF == 0x80046b19, "ISP_GET_CUR_SOF");
++_Static_assert(ISP_GET_DMA_ERR == 0xc0086b1a, "ISP_GET_DMA_ERR");
++_Static_assert(ISP_GET_INT_ERR == 0x80086b1b, "ISP_GET_INT_ERR");
++_Static_assert(ISP_GET_DROP_FRAME == 0xc0046b1c, "ISP_GET_DROP_FRAME");
++_Static_assert(ISP_SET_FPS == 0x40046b1d, "ISP_SET_FPS");
++_Static_assert(ISP_WAKELOCK_CTRL == 0xc0046b1e, "ISP_WAKELOCK_CTRL");
++_Static_assert(ISP_REGISTER_IRQ_USER_KEY == 0x80106b1f,
++	       "ISP_REGISTER_IRQ_USER_KEY");
++_Static_assert(ISP_MARK_IRQ_REQUEST == 0xc0606b20, "ISP_MARK_IRQ_REQUEST");
++_Static_assert(ISP_GET_MARK2QUERY_TIME == 0xc0606b21,
++	       "ISP_GET_MARK2QUERY_TIME");
++_Static_assert(ISP_FLUSH_IRQ_REQUEST == 0x40606b22, "ISP_FLUSH_IRQ_REQUEST");
++
++/* ------------------------------------------------------------------ */
++/* Library behaviour without a device                                  */
++/* ------------------------------------------------------------------ */
++
++int main(void)
++{
++	ISP_WAIT_IRQ_STRUCT irq;
++	ISP_RT_BUF_INFO_STRUCT buf;
++	ISP_REG_STRUCT reg = { .Addr = 0x15004000, .Val = 0 };
++	uint32_t value = 0;
++	int key = -1;
++
++	printf("compat32: ARM EABI layout and ioctl numbers ok\n");
++	printf("  ISP_REG_IO_STRUCT          %zu\n", sizeof(ISP_REG_IO_STRUCT));
++	printf("  ISP_WAIT_IRQ_STRUCT        %zu\n", sizeof(ISP_WAIT_IRQ_STRUCT));
++	printf("  ISP_REGISTER_USERKEY_STRUCT %zu\n",
++	       sizeof(ISP_REGISTER_USERKEY_STRUCT));
++	printf("  ISP_BUFFER_CTRL_STRUCT     %zu\n",
++	       sizeof(ISP_BUFFER_CTRL_STRUCT));
++	printf("  ISP_RT_BUF_INFO_STRUCT     %zu\n",
++	       sizeof(ISP_RT_BUF_INFO_STRUCT));
++	printf("  ISP_DEQUE_BUF_INFO_STRUCT  %zu\n",
++	       sizeof(ISP_DEQUE_BUF_INFO_STRUCT));
++	printf("  ISP_CQ_RING_CMD_ST         %zu\n",
++	       sizeof(ISP_CQ_RING_CMD_ST));
++	printf("  ISP_CQ_RTBC_RING_ST        %zu\n",
++	       sizeof(ISP_CQ_RTBC_RING_ST));
++	printf("  ISP_WAIT_IRQ               0x%08lx\n",
++	       (unsigned long)ISP_WAIT_IRQ);
++	printf("  ISP_BUFFER_CTRL            0x%08lx\n",
++	       (unsigned long)ISP_BUFFER_CTRL);
++
++	/* No descriptor in this process: every call must fail with ENODEV and
++	 * must not touch the caller's output arguments.  Pull both library
++	 * objects into the 32-bit link and exercise three of the ioctl paths. */
++	if (camdrv_read_reg(NULL, 0x15004000, &value) != -ENODEV)
++		return 1;
++	if (camdrv_read_regs(NULL, &reg, 1) != -ENODEV)
++		return 1;
++	buf.base_pAddr = 0;
++	if (camdrv_rtbuf_enqueue(NULL, _imgo_, &buf) != -ENODEV)
++		return 1;
++	if (camdrv_wait_irq(NULL, &irq) != -ENODEV)
++		return 1;
++	camdrv_irq_fill_v3(&irq, ISP_IRQ_TYPE_INT_P1_ST,
++			   ISP_IRQ_P1_STATUS_SOF1_INT_ST, 7, 1000);
++	if (irq.UserNumber != ISP_IRQ_USER_ISPDRV || irq.UserInfo.UserKey != 7 ||
++	    irq.UserInfo.Type != ISP_IRQ_TYPE_INT_P1_ST)
++		return 1;
++	if (camdrv_user_key(NULL) != -1)
++		return 1;
++	if (camdrv_cq_ring_base_pa(NULL) != 0)
++		return 1;
++	if (camdrv_register_user_key(NULL, "x", &key) != -ENODEV)
++		return 1;
++	printf("  errname(0)=%s\n", camdrv_errname(0));
++
++	return 0;
++}

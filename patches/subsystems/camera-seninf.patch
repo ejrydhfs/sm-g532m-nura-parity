@@ -1,0 +1,955 @@
+diff --git a/drivers/media/platform/mediatek/Kconfig b/drivers/media/platform/mediatek/Kconfig
+index 84104e2cd..995638f8a 100644
+--- a/drivers/media/platform/mediatek/Kconfig
++++ b/drivers/media/platform/mediatek/Kconfig
+@@ -7,3 +7,4 @@ source "drivers/media/platform/mediatek/mdp/Kconfig"
+ source "drivers/media/platform/mediatek/vcodec/Kconfig"
+ source "drivers/media/platform/mediatek/vpu/Kconfig"
+ source "drivers/media/platform/mediatek/mdp3/Kconfig"
++source "drivers/media/platform/mediatek/seninf/Kconfig"
+diff --git a/drivers/media/platform/mediatek/Makefile b/drivers/media/platform/mediatek/Makefile
+index 38e6ba917..5da75fe97 100644
+--- a/drivers/media/platform/mediatek/Makefile
++++ b/drivers/media/platform/mediatek/Makefile
+@@ -4,3 +4,4 @@ obj-y += mdp/
+ obj-y += vcodec/
+ obj-y += vpu/
+ obj-y += mdp3/
++obj-y += seninf/
+diff --git a/drivers/media/platform/mediatek/seninf/Kconfig b/drivers/media/platform/mediatek/seninf/Kconfig
+new file mode 100644
+index 000000000..e1ec4693a
+--- /dev/null
++++ b/drivers/media/platform/mediatek/seninf/Kconfig
+@@ -0,0 +1,16 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config VIDEO_MTK_SENINF
++	tristate "MediaTek MT6735 SENINF driver"
++	depends on MEDIA_SUPPORT && VIDEO_DEV && MEDIA_CONTROLLER && VIDEO_V4L2_SUBDEV_API && OF && COMMON_CLK
++	select V4L2_ASYNC
++	select V4L2_FWNODE
++	help
++	  Say Y or M here to enable the MediaTek MT6735 SENINF (sensor
++	  interface) driver.  The driver owns the camera subsystem media
++	  device, binds the sensor subdevices described in the device tree
++	  through the V4L2 async framework, and provides the per-camera MCLK
++	  output clocks.  The MIPI CSI-2 lane, D-PHY and timing programming is
++	  done by the proprietary MTK camera userspace and is not implemented.
++
++	  To compile this driver as a module, choose M here: the module will be
++	  called mtk-seninf.
+diff --git a/drivers/media/platform/mediatek/seninf/Makefile b/drivers/media/platform/mediatek/seninf/Makefile
+new file mode 100644
+index 000000000..4bfc5d7f8
+--- /dev/null
++++ b/drivers/media/platform/mediatek/seninf/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_VIDEO_MTK_SENINF) += mtk-seninf.o
+diff --git a/drivers/media/platform/mediatek/seninf/mtk-seninf-regs.h b/drivers/media/platform/mediatek/seninf/mtk-seninf-regs.h
+new file mode 100644
+index 000000000..6b2661da4
+--- /dev/null
++++ b/drivers/media/platform/mediatek/seninf/mtk-seninf-regs.h
+@@ -0,0 +1,73 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * MediaTek MT6735 SENINF register definitions
++ *
++ * Port from Samsung/MTK downstream:
++ *   drivers/misc/mediatek/cameraisp/src/mt6735/camera_isp_D1.c
++ *   drivers/misc/mediatek/cameraisp/src/mt6735/inc/camera_isp_D1.h
++ *   drivers/misc/mediatek/imgsensor/src/mt6735/kd_sensorlist.c
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ * Copyright (C) 2016 Samsung Electronics Co., Ltd.
++ *
++ * Downstream maps the SENINF block through the ISP driver and reaches the
++ * registers below as ISP_ADDR + offset, where ISP_ADDR is 0x15004000
++ * (camera_isp_D1.c:124-133) while the SENINF block itself starts at
++ * 0x15008000 (SENINF_BASE_ADDR, same lines, and the kd_camera_hw1 node in
++ * arch/arm/boot/dts/mt6735.dtsi:1307-1320).  The offsets in this file are
++ * expressed relative to the SENINF base, i.e. downstream offset - 0x4000.
++ */
++
++#ifndef __MTK_SENINF_REGS_H__
++#define __MTK_SENINF_REGS_H__
++
++#include <linux/bits.h>
++
++/* SENINF_REG_RANGE, camera_isp_D1.c:125 */
++#define MTK_SENINF_REG_RANGE		0x4000
++/* MIPIRX_CONFIG_RANGE, camera_isp_D1.c:129 */
++#define MTK_SENINF_MIPIRX_REG_RANGE	0x1000
++/* MIPIRX_ANALOG_RANGE, camera_isp_D1.c:131 */
++#define MTK_SENINF_MIPI_ANA_RANGE	0x3000
++
++/*
++ * Per-camera SENINF register block stride.  The four SENINF instances are
++ * 0x400 apart: SENINFn_IRQ_INTSTA is ISP_ADDR + 0x4128/0x4528/0x4928/0x4D28
++ * (camera_isp_D1.c:257-260) and the MCLK control registers are
++ * ISP_ADDR + 0x4200/0x4600/0x4A00 (camera_isp_D1.c:12060/12093/12123).
++ */
++#define MTK_SENINF_CAM_STRIDE		0x400
++
++/*
++ * SENINFn_IRQ_INTSTA, relative to the SENINF base:
++ *   SENINF1: 0x15008128 = 0x128, SENINF2: 0x15008528 = 0x528,
++ *   SENINF3: 0x15008928 = 0x928, SENINF4: 0x15008D28 = 0xD28.
++ */
++#define MTK_SENINF_CAM_INTSTA(n)	(0x128 + (n) * MTK_SENINF_CAM_STRIDE)
++
++/* SENINFn_IRQ_INTSTA error bits, camera_isp_D1.h:268-298 */
++#define MTK_SENINF_IRQ_OVERRUN		BIT(0)
++#define MTK_SENINF_IRQ_CRCERR		BIT(1)
++#define MTK_SENINF_IRQ_FSMERR		BIT(2)
++#define MTK_SENINF_IRQ_VSIZEERR		BIT(3)
++#define MTK_SENINF_IRQ_HSIZEERR		BIT(4)
++#define MTK_SENINF_IRQ_SENSOR_VSIZEERR	BIT(5)
++#define MTK_SENINF_IRQ_SENSOR_HSIZEERR	BIT(6)
++
++/* Error mask used downstream by ISP_REG_MASK_INT_SENINFn_ERR, camera_isp_D1.c:618-662 */
++#define MTK_SENINF_IRQ_ERR_MASK		(GENMASK(6, 0))
++
++/*
++ * MCLK control register, relative to the SENINF base:
++ *   ISP_MCLK1_EN: 0x15008200 = 0x200 (camera_isp_D1.c:12060)
++ *   ISP_MCLK2_EN: 0x15008600 = 0x600 (camera_isp_D1.c:12093)
++ *   ISP_MCLK3_EN: 0x15008A00 = 0xA00 (camera_isp_D1.c:12123)
++ * There is no ISP_MCLK4_EN in the downstream GPL source, so only three MCLK
++ * outputs are modelled.
++ */
++#define MTK_SENINF_MCLK_REG(n)		(0x200 + (n) * MTK_SENINF_CAM_STRIDE)
++
++/* Bit 29 (0x20000000) of the ISP_MCLKn_EN registers, camera_isp_D1.c:12063-12069 */
++#define MTK_SENINF_MCLK_EN		BIT(29)
++
++#endif /* __MTK_SENINF_REGS_H__ */
+diff --git a/drivers/media/platform/mediatek/seninf/mtk-seninf.c b/drivers/media/platform/mediatek/seninf/mtk-seninf.c
+new file mode 100644
+index 000000000..1ea4d819b
+--- /dev/null
++++ b/drivers/media/platform/mediatek/seninf/mtk-seninf.c
+@@ -0,0 +1,822 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek MT6735 SENINF (sensor interface) driver
++ *
++ * Port from Samsung/MTK downstream
++ *   drivers/misc/mediatek/cameraisp/src/mt6735/camera_isp_D1.c
++ *   drivers/misc/mediatek/cameraisp/src/mt6735/inc/camera_isp_D1.h
++ *   drivers/misc/mediatek/imgsensor/src/mt6735/kd_sensorlist.c
++ *   drivers/misc/mediatek/imgsensor/src/mt6735/camera_hw/kd_camera_hw.c
++ *
++ * Copyright (C) 2015 MediaTek Inc.
++ * Copyright (C) 2016 Samsung Electronics Co., Ltd.
++ *
++ * The SENINF block is the CSI-2 receiver of the MT6735 camera subsystem.  It
++ * owns the per-camera MCLK output gates and the per-camera error status
++ * registers, and it is the MIPI CSI-2 receiver the sensor subdevices connect
++ * to.  The table that programs the MIPI D-PHY and the SENINF lane/timing
++ * registers lives only in the proprietary userspace "seninf_drv" library
++ * (referenced at camera_isp_D1.c:125-133) and has no equivalent in the
++ * downstream GPL source; that programming is therefore deferred, see
++ * Documentation in the report.
++ */
++
++#include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/debugfs.h>
++#include <linux/minmax.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_graph.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/sprintf.h>
++
++#include <media/media-device.h>
++#include <media/v4l2-async.h>
++#include <media/v4l2-common.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fwnode.h>
++#include <media/v4l2-subdev.h>
++
++#include "mtk-seninf-regs.h"
++
++#define MTK_SENINF_NAME			"mtk-seninf"
++
++/*
++ * SENINF1..SENINF4 have a status block each (camera_isp_D1.c:257-260), so up
++ * to four sink ports can be described in DT.
++ */
++#define MTK_SENINF_NUM_CAMS		4
++
++/*
++ * Only ISP_MCLK1_EN..ISP_MCLK3_EN exist in the downstream source
++ * (camera_isp_D1.c:12048-12137, EXPORT_SYMBOL at 12076/12107/12137); no
++ * ISP_MCLK4_EN is defined anywhere in the GPL drop.
++ */
++#define MTK_SENINF_NUM_MCLKS		3
++
++/*
++ * Upper bound on the number of MIPI CSI-2 data lanes checked against the
++ * remote sensor configuration.  Four lanes are in use on this platform: the
++ * IMX219 sensor driver configures SENSOR_MIPI_4_LANE
++ * (imx219_mipi_raw/imx219mipiraw_Sensor.c:160) and is routed through this
++ * receiver, so the MIPI RX block accepts at least four data lanes.
++ */
++#define MTK_SENINF_MAX_DATA_LANES	4
++
++struct mtk_seninf;
++
++/**
++ * struct mtk_seninf_mclk - one MCLK output gate
++ * @hw: clock hardware exposed through the #clock-cells=<1> provider
++ * @priv: back pointer to the SENINF instance
++ * @parent_hws: single parent, the "camtg" clock
++ * @idx: camera index, selects the ISP_MCLKn_EN register
++ */
++struct mtk_seninf_mclk {
++	struct clk_hw hw;
++	struct mtk_seninf *priv;
++	const struct clk_hw *parent_hws[1];
++	unsigned int idx;
++};
++
++/**
++ * struct mtk_seninf_asc - async connection carrying the local sink pad index
++ * @asc: V4L2 async connection, must be the first member
++ * @pad: sink pad (== DT port number) the remote sensor is bound to
++ */
++struct mtk_seninf_asc {
++	struct v4l2_async_connection asc;
++	unsigned int pad;
++};
++
++/**
++ * struct mtk_seninf - driver instance
++ * @dev: device
++ * @base: SENINF register window
++ * @mipi_rx: MIPIRX_CONFIG register window (debugfs only)
++ * @mipi_ana: MIPIRX_ANALOG register window (debugfs only)
++ * @camtg: camera timing clock feeding the MCLK outputs
++ * @mclk: MCLK output gates
++ * @v4l2_dev: V4L2 device
++ * @mdev: media device, the single one of the camera subsystem
++ * @sd: SENINF V4L2 subdevice
++ * @pads: sink pads (one per DT port) plus one source pad
++ * @num_sink_pads: number of sink pads
++ * @notifier: async notifier for the sensor subdevices
++ * @lock: serialises s_stream
++ * @streaming: streaming state
++ * @debugfs: debugfs directory
++ */
++struct mtk_seninf {
++	struct device *dev;
++	void __iomem *base;
++	void __iomem *mipi_rx;
++	void __iomem *mipi_ana;
++	struct clk *camtg;
++
++	struct mtk_seninf_mclk mclk[MTK_SENINF_NUM_MCLKS];
++
++	struct v4l2_device v4l2_dev;
++	struct media_device mdev;
++	struct v4l2_subdev sd;
++	struct media_pad *pads;
++	unsigned int num_sink_pads;
++
++	struct v4l2_async_notifier notifier;
++
++	struct mutex lock;
++	bool streaming;
++
++	struct dentry *debugfs;
++};
++
++static inline struct mtk_seninf *to_mtk_seninf(struct v4l2_subdev *sd)
++{
++	return v4l2_get_subdevdata(sd);
++}
++
++static inline struct mtk_seninf_mclk *to_mtk_seninf_mclk(struct clk_hw *hw)
++{
++	return container_of(hw, struct mtk_seninf_mclk, hw);
++}
++
++/*
++ * Error status
++ *
++ * The SENINF status registers are polled through the ISP CAM0..CAM2 interrupt
++ * lines downstream (arch/arm/boot/dts/mt6735.dtsi:1314-1320, camera_isp_D1.c
++ * ISP_IRQ_TYPE_INT_SENINF1..4), never through an interrupt of their own, so this
++ * driver does not request an IRQ and has no interrupt-enable programming.
++ */
++
++static const char * const mtk_seninf_err_names[] = {
++	"overrun", "crc", "fsm", "vsize", "hsize", "sensor-vsize", "sensor-hsize",
++};
++
++static void mtk_seninf_check_errors(struct mtk_seninf *priv, const char *where)
++{
++	unsigned int i;
++
++	for (i = 0; i < MTK_SENINF_NUM_CAMS; i++) {
++		u32 reg = MTK_SENINF_CAM_INTSTA(i);
++		u32 err;
++		u32 sta;
++		char names[128];
++		size_t len = 0;
++		unsigned int bit;
++
++		sta = readl(priv->base + reg);
++		err = sta & MTK_SENINF_IRQ_ERR_MASK;
++		if (!err)
++			continue;
++
++		names[0] = '\0';
++		for (bit = 0; bit < ARRAY_SIZE(mtk_seninf_err_names); bit++) {
++			if (!(err & BIT(bit)))
++				continue;
++			len += scnprintf(names + len, sizeof(names) - len, "%s%s",
++					 len ? "|" : "", mtk_seninf_err_names[bit]);
++			if (len >= sizeof(names))
++				break;
++		}
++
++		dev_err(priv->dev, "SENINF%u error status 0x%08x at %s: %s\n",
++			i + 1, sta, where, names);
++
++		/*
++		 * [INFERENCE] The status register is cleared by writing back the
++		 * set bits (write-one-to-clear), like the other MTK IRQ_STA
++		 * registers.  The downstream source only ever reads this register
++		 * (camera_isp_D1.c:9203-9217, inside "#if 0"), so the clear
++		 * convention cannot be cited from the GPL drop.
++		 */
++		writel(err, priv->base + reg);
++		if (readl(priv->base + reg) & err)
++			dev_warn(priv->dev,
++				 "SENINF%u error status 0x%08x did not clear\n",
++				 i + 1, err);
++	}
++}
++
++/*
++ * MCLK clock provider
++ *
++ * ISP_MCLKn_EN sits in the per-camera SENINF register block and is raised while
++ * the "camtg" clock runs: kd_sensorlist.c:2453-2459 enables camtg before
++ * kdCISModulePowerOn() raises MCLK (kd_camera_hw.c:519-523) and disables it
++ * after the MCLK gate is dropped.
++ *
++ * The "camtg" clock is modelled as the CCF parent of every MCLK output, so
++ * clk_prepare_enable() on an MCLK output prepares/enables camtg through the
++ * clock core (correct refcounting, no manual user counters) and the rate
++ * reported to the sensor drivers is camtg's rate, exactly what the downstream
++ * kdSetSensorMclk() programs (kd_sensorlist.c:2442-2461).
++ *
++ * The SENINF registers themselves only need the ISP power domain, which is a
++ * pure SPM power domain (no clocks property in its DT node,
++ * arch/arm64/boot/dts/mediatek/mt6735.dtsi:223-227).  .prepare therefore takes
++ * a runtime PM reference so the domain is on, and .unprepare drops it.  Calling
++ * runtime PM from .prepare is safe: nothing in the resume path takes the CCF
++ * prepare_lock, because camtg is brought up by the clock core parent chain, not
++ * by the resume callback.
++ */
++static int mtk_seninf_mclk_prepare(struct clk_hw *hw)
++{
++	struct mtk_seninf_mclk *mclk = to_mtk_seninf_mclk(hw);
++	struct mtk_seninf *priv = mclk->priv;
++	u32 reg = MTK_SENINF_MCLK_REG(mclk->idx);
++	int ret;
++
++	ret = pm_runtime_resume_and_get(priv->dev);
++	if (ret < 0) {
++		dev_err(priv->dev, "mclk%u: failed to resume: %d\n",
++			mclk->idx, ret);
++		return ret;
++	}
++
++	writel(readl(priv->base + reg) | MTK_SENINF_MCLK_EN, priv->base + reg);
++
++	return 0;
++}
++
++static void mtk_seninf_mclk_unprepare(struct clk_hw *hw)
++{
++	struct mtk_seninf_mclk *mclk = to_mtk_seninf_mclk(hw);
++	struct mtk_seninf *priv = mclk->priv;
++	u32 reg = MTK_SENINF_MCLK_REG(mclk->idx);
++
++	writel(readl(priv->base + reg) & ~MTK_SENINF_MCLK_EN, priv->base + reg);
++
++	/* No autosuspend is used, so this matches the get in .prepare. */
++	pm_runtime_put(priv->dev);
++}
++
++static const struct clk_ops mtk_seninf_mclk_ops = {
++	.prepare = mtk_seninf_mclk_prepare,
++	.unprepare = mtk_seninf_mclk_unprepare,
++};
++
++static const char * const mtk_seninf_mclk_names[MTK_SENINF_NUM_MCLKS] = {
++	"mclk0", "mclk1", "mclk2",
++};
++
++static int mtk_seninf_register_mclks(struct mtk_seninf *priv)
++{
++	struct clk_hw *camtg_hw = __clk_get_hw(priv->camtg);
++	struct clk_hw_onecell_data *data;
++	unsigned int i;
++	int ret;
++
++	data = devm_kzalloc(priv->dev, struct_size(data, hws, MTK_SENINF_NUM_MCLKS),
++			    GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++
++	data->num = MTK_SENINF_NUM_MCLKS;
++
++	for (i = 0; i < MTK_SENINF_NUM_MCLKS; i++) {
++		struct mtk_seninf_mclk *mclk = &priv->mclk[i];
++		struct clk_init_data init = {
++			.name = mtk_seninf_mclk_names[i],
++			.ops = &mtk_seninf_mclk_ops,
++			.parent_hws = mclk->parent_hws,
++			.num_parents = 1,
++		};
++
++		mclk->priv = priv;
++		mclk->idx = i;
++		mclk->parent_hws[0] = camtg_hw;
++		mclk->hw.init = &init;
++
++		ret = devm_clk_hw_register(priv->dev, &mclk->hw);
++		if (ret) {
++			dev_err(priv->dev, "failed to register mclk%u: %d\n", i, ret);
++			return ret;
++		}
++
++		data->hws[i] = &mclk->hw;
++	}
++
++	return devm_of_clk_add_hw_provider(priv->dev, of_clk_hw_onecell_get, data);
++}
++
++/* Re-apply the MCLK gates after the ISP power domain came back. */
++static void mtk_seninf_mclk_restore(struct mtk_seninf *priv)
++{
++	unsigned int i;
++
++	for (i = 0; i < MTK_SENINF_NUM_MCLKS; i++) {
++		if (!clk_hw_is_prepared(&priv->mclk[i].hw))
++			continue;
++		writel(readl(priv->base + MTK_SENINF_MCLK_REG(i)) | MTK_SENINF_MCLK_EN,
++		       priv->base + MTK_SENINF_MCLK_REG(i));
++	}
++}
++
++static int mtk_seninf_runtime_resume(struct device *dev)
++{
++	struct mtk_seninf *priv = dev_get_drvdata(dev);
++
++	/*
++	 * The ISP power domain has just been switched on again, so the SENINF
++	 * registers lost their contents: re-apply the MCLK gates of every output
++	 * a consumer still holds and poll the error status.
++	 */
++	mtk_seninf_mclk_restore(priv);
++	mtk_seninf_check_errors(priv, "runtime resume");
++
++	return 0;
++}
++
++static int mtk_seninf_runtime_suspend(struct device *dev)
++{
++	/*
++	 * Nothing to do: the ISP power domain is switched off by genpd and the
++	 * "camtg" clock is kept on by the CCF parent chain for as long as a
++	 * consumer holds its MCLK output.
++	 */
++	return 0;
++}
++
++static const struct dev_pm_ops mtk_seninf_pm_ops = {
++	RUNTIME_PM_OPS(mtk_seninf_runtime_suspend, mtk_seninf_runtime_resume, NULL)
++};
++
++/*
++ * Link validation
++ *
++ * The remote sensor describes the CSI-2 link through its mbus configuration
++ * (link frequency and number of data lanes).  Those are the parameters the
++ * deferred D-PHY/SENINF programming would consume, so they are queried and
++ * logged here and a configuration the receiver cannot support is rejected.
++ */
++static int mtk_seninf_check_link(struct mtk_seninf *priv, unsigned int pad)
++{
++	struct media_pad *remote;
++	struct v4l2_subdev *remote_sd;
++	s64 link_freq;
++	int lanes;
++
++	remote = media_pad_remote_pad_first(&priv->pads[pad]);
++	if (!remote)
++		return 0;
++
++	remote_sd = media_entity_to_v4l2_subdev(remote->entity);
++
++	link_freq = v4l2_get_link_freq(remote, 1, 1);
++	if (link_freq < 0) {
++		if (link_freq != -ENOENT) {
++			dev_err(priv->dev, "pad%u: invalid link frequency: %lld\n",
++				pad, link_freq);
++			return link_freq;
++		}
++		dev_warn(priv->dev, "pad%u: %s does not report a link frequency\n",
++			 pad, remote_sd->name);
++	} else {
++		dev_info(priv->dev, "pad%u: %s link frequency %lld Hz\n",
++			 pad, remote_sd->name, link_freq);
++	}
++
++	lanes = v4l2_get_active_data_lanes(remote, MTK_SENINF_MAX_DATA_LANES);
++	if (lanes < 0) {
++		dev_err(priv->dev, "pad%u: unusable data lane count: %d\n",
++			pad, lanes);
++		return lanes;
++	}
++
++	dev_info(priv->dev, "pad%u: %s %d data lane(s)\n",
++		 pad, remote_sd->name, lanes);
++
++	return 0;
++}
++
++static int mtk_seninf_s_stream(struct v4l2_subdev *sd, int enable)
++{
++	struct mtk_seninf *priv = to_mtk_seninf(sd);
++	unsigned int i;
++	int ret = 0;
++
++	mutex_lock(&priv->lock);
++
++	if (enable == priv->streaming) {
++		mutex_unlock(&priv->lock);
++		return 0;
++	}
++
++	if (enable) {
++		ret = pm_runtime_resume_and_get(priv->dev);
++		if (ret < 0) {
++			dev_err(priv->dev, "failed to resume: %d\n", ret);
++			goto out_unlock;
++		}
++
++		for (i = 0; i < priv->num_sink_pads; i++) {
++			ret = mtk_seninf_check_link(priv, i);
++			if (ret)
++				goto err_put;
++		}
++
++		mtk_seninf_check_errors(priv, "stream on");
++		priv->streaming = true;
++	} else {
++		mtk_seninf_check_errors(priv, "stream off");
++		priv->streaming = false;
++		pm_runtime_put(priv->dev);
++	}
++
++	mutex_unlock(&priv->lock);
++	return 0;
++
++err_put:
++	pm_runtime_put(priv->dev);
++out_unlock:
++	mutex_unlock(&priv->lock);
++	return ret;
++}
++
++static const struct v4l2_subdev_video_ops mtk_seninf_video_ops = {
++	/*
++	 * Classic single-interface streaming hook, invoked through
++	 * v4l2_subdev_call(sd, video, s_stream, enable).  The newer per-pad
++	 * enable_streams/disable_streams pad operations require subdev state and
++	 * routing, which this bridge without a capture pipeline does not have.
++	 */
++	.s_stream = mtk_seninf_s_stream,
++};
++
++static const struct v4l2_subdev_ops mtk_seninf_subdev_ops = {
++	.video = &mtk_seninf_video_ops,
++};
++
++/*
++ * Async binding
++ */
++static int mtk_seninf_notifier_bound(struct v4l2_async_notifier *notifier,
++				     struct v4l2_subdev *subdev,
++				     struct v4l2_async_connection *asc)
++{
++	struct mtk_seninf *priv = container_of(notifier, struct mtk_seninf,
++					       notifier);
++	struct mtk_seninf_asc *sasc = container_of(asc, struct mtk_seninf_asc,
++						   asc);
++	unsigned int src_pad;
++	unsigned int i;
++	int ret;
++
++	for (i = 0, src_pad = 0; i < subdev->entity.num_pads; i++) {
++		if (subdev->entity.pads[i].flags & MEDIA_PAD_FL_SOURCE) {
++			src_pad = i;
++			break;
++		}
++	}
++	if (i == subdev->entity.num_pads) {
++		dev_err(priv->dev, "%s has no source pad\n", subdev->name);
++		return -EINVAL;
++	}
++
++	ret = media_create_pad_link(&subdev->entity, src_pad, &priv->sd.entity,
++				    sasc->pad,
++				    MEDIA_LNK_FL_IMMUTABLE | MEDIA_LNK_FL_ENABLED);
++	if (ret) {
++		dev_err(priv->dev, "failed to link %s to pad%u: %d\n",
++			subdev->name, sasc->pad, ret);
++		return ret;
++	}
++
++	dev_info(priv->dev, "bound %s to pad%u\n", subdev->name, sasc->pad);
++
++	return 0;
++}
++
++static int mtk_seninf_notifier_complete(struct v4l2_async_notifier *notifier)
++{
++	struct mtk_seninf *priv = container_of(notifier, struct mtk_seninf,
++					       notifier);
++	int ret;
++
++	ret = v4l2_device_register_subdev_nodes(&priv->v4l2_dev);
++	if (ret) {
++		dev_err(priv->dev, "failed to register subdev nodes: %d\n", ret);
++		return ret;
++	}
++
++	dev_info(priv->dev, "all sensor subdevices bound\n");
++
++	return 0;
++}
++
++static const struct v4l2_async_notifier_operations mtk_seninf_notifier_ops = {
++	.bound = mtk_seninf_notifier_bound,
++	.complete = mtk_seninf_notifier_complete,
++};
++
++static int mtk_seninf_register_notifier(struct mtk_seninf *priv)
++{
++	struct device_node *ep;
++	unsigned int count = 0;
++	int ret;
++
++	v4l2_async_nf_init(&priv->notifier, &priv->v4l2_dev);
++	priv->notifier.ops = &mtk_seninf_notifier_ops;
++
++	for_each_endpoint_of_node(priv->dev->of_node, ep) {
++		struct mtk_seninf_asc *sasc;
++		struct of_endpoint of_ep;
++
++		ret = of_graph_parse_endpoint(ep, &of_ep);
++		if (ret) {
++			dev_err(priv->dev, "failed to parse %pOF: %d\n", ep, ret);
++			of_node_put(ep);
++			goto err_cleanup;
++		}
++
++		if (of_ep.port >= MTK_SENINF_NUM_CAMS) {
++			dev_err(priv->dev, "%pOF: port %u out of range\n",
++				ep, of_ep.port);
++			of_node_put(ep);
++			ret = -EINVAL;
++			goto err_cleanup;
++		}
++
++		sasc = (struct mtk_seninf_asc *)
++			v4l2_async_nf_add_fwnode_remote(&priv->notifier,
++							of_fwnode_handle(ep),
++							struct mtk_seninf_asc);
++		if (IS_ERR(sasc)) {
++			ret = PTR_ERR(sasc);
++			dev_err(priv->dev, "failed to add %pOF: %d\n", ep, ret);
++			of_node_put(ep);
++			goto err_cleanup;
++		}
++
++		sasc->pad = of_ep.port;
++		count++;
++	}
++
++	if (!count) {
++		dev_err(priv->dev, "no sensor endpoint described in DT\n");
++		ret = -ENODEV;
++		goto err_cleanup;
++	}
++
++	ret = v4l2_async_nf_register(&priv->notifier);
++	if (ret) {
++		dev_err(priv->dev, "failed to register async notifier: %d\n", ret);
++		goto err_cleanup;
++	}
++
++	return 0;
++
++err_cleanup:
++	v4l2_async_nf_cleanup(&priv->notifier);
++	return ret;
++}
++
++/*
++ * Debugfs
++ *
++ * MIPIRX_CONFIG and MIPIRX_ANALOG are owned by the proprietary "seninf_drv"
++ * userspace component; the GPL drop contains no programming sequence for them,
++ * so they are mapped but only exposed through a read-only dump.
++ */
++static void mtk_seninf_dump_window(struct seq_file *s, const char *name,
++				   void __iomem *base, unsigned int size)
++{
++	unsigned int off;
++
++	seq_printf(s, "%s (%u bytes)\n", name, size);
++	for (off = 0; off < size; off += 4)
++		seq_printf(s, "  %04x: %08x\n", off, readl(base + off));
++}
++
++static int mtk_seninf_regs_show(struct seq_file *s, void *unused)
++{
++	struct mtk_seninf *priv = s->private;
++	int ret;
++
++	ret = pm_runtime_resume_and_get(priv->dev);
++	if (ret < 0)
++		return ret;
++
++	mtk_seninf_dump_window(s, "SENINF", priv->base, MTK_SENINF_REG_RANGE);
++	mtk_seninf_dump_window(s, "MIPIRX_CONFIG", priv->mipi_rx,
++			       MTK_SENINF_MIPIRX_REG_RANGE);
++	mtk_seninf_dump_window(s, "MIPIRX_ANALOG", priv->mipi_ana,
++			       MTK_SENINF_MIPI_ANA_RANGE);
++
++	pm_runtime_put(priv->dev);
++
++	return 0;
++}
++
++static int mtk_seninf_regs_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, mtk_seninf_regs_show, inode->i_private);
++}
++
++static const struct file_operations mtk_seninf_regs_fops = {
++	.owner = THIS_MODULE,
++	.open = mtk_seninf_regs_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++static void mtk_seninf_debugfs_init(struct mtk_seninf *priv)
++{
++	priv->debugfs = debugfs_create_dir(MTK_SENINF_NAME, NULL);
++	if (IS_ERR_OR_NULL(priv->debugfs)) {
++		dev_dbg(priv->dev, "debugfs not available\n");
++		priv->debugfs = NULL;
++		return;
++	}
++
++	debugfs_create_file("regs", 0444, priv->debugfs, priv,
++			    &mtk_seninf_regs_fops);
++}
++
++/*
++ * Probe / remove
++ */
++static int mtk_seninf_init_entity(struct mtk_seninf *priv)
++{
++	struct device_node *ep;
++	unsigned int num_sink = 0;
++	unsigned int i;
++	int ret;
++
++	for_each_endpoint_of_node(priv->dev->of_node, ep) {
++		struct of_endpoint of_ep;
++
++		ret = of_graph_parse_endpoint(ep, &of_ep);
++		if (ret)
++			continue;
++
++		if (of_ep.port >= MTK_SENINF_NUM_CAMS)
++			continue;
++
++		num_sink = max(num_sink, of_ep.port + 1);
++	}
++
++	if (!num_sink)
++		return -ENODEV;
++
++	priv->num_sink_pads = num_sink;
++	priv->pads = devm_kcalloc(priv->dev, num_sink + 1, sizeof(*priv->pads),
++				  GFP_KERNEL);
++	if (!priv->pads)
++		return -ENOMEM;
++
++	for (i = 0; i < num_sink; i++)
++		priv->pads[i].flags = MEDIA_PAD_FL_SINK;
++	priv->pads[num_sink].flags = MEDIA_PAD_FL_SOURCE;
++
++	v4l2_subdev_init(&priv->sd, &mtk_seninf_subdev_ops);
++	priv->sd.dev = priv->dev;
++	priv->sd.owner = THIS_MODULE;
++	priv->sd.flags = V4L2_SUBDEV_FL_HAS_DEVNODE;
++	priv->sd.entity.function = MEDIA_ENT_F_VID_IF_BRIDGE;
++	strscpy(priv->sd.name, MTK_SENINF_NAME, sizeof(priv->sd.name));
++	v4l2_set_subdevdata(&priv->sd, priv);
++
++	ret = media_entity_pads_init(&priv->sd.entity, num_sink + 1, priv->pads);
++	if (ret)
++		return ret;
++
++	return v4l2_device_register_subdev(&priv->v4l2_dev, &priv->sd);
++}
++
++static int mtk_seninf_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct mtk_seninf *priv;
++	int ret;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->dev = dev;
++	mutex_init(&priv->lock);
++	platform_set_drvdata(pdev, priv);
++
++	priv->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(priv->base))
++		return dev_err_probe(dev, PTR_ERR(priv->base),
++				     "failed to map SENINF registers\n");
++
++	priv->mipi_rx = devm_platform_ioremap_resource(pdev, 1);
++	if (IS_ERR(priv->mipi_rx))
++		return dev_err_probe(dev, PTR_ERR(priv->mipi_rx),
++				     "failed to map MIPIRX_CONFIG registers\n");
++
++	priv->mipi_ana = devm_platform_ioremap_resource(pdev, 2);
++	if (IS_ERR(priv->mipi_ana))
++		return dev_err_probe(dev, PTR_ERR(priv->mipi_ana),
++				     "failed to map MIPIRX_ANALOG registers\n");
++
++	priv->camtg = devm_clk_get(dev, "camtg");
++	if (IS_ERR(priv->camtg))
++		return dev_err_probe(dev, PTR_ERR(priv->camtg),
++				     "failed to get camtg clock\n");
++
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
++
++	priv->mdev.dev = dev;
++	strscpy(priv->mdev.model, "MT6735 SENINF", sizeof(priv->mdev.model));
++	media_device_init(&priv->mdev);
++	priv->v4l2_dev.mdev = &priv->mdev;
++
++	ret = v4l2_device_register(dev, &priv->v4l2_dev);
++	if (ret) {
++		dev_err_probe(dev, ret, "failed to register v4l2 device\n");
++		goto err_media_cleanup;
++	}
++
++	ret = media_device_register(&priv->mdev);
++	if (ret) {
++		dev_err_probe(dev, ret, "failed to register media device\n");
++		goto err_v4l2_unregister;
++	}
++
++	ret = mtk_seninf_init_entity(priv);
++	if (ret) {
++		if (ret == -ENODEV)
++			dev_err_probe(dev, ret,
++				      "no sensor endpoints described in DT\n");
++		else
++			dev_err_probe(dev, ret, "failed to init subdevice\n");
++		goto err_media_unregister;
++	}
++
++	ret = mtk_seninf_register_mclks(priv);
++	if (ret)
++		goto err_subdev_unregister;
++
++	ret = mtk_seninf_register_notifier(priv);
++	if (ret)
++		goto err_subdev_unregister;
++
++	mtk_seninf_debugfs_init(priv);
++
++	dev_info(dev, "%u sink pad(s), %u MCLK output(s)\n",
++		 priv->num_sink_pads, MTK_SENINF_NUM_MCLKS);
++
++	return 0;
++
++err_subdev_unregister:
++	v4l2_device_unregister_subdev(&priv->sd);
++err_media_unregister:
++	media_device_unregister(&priv->mdev);
++err_v4l2_unregister:
++	v4l2_device_unregister(&priv->v4l2_dev);
++err_media_cleanup:
++	media_device_cleanup(&priv->mdev);
++	mutex_destroy(&priv->lock);
++	return ret;
++}
++
++static void mtk_seninf_remove(struct platform_device *pdev)
++{
++	struct mtk_seninf *priv = platform_get_drvdata(pdev);
++
++	if (priv->streaming) {
++		priv->streaming = false;
++		pm_runtime_put(priv->dev);
++	}
++
++	debugfs_remove_recursive(priv->debugfs);
++	v4l2_async_nf_unregister(&priv->notifier);
++	v4l2_async_nf_cleanup(&priv->notifier);
++	v4l2_device_unregister_subdev(&priv->sd);
++	media_device_unregister(&priv->mdev);
++	v4l2_device_unregister(&priv->v4l2_dev);
++	media_device_cleanup(&priv->mdev);
++	mutex_destroy(&priv->lock);
++}
++
++static const struct of_device_id mtk_seninf_of_match[] = {
++	{ .compatible = "mediatek,mt6735-seninf" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, mtk_seninf_of_match);
++
++static struct platform_driver mtk_seninf_driver = {
++	.probe = mtk_seninf_probe,
++	.remove = mtk_seninf_remove,
++	.driver = {
++		.name = MTK_SENINF_NAME,
++		.of_match_table = mtk_seninf_of_match,
++		.pm = pm_ptr(&mtk_seninf_pm_ops),
++	},
++};
++module_platform_driver(mtk_seninf_driver);
++
++MODULE_DESCRIPTION("MediaTek MT6735 SENINF driver");
++MODULE_LICENSE("GPL");

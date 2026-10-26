@@ -1,0 +1,550 @@
+diff --git a/drivers/iio/proximity/Kconfig b/drivers/iio/proximity/Kconfig
+index 6070974c2..2f4b2c259 100644
+--- a/drivers/iio/proximity/Kconfig
++++ b/drivers/iio/proximity/Kconfig
+@@ -255,4 +255,14 @@ config AW96103
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called aw96103.
+ 
++config STK3013
++	tristate "Sensortek STK3013 proximity sensor"
++	depends on I2C
++	help
++	  Say Y here to build a driver for the Sensortek STK3013
++	  proximity sensor.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called stk3013.
++
+ endmenu
+diff --git a/drivers/iio/proximity/Makefile b/drivers/iio/proximity/Makefile
+index 152034d38..c12c5d939 100644
+--- a/drivers/iio/proximity/Makefile
++++ b/drivers/iio/proximity/Makefile
+@@ -21,6 +21,7 @@ obj-$(CONFIG_SX9324)		+= sx9324.o
+ obj-$(CONFIG_SX9360)		+= sx9360.o
+ obj-$(CONFIG_SX_COMMON) 	+= sx_common.o
+ obj-$(CONFIG_SX9500)		+= sx9500.o
++obj-$(CONFIG_STK3013)		+= stk3013.o
+ obj-$(CONFIG_VCNL3020)		+= vcnl3020.o
+ obj-$(CONFIG_VL53L0X_I2C)	+= vl53l0x-i2c.o
+ obj-$(CONFIG_AW96103)		+= aw96103.o
+diff --git a/drivers/iio/proximity/stk3013.c b/drivers/iio/proximity/stk3013.c
+new file mode 100644
+index 000000000..1101f2edf
+--- /dev/null
++++ b/drivers/iio/proximity/stk3013.c
+@@ -0,0 +1,513 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Sensortek STK3013 proximity sensor
++ *
++ * Ported from the Samsung/MTK downstream grandpplte driver:
++ *   drivers/sensors/stk3013.c
++ *   Copyright (C) 2015 Sensortek Technology Corp.
++ *
++ * The downstream driver exposes an Android input/sysfs interface.  This
++ * driver keeps the STK3013 register programming and exposes the same
++ * proximity reading and threshold events through IIO.
++ */
++
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/regulator/consumer.h>
++
++#include <linux/iio/events.h>
++#include <linux/iio/iio.h>
++#include <linux/iio/sysfs.h>
++
++#define STK3013_DRV_NAME	"stk3013"
++
++#define STK3013_REG_STATE	0x00
++#define STK3013_REG_PSCTRL	0x01
++#define STK3013_REG_LEDCTRL	0x03
++#define STK3013_REG_INT		0x04
++#define STK3013_REG_WAIT	0x05
++#define STK3013_REG_THDH1	0x06
++#define STK3013_REG_THDH2	0x07
++#define STK3013_REG_THDL1	0x08
++#define STK3013_REG_THDL2	0x09
++#define STK3013_REG_FLAG	0x10
++#define STK3013_REG_DATA1	0x11
++#define STK3013_REG_DATA2	0x12
++#define STK3013_REG_OFFSET1	0x15
++#define STK3013_REG_OFFSET2	0x16
++#define STK3013_REG_PID		0x3e
++#define STK3013_REG_SW_RESET	0x80
++
++#define STK3013_STATE_EN_PS	BIT(0)
++#define STK3013_STATE_EN_WAIT	BIT(2)
++#define STK3013_STATE_EN_MASK	(STK3013_STATE_EN_PS | STK3013_STATE_EN_WAIT)
++
++#define STK3013_FLAG_PSINT	BIT(4)
++#define STK3013_FLAG_OUI	BIT(2)
++#define STK3013_FLAG_IR_RDY	BIT(1)
++#define STK3013_FLAG_CLEAR	(STK3013_FLAG_PSINT | STK3013_FLAG_OUI | \
++				 STK3013_FLAG_IR_RDY)
++
++#define STK3013_INT_PS_MODE	1
++
++/* Defaults from grandpplte board DTS. */
++#define STK3013_DEFAULT_STATE	0x2d
++#define STK3013_DEFAULT_PSCTRL	0x70
++#define STK3013_DEFAULT_LEDCTRL	0xff
++#define STK3013_DEFAULT_WAIT	0x03
++#define STK3013_DEFAULT_THDH	18
++#define STK3013_DEFAULT_THDL	12
++
++struct stk3013_data {
++	struct i2c_client *client;
++	struct mutex lock;
++	struct regulator *vdd;
++	struct regulator *vled;
++	struct gpio_desc *vled_gpio;
++
++	u8 state;
++	u8 psctrl;
++	u8 ledctrl;
++	u8 wait;
++	u16 thdh;
++	u16 thdl;
++	u16 offset;
++	bool enabled;
++	bool near;
++	bool vled_on;
++};
++
++static int stk3013_read(struct stk3013_data *data, u8 reg, u8 *buf, int len)
++{
++	int ret;
++
++	ret = i2c_smbus_read_i2c_block_data(data->client, reg, len, buf);
++	if (ret != len)
++		return ret < 0 ? ret : -EIO;
++
++	return 0;
++}
++
++static int stk3013_write(struct stk3013_data *data, u8 reg, const u8 *buf,
++			 int len)
++{
++	return i2c_smbus_write_i2c_block_data(data->client, reg, len, buf);
++}
++
++static int stk3013_write_u8(struct stk3013_data *data, u8 reg, u8 val)
++{
++	return stk3013_write(data, reg, &val, 1);
++}
++
++static int stk3013_write_u16(struct stk3013_data *data, u8 reg, u16 val)
++{
++	u8 buf[2] = { val >> 8, val & 0xff };
++
++	return stk3013_write(data, reg, buf, 2);
++}
++
++static int stk3013_read_ps(struct stk3013_data *data, u16 *val)
++{
++	u8 buf[2];
++	int ret;
++
++	ret = stk3013_read(data, STK3013_REG_DATA1, buf, sizeof(buf));
++	if (ret)
++		return ret;
++
++	*val = (buf[0] << 8) | buf[1];
++	return 0;
++}
++
++static int stk3013_power(struct stk3013_data *data, bool on)
++{
++	int ret;
++
++	if (on) {
++		if (data->vled && !data->vled_on) {
++			ret = regulator_enable(data->vled);
++			if (ret)
++				return ret;
++			data->vled_on = true;
++		}
++		if (data->vled_gpio)
++			gpiod_set_value_cansleep(data->vled_gpio, 1);
++		if (data->vdd) {
++			ret = regulator_enable(data->vdd);
++			if (ret)
++				goto err_vled;
++		}
++	} else {
++		if (data->vdd)
++			regulator_disable(data->vdd);
++		if (data->vled_gpio)
++			gpiod_set_value_cansleep(data->vled_gpio, 0);
++		if (data->vled && data->vled_on) {
++			regulator_disable(data->vled);
++			data->vled_on = false;
++		}
++	}
++
++	return 0;
++
++err_vled:
++	if (data->vled && data->vled_on) {
++		regulator_disable(data->vled);
++		data->vled_on = false;
++	}
++	return ret;
++}
++
++static int stk3013_set_enable(struct stk3013_data *data, bool enable)
++{
++	u8 state = data->state;
++	int ret;
++
++	if (data->enabled == enable)
++		return 0;
++
++	if (enable) {
++		ret = stk3013_power(data, true);
++		if (ret)
++			return ret;
++		msleep(20);
++	} else {
++		state &= ~STK3013_STATE_EN_MASK;
++		ret = stk3013_write_u8(data, STK3013_REG_STATE, state);
++		if (ret)
++			return ret;
++		stk3013_power(data, false);
++		data->enabled = false;
++		return 0;
++	}
++
++	state |= STK3013_STATE_EN_MASK;
++	ret = stk3013_write_u8(data, STK3013_REG_STATE, state);
++	if (ret)
++		return ret;
++
++	data->state = state;
++	data->enabled = true;
++	return 0;
++}
++
++static int stk3013_init_regs(struct stk3013_data *data)
++{
++	int ret;
++	u8 pid;
++
++	ret = stk3013_write_u8(data, STK3013_REG_SW_RESET, 0x80);
++	if (ret)
++		return ret;
++	msleep(10);
++
++	ret = stk3013_read(data, STK3013_REG_PID, &pid, 1);
++	if (ret)
++		return ret;
++	if (pid == 0x00 || pid == 0xff)
++		return -ENODEV;
++
++	ret = stk3013_write_u8(data, STK3013_REG_STATE, data->state);
++	if (ret)
++		return ret;
++	ret = stk3013_write_u8(data, STK3013_REG_PSCTRL, data->psctrl);
++	if (ret)
++		return ret;
++	ret = stk3013_write_u8(data, STK3013_REG_LEDCTRL, data->ledctrl);
++	if (ret)
++		return ret;
++	ret = stk3013_write_u8(data, STK3013_REG_WAIT, data->wait);
++	if (ret)
++		return ret;
++	ret = stk3013_write_u16(data, STK3013_REG_THDH1, data->thdh);
++	if (ret)
++		return ret;
++	ret = stk3013_write_u16(data, STK3013_REG_THDL1, data->thdl);
++	if (ret)
++		return ret;
++	ret = stk3013_write_u16(data, STK3013_REG_OFFSET1, data->offset);
++	if (ret)
++		return ret;
++
++	return stk3013_write_u8(data, STK3013_REG_INT, STK3013_INT_PS_MODE);
++}
++
++static int stk3013_read_raw(struct iio_dev *indio_dev,
++			    struct iio_chan_spec const *chan,
++			    int *val, int *val2, long mask)
++{
++	struct stk3013_data *data = iio_priv(indio_dev);
++	u16 ps;
++	int ret;
++
++	switch (mask) {
++	case IIO_CHAN_INFO_RAW:
++		if (chan->type != IIO_PROXIMITY)
++			return -EINVAL;
++		ret = stk3013_read_ps(data, &ps);
++		if (ret)
++			return ret;
++		*val = ps;
++		return IIO_VAL_INT;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int stk3013_read_event_config(struct iio_dev *indio_dev,
++				     const struct iio_chan_spec *chan,
++				     enum iio_event_type type,
++				     enum iio_event_direction dir)
++{
++	struct stk3013_data *data = iio_priv(indio_dev);
++
++	return data->enabled;
++}
++
++static int stk3013_write_event_config(struct iio_dev *indio_dev,
++				      const struct iio_chan_spec *chan,
++				      enum iio_event_type type,
++				      enum iio_event_direction dir, bool state)
++{
++	struct stk3013_data *data = iio_priv(indio_dev);
++	int ret;
++
++	mutex_lock(&data->lock);
++	ret = stk3013_set_enable(data, state);
++	mutex_unlock(&data->lock);
++	return ret;
++}
++
++static int stk3013_read_event_value(struct iio_dev *indio_dev,
++				    const struct iio_chan_spec *chan,
++				    enum iio_event_type type,
++				    enum iio_event_direction dir,
++				    enum iio_event_info info, int *val,
++				    int *val2)
++{
++	struct stk3013_data *data = iio_priv(indio_dev);
++
++	if (info != IIO_EV_INFO_VALUE)
++		return -EINVAL;
++
++	*val = dir == IIO_EV_DIR_RISING ? data->thdh : data->thdl;
++	return IIO_VAL_INT;
++}
++
++static int stk3013_write_event_value(struct iio_dev *indio_dev,
++				     const struct iio_chan_spec *chan,
++				     enum iio_event_type type,
++				     enum iio_event_direction dir,
++				     enum iio_event_info info, int val,
++				     int val2)
++{
++	struct stk3013_data *data = iio_priv(indio_dev);
++	int ret;
++
++	if (info != IIO_EV_INFO_VALUE || val < 0 || val > 0xffff)
++		return -EINVAL;
++
++	mutex_lock(&data->lock);
++	if (dir == IIO_EV_DIR_RISING) {
++		ret = stk3013_write_u16(data, STK3013_REG_THDH1, val);
++		if (!ret)
++			data->thdh = val;
++	} else {
++		ret = stk3013_write_u16(data, STK3013_REG_THDL1, val);
++		if (!ret)
++			data->thdl = val;
++	}
++	mutex_unlock(&data->lock);
++
++	return ret;
++}
++
++static const struct iio_event_spec stk3013_events[] = {
++	{
++		.type = IIO_EV_TYPE_THRESH,
++		.dir = IIO_EV_DIR_RISING,
++		.mask_separate = BIT(IIO_EV_INFO_VALUE) |
++				 BIT(IIO_EV_INFO_ENABLE),
++	}, {
++		.type = IIO_EV_TYPE_THRESH,
++		.dir = IIO_EV_DIR_FALLING,
++		.mask_separate = BIT(IIO_EV_INFO_VALUE) |
++				 BIT(IIO_EV_INFO_ENABLE),
++	},
++};
++
++static const struct iio_chan_spec stk3013_channels[] = {
++	{
++		.type = IIO_PROXIMITY,
++		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),
++		.event_spec = stk3013_events,
++		.num_event_specs = ARRAY_SIZE(stk3013_events),
++	},
++};
++
++static const struct iio_info stk3013_info = {
++	.read_raw = stk3013_read_raw,
++	.read_event_config = stk3013_read_event_config,
++	.write_event_config = stk3013_write_event_config,
++	.read_event_value = stk3013_read_event_value,
++	.write_event_value = stk3013_write_event_value,
++};
++
++static irqreturn_t stk3013_irq(int irq, void *priv)
++{
++	struct iio_dev *indio_dev = priv;
++	struct stk3013_data *data = iio_priv(indio_dev);
++	enum iio_event_direction dir;
++	u16 ps;
++	u8 flag;
++	int ret;
++
++	ret = stk3013_read(data, STK3013_REG_FLAG, &flag, 1);
++	if (ret)
++		return IRQ_HANDLED;
++
++	if (!(flag & STK3013_FLAG_PSINT))
++		return IRQ_HANDLED;
++
++	stk3013_write_u8(data, STK3013_REG_FLAG, flag | STK3013_FLAG_CLEAR);
++
++	ret = stk3013_read_ps(data, &ps);
++	if (ret)
++		return IRQ_HANDLED;
++
++	if (!data->near && ps >= data->thdh) {
++		data->near = true;
++		dir = IIO_EV_DIR_RISING;
++	} else if (data->near && ps <= data->thdl) {
++		data->near = false;
++		dir = IIO_EV_DIR_FALLING;
++	} else {
++		return IRQ_HANDLED;
++	}
++
++	iio_push_event(indio_dev,
++		       IIO_UNMOD_EVENT_CODE(IIO_PROXIMITY, 0,
++					    IIO_EV_TYPE_THRESH, dir),
++		       iio_get_time_ns(indio_dev));
++
++	return IRQ_HANDLED;
++}
++
++static int stk3013_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct stk3013_data *data;
++	struct iio_dev *indio_dev;
++	u32 val;
++	int ret;
++
++	indio_dev = devm_iio_device_alloc(dev, sizeof(*data));
++	if (!indio_dev)
++		return -ENOMEM;
++
++	data = iio_priv(indio_dev);
++	data->client = client;
++	mutex_init(&data->lock);
++	i2c_set_clientdata(client, indio_dev);
++
++	data->state = STK3013_DEFAULT_STATE;
++	data->psctrl = STK3013_DEFAULT_PSCTRL;
++	data->ledctrl = STK3013_DEFAULT_LEDCTRL;
++	data->wait = STK3013_DEFAULT_WAIT;
++	data->thdh = STK3013_DEFAULT_THDH;
++	data->thdl = STK3013_DEFAULT_THDL;
++
++	if (!device_property_read_u32(dev, "stk,state-reg", &val))
++		data->state = val;
++	if (!device_property_read_u32(dev, "stk,psctrl-reg", &val))
++		data->psctrl = val;
++	if (!device_property_read_u32(dev, "stk,ledctrl-reg", &val))
++		data->ledctrl = val;
++	if (!device_property_read_u32(dev, "stk,wait-reg", &val))
++		data->wait = val;
++	if (!device_property_read_u32(dev, "stk,ps-thd-h", &val))
++		data->thdh = val;
++	if (!device_property_read_u32(dev, "stk,ps-thd-l", &val))
++		data->thdl = val;
++	if (!device_property_read_u32(dev, "stk,ps-default-offset", &val))
++		data->offset = val;
++
++	data->vdd = devm_regulator_get_optional(dev, "vdd");
++	if (IS_ERR(data->vdd))
++		return dev_err_probe(dev, PTR_ERR(data->vdd),
++				     "failed to get vdd supply\n");
++
++	data->vled = devm_regulator_get_optional(dev, "vled");
++	if (IS_ERR(data->vled))
++		return dev_err_probe(dev, PTR_ERR(data->vled),
++				     "failed to get vled supply\n");
++
++	data->vled_gpio = devm_gpiod_get_optional(dev, "vled", GPIOD_OUT_LOW);
++	if (IS_ERR(data->vled_gpio))
++		return dev_err_probe(dev, PTR_ERR(data->vled_gpio),
++				     "failed to get vled gpio\n");
++
++	ret = stk3013_power(data, true);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to power on\n");
++	msleep(20);
++
++	ret = stk3013_init_regs(data);
++	stk3013_power(data, false);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to initialise sensor\n");
++
++	indio_dev->name = STK3013_DRV_NAME;
++	indio_dev->modes = INDIO_DIRECT_MODE;
++	indio_dev->info = &stk3013_info;
++	indio_dev->channels = stk3013_channels;
++	indio_dev->num_channels = ARRAY_SIZE(stk3013_channels);
++
++	if (client->irq > 0) {
++		ret = devm_request_threaded_irq(dev, client->irq, NULL,
++						stk3013_irq,
++						IRQF_ONESHOT |
++						IRQF_TRIGGER_FALLING,
++						STK3013_DRV_NAME, indio_dev);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "failed to request IRQ\n");
++		disable_irq(client->irq);
++	}
++
++	ret = devm_iio_device_register(dev, indio_dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to register IIO device\n");
++
++	return 0;
++}
++
++static const struct of_device_id stk3013_of_match[] = {
++	{ .compatible = "stk,stk3013" },
++	{ .compatible = "sensortek,stk3013" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, stk3013_of_match);
++
++static const struct i2c_device_id stk3013_id[] = {
++	{ "stk3013", 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, stk3013_id);
++
++static struct i2c_driver stk3013_driver = {
++	.driver = {
++		.name = STK3013_DRV_NAME,
++		.of_match_table = stk3013_of_match,
++	},
++	.probe = stk3013_probe,
++	.id_table = stk3013_id,
++};
++module_i2c_driver(stk3013_driver);
++
++MODULE_DESCRIPTION("Sensortek STK3013 proximity sensor");
++MODULE_LICENSE("GPL");
