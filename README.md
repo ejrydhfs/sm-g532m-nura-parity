@@ -7,7 +7,7 @@ MediaTek **MT6737T**) hardware support toward parity with the
 
 This repository contains **no ROM images, firmware, vendor ELFs, or other
 proprietary blobs**. It contains source patches, original/reworked driver code,
-documentation, build artifacts, and a sanitized session transcript. The firmware was obtained from SamFW https://samfw.com/firmware/SM-G532M/PBS/G532MUMU1ASD1 
+documentation, build artifacts, and a sanitized session transcript. The ROM was obtained from SamFW https://samfw.com/firmware/SM-G532M/PBS/G532MUMU1ASD1 
 
 ## Target
 
