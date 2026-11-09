@@ -65,6 +65,7 @@ code/
 
 session/
   omp-session-public-sanitized.zip
+  omp-session-full-sanitized.zip
   README.md
 
 LICENSE                     GPL-2.0
@@ -133,7 +134,8 @@ The complete fragment is `patches/core/0012-required-config.txt`.
 
 ## Session archive
 
-`session/omp-session-public-sanitized.zip` was produced with
+`session/omp-session-public-sanitized.zip` (and the full
+`session/omp-session-full-sanitized.zip`) were produced with
 [`alosslessdev/omp-archive`](https://github.com/alosslessdev/omp-archive-main).
 It contains the main transcript, agent metadata, job index and standalone HTML
 viewer. It is the **no-artifacts** variant: untruncated tool logs and binary

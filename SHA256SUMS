@@ -1043,5 +1043,6 @@ dda15f98f0e4cd2f22428cf6bf37da1df32bf2bfbd93b41cf167a92721b34a34  ./patches/subs
 a86cb64dc690410d841ce5b5ea43c54bd467d20a7a363b3090799dead90c484f  ./patches/subsystems/wcn-wlan.patch
 1d127cb957126b1e360d1d708aa50bc78547fb1c89d28f455554d9ce9f87bc49  ./patches/subsystems/wcn-wmt.patch
 9041ac7b24d799988c89eca910c386f92100e31f59cf5ccabf2891c97918bf1f  ./README.md
+f2e75aa7ea11b3e631b84a1ef047ac0331505fb4070fa16f028462668ef73f91  ./session/omp-session-full-sanitized.zip
 0b4ec79f68f23b6daeff960ff75949a34b4b5882549cec38a0dd23032b5b0458  ./session/omp-session-public-sanitized.zip
-125dacfc4ad13f1954523f246292a4d27d870b80402304996d9e8386796a00d6  ./session/README.md
+43726ff47e5f13b81c10de99f5ec5ce9323635f82872bb3d7bcd66cc5bc62b0b  ./session/README.md

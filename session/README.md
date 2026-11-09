@@ -14,10 +14,15 @@
 | `viewer.html` | Standalone HTML viewer |
 | `README.md` | Plugin-generated index |
 
-This is the **no-artifacts** export. The full archive includes untruncated tool
-logs and the session artifact tree; it is published as a release asset:
+Two archives are kept here:
 
-<https://github.com/ejrydhfs/sm-g532m-nura-parity/releases/tag/session-archive-2026-10-26>
+| File | Contents |
+|---|---|
+| `omp-session-public-sanitized.zip` | no-artifacts export (transcript, agents, jobs, viewer) |
+| `omp-session-full-sanitized.zip` | full export, including untruncated tool logs and the session artifact tree |
+
+Both are also published as release assets on
+<https://github.com/ejrydhfs/sm-g532m-nura-parity/releases/tag/session-archive-2026-10-26>.
 
 ## Sanitization
 
